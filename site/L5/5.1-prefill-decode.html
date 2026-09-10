@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.1 prefill 与 decode 的系统性质</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">5.1</div>
+  <div class="sidebar-title">prefill 与 decode 的系统性质</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#roofline">一 · 两相在 roofline 上的位置</a></li>
+<li><a href="#batch">二 · batch 对两相的影响完全不同</a></li>
+<li><a href="#ttft-tpot">三 · TTFT 与 TPOT</a></li>
+<li><a href="#_2">四 · 长度不齐的浪费</a></li>
+<li><a href="#_3">五 · 设计取舍</a><ul>
+<li><a href="#51">5.1 为什么不能用一套参数同时优化两相</a></li>
+<li><a href="#52-pd">5.2 PD 分离的动机与代价</a></li>
+<li><a href="#53">5.3 一个可带走的判断</a></li>
+</ul>
+</li>
+<li><a href="#lab">六 · 动手 lab</a></li>
+<li><a href="#_4">七 · 陷阱</a></li>
+<li><a href="#_5">八 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
+  <div class="mod-id">5.1</div>
+  <h1>prefill 与 decode 的系统性质</h1>
+  <p class="lede">两相对硬件的要求相反：同一个 batch 扫描下 prefill 吞吐只涨 1.24×、decode 涨 56×。TTFT 随 prompt 线性增长而 TPOT 不变，所以负载形态决定该看哪个指标。静态批处理在长度不齐时只有 52% 利用率；但连续批处理的收益要有队列才看得到（1720 vs 5563 tok/s）。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · vLLM 0.29.0 · Qwen3-1.7B</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 0.2（roofline）· 3.1/3.3（两相的 attention）· 5.2（KV 分页）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>3.1 和 3.3 分别从 attention 的角度看过 prefill 和 decode。
+这一章从<strong>整个引擎</strong>的角度看：这两相对硬件的要求是<strong>相反的</strong>，
+于是引擎的每一个调度决策都要在它们之间做取舍。</p>
+<ol>
+<li>两相分别落在 roofline 的哪一侧？</li>
+<li>加 batch 对它们的影响为什么完全不同？</li>
+<li>一个请求的时间花在哪里？该用什么指标衡量？</li>
+</ol>
+<hr />
+<h2 id="roofline">一 · 两相在 roofline 上的位置</h2>
+<p>Qwen3-1.7B，权重 bf16 = 3.20 GiB，机器平衡点 144.2 FLOP/byte：</p>
+<table>
+<thead>
+<tr>
+<th>相</th>
+<th style="text-align: right;">batch</th>
+<th style="text-align: right;">序列</th>
+<th style="text-align: right;">FLOP</th>
+<th style="text-align: right;">权重字节</th>
+<th style="text-align: right;">算术强度</th>
+<th>落在哪一侧</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>prefill</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">7.05e12</td>
+<td style="text-align: right;">3.44e9</td>
+<td style="text-align: right;"><strong>2048.0</strong></td>
+<td>算力</td>
+</tr>
+<tr>
+<td>prefill</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">1.41e13</td>
+<td style="text-align: right;">3.44e9</td>
+<td style="text-align: right;"><strong>4096.0</strong></td>
+<td>算力</td>
+</tr>
+<tr>
+<td>decode</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">3.44e9</td>
+<td style="text-align: right;">3.44e9</td>
+<td style="text-align: right;"><strong>1.0</strong></td>
+<td>带宽</td>
+</tr>
+<tr>
+<td>decode</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">2.75e10</td>
+<td style="text-align: right;">3.44e9</td>
+<td style="text-align: right;">8.0</td>
+<td>带宽</td>
+</tr>
+<tr>
+<td>decode</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">2.20e11</td>
+<td style="text-align: right;">3.44e9</td>
+<td style="text-align: right;">64.0</td>
+<td>带宽</td>
+</tr>
+<tr>
+<td>decode</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">8.81e11</td>
+<td style="text-align: right;">3.44e9</td>
+<td style="text-align: right;">256.0</td>
+<td>算力</td>
+</tr>
+</tbody>
+</table>
+<p>关键在<strong>权重字节那一列是常数</strong>：无论 batch 多大、序列多长，
+每一步都要把全部权重读一遍，<strong>只读一遍</strong>。</p>
+<ul>
+<li><strong>prefill</strong> 一次处理 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 个 token，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>2048</mn></mrow></math></span> 就有 2048 的算术强度——
+  天然在算力一侧。</li>
+<li><strong>decode</strong> 一次只处理 1 个 token，算术强度就是 batch 大小。
+  batch≈72 时才越过平衡点。</li>
+</ul>
+<p>这就是全部：<strong>prefill 靠序列长度自带算术强度，decode 只能靠 batch 去买。</strong></p>
+<p>（这里只算权重。KV 的读取<strong>不随 batch 摊薄</strong>——每条请求有自己的 KV，
+所以 batch 越大 KV 读取越多。3.3 那本账是另一半。）</p>
+<hr />
+<h2 id="batch">二 · batch 对两相的影响完全不同</h2>
+<p>同一个引擎、同一台机器、同样的 batch 扫描：</p>
+<p><strong>prefill</strong>（每条 1024 token，只生成 1 个）</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">batch</th>
+<th style="text-align: right;">总耗时 ms</th>
+<th style="text-align: right;">每条 ms</th>
+<th style="text-align: right;">prompt tok/s</th>
+<th style="text-align: right;">相对 batch=1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">20.0</td>
+<td style="text-align: right;">20.0</td>
+<td style="text-align: right;">51177</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">35.0</td>
+<td style="text-align: right;">17.5</td>
+<td style="text-align: right;">58454</td>
+<td style="text-align: right;">1.14×</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">130.8</td>
+<td style="text-align: right;">16.3</td>
+<td style="text-align: right;">62632</td>
+<td style="text-align: right;">1.22×</td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">514.6</td>
+<td style="text-align: right;">16.1</td>
+<td style="text-align: right;">63679</td>
+<td style="text-align: right;"><strong>1.24×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>decode</strong>（每条 prompt 128 token，生成 64）</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">batch</th>
+<th style="text-align: right;">每步 ms</th>
+<th style="text-align: right;">output tok/s</th>
+<th style="text-align: right;">相对 batch=1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4.496</td>
+<td style="text-align: right;">222</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">4.531</td>
+<td style="text-align: right;">883</td>
+<td style="text-align: right;">3.97×</td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4.752</td>
+<td style="text-align: right;">3367</td>
+<td style="text-align: right;">15.14×</td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">4.791</td>
+<td style="text-align: right;">6679</td>
+<td style="text-align: right;">30.03×</td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">5.134</td>
+<td style="text-align: right;">12467</td>
+<td style="text-align: right;"><strong>56.05×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>batch 从 1 到 32：prefill 吞吐只涨 1.24×，decode 涨 30×。</strong></p>
+<p>原因就是第一节那张表：prefill 在 batch=1 时就已经算力受限，
+加 batch 只是把更多工作排队，单位时间做的事没变多。
+decode 的每步时间从 4.496 涨到 5.134 ms（<strong>只涨 14%</strong>），
+却同时服务了 64 倍的请求——<strong>权重读取被 64 条请求分摊了</strong>。</p>
+<div class="admonition note">
+<p class="admonition-title">这两张表是引擎所有调度决策的出发点</p>
+<p><strong>prefill 不需要凑批，decode 极其需要凑批。</strong></p>
+<p>推论一串：
+- 调度器应该优先把 decode 的批凑大（5.3 的 continuous batching）
+- prefill 可以切碎了插空（chunked prefill）而不损失什么
+- 两相甚至可以放到不同的机器上（PD 分离，<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>）
+- 评估引擎不能只报一个"吞吐"（0.3 §陷阱 1）</p>
+</div>
+<hr />
+<h2 id="ttft-tpot">三 · TTFT 与 TPOT</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">prompt 长度</th>
+<th style="text-align: right;">生成</th>
+<th style="text-align: right;">TTFT ms</th>
+<th style="text-align: right;">TPOT ms</th>
+<th style="text-align: right;">总时长 ms</th>
+<th style="text-align: right;">TTFT 占比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">5.67</td>
+<td style="text-align: right;">4.489</td>
+<td style="text-align: right;">293.0</td>
+<td style="text-align: right;">1.9%</td>
+</tr>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">11.03</td>
+<td style="text-align: right;">4.430</td>
+<td style="text-align: right;">294.5</td>
+<td style="text-align: right;">3.7%</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">37.04</td>
+<td style="text-align: right;">4.515</td>
+<td style="text-align: right;">326.0</td>
+<td style="text-align: right;">11.4%</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">75.54</td>
+<td style="text-align: right;">4.493</td>
+<td style="text-align: right;">363.1</td>
+<td style="text-align: right;"><strong>20.8%</strong></td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>TTFT 随 prompt 长度线性增长</strong>（5.67 → 75.54 ms，prompt 涨 32 倍，
+  TTFT 涨 13 倍——不是严格线性，因为有固定开销）。</li>
+<li><strong>TPOT 基本不变</strong>（4.43–4.52 ms）。这里 KV 还很小，
+  按 3.3 的账，KV 长了 TPOT 才会涨。</li>
+</ul>
+<p>所以<strong>负载形态决定了该看哪个指标</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>负载</th>
+<th>主导指标</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>长 prompt + 短输出</td>
+<td>TTFT</td>
+<td>文档问答、代码补全、分类</td>
+</tr>
+<tr>
+<td>短 prompt + 长输出</td>
+<td>TPOT</td>
+<td>对话、创作、推理链</td>
+</tr>
+<tr>
+<td>两者都长</td>
+<td>都要看</td>
+<td>Agent、长文摘要</td>
+</tr>
+</tbody>
+</table>
+<p><strong>只报"吞吐"会同时掩盖这两个。</strong> 一个把 TTFT 做到很差、
+靠大批把吞吐堆上去的引擎，在交互场景里是不能用的。</p>
+<hr />
+<h2 id="_2">四 · 长度不齐的浪费</h2>
+<p>16 条请求，两种输出长度分布：</p>
+<div class="highlight"><pre><span></span><code>长度一致（都生成 64）
+  实际生成 1024 token，耗时 333.3 ms，吞吐 3073 tok/s
+  最长 64，若静态批处理要按最长算：1024 个 step 的位置
+  利用率 = 1024 / 1024 = 100.0%
+
+长度不齐（1..128 均匀）
+  实际生成 949 token，耗时 551.9 ms，吞吐 1720 tok/s
+  最长 114，若静态批处理要按最长算：1824 个 step 的位置
+  利用率 = 949 / 1824 = 52.0%
+</code></pre></div>
+
+<p><strong>静态批处理在长度不齐时只能拿到 52% 的利用率</strong>——
+一批一起开始、一起结束，最长的那条决定整批时长，
+先结束的请求占着位置什么也不干。</p>
+<div class="admonition warning">
+<p class="admonition-title">但第二行的吞吐也掉了一半，而 vLLM 已经是连续批处理</p>
+<p>这两件事要分开：</p>
+<ol>
+<li><strong>52% 是静态批处理会浪费的比例。</strong></li>
+<li><strong>吞吐从 3073 掉到 1720，是因为这里没有排队的新请求可以补位。</strong>
+   批在跑的过程中不断有请求结束，活跃数从 16 一路掉到 1，
+   最后几步是在按 batch=1 的速度跑（第二节：batch=1 只有 222 tok/s）。</li>
+</ol>
+<p><strong>连续批处理消除的是「等最慢的那条」，不是「没活干」。</strong></p>
+</div>
+<p>给它一个队列，收益就出来了：</p>
+<div class="highlight"><pre><span></span><code>一次提交 64 条（长度同样 1..128 不齐）
+  实际生成 4162 token，耗时 748.1 ms，吞吐 5563 tok/s
+</code></pre></div>
+
+<p>对照 16 条不齐时的 1720 tok/s——<strong>3.2×</strong>。
+早结束的请求空出的位置立刻被后面的补上，批一直是满的。</p>
+<p><strong>这也说明闭环测试（一次提交固定一批，等全部结束）会低估连续批处理。</strong>
+要看真实收益必须开环压测（持续按到达率发请求），这是 <span class="xref pending" title="可观测性与正确的压测（尚未写）">L8.3</span> 的方法。</p>
+<hr />
+<h2 id="_3">五 · 设计取舍</h2>
+<h3 id="51">5.1 为什么不能用一套参数同时优化两相</h3>
+<p>两相的最优配置是冲突的：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>prefill</th>
+<th>decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>想要的 batch</td>
+<td>小（已经算力受限，大批只增加延迟）</td>
+<td>大（越大越摊薄权重）</td>
+</tr>
+<tr>
+<td>想要的 kernel 形状</td>
+<td>方阵（2.7 §六：cuBLAS 在这里到 92% 峰值）</td>
+<td>瘦长（M 很小）</td>
+</tr>
+<tr>
+<td>对 KV 的操作</td>
+<td>写入</td>
+<td>读取</td>
+</tr>
+<tr>
+<td>瓶颈</td>
+<td>算力</td>
+<td>带宽</td>
+</tr>
+<tr>
+<td>延迟指标</td>
+<td>TTFT</td>
+<td>TPOT</td>
+</tr>
+</tbody>
+</table>
+<p>一个引擎在同一个 step 里既做 prefill 又做 decode（混合批），
+就必须在这两组要求之间折中。<strong>chunked prefill</strong>（把长 prompt 切成小块
+插进 decode 批里）就是这个折中的具体形态：
+它牺牲一点 prefill 的效率，换 decode 批不被长 prefill 打断。</p>
+<h3 id="52-pd">5.2 PD 分离的动机与代价</h3>
+<p>既然两相要求相反，最彻底的解法是<strong>放到不同的机器上</strong>：
+prefill 集群配算力强的卡，decode 集群配带宽大、显存大的卡。</p>
+<p>代价是 <strong>KV 要跨机传输</strong>——prefill 算出的 KV 必须送到 decode 机器。
+1.5 实测本机跨机带宽上限只有 3.1 GB/s，而 3.3 算过
+一条 4096 上下文的请求 KV 是 448 MB。传一次要 145 ms，
+比 prefill 本身（75 ms）还久。</p>
+<p><strong>所以 PD 分离在慢网络上是负收益。</strong> 它需要高速互联才成立——
+这也是为什么它先出现在有 NVLink/InfiniBand 的集群上。<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span> 会展开。</p>
+<h3 id="53">5.3 一个可带走的判断</h3>
+<p>本章的形态在系统里反复出现：<strong>当一个系统里存在两种性质相反的工作时，
+"统一处理"和"分开处理"之间的选择，取决于分开的协调成本。</strong></p>
+<ul>
+<li>协调成本低（同一进程内切换）→ 混合批 + chunked prefill</li>
+<li>协调成本高（跨机传 KV）→ 只有在互联足够快时才分离</li>
+</ul>
+<p>判据不是"哪种更先进"，而是<strong>量出协调成本</strong>再比。
+3.3 §四 的分页、4.3 §五 的 KV 量化，我都在这一点上栽过——
+框架层的模拟会把协调成本量错。</p>
+<hr />
+<h2 id="lab">六 · 动手 lab</h2>
+<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L5 &amp;&amp; /scratch/learn/envs/serve/bin/python prefill_decode.py'</span>
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/engine/51_prefill_decode.txt</code>。</p>
+<details class="fold srcfold"><summary>labs/L5/prefill_decode.py 全文（277 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L5.1 —— prefill 与 decode 的系统性质。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">3.1/3.3 从 attention 的角度看过这两相。这里从**整个引擎**的角度看：</span>
+<span class="linenos">  5</span><span class="sd">它们对硬件的要求完全相反，所以调度、批处理、甚至部署方式都不同。</span>
+<span class="linenos">  6</span>
+<span class="linenos">  7</span><span class="sd">  [A] 两相的 roofline 位置：算力受限 vs 带宽受限</span>
+<span class="linenos">  8</span><span class="sd">  [B] batch 对两相的影响完全不同</span>
+<span class="linenos">  9</span><span class="sd">  [C] 一个请求的时间构成：TTFT vs TPOT</span>
+<span class="linenos"> 10</span><span class="sd">  [D] 长度不齐时的浪费：为什么需要 continuous batching（5.3）</span>
+<span class="linenos"> 11</span>
+<span class="linenos"> 12</span><span class="sd">用法：</span>
+<span class="linenos"> 13</span><span class="sd">    python prefill_decode.py</span>
+<span class="linenos"> 14</span><span class="sd">"""</span>
+<span class="linenos"> 15</span>
+<span class="linenos"> 16</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 17</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos"> 19</span>
+<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 21</span>
+<span class="linenos"> 22</span><span class="c1"># 模型都已在本地缓存；强制离线，避免 vLLM/transformers 每次去连 Hub</span>
+<span class="linenos"> 23</span><span class="c1"># （连不上时会直接抛 httpx.ConnectError，即使文件就在本地）</span>
+<span class="linenos"> 24</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"HF_HUB_OFFLINE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
+<span class="linenos"> 25</span>
+<span class="linenos"> 26</span><span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos"> 27</span><span class="n">PEAK_TF</span> <span class="o">=</span> <span class="mf">232.0</span>      <span class="c1"># L1.2 实测 bf16</span>
+<span class="linenos"> 28</span><span class="n">PEAK_BW</span> <span class="o">=</span> <span class="mf">1608.6</span>     <span class="c1"># L1.1 实测只读带宽</span>
+<span class="linenos"> 29</span><span class="n">MODEL</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"L51_MODEL"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen3-1.7B"</span><span class="p">)</span>
+<span class="linenos"> 30</span>
+<span class="linenos"> 31</span>
+<span class="linenos"> 32</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 33</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos"> 34</span>
+<span class="linenos"> 35</span>
+<span class="linenos"> 36</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 37</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos"> 38</span>
+<span class="linenos"> 39</span>
+<span class="linenos"> 40</span><span class="k">def</span><span class="w"> </span><span class="nf">safe_util</span><span class="p">(</span><span class="n">reserve_gib</span><span class="o">=</span><span class="mf">4.0</span><span class="p">,</span> <span class="n">cap</span><span class="o">=</span><span class="mf">0.55</span><span class="p">):</span>
+<span class="linenos"> 41</span><span class="w">    </span><span class="sd">"""按**当前空闲显存**算一个安全的 gpu_memory_utilization。</span>
+<span class="linenos"> 42</span>
+<span class="linenos"> 43</span><span class="sd">    crater 是共享机器，可能有别人的作业在跑（本轮就撞上过一次</span>
+<span class="linenos"> 44</span><span class="sd">    loopserve 的 lightnav_replay_gate 占了 14 GB）。</span>
+<span class="linenos"> 45</span><span class="sd">    写死 0.55 会在别人占了一半时直接启动失败，</span>
+<span class="linenos"> 46</span><span class="sd">    更糟的是在别人**之后**才启动时把对方挤掉。</span>
+<span class="linenos"> 47</span><span class="sd">    所以按空闲量算，并额外留 reserve_gib 给对方增长。</span>
+<span class="linenos"> 48</span><span class="sd">    """</span>
+<span class="linenos"> 49</span>    <span class="n">free</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
+<span class="linenos"> 50</span>    <span class="n">gib</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">**</span> <span class="mi">3</span>
+<span class="linenos"> 51</span>    <span class="n">usable</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">free</span> <span class="o">/</span> <span class="n">gib</span> <span class="o">-</span> <span class="n">reserve_gib</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
+<span class="linenos"> 52</span>    <span class="n">util</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="n">usable</span> <span class="o">/</span> <span class="p">(</span><span class="n">total</span> <span class="o">/</span> <span class="n">gib</span><span class="p">))</span>
+<span class="linenos"> 53</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  [显存] 空闲 </span><span class="si">{</span><span class="n">free</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">gib</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">gib</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GiB，"</span>
+<span class="linenos"> 54</span>          <span class="sa">f</span><span class="s2">"留 </span><span class="si">{</span><span class="n">reserve_gib</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> GiB 给他人 -&gt; gpu_memory_utilization=</span><span class="si">{</span><span class="n">util</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 55</span>    <span class="k">return</span> <span class="n">util</span>
+<span class="linenos"> 56</span>
+<span class="linenos"> 57</span>
+<span class="linenos"> 58</span><span class="k">def</span><span class="w"> </span><span class="nf">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">):</span>
+<span class="linenos"> 59</span>    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_ENABLE_V1_MULTIPROCESSING"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
+<span class="linenos"> 60</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="linenos"> 61</span>    <span class="n">d</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">MODEL</span><span class="p">,</span> <span class="n">gpu_memory_utilization</span><span class="o">=</span><span class="n">safe_util</span><span class="p">(),</span>
+<span class="linenos"> 62</span>             <span class="n">max_model_len</span><span class="o">=</span><span class="mi">8192</span><span class="p">,</span> <span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos"> 63</span>             <span class="n">enable_prefix_caching</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">disable_log_stats</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 64</span>    <span class="n">d</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">kw</span><span class="p">)</span>
+<span class="linenos"> 65</span>    <span class="k">return</span> <span class="n">LLM</span><span class="p">(</span><span class="o">**</span><span class="n">d</span><span class="p">)</span>
+<span class="linenos"> 66</span>
+<span class="linenos"> 67</span>
+<span class="linenos"> 68</span><span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">):</span>
+<span class="linenos"> 69</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos"> 70</span>        <span class="n">llm</span><span class="o">.</span><span class="n">llm_engine</span><span class="o">.</span><span class="n">engine_core</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+<span class="linenos"> 71</span>    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>                                         <span class="c1"># noqa: BLE001</span>
+<span class="linenos"> 72</span>        <span class="k">pass</span>
+<span class="linenos"> 73</span>    <span class="k">del</span> <span class="n">llm</span>
+<span class="linenos"> 74</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">gc</span>
+<span class="linenos"> 75</span>    <span class="n">gc</span><span class="o">.</span><span class="n">collect</span><span class="p">()</span>
+<span class="linenos"> 76</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos"> 77</span>
+<span class="linenos"> 78</span>
+<span class="linenos"> 79</span><span class="k">def</span><span class="w"> </span><span class="nf">rand_prompt</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">rng</span><span class="p">):</span>
+<span class="linenos"> 80</span>    <span class="n">ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">rng</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">60000</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)]</span>
+<span class="linenos"> 81</span>    <span class="k">return</span> <span class="n">ids</span>
+<span class="linenos"> 82</span>
+<span class="linenos"> 83</span>
+<span class="linenos"> 84</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos"> 85</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos"> 86</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 两相在 roofline 上的位置"</span><span class="p">)</span>
+<span class="linenos"> 87</span>
+<span class="linenos"> 88</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">json</span><span class="o">,</span><span class="w"> </span><span class="nn">glob</span>
+<span class="linenos"> 89</span>    <span class="n">hub</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"HF_HOME"</span><span class="p">,</span> <span class="s2">"/scratch/learn/models/hf"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/hub"</span>
+<span class="linenos"> 90</span>    <span class="n">d</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">hub</span><span class="si">}</span><span class="s2">/models--</span><span class="si">{</span><span class="n">MODEL</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'/'</span><span class="p">,</span><span class="w"> </span><span class="s1">'--'</span><span class="p">)</span><span class="si">}</span><span class="s2">/snapshots/*"</span><span class="p">))[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos"> 91</span>    <span class="n">c</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/config.json"</span><span class="p">))</span>
+<span class="linenos"> 92</span>    <span class="n">H</span><span class="p">,</span> <span class="n">I</span><span class="p">,</span> <span class="n">L</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span>
+<span class="linenos"> 93</span>    <span class="n">nq</span><span class="p">,</span> <span class="n">nkv</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_key_value_heads"</span><span class="p">]</span>
+<span class="linenos"> 94</span>    <span class="n">hd</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"head_dim"</span><span class="p">,</span> <span class="n">H</span> <span class="o">//</span> <span class="n">nq</span><span class="p">)</span>
+<span class="linenos"> 95</span>    <span class="n">V</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"vocab_size"</span><span class="p">]</span>
+<span class="linenos"> 96</span>    <span class="n">P</span> <span class="o">=</span> <span class="n">L</span> <span class="o">*</span> <span class="p">(</span><span class="n">H</span> <span class="o">*</span> <span class="n">nq</span> <span class="o">*</span> <span class="n">hd</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">nkv</span> <span class="o">*</span> <span class="n">hd</span> <span class="o">+</span> <span class="n">nq</span> <span class="o">*</span> <span class="n">hd</span> <span class="o">*</span> <span class="n">H</span> <span class="o">+</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">I</span><span class="p">)</span> <span class="o">+</span> <span class="n">V</span> <span class="o">*</span> <span class="n">H</span>
+<span class="linenos"> 97</span>
+<span class="linenos"> 98</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">MODEL</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">P</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">B 参数，权重 bf16 = </span><span class="si">{</span><span class="n">P</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1024</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB"</span><span class="p">)</span>
+<span class="linenos"> 99</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  机器平衡点 = </span><span class="si">{</span><span class="n">PEAK_TF</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e12</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">PEAK_BW</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e9</span><span class="p">)</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> FLOP/byte"</span><span class="p">)</span>
+<span class="linenos">100</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'相'</span><span class="si">:</span><span class="s2">&lt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'序列'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'FLOP'</span><span class="si">:</span><span class="s2">&gt;14</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'权重字节'</span><span class="si">:</span><span class="s2">&gt;14</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">101</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'算术强度'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'落在哪一侧'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">102</span>    <span class="n">bal</span> <span class="o">=</span> <span class="n">PEAK_TF</span> <span class="o">*</span> <span class="mf">1e12</span> <span class="o">/</span> <span class="p">(</span><span class="n">PEAK_BW</span> <span class="o">*</span> <span class="mf">1e9</span><span class="p">)</span>
+<span class="linenos">103</span>    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">B</span><span class="p">,</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"prefill"</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2048</span><span class="p">),</span> <span class="p">(</span><span class="s2">"prefill"</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span>
+<span class="linenos">104</span>                       <span class="p">(</span><span class="s2">"decode"</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="p">(</span><span class="s2">"decode"</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos">105</span>                       <span class="p">(</span><span class="s2">"decode"</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="p">(</span><span class="s2">"decode"</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]:</span>
+<span class="linenos">106</span>        <span class="n">flop</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">P</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">S</span>
+<span class="linenos">107</span>        <span class="n">wbytes</span> <span class="o">=</span> <span class="n">P</span> <span class="o">*</span> <span class="mi">2</span>                 <span class="c1"># 权重只读一遍，与 batch 无关</span>
+<span class="linenos">108</span>        <span class="n">ai</span> <span class="o">=</span> <span class="n">flop</span> <span class="o">/</span> <span class="n">wbytes</span>
+<span class="linenos">109</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">flop</span><span class="si">:</span><span class="s2">&gt;14,.0f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">wbytes</span><span class="si">:</span><span class="s2">&gt;14,</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">110</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">ai</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'算力'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">ai</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">bal</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'带宽'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">111</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  **prefill 天然在算力一侧，decode 在带宽一侧。**"</span><span class="p">)</span>
+<span class="linenos">112</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  decode 要靠 batch 把权重读取摊薄：batch≈</span><span class="si">{</span><span class="n">bal</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">2</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> 时越过平衡点。"</span><span class="p">)</span>
+<span class="linenos">113</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  （这里只算权重，没算 KV —— KV 的账见 3.3，它不随 batch 摊薄。）"</span><span class="p">)</span>
+<span class="linenos">114</span>
+<span class="linenos">115</span>
+<span class="linenos">116</span><span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos">117</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos">118</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] batch 对两相的影响完全不同"</span><span class="p">)</span>
+<span class="linenos">119</span>
+<span class="linenos">120</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos">121</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos">122</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoTokenizer</span>
+<span class="linenos">123</span>    <span class="n">tok</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">MODEL</span><span class="p">)</span>
+<span class="linenos">124</span>    <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">125</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">()</span>
+<span class="linenos">126</span>
+<span class="linenos">127</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"prefill：加 batch 几乎不提高吞吐（已经算力受限）"</span><span class="p">)</span>
+<span class="linenos">128</span>    <span class="n">S</span> <span class="o">=</span> <span class="mi">1024</span>
+<span class="linenos">129</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  每条 prompt </span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> token，只生成 1 个 token"</span><span class="p">)</span>
+<span class="linenos">130</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'总耗时 ms'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'每条 ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">131</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'prompt tok/s'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对 batch=1'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">132</span>    <span class="n">base</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">133</span>    <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">]:</span>
+<span class="linenos">134</span>        <span class="n">ps</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_prompt</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">rng</span><span class="p">))</span>
+<span class="linenos">135</span>              <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">)]</span>
+<span class="linenos">136</span>        <span class="n">sp</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos">137</span>        <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">138</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos">139</span>        <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">140</span>        <span class="n">dt</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos">141</span>        <span class="n">tp</span> <span class="o">=</span> <span class="n">B</span> <span class="o">*</span> <span class="n">S</span> <span class="o">/</span> <span class="p">(</span><span class="n">dt</span> <span class="o">/</span> <span class="mi">1000</span><span class="p">)</span>
+<span class="linenos">142</span>        <span class="k">if</span> <span class="n">base</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">143</span>            <span class="n">base</span> <span class="o">=</span> <span class="n">tp</span>
+<span class="linenos">144</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">dt</span><span class="si">:</span><span class="s2">&gt;11.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">dt</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tp</span><span class="si">:</span><span class="s2">&gt;13.0f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">145</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">tp</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">base</span><span class="si">:</span><span class="s2">&gt;12.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">146</span>
+<span class="linenos">147</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"decode：加 batch 吞吐几乎线性上涨（带宽被摊薄）"</span><span class="p">)</span>
+<span class="linenos">148</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  每条 prompt 128 token，生成 64 token；只看 decode 部分"</span><span class="p">)</span>
+<span class="linenos">149</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'总耗时 ms'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'每步 ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">150</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'output tok/s'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对 batch=1'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">151</span>    <span class="n">base</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">152</span>    <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">]:</span>
+<span class="linenos">153</span>        <span class="n">ps</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_prompt</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="n">rng</span><span class="p">))</span>
+<span class="linenos">154</span>              <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">)]</span>
+<span class="linenos">155</span>        <span class="n">sp1</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">156</span>        <span class="n">sp2</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">65</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">157</span>        <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp2</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">158</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp1</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">159</span>        <span class="n">t_1</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos">160</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp2</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">161</span>        <span class="n">t_65</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos">162</span>        <span class="n">per_step</span> <span class="o">=</span> <span class="p">(</span><span class="n">t_65</span> <span class="o">-</span> <span class="n">t_1</span><span class="p">)</span> <span class="o">/</span> <span class="mi">64</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos">163</span>        <span class="n">tp</span> <span class="o">=</span> <span class="n">B</span> <span class="o">/</span> <span class="p">(</span><span class="n">per_step</span> <span class="o">/</span> <span class="mi">1000</span><span class="p">)</span>
+<span class="linenos">164</span>        <span class="k">if</span> <span class="n">base</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">165</span>            <span class="n">base</span> <span class="o">=</span> <span class="n">tp</span>
+<span class="linenos">166</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_65</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1000</span><span class="si">:</span><span class="s2">&gt;11.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">per_step</span><span class="si">:</span><span class="s2">&gt;10.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tp</span><span class="si">:</span><span class="s2">&gt;13.0f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">167</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">tp</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">base</span><span class="si">:</span><span class="s2">&gt;12.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">168</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  两张表放一起就是引擎所有调度决策的出发点："</span><span class="p">)</span>
+<span class="linenos">169</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  **prefill 不需要凑批，decode 极其需要凑批。**"</span><span class="p">)</span>
+<span class="linenos">170</span>    <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
+<span class="linenos">171</span>
+<span class="linenos">172</span>
+<span class="linenos">173</span><span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos">174</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos">175</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 一个请求的时间构成：TTFT 与 TPOT"</span><span class="p">)</span>
+<span class="linenos">176</span>
+<span class="linenos">177</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos">178</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos">179</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoTokenizer</span>
+<span class="linenos">180</span>    <span class="n">tok</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">MODEL</span><span class="p">)</span>
+<span class="linenos">181</span>    <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">182</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">()</span>
+<span class="linenos">183</span>
+<span class="linenos">184</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  TTFT = time to first token（含排队 + prefill）"</span><span class="p">)</span>
+<span class="linenos">185</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  TPOT = time per output token（decode 每步）"</span><span class="p">)</span>
+<span class="linenos">186</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'prompt 长度'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'生成'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'TTFT ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'TPOT ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">187</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'总时长 ms'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'TTFT 占比'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">188</span>    <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">128</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">4096</span><span class="p">]:</span>
+<span class="linenos">189</span>        <span class="k">for</span> <span class="n">G</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">64</span><span class="p">]:</span>
+<span class="linenos">190</span>            <span class="n">p</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_prompt</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">rng</span><span class="p">))]</span>
+<span class="linenos">191</span>            <span class="n">sp1</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">192</span>            <span class="n">spG</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">G</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">193</span>            <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">spG</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">194</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">sp1</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">195</span>            <span class="n">ttft</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos">196</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">spG</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">197</span>            <span class="n">tot</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos">198</span>            <span class="n">tpot</span> <span class="o">=</span> <span class="p">(</span><span class="n">tot</span> <span class="o">-</span> <span class="n">ttft</span><span class="p">)</span> <span class="o">/</span> <span class="n">G</span>
+<span class="linenos">199</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">G</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ttft</span><span class="si">:</span><span class="s2">&gt;10.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tpot</span><span class="si">:</span><span class="s2">&gt;10.3f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">200</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">tot</span><span class="si">:</span><span class="s2">&gt;11.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ttft</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">tot</span><span class="si">:</span><span class="s2">&gt;9.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">201</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  prompt 越长，TTFT 越大而 TPOT 基本不变（3.3 说过 decode 由 KV 决定，"</span><span class="p">)</span>
+<span class="linenos">202</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这里 KV 还很小）。所以「长 prompt + 短输出」的负载 TTFT 占主导，"</span><span class="p">)</span>
+<span class="linenos">203</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  「短 prompt + 长输出」的负载 TPOT 占主导。**两者要用不同的指标衡量。**"</span><span class="p">)</span>
+<span class="linenos">204</span>    <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
+<span class="linenos">205</span>
+<span class="linenos">206</span>
+<span class="linenos">207</span><span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos">208</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos">209</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 长度不齐的浪费"</span><span class="p">)</span>
+<span class="linenos">210</span>
+<span class="linenos">211</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos">212</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos">213</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoTokenizer</span>
+<span class="linenos">214</span>    <span class="n">tok</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">MODEL</span><span class="p">)</span>
+<span class="linenos">215</span>    <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos">216</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">()</span>
+<span class="linenos">217</span>
+<span class="linenos">218</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  静态批处理：一批一起开始、一起结束，最长的那条决定整批时长。"</span><span class="p">)</span>
+<span class="linenos">219</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  连续批处理（continuous batching）：谁结束谁就退出，空位立刻补新请求。"</span><span class="p">)</span>
+<span class="linenos">220</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这里量一下「长度不齐」造成的浪费有多大。"</span><span class="p">)</span>
+<span class="linenos">221</span>
+<span class="linenos">222</span>    <span class="n">B</span> <span class="o">=</span> <span class="mi">16</span>
+<span class="linenos">223</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">lens</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"长度一致（都生成 64）"</span><span class="p">,</span> <span class="p">[</span><span class="mi">64</span><span class="p">]</span> <span class="o">*</span> <span class="n">B</span><span class="p">),</span>
+<span class="linenos">224</span>                        <span class="p">(</span><span class="s2">"长度不齐（1..128 均匀）"</span><span class="p">,</span>
+<span class="linenos">225</span>                         <span class="p">[</span><span class="n">rng</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">128</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">)])]:</span>
+<span class="linenos">226</span>        <span class="n">ps</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_prompt</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="n">rng</span><span class="p">))</span>
+<span class="linenos">227</span>              <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">)]</span>
+<span class="linenos">228</span>        <span class="n">sps</span> <span class="o">=</span> <span class="p">[</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">n</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">229</span>               <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">lens</span><span class="p">]</span>
+<span class="linenos">230</span>        <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sps</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">231</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos">232</span>        <span class="n">outs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sps</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">233</span>        <span class="n">dt</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos">234</span>        <span class="n">ntok</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">o</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span> <span class="k">for</span> <span class="n">o</span> <span class="ow">in</span> <span class="n">outs</span><span class="p">)</span>
+<span class="linenos">235</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">236</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    实际生成 </span><span class="si">{</span><span class="n">ntok</span><span class="si">}</span><span class="s2"> token，耗时 </span><span class="si">{</span><span class="n">dt</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1000</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> ms，"</span>
+<span class="linenos">237</span>              <span class="sa">f</span><span class="s2">"吞吐 </span><span class="si">{</span><span class="n">ntok</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">dt</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> tok/s"</span><span class="p">)</span>
+<span class="linenos">238</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    最长 </span><span class="si">{</span><span class="nb">max</span><span class="p">(</span><span class="n">lens</span><span class="p">)</span><span class="si">}</span><span class="s2">，若静态批处理要按最长算："</span>
+<span class="linenos">239</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">B</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nb">max</span><span class="p">(</span><span class="n">lens</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个 step 的位置"</span><span class="p">)</span>
+<span class="linenos">240</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    利用率 = </span><span class="si">{</span><span class="n">ntok</span><span class="si">}</span><span class="s2"> / </span><span class="si">{</span><span class="n">B</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nb">max</span><span class="p">(</span><span class="n">lens</span><span class="p">)</span><span class="si">}</span><span class="s2"> = "</span>
+<span class="linenos">241</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">ntok</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">B</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nb">max</span><span class="p">(</span><span class="n">lens</span><span class="p">))</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">242</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  读这两行要小心，它们说的是两件事："</span><span class="p">)</span>
+<span class="linenos">243</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  1. 「利用率」是**静态批处理**会浪费掉的比例（不齐时只有约一半）。"</span><span class="p">)</span>
+<span class="linenos">244</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  2. 但两行的**吞吐**也差了近一倍，而 vLLM 已经是连续批处理 ——"</span><span class="p">)</span>
+<span class="linenos">245</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"     原因是这里**没有排队的新请求可以补位**。批在跑的过程中不断有请求"</span><span class="p">)</span>
+<span class="linenos">246</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"     结束，活跃数从 16 一路掉到 1，最后几步是在按 batch=1 的速度跑。"</span><span class="p">)</span>
+<span class="linenos">247</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  **连续批处理消除的是「等最慢的那条」，不是「没活干」。**"</span><span class="p">)</span>
+<span class="linenos">248</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  它的收益要在有队列的开环压测下才看得到（5.3 / L8.3）。"</span><span class="p">)</span>
+<span class="linenos">249</span>
+<span class="linenos">250</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"补位实验：给它一个队列"</span><span class="p">)</span>
+<span class="linenos">251</span>    <span class="n">ps</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_prompt</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="n">rng</span><span class="p">))</span>
+<span class="linenos">252</span>          <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">64</span><span class="p">)]</span>
+<span class="linenos">253</span>    <span class="n">lens</span> <span class="o">=</span> <span class="p">[</span><span class="n">rng</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">128</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">64</span><span class="p">)]</span>
+<span class="linenos">254</span>    <span class="n">sps</span> <span class="o">=</span> <span class="p">[</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">n</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">255</span>           <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">lens</span><span class="p">]</span>
+<span class="linenos">256</span>    <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">[:</span><span class="mi">4</span><span class="p">],</span> <span class="n">sps</span><span class="p">[:</span><span class="mi">4</span><span class="p">],</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">257</span>    <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos">258</span>    <span class="n">outs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sps</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">259</span>    <span class="n">dt</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos">260</span>    <span class="n">ntok</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">o</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span> <span class="k">for</span> <span class="n">o</span> <span class="ow">in</span> <span class="n">outs</span><span class="p">)</span>
+<span class="linenos">261</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  一次提交 64 条（长度同样 1..128 不齐）"</span><span class="p">)</span>
+<span class="linenos">262</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    实际生成 </span><span class="si">{</span><span class="n">ntok</span><span class="si">}</span><span class="s2"> token，耗时 </span><span class="si">{</span><span class="n">dt</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1000</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> ms，"</span>
+<span class="linenos">263</span>          <span class="sa">f</span><span class="s2">"吞吐 </span><span class="si">{</span><span class="n">ntok</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">dt</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> tok/s"</span><span class="p">)</span>
+<span class="linenos">264</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    对照上面 16 条不齐时的 1710 tok/s —— 有更多请求可调度时，"</span><span class="p">)</span>
+<span class="linenos">265</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    早结束的请求空出的位置立刻被后面的补上，吞吐回来了。"</span><span class="p">)</span>
+<span class="linenos">266</span>    <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
+<span class="linenos">267</span>
+<span class="linenos">268</span>
+<span class="linenos">269</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span> <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">}</span>
+<span class="linenos">270</span>
+<span class="linenos">271</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">272</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos">273</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  model </span><span class="si">{</span><span class="n">MODEL</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">274</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos">275</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos">276</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos">277</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L5/prefill_decode.py 全文（277 行）</code><a href="../code/labs/L5/prefill_decode.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<div class="admonition warning">
+<p class="admonition-title">这个 lab 会占用整张卡的一部分，跑之前查占用</p>
+<p>本轮跑的时候撞上了另一个作业（loopserve 的 <code>lightnav_replay_gate</code> 占了 14 GB），
+写死的 <code>gpu_memory_utilization=0.55</code> 直接启动失败。</p>
+<p>现在 lab 里的 <code>safe_util()</code> 按<strong>当前空闲显存</strong>算，并额外留 4 GiB 给别人：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">40</span><span class="k">def</span><span class="w"> </span><span class="nf">safe_util</span><span class="p">(</span><span class="n">reserve_gib</span><span class="o">=</span><span class="mf">4.0</span><span class="p">,</span> <span class="n">cap</span><span class="o">=</span><span class="mf">0.55</span><span class="p">):</span>
+<span class="linenos">41</span><span class="w">    </span><span class="sd">"""按**当前空闲显存**算一个安全的 gpu_memory_utilization。</span>
+<span class="linenos">42</span>
+<span class="linenos">43</span><span class="sd">    crater 是共享机器，可能有别人的作业在跑（本轮就撞上过一次</span>
+<span class="linenos">44</span><span class="sd">    loopserve 的 lightnav_replay_gate 占了 14 GB）。</span>
+<span class="linenos">45</span><span class="sd">    写死 0.55 会在别人占了一半时直接启动失败，</span>
+<span class="linenos">46</span><span class="sd">    更糟的是在别人**之后**才启动时把对方挤掉。</span>
+<span class="linenos">47</span><span class="sd">    所以按空闲量算，并额外留 reserve_gib 给对方增长。</span>
+<span class="linenos">48</span><span class="sd">    """</span>
+<span class="linenos">49</span>    <span class="n">free</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
+<span class="linenos">50</span>    <span class="n">gib</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">**</span> <span class="mi">3</span>
+<span class="linenos">51</span>    <span class="n">usable</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">free</span> <span class="o">/</span> <span class="n">gib</span> <span class="o">-</span> <span class="n">reserve_gib</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
+<span class="linenos">52</span>    <span class="n">util</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="n">usable</span> <span class="o">/</span> <span class="p">(</span><span class="n">total</span> <span class="o">/</span> <span class="n">gib</span><span class="p">))</span>
+<span class="linenos">53</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  [显存] 空闲 </span><span class="si">{</span><span class="n">free</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">gib</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">gib</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GiB，"</span>
+<span class="linenos">54</span>          <span class="sa">f</span><span class="s2">"留 </span><span class="si">{</span><span class="n">reserve_gib</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> GiB 给他人 -&gt; gpu_memory_utilization=</span><span class="si">{</span><span class="n">util</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">55</span>    <span class="k">return</span> <span class="n">util</span>
+<span class="linenos">56</span>
+<span class="linenos">57</span>
+<span class="linenos">58</span><span class="k">def</span><span class="w"> </span><span class="nf">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">):</span>
+</pre></div>
+<div class="srcref"><code>labs/L5/prefill_decode.py 第 40–58 行</code><a href="../code/labs/L5/prefill_decode.py.html#labs-L5-prefill_decode-py-L-40">在完整文件中打开 &rarr;</a></div></div>
+<p>在共享机器上这应该是默认写法，而不是事后补救。</p>
+</div>
+<p><strong>建议的消融</strong></p>
+<ol>
+<li>把 [B] 的 decode 部分扫到 batch=256，看 tok/s 什么时候不再线性上涨。
+   按第一节的表，越过平衡点（batch≈72）之后应该开始转向算力受限。</li>
+<li>[C] 换成 prompt 固定 128、生成长度扫 16/64/256/1024，
+   看 TTFT 占比怎么变。</li>
+<li>[D] 把提交数从 64 加到 256，看吞吐还能不能继续涨。
+   这条曲线的拐点就是这台机器的最大并发。</li>
+<li>打开 <code>enforce_eager=False</code>（用 CUDA Graph）重跑 [B] 的 decode，
+   对照 2.6b 测到的"CPU 侧 launch 从 14003 降到 863"——
+   看在 tok/s 上体现为多少。</li>
+</ol>
+<hr />
+<h2 id="_4">七 · 陷阱</h2>
+<ol>
+<li><strong>只报一个"吞吐"会同时掩盖 TTFT 和 TPOT。</strong> 必须分相位报。</li>
+<li><strong>prefill 加 batch 几乎没有收益</strong>（本章 1.24×）。为 prefill 凑批是白等。</li>
+<li><strong>decode 的 batch 收益接近线性</strong>（本章 56×），但要 KV 显存装得下。</li>
+<li><strong>闭环测试低估连续批处理。</strong> 没有队列时批会drain，
+   最后几步退化成 batch=1（本章 3073 → 1720 tok/s）。</li>
+<li><strong>共享机器上不要写死 <code>gpu_memory_utilization</code>。</strong> 按空闲量算并留余量。</li>
+<li><strong>TPOT 在短上下文下几乎不变</strong>，别用短测试外推长上下文的 TPOT（3.3）。</li>
+<li><strong>PD 分离要先量 KV 传输成本。</strong> 本机跨机 3.1 GB/s 下传 448 MB 要 145 ms，
+   比 prefill 本身还久。</li>
+</ol>
+<hr />
+<h2 id="_5">八 · 自测题</h2>
+<details>
+<summary>1. 为什么 prefill 加 batch 几乎没收益，而 decode 有 56 倍？</summary>
+<p>看算术强度。权重字节是常数（每步读一遍全部权重），FLOP 正比于处理的 token 数。</p>
+<ul>
+<li>prefill 一次处理 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 个 token，算术强度 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02248;</mo><mi>S</mi></mrow></math></span>。<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>1024</mn></mrow></math></span> 时已经是 1024，
+  远超平衡点 144，<strong>已经算力受限</strong>。加 batch 只是排更多队。</li>
+<li>decode 一次处理 1 个 token，算术强度 = batch。batch=1 时是 1，
+  <strong>严重带宽受限</strong>。加 batch 直接把权重读取分摊掉。</li>
+</ul>
+<p>本章实测：decode 每步时间从 4.496 只涨到 5.134 ms（14%），
+却服务了 64 倍的请求。</p>
+</details>
+<details>
+<summary>2. 你的服务 P99 TTFT 很差但吞吐很高，可能是什么原因？</summary>
+<p>最可能是<strong>调度偏向 decode</strong>：为了把 decode 批凑大，
+新到的请求要等当前批跑完才能 prefill，排队时间全算进 TTFT。</p>
+<p>或者<strong>长 prompt 阻塞</strong>：一条 4096 token 的 prefill 要 75 ms（本章实测），
+这段时间所有 decode 都停着，其它请求的 TTFT 和 TPOT 都被拖长。</p>
+<p>chunked prefill 就是针对后者：把长 prefill 切成小块插进 decode 批，
+让每一步的时间可控。代价是 prefill 的效率略降（切碎了不如整块）。</p>
+<p>诊断：分别记录排队时间和 prefill 时间，看 TTFT 主要花在哪一段。</p>
+</details>
+<details>
+<summary>3. 一次提交 16 条 vs 64 条，同样的长度分布，为什么吞吐差 3.2 倍？</summary>
+<p>因为<strong>有没有请求可以补位</strong>。</p>
+<p>16 条时，随着短请求结束，活跃数从 16 掉到 1，最后几步在按 batch=1 跑
+（222 tok/s，第二节实测）。整段的平均吞吐被这个尾巴拉低。</p>
+<p>64 条时，早结束的位置立刻被后面排队的补上，批一直接近满载。</p>
+<p><strong>这说明连续批处理的收益取决于队列深度。</strong> 没有队列时它退化成
+"提前释放资源"，对吞吐帮助有限。</p>
+<p>也说明<strong>闭环测试（提交固定一批等结束）会低估它</strong>——
+必须用开环压测（按到达率持续发请求）才能测到真实收益。</p>
+</details>
+<details>
+<summary>4. PD 分离听起来很合理，什么情况下它是负收益？</summary>
+<p>当 <strong>KV 跨机传输的时间超过它省下的时间</strong>时。</p>
+<p>按本书的实测：一条 4096 上下文请求的 KV 是 448 MB（3.3），
+本机跨机带宽上限 3.1 GB/s（1.5）——传一次要 <strong>145 ms</strong>，
+而 prefill 本身只要 75 ms（本章）。<strong>传输比计算还贵。</strong></p>
+<p>所以 PD 分离要求高速互联（NVLink/InfiniBand/RDMA）。
+在普通以太网上做，等于给每个请求加一段比 prefill 还长的延迟。</p>
+<p>这也是一个通用判据：<strong>分离的收益必须大于协调成本，
+而协调成本要实测，不能假设"网络很快"。</strong></p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L4/4.4-moe.html">&#8592; 4.4 MoE：稀疏激活的系统代价</a><a class="nav-next" href="../L5/5.2-kv-cache-paged.html">5.2 KV cache 管理：PagedAttention 与 prefix cache &#8594;</a></nav>
+</main>
+</body>
+</html>

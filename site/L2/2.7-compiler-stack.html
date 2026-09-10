@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.7 编译器栈：torch.compile 到 MLIR</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">2.7</div>
+  <div class="sidebar-title">编译器栈：torch.compile 到 MLIR</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">一 · 守卫：编译结果的有效期</a></li>
+<li><a href="#_3">二 · 什么会让编译结果失效</a><ul>
+<li><a href="#_4">标量参数也会自动去特化</a></li>
+<li><a href="#_5">真的会炸的是维数</a></li>
+<li><a href="#eager">「撑爆缓存就会退回 eager」——这个说法不准确</a></li>
+</ul>
+</li>
+<li><a href="#_6">三 · 动态形状的真实代价</a></li>
+<li><a href="#inductor">四 · 融合边界：Inductor 在哪里停下来</a></li>
+<li><a href="#_7">五 · 设计取舍</a><ul>
+<li><a href="#51">5.1 守卫为什么是一棵树，而不是一个哈希</a></li>
+<li><a href="#52-automatic-dynamic">5.2 automatic dynamic：把猜错的代价推迟到第二次</a></li>
+<li><a href="#53-vllm-inductor">5.3 为什么 vLLM 不把整个模型交给 Inductor</a></li>
+</ul>
+</li>
+<li><a href="#autotune">六 · autotune 真的更快吗</a></li>
+<li><a href="#_8">七 · 广度：几条不同的编译路线</a><ul>
+<li><a href="#torchexport">torch.export：另一条路</a></li>
+<li><a href="#_9">另外两个后端，以及本书为什么不走</a></li>
+</ul>
+</li>
+<li><a href="#_10">八 · 陷阱</a></li>
+<li><a href="#lab">九 · 动手 lab</a></li>
+<li><a href="#_11">十 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="mod-id">2.7</div>
+  <h1>编译器栈：torch.compile 到 MLIR</h1>
+  <p class="lede">Dynamo 的守卫与重编译、automatic dynamic 的代价、Inductor 的融合边界、autotune 到底赢不赢。三个负面结果：max-autotune 在测过的三种形状上全部更慢；动态形状让一个归约慢 5342 倍；「撑爆缓存退回 eager」这个说法不准确。并置 torch.compile 的几个后端与 torch.export。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · CUDA 13.0</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 2.6b（三段式的产物长什么样）· 2.0（DispatchKeySet）· 2.3（访存阶梯）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>2.6b 已经把 Dynamo 的 FX 图、AOTAutograd 的联合图、Inductor 生成的 Triton
+源码逐字打印过了。那一章问的是"编译产物长什么样"。这一章问的是别的：</p>
+<ol>
+<li>编译好的代码凭什么可以复用？Dynamo 每次调用到底检查什么？</li>
+<li>什么时候这份代码<strong>失效</strong>？失效之后会发生什么——报错，还是悄悄变慢？</li>
+<li><code>mode="max-autotune"</code> 真的更快吗？Inductor 在哪些形状上打不过 cuBLAS？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">这一章有三个负面结果</p>
+<p>本章测出来的三件事都和常见说法相反：<code>max-autotune</code> 在测过的三种形状上<strong>全部更慢</strong>；
+动态形状让一个归约慢 <strong>5300 倍</strong>；"撑爆编译缓存会退回 eager"这个说法不准确。
+每一条都给了判据和复现命令。原始输出在
+<code>results/crater/compile/27_compiler_stack.txt</code>。</p>
+</div>
+<hr />
+<h2 id="_2">一 · 守卫：编译结果的有效期</h2>
+<p><code>torch.compile</code> 不是"把函数编译一次然后一直用"。它编译的是
+<strong>某一类输入下的这个函数</strong>，并把"哪一类"写成一串检查，叫守卫（guard）。
+每次调用先跑守卫，全过才用编译好的代码。</p>
+<p>对这个函数：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">f</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">alpha</span><span class="p">):</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="n">alpha</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+</code></pre></div>
+
+<p>Dynamo 装了 15 行守卫。原文（节选，完整的在 lab 输出里）：</p>
+<div class="highlight"><pre><span></span><code>TREE_GUARD_MANAGER:
++- RootGuardManager
+| +- GLOBAL_STATE: ___check_global_state() against {"allow_bf16_reduce":0,"allow_fp16_reduce":0,"allow_tf32":f
+| +- TORCH_FUNCTION_MODE_STACK: ___check_torch_function_mode_stack()
+| +- DEFAULT_DEVICE: utils_device.CURRENT_DEVICE == None
+| +- GuardManager: source=L['x'], accessed_by=FrameLocalsGuardAccessor(key='x', framelocals_idx=0)
+| | +- TENSOR_MATCH: check_tensor(L['x'], Tensor, DispatchKeySet(CUDA, BackendSelect, ADInplaceOrView, Autogra
+| | +- DIMENSION_DYNAMIC_MARKING_GUARD: hasattr(L['x'], '_dynamo_dynamic_indices') == False
+| +- GuardManager: source=L['alpha'], accessed_by=FrameLocalsGuardAccessor(key='alpha', framelocals_idx=1)
+| | +- EQUALS_MATCH: L['alpha'] == 2.0
+</code></pre></div>
+
+<p>三处值得停一下：</p>
+<ul>
+<li><strong><code>TENSOR_MATCH</code> 里出现了 <code>DispatchKeySet(CUDA, BackendSelect, ADInplaceOrView, Autograd…)</code>。</strong>
+  这正是 2.0 里那个 64 位位图。守卫检查的不只是形状和 dtype，
+  还包括这个张量会分发到哪条路径上——因为分发路径变了，生成的代码就不对了。</li>
+<li><strong><code>EQUALS_MATCH: L['alpha'] == 2.0</code>。</strong> 浮点参数 <code>alpha</code> 被当成<strong>编译期常量</strong>
+  折进了代码里。传 <code>3.0</code> 进来这份代码就不能用。</li>
+<li><strong><code>GLOBAL_STATE</code></strong> 检查的是 <code>allow_tf32</code>、<code>allow_bf16_reduce</code> 这类全局开关。
+  在编译之后改 <code>torch.backends.cuda.matmul.allow_tf32</code>，守卫会失败。</li>
+</ul>
+<p>守卫每次调用都要跑一遍，所以它本身是运行时开销。
+这也解释了为什么 <code>torch.compile</code> 对<strong>极小</strong>的函数可能是负收益。</p>
+<hr />
+<h2 id="_3">二 · 什么会让编译结果失效</h2>
+<p>同一个函数，依次喂不同的东西，看累计编译次数：</p>
+<table>
+<thead>
+<tr>
+<th>调用</th>
+<th style="text-align: right;">累计编译次数</th>
+<th style="text-align: right;">本次新增</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基准 (8,8) f32 cuda</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr>
+<td>同形状同 dtype 再来一次</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>换形状 (16,16)</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr>
+<td>再换形状 (32,32)</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;"><strong>0</strong></td>
+</tr>
+<tr>
+<td>换 dtype bf16</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr>
+<td>换维数 (8,8,8)</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr>
+<td>换 device cpu</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr>
+<td>非连续（转置）</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">1</td>
+</tr>
+</tbody>
+</table>
+<p>第 3 行和第 4 行是这张表的重点：<strong>第一次换形状会重编译，第二次不会。</strong>
+Dynamo 第一次把形状特化成常量；发现形状会变之后，
+它把这一维改成符号量重编译一次，之后所有形状复用同一份代码。
+这个机制叫 automatic dynamic。</p>
+<p>最后一行也值得记：<strong>转置会触发重编译</strong>。因为 stride 变了，
+生成的访存代码不一样——2.0 里那条 stride 公式，在这里表现为一次重编译。</p>
+<h3 id="_4">标量参数也会自动去特化</h3>
+<p>我原本以为每个不同的 python int 都会编一份新代码。实测不是：</p>
+<div class="highlight"><pre><span></span><code>k = 0..11 时累计编译次数: [1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+</code></pre></div>
+
+<p>只编译了 2 次，和形状是同一个机制。<strong>不要假设标量一定会特化。</strong></p>
+<h3 id="_5">真的会炸的是维数</h3>
+<p>维数（rank）没法做成动态——张量有几维决定了循环有几层。
+用维数去撑：</p>
+<div class="highlight"><pre><span></span><code>   维数       累计编译  说明
+    1          1
+    2          2
+   ...
+    8          8  &lt;- 卡在 cache_size_limit
+    9          8  &lt;- 卡在 cache_size_limit
+   12          8  &lt;- 卡在 cache_size_limit
+</code></pre></div>
+
+<p><code>cache_size_limit</code> 默认 8（<code>accumulated_cache_size_limit</code> 是 256）。
+到了上限，Dynamo 打印一条警告然后不再为这个函数编译：</p>
+<div class="highlight"><pre><span></span><code>torch._dynamo hit config.recompile_limit (8)
+   function: 'probe' (&lt;stdin&gt;:3)
+   last reason: 0/7: tensor 't' rank mismatch. expected 7, actual 8
+</code></pre></div>
+
+<h3 id="eager">「撑爆缓存就会退回 eager」——这个说法不准确</h3>
+<p>我按这个说法做了测量，数字对不上，于是把它拆开测：</p>
+<div class="highlight"><pre><span></span><code>撑爆，但 big 那条缓存还在（rank 2..13）      0.019 ms   编译数=8
+撑爆，且 big 那条被挤掉（rank 1..12）       80.100 ms   编译数=8
+纯 eager 参照                            0.025 ms
+</code></pre></div>
+
+<p>第一行说明<strong>撑爆缓存本身不贵</strong>：只要还有一条守卫对得上，
+照样用编译好的代码，Dynamo 连编译器都不进（<code>frames</code> 计数器增量为 0）。</p>
+<p>第二行那 80 ms 也不是"退回 eager"——eager 只要 0.025 ms，
+退回 eager 应该是 0.025 而不是 80。<strong>慢了 3200 倍，方向都不对。</strong></p>
+<p>真正的原因在下一节。这里先记一个方法上的教训：
+<strong>当一个解释预测的是"变慢一点"而你测到"慢三千倍"时，那个解释是错的，
+不是"程度上有出入"。</strong></p>
+<hr />
+<h2 id="_6">三 · 动态形状的真实代价</h2>
+<p>上一节那 80 ms 的来源：rank 1 的缓存被一个 2 元素的张量顶掉，
+触发 automatic dynamic，于是那个归约变成了动态形状版本。</p>
+<p>直接对照静态与动态（4M 元素 = 16 MiB，crater）：</p>
+<table>
+<thead>
+<tr>
+<th>表达式</th>
+<th style="text-align: right;">eager</th>
+<th style="text-align: right;">静态</th>
+<th style="text-align: right;">动态</th>
+<th style="text-align: right;">动态/静态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>归约 <code>(t*2).relu().sum()</code></td>
+<td style="text-align: right;">0.025 ms</td>
+<td style="text-align: right;">0.015 ms</td>
+<td style="text-align: right;"><strong>80.096 ms</strong></td>
+<td style="text-align: right;"><strong>5342.6×</strong></td>
+</tr>
+<tr>
+<td>逐元素 <code>(t*2).relu()*1.5</code></td>
+<td style="text-align: right;">0.025 ms</td>
+<td style="text-align: right;">0.012 ms</td>
+<td style="text-align: right;">0.015 ms</td>
+<td style="text-align: right;">1.2×</td>
+</tr>
+</tbody>
+</table>
+<p>差别在生成的 kernel 上，<code>size_hints</code> 一眼看出来：</p>
+<div class="highlight"><pre><span></span><code>归约   静态 size_hints ["size_hints={'x': 512, 'r0_': 8192}", "size_hints={'x': 1, 'r0_': 512}"]
+归约   动态 size_hints ["size_hints={'x': 1, 'r0_': 2}"]
+
+逐元素 静态 size_hints ["size_hints={'x': 4194304}"]
+逐元素 动态 size_hints ["size_hints={'x': 4194304}"]
+</code></pre></div>
+
+<ul>
+<li><strong>逐元素不受影响。</strong> kernel 本来就是一维网格，元素个数当运行时参数传进去，
+  grid 大小在启动时算。形状是不是编译期已知，不改变并行结构。</li>
+<li><strong>归约塌了。</strong> 静态版是 <code>{'x': 512, 'r0_': 8192}</code>：512 个 block，
+  每个块归约 8192 个元素，再来第二个 kernel 归约那 512 个部分和——
+  这就是 2.3 里那个两段式归约。动态版只有 <code>{'x': 1}</code>：
+  形状未知时 Inductor 无法决定怎么切分归约维，退化成
+  <strong>一个 block 顺序扫完整个张量</strong>。</li>
+</ul>
+<p>并行度从 512 掉到 1。这不是"少了一点常量折叠"，是并行结构没了。
+按带宽算：80 ms 搬 32 MiB（读+写）约等于 <strong>0.4 GB/s</strong>，
+而这张卡的 DRAM 上限是 1519 GB/s（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a>）。</p>
+<div class="admonition danger">
+<p class="admonition-title">这条对服务的直接含义</p>
+<p>变长输入是推理服务的常态。一旦某个含归约的函数被 automatic dynamic 转成动态版，
+它可能在<strong>不报任何错</strong>的情况下慢几千倍。
+LayerNorm、softmax、<code>sum</code>、<code>mean</code>、<code>max</code> 全是归约。</p>
+<p>可操作的做法：
+1. 用 <code>torch._logging</code> 打开 <code>recompiles</code>，观察哪些函数在反复重编译。
+2. 对确实变长的维度用 <code>mark_dynamic</code> 显式声明，而不是让它自动发生——
+   至少你知道哪些 kernel 是动态版。
+3. 更常见的工程解法是<strong>分桶</strong>：把长度补齐到有限几档，让每一档都是静态形状。
+   vLLM 捕获若干个固定 batch 尺寸的 CUDA Graph（2.6b），正是这个思路。
+4. 关键路径上直接量一遍：静态与动态各跑一次，比值不该超过个位数。</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">这一条的边界</p>
+<p>测的是 torch 2.13.0 + Inductor 在 sm_120 上的行为，工作负载是一维归约。
+更高维的归约（例如 LayerNorm 沿最后一维）通常只有最后一维参与归约，
+而那一维往往是静态的（hidden_size），塌陷程度可能完全不同。
+<strong>不要把 5342× 这个数字外推到别的算子上</strong>，要外推的是那个方法：
+比 <code>size_hints</code>，看并行度有没有掉。</p>
+</div>
+<hr />
+<h2 id="inductor">四 · 融合边界：Inductor 在哪里停下来</h2>
+<p>4M 元素、fp32，数生成了几个 Triton kernel：</p>
+<table>
+<thead>
+<tr>
+<th>表达式</th>
+<th style="text-align: right;">triton kernel 数</th>
+<th style="text-align: right;">eager ms</th>
+<th style="text-align: right;">compiled ms</th>
+<th style="text-align: right;">加速</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5 个逐元素算子</td>
+<td style="text-align: right;"><strong>1</strong></td>
+<td style="text-align: right;">0.440</td>
+<td style="text-align: right;">0.116</td>
+<td style="text-align: right;">3.78×</td>
+</tr>
+<tr>
+<td>逐元素 + 一个归约</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.289</td>
+<td style="text-align: right;">0.084</td>
+<td style="text-align: right;">3.43×</td>
+</tr>
+<tr>
+<td>归约之后再逐元素</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.193</td>
+<td style="text-align: right;">0.084</td>
+<td style="text-align: right;">2.30×</td>
+</tr>
+<tr>
+<td>两个独立归约</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">0.157</td>
+<td style="text-align: right;">0.090</td>
+<td style="text-align: right;">1.74×</td>
+</tr>
+<tr>
+<td>中间要写出去（转置后再归约）</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.287</td>
+<td style="text-align: right;">0.045</td>
+<td style="text-align: right;">6.36×</td>
+</tr>
+</tbody>
+</table>
+<p>读法：</p>
+<ul>
+<li><strong>连续的逐元素算子全部融进一个 kernel。</strong> 5 个算子 1 个 kernel，
+  中间结果不落显存——这就是 2.3 讲的那个收益，3.78×。</li>
+<li><strong>归约是一道边界。</strong> 逐元素可以融进归约的前面（第 2 行：
+  <code>*2</code>、<code>+</code>、<code>relu</code>、<code>*1.5</code> 都并进了归约 kernel），
+  但归约的结果要等所有块都算完，所以后面的算子进不去同一个 kernel。</li>
+<li><strong>两个独立归约给了 4 个 kernel</strong>，因为每个归约都是两段式。</li>
+</ul>
+<p>图断裂是另一回事：它发生在<strong>捕获</strong>阶段，不是代码生成阶段。</p>
+<div class="highlight"><pre><span></span><code>图数量 2  断裂 1
+原因: Unsupported Tensor.item() call with capture_scalar_outputs=False
+</code></pre></div>
+
+<p><code>.item()</code> 要把值搬回 host 才能参与 python 的 <code>if</code>，
+Dynamo 只能在这里把图切开、交回 python、再从下一句重新开始捕获。
+这和 2.0 里那个"<code>.item()</code> 会强制一次同步"是同一件事的两个侧面：
+它既是运行时的同步点，也是编译期的边界。</p>
+<hr />
+<h2 id="_7">五 · 设计取舍</h2>
+<h3 id="51">5.1 守卫为什么是一棵树，而不是一个哈希</h3>
+<p>最省事的设计是把输入特征拼成一个 key 去查哈希表。Dynamo 没这么做，
+它生成的是一棵 <code>TREE_GUARD_MANAGER</code>。原因可以从上面那份原文读出来：</p>
+<p><strong>守卫要检查的东西不在一个层级上。</strong> 有全局状态（<code>allow_tf32</code>）、
+有线程局部状态（torch function mode stack）、有每个参数的属性、
+还有参数的参数（<code>L['x'].__class__</code>）。哈希 key 要求你<strong>先把所有特征取出来</strong>，
+而树可以<strong>短路</strong>——第一层不过就不必再去访问后面的字段。
+考虑到守卫在每次调用的热路径上，这个差别是实打实的。</p>
+<p>代价是：守卫的失败原因变成一条路径而不是一个值，
+所以诊断要靠 <code>TORCH_LOGS=recompiles</code> 打出"哪一条守卫在第几号缓存上失败了"。
+上面那条 <code>last reason: 0/7: tensor 't' rank mismatch. expected 7, actual 8</code>
+就是这个格式：<code>0/7</code> 是第 0 号 code、第 7 号缓存项。</p>
+<h3 id="52-automatic-dynamic">5.2 automatic dynamic：把猜错的代价推迟到第二次</h3>
+<p>设计空间里有三个选择：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>做法</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A. 一律静态</td>
+<td>每个形状编一份</td>
+<td>形状一多就爆缓存</td>
+</tr>
+<tr>
+<td>B. 一律动态</td>
+<td>从不特化</td>
+<td>每个 kernel 都放弃形状信息——本章测到归约慢 5342×</td>
+</tr>
+<tr>
+<td>C. 先静态，被打脸再转动态</td>
+<td>automatic dynamic</td>
+<td>第一次遇到新形状要多编译一次</td>
+</tr>
+</tbody>
+</table>
+<p>PyTorch 选 C。这个选择的<strong>假设</strong>是"大多数程序的大多数张量形状是固定的"，
+对训练基本成立。但推理服务恰恰是反例：序列长度天生变长。</p>
+<p>于是就有了本章第三节那个坑：C 的失败模式比 B 更隐蔽——
+B 至少是一致地慢，C 是<strong>平时很快、某次输入之后突然慢几千倍</strong>，
+而且触发条件（第二次见到不同形状）在测试里很容易碰不到。</p>
+<p>这是一个可以带走的判断：<strong>当一个系统用"先猜、猜错再改"来省成本时，
+要问的是"猜错之后的状态有多差"，而不只是"猜错的概率有多大"。</strong></p>
+<h3 id="53-vllm-inductor">5.3 为什么 vLLM 不把整个模型交给 Inductor</h3>
+<p>下一节的测量会显示 Inductor 在 GEMM 上打不过 cuBLAS。
+结合 2.6b 看到的 <code>splitting_ops</code>：vLLM 的做法是
+<strong>让 Inductor 做它擅长的（逐元素融合、layout），把 GEMM 和 attention
+留给专用库，再用 CUDA Graph 收掉提交开销</strong>。
+三件事由三种机制分别负责，而不是指望一个编译器全包。</p>
+<hr />
+<h2 id="autotune">六 · autotune 真的更快吗</h2>
+<p>三种形状，都是 bf16。方阵代表 prefill，瘦长的两个代表 decode：</p>
+<p><strong>方阵 4096×4096×4096</strong></p>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th style="text-align: right;">编译 s</th>
+<th style="text-align: right;">运行 ms</th>
+<th style="text-align: right;">TFLOP/s</th>
+<th style="text-align: right;">相对 eager</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>eager (cuBLAS)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">0.6446</td>
+<td style="text-align: right;">213.2</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td>default</td>
+<td style="text-align: right;">0.3</td>
+<td style="text-align: right;">0.6367</td>
+<td style="text-align: right;">215.8</td>
+<td style="text-align: right;">1.01×</td>
+</tr>
+<tr>
+<td>max-autotune</td>
+<td style="text-align: right;">0.0</td>
+<td style="text-align: right;">0.6976</td>
+<td style="text-align: right;">197.0</td>
+<td style="text-align: right;"><strong>0.92×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>瘦长 8×4096×4096（decode 形状）</strong></p>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th style="text-align: right;">编译 s</th>
+<th style="text-align: right;">运行 ms</th>
+<th style="text-align: right;">GB/s</th>
+<th style="text-align: right;">相对 eager</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>eager (cuBLAS)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">0.0230</td>
+<td style="text-align: right;">1465.9</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td>default</td>
+<td style="text-align: right;">0.2</td>
+<td style="text-align: right;">0.0232</td>
+<td style="text-align: right;">1454.1</td>
+<td style="text-align: right;">0.99×</td>
+</tr>
+<tr>
+<td>max-autotune</td>
+<td style="text-align: right;">1.5</td>
+<td style="text-align: right;">0.0360</td>
+<td style="text-align: right;">935.2</td>
+<td style="text-align: right;"><strong>0.64×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>瘦长 1×4096×11008（decode + FFN）</strong></p>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th style="text-align: right;">编译 s</th>
+<th style="text-align: right;">运行 ms</th>
+<th style="text-align: right;">GB/s</th>
+<th style="text-align: right;">相对 eager</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>eager (cuBLAS)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">0.0325</td>
+<td style="text-align: right;">2775.1</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td>default</td>
+<td style="text-align: right;">0.1</td>
+<td style="text-align: right;">0.0614</td>
+<td style="text-align: right;">1468.0</td>
+<td style="text-align: right;"><strong>0.53×</strong></td>
+</tr>
+<tr>
+<td>max-autotune</td>
+<td style="text-align: right;">0.8</td>
+<td style="text-align: right;">0.1523</td>
+<td style="text-align: right;">592.5</td>
+<td style="text-align: right;"><strong>0.21×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>在测过的三种形状上，<code>max-autotune</code> 全部比 eager 慢</strong>，
+而且越是 decode 形状越慢。原因是 <code>max-autotune</code> 会用 Inductor 自己的
+Triton GEMM 模板去替换 <code>aten::mm</code>（也就是 cuBLAS），
+然后在候选配置里挑最好的——但"一组候选里的最好"不等于"比 cuBLAS 好"。
+<code>default</code> 模式保留 cuBLAS，所以基本打平。</p>
+<p>方阵那一行还能交叉验证：cuBLAS 的 213.2 TFLOP/s 对上 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测的
+bf16 上限 232 TFLOP/s，是 <strong>92%</strong>。已经没多少可赢的了。</p>
+<div class="admonition note">
+<p class="admonition-title">2775 GB/s 又一次超过了 DRAM 上限</p>
+<p>第三个形状里 eager 报 2775.1 GB/s，而这张卡 DRAM 上限是 1519 GB/s。
+和 2.0 里那次一样：权重 4096×11008×bf16 = 86 MiB，<strong>装得进 96 MiB 的 L2</strong>。
+所以这是 L2 带宽，不是 DRAM 带宽。
+反复出现同一个陷阱，说明「先算工作集、再和 roofline 比」应该是条件反射。</p>
+</div>
+<hr />
+<h2 id="_8">七 · 广度：几条不同的编译路线</h2>
+<p>8 层 Block、batch=1、bf16——这是 launch 开销占比最高的区间（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a>）。
+两种计时都报：紧凑循环（CPU 提交能和 GPU 重叠）与每次同步
+（服务里逐 token 返回时看到的那种）。</p>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th style="text-align: right;">紧凑循环 ms</th>
+<th style="text-align: right;">加速</th>
+<th style="text-align: right;">每次同步 ms</th>
+<th style="text-align: right;">加速</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>eager</td>
+<td style="text-align: right;">0.2074</td>
+<td style="text-align: right;">1.00×</td>
+<td style="text-align: right;">0.2193</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td>compile/aot_eager</td>
+<td style="text-align: right;">0.2199</td>
+<td style="text-align: right;">0.94×</td>
+<td style="text-align: right;">0.2400</td>
+<td style="text-align: right;">0.91×</td>
+</tr>
+<tr>
+<td>compile/inductor</td>
+<td style="text-align: right;">0.1842</td>
+<td style="text-align: right;">1.13×</td>
+<td style="text-align: right;">0.2130</td>
+<td style="text-align: right;">1.03×</td>
+</tr>
+<tr>
+<td>compile/reduce-overhead</td>
+<td style="text-align: right;"><strong>0.1522</strong></td>
+<td style="text-align: right;"><strong>1.36×</strong></td>
+<td style="text-align: right;"><strong>0.1947</strong></td>
+<td style="text-align: right;"><strong>1.13×</strong></td>
+</tr>
+<tr>
+<td>compile/max-autotune</td>
+<td style="text-align: right;">0.1728</td>
+<td style="text-align: right;">1.20×</td>
+<td style="text-align: right;">0.2143</td>
+<td style="text-align: right;">1.02×</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong><code>aot_eager</code> 比 eager 还慢。</strong> 它只做图捕获与 AOTAutograd，不生成代码，
+  是给编译器开发者用的调试后端。出现在这张表里是为了说明
+  "接了 torch.compile" 不等于"变快了"。</li>
+<li><strong><code>reduce-overhead</code> 赢得最多（1.36×）</strong>，因为它在 Inductor 之上加了 CUDA Graph。
+  这个区间的瓶颈就是提交次数——和 2.6b 测到的"图把 CPU 侧 launch 从 14,003 降到 863"是同一件事。</li>
+<li><strong>两列计时不一样。</strong> 紧凑循环里 CPU 提交能藏在 GPU 执行后面，
+  加速看起来更大；每次同步则暴露真实的单次延迟。
+  报加速比时必须说明是哪一种，否则同一份代码可以报出 1.36× 或 1.13×。</li>
+</ul>
+<h3 id="torchexport">torch.export：另一条路</h3>
+<div class="highlight"><pre><span></span><code>导出成功：90 个节点，40 个 call_function
+  aten.linear.default                              16
+  aten.layer_norm.default                          8
+  aten.gelu.default                                8
+  aten.add.Tensor                                  8
+</code></pre></div>
+
+<p>8 层 × 2 个 linear = 16 个 <code>aten.linear</code>，逐项对得上。</p>
+<p><code>torch.export</code> 与 <code>torch.compile</code> 的关键区别不是快慢，是<strong>图里还有没有 python</strong>。
+<code>compile</code> 生成的代码仍然活在 python 进程里，靠守卫决定走哪条路；
+<code>export</code> 产出一个不含 python 控制流的完整图，可以交给 AOTInductor 编成
+<code>.so</code> 脱离 python 运行时部署。代价是它要求整个模型可以被完整捕获——
+任何一处 <code>.item()</code>、任何数据相关的控制流都会让它失败，而不是像 <code>compile</code>
+那样退回 python 继续跑。</p>
+<h3 id="_9">另外两个后端，以及本书为什么不走</h3>
+<p><code>torch._dynamo.list_backends()</code> 在这台机器上还有两项本章没用：</p>
+<ul>
+<li><strong><code>cudagraphs</code></strong> —— 只做 CUDA Graph 捕获，不做 codegen。
+  它和上表的 <code>reduce-overhead</code> 目标相同（都是压 launch 开销），
+  但 <code>reduce-overhead</code> 是 <strong>Inductor 之上再加图</strong>，两件事都做，所以更快。
+  <strong>更重要的是：真实推理引擎不用这条路。</strong> vLLM 自己管理图的捕获时机、
+  捕获哪些 batch size、padding 到哪一档（5.4 全章在讲这件事）——
+  因为只有引擎知道哪些形状会真的出现。
+  <strong>通用编译器不知道你的负载分布，所以这个决定必须留在引擎手里</strong>（§5.3 同一条理由）。</li>
+<li><strong><code>openxla</code></strong> —— 走 XLA，主要面向 TPU 和 XLA 生态。
+  本书的硬件底座全是 NVIDIA GPU，这条路线<strong>不在范围内，也没有测</strong>。</li>
+</ul>
+<div class="admonition warning">
+<p class="admonition-title">本轮没做的对照</p>
+<p><code>TensorRT</code> 与 <code>ONNX Runtime</code> 这两条路线<strong>没有测</strong>——crater 的学习环境里没装，
+而在共用 vLLM venv 里装它们会动到别的实验的依赖。
+所以本章的"广度"只覆盖了 PyTorch 自己的几个后端。</p>
+<p>要补的话：在 <code>/scratch/learn/envs/</code> 下另开一个独立 venv，
+装 <code>onnxruntime-gpu</code> 与 <code>torch-tensorrt</code>，用同一个 <code>Stack</code> 模块导出对照，
+比较三件事——图节点数、算子融合结果、同一批形状下的每次同步延迟。
+在补上之前，本章不对这两条路线作任何性能断言。</p>
+</div>
+<hr />
+<h2 id="_10">八 · 陷阱</h2>
+<ol>
+<li><strong>以为标量参数一定会特化。</strong> 实测 python int 和形状一样走 automatic dynamic，
+   0..11 只编译了 2 次。</li>
+<li><strong>以为撑爆 <code>cache_size_limit</code> 就是退回 eager。</strong> 只要还有守卫对得上，
+   照样用编译好的代码；对不上时的慢也不是 eager 的慢。</li>
+<li><strong>动态形状 + 归约 = 并行度塌成 1。</strong> 本章实测 5342×。
+   比 <code>size_hints</code> 是最快的判据。</li>
+<li><strong><code>max-autotune</code> 不保证更快。</strong> 本章三种形状全部更慢，decode 形状最差 0.21×。
+   它换掉的是 cuBLAS，而 cuBLAS 在方阵上已经到 92% 峰值。</li>
+<li><strong><code>aot_eager</code> 不是"更快的 eager"</strong>，它是调试后端，比 eager 慢。</li>
+<li><strong>报加速比不说计时方式。</strong> 同一份代码紧凑循环 1.36×、每次同步 1.13×。</li>
+<li><strong>忘了算工作集是否超过 L2。</strong> 本章又一次测出 2775 GB/s &gt; DRAM 上限 1519 GB/s。</li>
+<li><strong>改全局开关会让守卫失效。</strong> 编译之后再改 <code>allow_tf32</code> 会触发重编译，
+   <code>GLOBAL_STATE</code> 守卫就是干这个的。</li>
+</ol>
+<hr />
+<h2 id="lab">九 · 动手 lab</h2>
+<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L2 &amp;&amp; /scratch/learn/envs/serve/bin/python compiler_stack.py'</span>
+</code></pre></div>
+
+<p>单节：<code>compiler_stack.py C E</code>。原始输出
+<code>results/crater/compile/27_compiler_stack.txt</code>（155 行）。</p>
+<details class="fold srcfold"><summary>labs/L2/compiler_stack.py 全文（444 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L2.7 —— 编译器栈：守卫、重编译、融合边界、autotune。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">2.6b 已经把 Dynamo / AOTAutograd / Inductor 三段的**产物**打印过了。</span>
+<span class="linenos">  5</span><span class="sd">这一章问的是另一组问题：编译好的代码什么时候**不能用**了？</span>
+<span class="linenos">  6</span><span class="sd">Dynamo 每次调用到底检查什么？Inductor 在哪里停下来不再融合？</span>
+<span class="linenos">  7</span>
+<span class="linenos">  8</span><span class="sd">用法：</span>
+<span class="linenos">  9</span><span class="sd">    python compiler_stack.py            # 全跑</span>
+<span class="linenos"> 10</span><span class="sd">    python compiler_stack.py B D</span>
+<span class="linenos"> 11</span><span class="sd">"""</span>
+<span class="linenos"> 12</span>
+<span class="linenos"> 13</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 14</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 15</span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos"> 16</span>
+<span class="linenos"> 17</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch._dynamo</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dynamo</span>
+<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch._dynamo.utils</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dutils</span>
+<span class="linenos"> 20</span><span class="kn">from</span><span class="w"> </span><span class="nn">torch._inductor.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">run_and_get_code</span>
+<span class="linenos"> 21</span>
+<span class="linenos"> 22</span><span class="n">DEV</span> <span class="o">=</span> <span class="s2">"cuda"</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="k">else</span> <span class="s2">"cpu"</span>
+<span class="linenos"> 23</span>
+<span class="linenos"> 24</span>
+<span class="linenos"> 25</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 26</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos"> 27</span>
+<span class="linenos"> 28</span>
+<span class="linenos"> 29</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 30</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos"> 31</span>
+<span class="linenos"> 32</span>
+<span class="linenos"> 33</span><span class="k">def</span><span class="w"> </span><span class="nf">n_kernels</span><span class="p">(</span><span class="n">code_list</span><span class="p">):</span>
+<span class="linenos"> 34</span><span class="w">    </span><span class="sd">"""一次编译产出了几个 triton kernel。"""</span>
+<span class="linenos"> 35</span>    <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">count</span><span class="p">(</span><span class="s2">"@triton.jit"</span><span class="p">)</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">code_list</span><span class="p">)</span>
+<span class="linenos"> 36</span>
+<span class="linenos"> 37</span>
+<span class="linenos"> 38</span><span class="k">def</span><span class="w"> </span><span class="nf">recompiles</span><span class="p">():</span>
+<span class="linenos"> 39</span>    <span class="k">return</span> <span class="n">dutils</span><span class="o">.</span><span class="n">counters</span><span class="p">[</span><span class="s2">"stats"</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"unique_graphs"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+<span class="linenos"> 40</span>
+<span class="linenos"> 41</span>
+<span class="linenos"> 42</span><span class="k">def</span><span class="w"> </span><span class="nf">timeit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">10</span><span class="p">):</span>
+<span class="linenos"> 43</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">warmup</span><span class="p">):</span>
+<span class="linenos"> 44</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 45</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 46</span>    <span class="n">s</span><span class="p">,</span> <span class="n">e</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 47</span>    <span class="n">s</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 48</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos"> 49</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 50</span>    <span class="n">e</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 51</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 52</span>    <span class="k">return</span> <span class="n">s</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">e</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
+<span class="linenos"> 53</span>
+<span class="linenos"> 54</span>
+<span class="linenos"> 55</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos"> 56</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos"> 57</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 守卫：编译结果凭什么可以复用"</span><span class="p">)</span>
+<span class="linenos"> 58</span>
+<span class="linenos"> 59</span>    <span class="k">def</span><span class="w"> </span><span class="nf">f</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">alpha</span><span class="p">):</span>
+<span class="linenos"> 60</span>        <span class="k">return</span> <span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="n">alpha</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos"> 61</span>
+<span class="linenos"> 62</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos"> 63</span>    <span class="n">exp</span> <span class="o">=</span> <span class="n">dynamo</span><span class="o">.</span><span class="n">explain</span><span class="p">(</span><span class="n">f</span><span class="p">)(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">),</span> <span class="mf">2.0</span><span class="p">)</span>
+<span class="linenos"> 64</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  图数量        </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 65</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  图断裂次数    </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">graph_break_count</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 66</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  被捕获的算子  </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">op_count</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 67</span>    <span class="k">if</span> <span class="n">exp</span><span class="o">.</span><span class="n">break_reasons</span><span class="p">:</span>
+<span class="linenos"> 68</span>        <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">exp</span><span class="o">.</span><span class="n">break_reasons</span><span class="p">:</span>
+<span class="linenos"> 69</span>            <span class="nb">print</span><span class="p">(</span><span class="s2">"  断裂原因:"</span><span class="p">,</span> <span class="n">r</span><span class="p">)</span>
+<span class="linenos"> 70</span>
+<span class="linenos"> 71</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"Dynamo 实际装了哪些守卫（TORCH_LOGS=guards 的内容）"</span><span class="p">)</span>
+<span class="linenos"> 72</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos"> 73</span>    <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+<span class="linenos"> 74</span>    <span class="n">cf</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">),</span> <span class="mf">2.0</span><span class="p">)</span>
+<span class="linenos"> 75</span>    <span class="c1"># 从编译产物里把守卫取出来</span>
+<span class="linenos"> 76</span>    <span class="n">got</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos"> 77</span>    <span class="k">for</span> <span class="n">code</span><span class="p">,</span> <span class="n">entries</span> <span class="ow">in</span> <span class="n">dynamo</span><span class="o">.</span><span class="n">eval_frame</span><span class="o">.</span><span class="n">_debug_get_cache_entry_list</span><span class="o">.</span><span class="vm">__doc__</span> <span class="ow">and</span> <span class="p">[]</span> <span class="ow">or</span> <span class="p">[]:</span>
+<span class="linenos"> 78</span>        <span class="k">pass</span>
+<span class="linenos"> 79</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos"> 80</span>        <span class="n">entries</span> <span class="o">=</span> <span class="n">dynamo</span><span class="o">.</span><span class="n">eval_frame</span><span class="o">.</span><span class="n">_debug_get_cache_entry_list</span><span class="p">(</span><span class="n">f</span><span class="o">.</span><span class="vm">__code__</span><span class="p">)</span>
+<span class="linenos"> 81</span>        <span class="k">for</span> <span class="n">ent</span> <span class="ow">in</span> <span class="n">entries</span><span class="p">:</span>
+<span class="linenos"> 82</span>            <span class="n">gm</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">ent</span><span class="p">,</span> <span class="s2">"guard_manager"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">ent</span><span class="p">,</span> <span class="s2">"check_fn"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+<span class="linenos"> 83</span>            <span class="n">txt</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
+<span class="linenos"> 84</span>            <span class="n">got</span> <span class="o">=</span> <span class="p">[</span><span class="n">ln</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">for</span> <span class="n">ln</span> <span class="ow">in</span> <span class="n">txt</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()</span> <span class="k">if</span> <span class="n">ln</span><span class="o">.</span><span class="n">strip</span><span class="p">()]</span>
+<span class="linenos"> 85</span>    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
+<span class="linenos"> 86</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  取守卫失败:"</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
+<span class="linenos"> 87</span>    <span class="k">if</span> <span class="n">got</span><span class="p">:</span>
+<span class="linenos"> 88</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  共 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">got</span><span class="p">)</span><span class="si">}</span><span class="s2"> 行守卫，节选："</span><span class="p">)</span>
+<span class="linenos"> 89</span>        <span class="k">for</span> <span class="n">ln</span> <span class="ow">in</span> <span class="n">got</span><span class="p">[:</span><span class="mi">24</span><span class="p">]:</span>
+<span class="linenos"> 90</span>            <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">ln</span><span class="p">[:</span><span class="mi">110</span><span class="p">])</span>
+<span class="linenos"> 91</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  守卫是「这份编译结果什么时候还算数」的完整条件。"</span><span class="p">)</span>
+<span class="linenos"> 92</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  每次调用都要把它跑一遍 —— 所以守卫本身也是运行时开销。"</span><span class="p">)</span>
+<span class="linenos"> 93</span>
+<span class="linenos"> 94</span>
+<span class="linenos"> 95</span><span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos"> 96</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos"> 97</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 重编译：什么会让编译结果失效"</span><span class="p">)</span>
+<span class="linenos"> 98</span>
+<span class="linenos"> 99</span>    <span class="k">def</span><span class="w"> </span><span class="nf">f</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+<span class="linenos">100</span>        <span class="k">return</span> <span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos">101</span>
+<span class="linenos">102</span>    <span class="n">cases</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">103</span>        <span class="p">(</span><span class="s2">"基准 (8,8) f32 cuda"</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)),</span>
+<span class="linenos">104</span>        <span class="p">(</span><span class="s2">"同形状同 dtype 再来一次"</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)),</span>
+<span class="linenos">105</span>        <span class="p">(</span><span class="s2">"换形状 (16,16)"</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)),</span>
+<span class="linenos">106</span>        <span class="p">(</span><span class="s2">"再换形状 (32,32)"</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)),</span>
+<span class="linenos">107</span>        <span class="p">(</span><span class="s2">"换 dtype bf16"</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)),</span>
+<span class="linenos">108</span>        <span class="p">(</span><span class="s2">"换维数 (8,8,8)"</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)),</span>
+<span class="linenos">109</span>        <span class="p">(</span><span class="s2">"换 device cpu"</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">)),</span>
+<span class="linenos">110</span>        <span class="p">(</span><span class="s2">"非连续 (转置)"</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)</span><span class="o">.</span><span class="n">t</span><span class="p">()),</span>
+<span class="linenos">111</span>    <span class="p">]</span>
+<span class="linenos">112</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">113</span>    <span class="n">dutils</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+<span class="linenos">114</span>    <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+<span class="linenos">115</span>    <span class="n">prev</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos">116</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'调用'</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'累计编译次数'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'本次新增'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">117</span>    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">mk</span> <span class="ow">in</span> <span class="n">cases</span><span class="p">:</span>
+<span class="linenos">118</span>        <span class="n">cf</span><span class="p">(</span><span class="n">mk</span><span class="p">())</span>
+<span class="linenos">119</span>        <span class="n">cur</span> <span class="o">=</span> <span class="n">recompiles</span><span class="p">()</span>
+<span class="linenos">120</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">cur</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">cur</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">prev</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">121</span>        <span class="n">prev</span> <span class="o">=</span> <span class="n">cur</span>
+<span class="linenos">122</span>
+<span class="linenos">123</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"cache_size_limit：编译太多次会发生什么"</span><span class="p">)</span>
+<span class="linenos">124</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  cache_size_limit = </span><span class="si">{</span><span class="n">dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">cache_size_limit</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">125</span>          <span class="sa">f</span><span class="s2">"   accumulated = </span><span class="si">{</span><span class="n">dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">accumulated_cache_size_limit</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">126</span>
+<span class="linenos">127</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  先看一个**不会**炸的：python int 参数。"</span><span class="p">)</span>
+<span class="linenos">128</span>
+<span class="linenos">129</span>    <span class="k">def</span><span class="w"> </span><span class="nf">g</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">k</span><span class="p">):</span>
+<span class="linenos">130</span>        <span class="k">return</span> <span class="n">x</span> <span class="o">*</span> <span class="n">k</span>
+<span class="linenos">131</span>
+<span class="linenos">132</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">133</span>    <span class="n">dutils</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+<span class="linenos">134</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)</span>
+<span class="linenos">135</span>    <span class="n">cg</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">g</span><span class="p">)</span>
+<span class="linenos">136</span>    <span class="n">seq</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">137</span>    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">12</span><span class="p">):</span>
+<span class="linenos">138</span>        <span class="n">cg</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
+<span class="linenos">139</span>        <span class="n">seq</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">recompiles</span><span class="p">())</span>
+<span class="linenos">140</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  k = 0..11 时累计编译次数: </span><span class="si">{</span><span class="n">seq</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">141</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  只编译了 2 次。第一次把 k 特化成常量 0，第二次发现 k 变了，"</span><span class="p">)</span>
+<span class="linenos">142</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  于是把 k 转成动态标量，之后所有 k 都复用同一份代码。"</span><span class="p">)</span>
+<span class="linenos">143</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  **这和形状的 automatic dynamic 是同一个机制**，不要以为标量一定会特化。"</span><span class="p">)</span>
+<span class="linenos">144</span>
+<span class="linenos">145</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  再看一个真的会炸的：维数（rank）。rank 没法做成动态。"</span><span class="p">)</span>
+<span class="linenos">146</span>
+<span class="linenos">147</span>    <span class="k">def</span><span class="w"> </span><span class="nf">h</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+<span class="linenos">148</span>        <span class="k">return</span> <span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos">149</span>
+<span class="linenos">150</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">151</span>    <span class="n">dutils</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+<span class="linenos">152</span>    <span class="n">ch</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">h</span><span class="p">)</span>
+<span class="linenos">153</span>    <span class="n">lim</span> <span class="o">=</span> <span class="n">dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">cache_size_limit</span>
+<span class="linenos">154</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'维数'</span><span class="si">:</span><span class="s2">&gt;5</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'累计编译'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">  说明"</span><span class="p">)</span>
+<span class="linenos">155</span>    <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">13</span><span class="p">):</span>
+<span class="linenos">156</span>        <span class="n">ch</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">*</span><span class="p">([</span><span class="mi">2</span><span class="p">]</span> <span class="o">*</span> <span class="n">r</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">))</span>
+<span class="linenos">157</span>        <span class="n">note</span> <span class="o">=</span> <span class="s2">""</span>
+<span class="linenos">158</span>        <span class="k">if</span> <span class="n">recompiles</span><span class="p">()</span> <span class="o">==</span> <span class="n">lim</span> <span class="ow">and</span> <span class="n">r</span> <span class="o">&gt;=</span> <span class="n">lim</span><span class="p">:</span>
+<span class="linenos">159</span>            <span class="n">note</span> <span class="o">=</span> <span class="s2">"&lt;- 卡在 cache_size_limit"</span>
+<span class="linenos">160</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">r</span><span class="si">:</span><span class="s2">&gt;5</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">recompiles</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">note</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">161</span>
+<span class="linenos">162</span>    <span class="n">plateau</span> <span class="o">=</span> <span class="n">recompiles</span><span class="p">()</span>
+<span class="linenos">163</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  累计编译停在 </span><span class="si">{</span><span class="n">plateau</span><span class="si">}</span><span class="s2">，等于 cache_size_limit = </span><span class="si">{</span><span class="n">lim</span><span class="si">}</span><span class="s2">。"</span><span class="p">)</span>
+<span class="linenos">164</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  之后每个新维数都不再编译，直接退回 eager 执行 —— 不报错，只是变慢。"</span><span class="p">)</span>
+<span class="linenos">165</span>
+<span class="linenos">166</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"撑爆缓存本身贵不贵"</span><span class="p">)</span>
+<span class="linenos">167</span>    <span class="n">big</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">22</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)</span>
+<span class="linenos">168</span>
+<span class="linenos">169</span>    <span class="k">def</span><span class="w"> </span><span class="nf">probe</span><span class="p">(</span><span class="n">t</span><span class="p">):</span>
+<span class="linenos">170</span>        <span class="k">return</span> <span class="p">(</span><span class="n">t</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos">171</span>
+<span class="linenos">172</span>    <span class="k">def</span><span class="w"> </span><span class="nf">bust_then_time</span><span class="p">(</span><span class="n">bust_ranks</span><span class="p">,</span> <span class="n">label</span><span class="p">):</span>
+<span class="linenos">173</span>        <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">();</span> <span class="n">dutils</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+<span class="linenos">174</span>        <span class="n">cp</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">probe</span><span class="p">)</span>
+<span class="linenos">175</span>        <span class="n">cp</span><span class="p">(</span><span class="n">big</span><span class="p">)</span>                                    <span class="c1"># rank 1 大张量先编一份</span>
+<span class="linenos">176</span>        <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">bust_ranks</span><span class="p">:</span>
+<span class="linenos">177</span>            <span class="n">cp</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">*</span><span class="p">([</span><span class="mi">2</span><span class="p">]</span> <span class="o">*</span> <span class="n">r</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">))</span>
+<span class="linenos">178</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">5</span><span class="p">):</span>
+<span class="linenos">179</span>            <span class="n">cp</span><span class="p">(</span><span class="n">big</span><span class="p">)</span>
+<span class="linenos">180</span>        <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">cp</span><span class="p">(</span><span class="n">big</span><span class="p">),</span> <span class="n">n</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+<span class="linenos">181</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">:</span><span class="s2">&lt;40</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> ms   编译数=</span><span class="si">{</span><span class="n">recompiles</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">182</span>        <span class="k">return</span> <span class="n">t</span>
+<span class="linenos">183</span>
+<span class="linenos">184</span>    <span class="n">t_keep</span> <span class="o">=</span> <span class="n">bust_then_time</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">14</span><span class="p">),</span> <span class="s2">"撑爆，但 big 那条缓存还在（rank 2..13）"</span><span class="p">)</span>
+<span class="linenos">185</span>    <span class="n">t_lost</span> <span class="o">=</span> <span class="n">bust_then_time</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">13</span><span class="p">),</span> <span class="s2">"撑爆，且 big 那条被挤掉（rank 1..12）"</span><span class="p">)</span>
+<span class="linenos">186</span>    <span class="n">t_eager</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">probe</span><span class="p">(</span><span class="n">big</span><span class="p">),</span> <span class="n">n</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+<span class="linenos">187</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'纯 eager 参照'</span><span class="si">:</span><span class="s2">&lt;40</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_eager</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
+<span class="linenos">188</span>    <span class="nb">print</span><span class="p">()</span>
+<span class="linenos">189</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  第一行说明：**撑爆缓存本身不贵**。只要还有一条守卫能对上，"</span><span class="p">)</span>
+<span class="linenos">190</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  它照样用编译好的代码，Dynamo 也不会重新进编译器（frames 增量为 0）。"</span><span class="p">)</span>
+<span class="linenos">191</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  第二行那 </span><span class="si">{</span><span class="n">t_lost</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> ms 不是「退回 eager」造成的 —— eager 只要 "</span>
+<span class="linenos">192</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">t_eager</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms。"</span><span class="p">)</span>
+<span class="linenos">193</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  真正的原因是：rank 1 被一个 2 元素的张量顶掉之后触发了 automatic dynamic，"</span><span class="p">)</span>
+<span class="linenos">194</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  而**动态形状的归约 kernel** 在大输入上会塌掉。这是 [C] 节的主题。"</span><span class="p">)</span>
+<span class="linenos">195</span>
+<span class="linenos">196</span>
+<span class="linenos">197</span><span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos">198</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos">199</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 动态形状：让一份代码吃所有长度"</span><span class="p">)</span>
+<span class="linenos">200</span>
+<span class="linenos">201</span>    <span class="k">def</span><span class="w"> </span><span class="nf">f</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+<span class="linenos">202</span>        <span class="k">return</span> <span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos">203</span>
+<span class="linenos">204</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"1. 默认：先特化，被打脸一次之后自动转动态"</span><span class="p">)</span>
+<span class="linenos">205</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">();</span> <span class="n">dutils</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+<span class="linenos">206</span>    <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+<span class="linenos">207</span>    <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">):</span>
+<span class="linenos">208</span>        <span class="n">cf</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">))</span>
+<span class="linenos">209</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  shape=(</span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2">,)   累计编译 </span><span class="si">{</span><span class="n">recompiles</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">210</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  第 1 次特化成 8，第 2 次发现形状变了 -&gt; 重编译成动态，之后不再涨。"</span><span class="p">)</span>
+<span class="linenos">211</span>
+<span class="linenos">212</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"2. 一开始就声明动态"</span><span class="p">)</span>
+<span class="linenos">213</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">();</span> <span class="n">dutils</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+<span class="linenos">214</span>    <span class="n">cf2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">215</span>    <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">):</span>
+<span class="linenos">216</span>        <span class="n">cf2</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">))</span>
+<span class="linenos">217</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  shape=(</span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2">,)   累计编译 </span><span class="si">{</span><span class="n">recompiles</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">218</span>
+<span class="linenos">219</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"3. 动态形状的代价：归约会塌，逐元素不会"</span><span class="p">)</span>
+<span class="linenos">220</span>    <span class="k">if</span> <span class="n">DEV</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">221</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  需要 CUDA"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos">222</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+<span class="linenos">223</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">22</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>          <span class="c1"># 4M 元素 = 16 MiB</span>
+<span class="linenos">224</span>
+<span class="linenos">225</span>    <span class="k">def</span><span class="w"> </span><span class="nf">bench</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">dyn</span><span class="p">):</span>
+<span class="linenos">226</span>        <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">227</span>        <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="n">dyn</span><span class="p">)</span> <span class="k">if</span> <span class="n">dyn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">fn</span><span class="p">)</span>
+<span class="linenos">228</span>        <span class="n">_</span><span class="p">,</span> <span class="n">code</span> <span class="o">=</span> <span class="n">run_and_get_code</span><span class="p">(</span><span class="n">cf</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
+<span class="linenos">229</span>        <span class="n">hints</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">findall</span><span class="p">(</span><span class="sa">r</span><span class="s2">"size_hints=\{[^}]*\}"</span><span class="p">,</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">code</span><span class="p">))</span>
+<span class="linenos">230</span>        <span class="k">return</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">cf</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">n</span><span class="o">=</span><span class="mi">20</span><span class="p">),</span> <span class="n">hints</span>
+<span class="linenos">231</span>
+<span class="linenos">232</span>    <span class="n">cases</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">"归约 (t*2).relu().sum()"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">t</span><span class="p">:</span> <span class="p">(</span><span class="n">t</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()),</span>
+<span class="linenos">233</span>             <span class="p">(</span><span class="s2">"逐元素 (t*2).relu()*1.5"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">t</span><span class="p">:</span> <span class="p">(</span><span class="n">t</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span> <span class="o">*</span> <span class="mf">1.5</span><span class="p">)]</span>
+<span class="linenos">234</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'表达式'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'eager'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'静态'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'动态'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'动态/静态'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">235</span>    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">fn</span> <span class="ow">in</span> <span class="n">cases</span><span class="p">:</span>
+<span class="linenos">236</span>        <span class="n">te</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">fn</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">n</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+<span class="linenos">237</span>        <span class="n">ts</span><span class="p">,</span> <span class="n">hs</span> <span class="o">=</span> <span class="n">bench</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+<span class="linenos">238</span>        <span class="n">td</span><span class="p">,</span> <span class="n">hd</span> <span class="o">=</span> <span class="n">bench</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+<span class="linenos">239</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">te</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ts</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">td</span><span class="si">:</span><span class="s2">&gt;10.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">td</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">ts</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">240</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">''</span><span class="si">:</span><span class="s2">26</span><span class="si">}</span><span class="s2">   静态 size_hints </span><span class="si">{</span><span class="n">hs</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">241</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">''</span><span class="si">:</span><span class="s2">26</span><span class="si">}</span><span class="s2">   动态 size_hints </span><span class="si">{</span><span class="n">hd</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">242</span>
+<span class="linenos">243</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  逐元素几乎不受影响：kernel 本来就是一维网格，元素个数当运行时参数传进去就行。"</span><span class="p">)</span>
+<span class="linenos">244</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  归约塌了：静态版拿到 `{'x': 512, 'r0_': 8192}`，是 512 个 block 的两段式归约；"</span><span class="p">)</span>
+<span class="linenos">245</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  动态版只拿到 `{'x': 1}` —— 形状未知时 Inductor 无法决定怎么切分归约维，"</span><span class="p">)</span>
+<span class="linenos">246</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  于是退化成**一个 block 顺序扫完整个张量**。"</span><span class="p">)</span>
+<span class="linenos">247</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这不是常量折叠少了一点，是并行度从 512 掉到 1。"</span><span class="p">)</span>
+<span class="linenos">248</span>    <span class="k">del</span> <span class="n">x</span>
+<span class="linenos">249</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">250</span>
+<span class="linenos">251</span>
+<span class="linenos">252</span><span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos">253</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos">254</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 融合边界：Inductor 在哪里停下来"</span><span class="p">)</span>
+<span class="linenos">255</span>    <span class="k">if</span> <span class="n">DEV</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">256</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"需要 CUDA"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos">257</span>
+<span class="linenos">258</span>    <span class="n">N</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">24</span>                                   <span class="c1"># 16M 元素 = 64 MiB fp32</span>
+<span class="linenos">259</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">260</span>    <span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">261</span>
+<span class="linenos">262</span>    <span class="n">cases</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">263</span>        <span class="p">(</span><span class="s2">"5 个逐元素算子"</span><span class="p">,</span>
+<span class="linenos">264</span>         <span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="p">((</span><span class="n">a</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">+</span> <span class="n">b</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span> <span class="o">*</span> <span class="mf">1.5</span> <span class="o">-</span> <span class="n">b</span><span class="p">)</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()),</span>
+<span class="linenos">265</span>        <span class="p">(</span><span class="s2">"逐元素 + 一个归约"</span><span class="p">,</span>
+<span class="linenos">266</span>         <span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="p">((</span><span class="n">a</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">+</span> <span class="n">b</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span> <span class="o">*</span> <span class="mf">1.5</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()),</span>
+<span class="linenos">267</span>        <span class="p">(</span><span class="s2">"归约之后再逐元素"</span><span class="p">,</span>
+<span class="linenos">268</span>         <span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="p">((</span><span class="n">a</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">+</span> <span class="n">b</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">*</span> <span class="mf">1.5</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()),</span>
+<span class="linenos">269</span>        <span class="p">(</span><span class="s2">"两个独立归约"</span><span class="p">,</span>
+<span class="linenos">270</span>         <span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="p">(</span><span class="n">a</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">+</span> <span class="p">(</span><span class="n">b</span> <span class="o">*</span> <span class="mi">3</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()),</span>
+<span class="linenos">271</span>        <span class="p">(</span><span class="s2">"中间要写出去（两次用到不同形状）"</span><span class="p">,</span>
+<span class="linenos">272</span>         <span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="p">(</span><span class="n">a</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">4096</span><span class="p">)</span><span class="o">.</span><span class="n">t</span><span class="p">()</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()),</span>
+<span class="linenos">273</span>    <span class="p">]</span>
+<span class="linenos">274</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'表达式'</span><span class="si">:</span><span class="s2">&lt;34</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'triton kernel 数'</span><span class="si">:</span><span class="s2">&gt;16</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'eager ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'compiled ms'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'加速'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">275</span>    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">fn</span> <span class="ow">in</span> <span class="n">cases</span><span class="p">:</span>
+<span class="linenos">276</span>        <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">277</span>        <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">fn</span><span class="p">)</span>
+<span class="linenos">278</span>        <span class="n">_</span><span class="p">,</span> <span class="n">code</span> <span class="o">=</span> <span class="n">run_and_get_code</span><span class="p">(</span><span class="n">cf</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">)</span>
+<span class="linenos">279</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">n_kernels</span><span class="p">(</span><span class="n">code</span><span class="p">)</span>
+<span class="linenos">280</span>        <span class="n">te</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">fn</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">))</span>
+<span class="linenos">281</span>        <span class="n">tc</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">cf</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">))</span>
+<span class="linenos">282</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;34</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">k</span><span class="si">:</span><span class="s2">&gt;16</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">te</span><span class="si">:</span><span class="s2">&gt;10.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tc</span><span class="si">:</span><span class="s2">&gt;12.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">te</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">tc</span><span class="si">:</span><span class="s2">&gt;6.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">283</span>
+<span class="linenos">284</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"图断裂：.item() 把一张图切成两张"</span><span class="p">)</span>
+<span class="linenos">285</span>    <span class="k">def</span><span class="w"> </span><span class="nf">with_item</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">):</span>
+<span class="linenos">286</span>        <span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="n">a</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">+</span> <span class="n">b</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos">287</span>        <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>                 <span class="c1"># 需要把值搬回 host -&gt; 必须断</span>
+<span class="linenos">288</span>            <span class="k">return</span> <span class="n">a</span> <span class="o">*</span> <span class="mi">3</span>
+<span class="linenos">289</span>        <span class="k">return</span> <span class="n">a</span> <span class="o">*</span> <span class="mi">4</span>
+<span class="linenos">290</span>
+<span class="linenos">291</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">292</span>    <span class="n">exp</span> <span class="o">=</span> <span class="n">dynamo</span><span class="o">.</span><span class="n">explain</span><span class="p">(</span><span class="n">with_item</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">)</span>
+<span class="linenos">293</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  图数量 </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">  断裂 </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">graph_break_count</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">294</span>    <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">exp</span><span class="o">.</span><span class="n">break_reasons</span><span class="p">[:</span><span class="mi">3</span><span class="p">]:</span>
+<span class="linenos">295</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  原因:"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">r</span><span class="p">)[:</span><span class="mi">150</span><span class="p">])</span>
+<span class="linenos">296</span>    <span class="k">del</span> <span class="n">x</span><span class="p">,</span> <span class="n">y</span>
+<span class="linenos">297</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">298</span>
+<span class="linenos">299</span>
+<span class="linenos">300</span><span class="c1"># ---------------------------------------------------------------- E</span>
+<span class="linenos">301</span><span class="k">def</span><span class="w"> </span><span class="nf">section_E</span><span class="p">():</span>
+<span class="linenos">302</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[E] autotune：编译时间换运行时间"</span><span class="p">)</span>
+<span class="linenos">303</span>    <span class="k">if</span> <span class="n">DEV</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">304</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"需要 CUDA"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos">305</span>
+<span class="linenos">306</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  autotune 只在「cuBLAS 的启发式选得不好」的形状上才有东西可赢。"</span><span class="p">)</span>
+<span class="linenos">307</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以要同时测一个方方正正的 GEMM 和一个 decode 形状的瘦长 GEMM。"</span><span class="p">)</span>
+<span class="linenos">308</span>
+<span class="linenos">309</span>    <span class="k">def</span><span class="w"> </span><span class="nf">mm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">):</span>
+<span class="linenos">310</span>        <span class="k">return</span> <span class="p">(</span><span class="n">x</span> <span class="o">@</span> <span class="n">y</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span>
+<span class="linenos">311</span>
+<span class="linenos">312</span>    <span class="n">shapes</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">313</span>        <span class="p">(</span><span class="s2">"方阵 4096×4096×4096（prefill 形状）"</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span>
+<span class="linenos">314</span>        <span class="p">(</span><span class="s2">"瘦长 8×4096×4096（decode 形状）"</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span>
+<span class="linenos">315</span>        <span class="p">(</span><span class="s2">"瘦长 1×4096×11008（decode + FFN）"</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="mi">11008</span><span class="p">),</span>
+<span class="linenos">316</span>    <span class="p">]</span>
+<span class="linenos">317</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">M</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">N</span> <span class="ow">in</span> <span class="n">shapes</span><span class="p">:</span>
+<span class="linenos">318</span>        <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">M</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">319</span>        <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">K</span><span class="p">,</span> <span class="n">N</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">320</span>        <span class="n">flops</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">M</span> <span class="o">*</span> <span class="n">K</span> <span class="o">*</span> <span class="n">N</span>
+<span class="linenos">321</span>        <span class="n">bytes_moved</span> <span class="o">=</span> <span class="p">(</span><span class="n">M</span> <span class="o">*</span> <span class="n">K</span> <span class="o">+</span> <span class="n">K</span> <span class="o">*</span> <span class="n">N</span> <span class="o">+</span> <span class="n">M</span> <span class="o">*</span> <span class="n">N</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos">322</span>        <span class="n">te</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">mm</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">),</span> <span class="n">n</span><span class="o">=</span><span class="mi">30</span><span class="p">)</span>
+<span class="linenos">323</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">324</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'mode'</span><span class="si">:</span><span class="s2">&lt;18</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'编译 s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'运行 ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'TFLOP/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">325</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对 eager'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">326</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'eager (cuBLAS)'</span><span class="si">:</span><span class="s2">&lt;18</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'-'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">te</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">327</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">flops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">te</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">bytes_moved</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">te</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="mf">1.0</span><span class="si">:</span><span class="s2">&gt;10.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">328</span>        <span class="k">for</span> <span class="n">mode</span> <span class="ow">in</span> <span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="s2">"max-autotune"</span><span class="p">]:</span>
+<span class="linenos">329</span>            <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">330</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos">331</span>            <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">mm</span><span class="p">)</span> <span class="k">if</span> <span class="n">mode</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">mm</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="n">mode</span><span class="p">)</span>
+<span class="linenos">332</span>            <span class="n">cf</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+<span class="linenos">333</span>            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">334</span>            <span class="n">compile_s</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos">335</span>            <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">cf</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">),</span> <span class="n">n</span><span class="o">=</span><span class="mi">30</span><span class="p">)</span>
+<span class="linenos">336</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">mode</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="s1">'default'</span><span class="si">:</span><span class="s2">&lt;18</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">compile_s</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">337</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">flops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">bytes_moved</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">338</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">te</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;10.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">339</span>        <span class="k">del</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span>
+<span class="linenos">340</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">341</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  方阵上 cuBLAS 已经接近实测算力上限（L1.1 测得 232 TFLOP/s），没什么可赢的。"</span><span class="p">)</span>
+<span class="linenos">342</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  瘦长形状是 memory-bound 的，要看 GB/s 而不是 TFLOP/s。"</span><span class="p">)</span>
+<span class="linenos">343</span>
+<span class="linenos">344</span>
+<span class="linenos">345</span><span class="c1"># ---------------------------------------------------------------- F</span>
+<span class="linenos">346</span><span class="k">def</span><span class="w"> </span><span class="nf">section_F</span><span class="p">():</span>
+<span class="linenos">347</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[F] 广度：同一个模块，几条不同的编译路线"</span><span class="p">)</span>
+<span class="linenos">348</span>    <span class="k">if</span> <span class="n">DEV</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">349</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"需要 CUDA"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos">350</span>
+<span class="linenos">351</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+<span class="linenos">352</span>
+<span class="linenos">353</span>    <span class="k">class</span><span class="w"> </span><span class="nc">Block</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="linenos">354</span>        <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">d</span><span class="o">=</span><span class="mi">1024</span><span class="p">):</span>
+<span class="linenos">355</span>            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos">356</span>            <span class="bp">self</span><span class="o">.</span><span class="n">n</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">d</span><span class="p">)</span>
+<span class="linenos">357</span>            <span class="bp">self</span><span class="o">.</span><span class="n">fc1</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">d</span><span class="p">)</span>
+<span class="linenos">358</span>            <span class="bp">self</span><span class="o">.</span><span class="n">fc2</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">4</span> <span class="o">*</span> <span class="n">d</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>
+<span class="linenos">359</span>
+<span class="linenos">360</span>        <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+<span class="linenos">361</span>            <span class="k">return</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc2</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">gelu</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">fc1</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">n</span><span class="p">(</span><span class="n">x</span><span class="p">))))</span>
+<span class="linenos">362</span>
+<span class="linenos">363</span>    <span class="k">class</span><span class="w"> </span><span class="nc">Stack</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="linenos">364</span>        <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">depth</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span> <span class="n">d</span><span class="o">=</span><span class="mi">1024</span><span class="p">):</span>
+<span class="linenos">365</span>            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos">366</span>            <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">ModuleList</span><span class="p">([</span><span class="n">Block</span><span class="p">(</span><span class="n">d</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">depth</span><span class="p">)])</span>
+<span class="linenos">367</span>
+<span class="linenos">368</span>        <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+<span class="linenos">369</span>            <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span>
+<span class="linenos">370</span>                <span class="n">x</span> <span class="o">=</span> <span class="n">b</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">371</span>            <span class="k">return</span> <span class="n">x</span>
+<span class="linenos">372</span>
+<span class="linenos">373</span>    <span class="n">m</span> <span class="o">=</span> <span class="n">Stack</span><span class="p">()</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<span class="linenos">374</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>   <span class="c1"># decode 形状</span>
+<span class="linenos">375</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  8 层 Block、batch=1 —— 这是 launch 开销占比最高的区间（见 L1.4）。"</span><span class="p">)</span>
+<span class="linenos">376</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  两种计时都报：紧凑循环（CPU 提交可以和 GPU 重叠）"</span><span class="p">)</span>
+<span class="linenos">377</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  与每次同步（服务里逐 token 返回时看到的那种）。"</span><span class="p">)</span>
+<span class="linenos">378</span>
+<span class="linenos">379</span>    <span class="k">def</span><span class="w"> </span><span class="nf">timed_sync</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">10</span><span class="p">):</span>
+<span class="linenos">380</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">warmup</span><span class="p">):</span>
+<span class="linenos">381</span>            <span class="n">fn</span><span class="p">();</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">382</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos">383</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos">384</span>            <span class="n">fn</span><span class="p">();</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">385</span>        <span class="k">return</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos">386</span>
+<span class="linenos">387</span>    <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">388</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">389</span>        <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"eager"</span><span class="p">,</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">m</span><span class="p">(</span><span class="n">x</span><span class="p">)),</span> <span class="n">timed_sync</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">m</span><span class="p">(</span><span class="n">x</span><span class="p">))))</span>
+<span class="linenos">390</span>        <span class="k">for</span> <span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"aot_eager"</span><span class="p">,</span> <span class="s2">"inductor"</span><span class="p">]:</span>
+<span class="linenos">391</span>            <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">392</span>            <span class="k">try</span><span class="p">:</span>
+<span class="linenos">393</span>                <span class="n">cm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">)</span>
+<span class="linenos">394</span>                <span class="n">cm</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">395</span>                <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="sa">f</span><span class="s2">"compile/</span><span class="si">{</span><span class="n">backend</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">cm</span><span class="p">(</span><span class="n">x</span><span class="p">)),</span>
+<span class="linenos">396</span>                             <span class="n">timed_sync</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">cm</span><span class="p">(</span><span class="n">x</span><span class="p">))))</span>
+<span class="linenos">397</span>            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                          <span class="c1"># noqa: BLE001</span>
+<span class="linenos">398</span>                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">backend</span><span class="si">}</span><span class="s2"> 失败: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">120</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">399</span>        <span class="k">for</span> <span class="n">mode</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"reduce-overhead"</span><span class="p">,</span> <span class="s2">"max-autotune"</span><span class="p">]:</span>
+<span class="linenos">400</span>            <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos">401</span>            <span class="k">try</span><span class="p">:</span>
+<span class="linenos">402</span>                <span class="n">cm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="n">mode</span><span class="p">)</span>
+<span class="linenos">403</span>                <span class="n">cm</span><span class="p">(</span><span class="n">x</span><span class="p">);</span> <span class="n">cm</span><span class="p">(</span><span class="n">x</span><span class="p">);</span> <span class="n">cm</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">404</span>                <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="sa">f</span><span class="s2">"compile/</span><span class="si">{</span><span class="n">mode</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">cm</span><span class="p">(</span><span class="n">x</span><span class="p">)),</span>
+<span class="linenos">405</span>                             <span class="n">timed_sync</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">cm</span><span class="p">(</span><span class="n">x</span><span class="p">))))</span>
+<span class="linenos">406</span>            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                          <span class="c1"># noqa: BLE001</span>
+<span class="linenos">407</span>                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">mode</span><span class="si">}</span><span class="s2"> 失败: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">120</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">408</span>
+<span class="linenos">409</span>    <span class="n">b_loop</span><span class="p">,</span> <span class="n">b_sync</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">1</span><span class="p">],</span> <span class="n">rows</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">2</span><span class="p">]</span>
+<span class="linenos">410</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'路线'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'紧凑循环 ms'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'加速'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'每次同步 ms'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'加速'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">411</span>    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">tl</span><span class="p">,</span> <span class="n">ts</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">:</span>
+<span class="linenos">412</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tl</span><span class="si">:</span><span class="s2">&gt;12.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">b_loop</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">tl</span><span class="si">:</span><span class="s2">&gt;6.2f</span><span class="si">}</span><span class="s2">× "</span>
+<span class="linenos">413</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">ts</span><span class="si">:</span><span class="s2">&gt;13.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">b_sync</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">ts</span><span class="si">:</span><span class="s2">&gt;6.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">414</span>
+<span class="linenos">415</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"torch.export：把图固化下来，不带 python"</span><span class="p">)</span>
+<span class="linenos">416</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos">417</span>        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">418</span>            <span class="n">ep</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">export</span><span class="o">.</span><span class="n">export</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="p">(</span><span class="n">x</span><span class="p">,))</span>
+<span class="linenos">419</span>        <span class="n">g</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_module</span><span class="o">.</span><span class="n">graph</span>
+<span class="linenos">420</span>        <span class="n">ops</span> <span class="o">=</span> <span class="p">[</span><span class="n">n</span><span class="o">.</span><span class="n">target</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">g</span><span class="o">.</span><span class="n">nodes</span> <span class="k">if</span> <span class="n">n</span><span class="o">.</span><span class="n">op</span> <span class="o">==</span> <span class="s2">"call_function"</span><span class="p">]</span>
+<span class="linenos">421</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  导出成功：</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">g</span><span class="o">.</span><span class="n">nodes</span><span class="p">))</span><span class="si">}</span><span class="s2"> 个节点，</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">ops</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个 call_function"</span><span class="p">)</span>
+<span class="linenos">422</span>        <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">Counter</span>
+<span class="linenos">423</span>        <span class="k">for</span> <span class="n">op</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">Counter</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">o</span><span class="p">)</span> <span class="k">for</span> <span class="n">o</span> <span class="ow">in</span> <span class="n">ops</span><span class="p">)</span><span class="o">.</span><span class="n">most_common</span><span class="p">(</span><span class="mi">8</span><span class="p">):</span>
+<span class="linenos">424</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">op</span><span class="si">:</span><span class="s2">&lt;48</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">c</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">425</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  export 的图不含 python 控制流，可以脱离 python 运行时部署。"</span><span class="p">)</span>
+<span class="linenos">426</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  这是与 torch.compile 最大的区别：compile 仍然活在 python 进程里。"</span><span class="p">)</span>
+<span class="linenos">427</span>    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
+<span class="linenos">428</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  export 失败:"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">200</span><span class="p">])</span>
+<span class="linenos">429</span>
+<span class="linenos">430</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  未装 TensorRT / ONNX Runtime，这两条路线本轮无法对照（见正文「待补」）。"</span><span class="p">)</span>
+<span class="linenos">431</span>
+<span class="linenos">432</span>
+<span class="linenos">433</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span>
+<span class="linenos">434</span>            <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">,</span> <span class="s2">"E"</span><span class="p">:</span> <span class="n">section_E</span><span class="p">,</span> <span class="s2">"F"</span><span class="p">:</span> <span class="n">section_F</span><span class="p">}</span>
+<span class="linenos">435</span>
+<span class="linenos">436</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">437</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos">438</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  device </span><span class="si">{</span><span class="n">DEV</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">439</span>    <span class="k">if</span> <span class="n">DEV</span> <span class="o">==</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos">440</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"gpu   </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_name</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">441</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos">442</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos">443</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos">444</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L2/compiler_stack.py 全文（444 行）</code><a href="../code/labs/L2/compiler_stack.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p><strong>建议的消融</strong></p>
+<ol>
+<li>把 [C] 里的归约换成沿最后一维的 LayerNorm（<code>x.mean(-1)</code>，
+   <code>x</code> 形状 <code>(B, 4096)</code>，只有 B 动态），再比 <code>size_hints</code>。
+   我预测塌陷会小得多，因为归约维是静态的——<strong>这是一个预测，去证伪它</strong>。</li>
+<li>在 [B] 的撑爆实验里改 <code>torch._dynamo.config.cache_size_limit</code>，
+   看是不是精确地卡在你设的值上。</li>
+<li>给 [E] 加一个 <code>torch.backends.cuda.matmul.allow_tf32 = True</code> 的对照，
+   看 fp32 路径上 autotune 的结论会不会翻过来。</li>
+<li>用 <code>TORCH_LOGS=recompiles</code> 重跑 [B]，把每次重编译的原因打出来，
+   对照那张表逐行确认。</li>
+</ol>
+<hr />
+<h2 id="_11">十 · 自测题</h2>
+<details>
+<summary>1. 一个函数在测试里 `torch.compile` 后快 2 倍，上线后吞吐反而下降。列出三个可能原因和各自的判据。</summary>
+<ul>
+<li><strong>反复重编译</strong>：线上输入的形状/dtype/rank 比测试里多。
+  判据：<code>TORCH_LOGS=recompiles</code>，或读 <code>torch._dynamo.utils.counters["stats"]["unique_graphs"]</code>。</li>
+<li><strong>automatic dynamic 把含归约的 kernel 转成了动态版</strong>：本章实测可以慢几千倍。
+  判据：比静态与动态两次编译的 <code>size_hints</code>，看并行度有没有掉。</li>
+<li><strong>计时方式不同</strong>：测试用紧凑循环（CPU 提交与 GPU 重叠），
+  线上是每个 token 同步一次。本章同一份代码两种计时分别是 1.36× 和 1.13×。
+  判据：用每次同步的方式重测。</li>
+</ul>
+<p>还有一个常见但本章没测的：编译发生在第一次请求上，冷启动延迟被算进了 P99。</p>
+</details>
+<details>
+<summary>2. 为什么 `.item()` 会造成图断裂，而 `.sum()` 不会？</summary>
+<p><code>.sum()</code> 的结果仍是一个 GPU 上的张量，可以继续作为图里的节点参与后续算子，
+Dynamo 不需要知道它的值。</p>
+<p><code>.item()</code> 要把值搬回 host 变成一个 python 数，通常是为了参与 python 的
+<code>if</code>/<code>while</code>。Dynamo 在追踪时并不执行真实计算，拿不到这个值，
+也就无法决定走哪个分支，只能把图切开、交回 python 执行、再从下一句重新捕获。</p>
+<p>（<code>capture_scalar_outputs=True</code> 可以让它用未定符号继续追踪，
+代价是后续所有依赖这个值的形状都变成 unbacked symint，约束求解会更难。）</p>
+</details>
+<details>
+<summary>3. 你的模型里有一个 `LayerNorm`，输入形状是 `(B, S, 4096)`，B 和 S 都变长。哪一维动态是危险的？</summary>
+<p><code>LayerNorm</code> 沿<strong>最后一维</strong>（4096，hidden_size）归约，这一维是静态的。
+B 和 S 只是"有多少行要各自归约一次"，对应 kernel 的 x 维（并行维），
+形状未知不影响归约维的切分策略。</p>
+<p>所以这个例子里 B、S 动态大概率是安全的，危险的是归约维本身动态——
+例如对变长序列做 <code>x.sum(dim=1)</code>（沿序列长度归约）。</p>
+<p>但注意这是<strong>推理，不是实测</strong>。判据仍然是比 <code>size_hints</code>：
+把 B、S 换几个值编译，看归约那一维的 hint 有没有从具体数字变成 1。
+自测题 9.1 就是让你去做这件事。</p>
+</details>
+<details>
+<summary>4. `max-autotune` 花了 1.5 秒编译，结果比 eager 慢 36%。它做错了什么？</summary>
+<p>不能说它"做错了"。<code>max-autotune</code> 的工作是：用 Inductor 的 Triton GEMM 模板
+生成一批候选配置，实测每个候选，选最快的那个。它确实选出了候选里最快的。</p>
+<p>问题在于<strong>候选集合本身不含 cuBLAS 那条路径</strong>（或者说，在这个形状上
+cuBLAS 的实现优于所有候选）。"一组候选里的最好"不等于"全局最好"。</p>
+<p>对使用者的含义：<code>max-autotune</code> 值得试，但必须<strong>测</strong>，
+不能当成一个只会变快的开关。<code>default</code> 模式保留 <code>aten::mm</code> → cuBLAS，
+在 GEMM 上通常是更安全的默认。</p>
+</details>
+<details>
+<summary>5. 守卫为什么要检查 <code>DispatchKeySet</code>？形状和 dtype 不够吗？</summary>
+<p>不够。同样形状、同样 dtype 的张量，可能是稠密的也可能是稀疏的，
+可能在 CUDA 上也可能在 meta 上，可能带 autograd 也可能被 functorch 包着。
+这些差别决定了 <code>a + b</code> 最终分发到哪个 kernel（2.0 那张 97 行的分发表）。</p>
+<p>Inductor 生成的代码是针对某一条分发路径的。路径变了，代码就不适用。
+所以守卫直接检查那个 64 位位图——它正是"这个张量会走哪条路"的完整编码。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.6b-graph-anatomy.html">&#8592; 2.6b 算子图的样子：Dynamo FX 图、Inductor 输出与真实文本</a><a class="nav-next" href="../L2/2.8-custom-op-integration.html">2.8 把一个算子接进 PyTorch：注册、分发、backward 与 compile &#8594;</a></nav>
+</main>
+</body>
+</html>

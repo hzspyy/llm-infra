@@ -1,0 +1,195 @@
+
+==============================================================================
+[A] 分片与 index：一个张量怎么在 5 个文件里被找到
+==============================================================================
+  5 个分片：
+    model-00001-of-00005.safetensors   3811.1 MB  头   9328 B    81 个张量
+    model-00002-of-00005.safetensors   3808.2 MB  头  13144 B   114 个张量
+    model-00003-of-00005.safetensors   3776.2 MB  头  12824 B   111 个张量
+    model-00004-of-00005.safetensors   3040.2 MB  头  10600 B    92 个张量
+    model-00005-of-00005.safetensors   1187.0 MB  头    120 B     1 个张量
+  合计 15.26 GiB
+
+  index.json: metadata={'total_size': 16381470720}
+  weight_map 有 399 条，形如 张量名 -> 哪个文件
+    lm_head.weight                                     -> model-00005-of-00005.safetensors
+    model.embed_tokens.weight                          -> model-00001-of-00005.safetensors
+    model.layers.0.input_layernorm.weight              -> model-00001-of-00005.safetensors
+    model.layers.0.mlp.down_proj.weight                -> model-00001-of-00005.safetensors
+    ...
+
+  每个分片里的层号范围：
+    model-00001-of-00005.safetensors   layers 0..7          另有 1 个非 layer 张量: ['model.embed_tokens.weight']
+    model-00002-of-00005.safetensors   layers 7..17         另有 0 个非 layer 张量: []
+    model-00003-of-00005.safetensors   layers 17..27        另有 0 个非 layer 张量: []
+    model-00004-of-00005.safetensors   layers 27..35        另有 1 个非 layer 张量: ['model.norm.weight']
+    model-00005-of-00005.safetensors   无 layer              另有 1 个非 layer 张量: ['lm_head.weight']
+
+  注意层号范围**是重叠的**（0..7 和 7..17）——
+  分片纯粹按字节大小切，**不保证一层的张量在同一个文件里**。
+  第 7 层的 11 个张量分布：{'002-of-00005.safetensors': 8, '001-of-00005.safetensors': 3}
+    7.input_layernorm.weight                 002-of-00005.safetensors
+    7.mlp.down_proj.weight                   002-of-00005.safetensors
+    7.mlp.gate_proj.weight                   002-of-00005.safetensors
+    7.mlp.up_proj.weight                     002-of-00005.safetensors
+    7.post_attention_layernorm.weight        002-of-00005.safetensors
+    7.self_attn.k_norm.weight                002-of-00005.safetensors
+    7.self_attn.k_proj.weight                001-of-00005.safetensors
+    7.self_attn.o_proj.weight                002-of-00005.safetensors
+    7.self_attn.q_norm.weight                002-of-00005.safetensors
+    7.self_attn.q_proj.weight                001-of-00005.safetensors
+    7.self_attn.v_proj.weight                001-of-00005.safetensors
+  q/k/v_proj 在第 1 个文件，其余在第 2 个 —— 同一层被切开了。
+  所以「加载完一层就能开始算」需要跨文件协调，不是免费的。
+
+--- 找一个具体张量：它在哪个文件的哪些字节 -----------------------------------------------------
+  model.layers.20.self_attn.q_proj.weight
+    文件      model-00003-of-00005.safetensors
+    dtype     BF16   shape [4096, 4096]
+    数据区偏移 [1317078528, 1350632960)  共 33554432 字节
+    文件内绝对偏移 = 8 + 12824 + 1317078528 = 1317091360
+    校验: 16777216 元素 × 2 字节(bf16) = 33554432 ✓
+
+==============================================================================
+[B] 命名：磁盘上的名字不是引擎里的名字
+==============================================================================
+  Qwen3-1.7B 第 0 层在磁盘上的 11 个张量：
+    model.layers.0.input_layernorm.weight                [2048]           BF16
+    model.layers.0.mlp.down_proj.weight                  [2048, 6144]     BF16
+    model.layers.0.mlp.gate_proj.weight                  [6144, 2048]     BF16
+    model.layers.0.mlp.up_proj.weight                    [6144, 2048]     BF16
+    model.layers.0.post_attention_layernorm.weight       [2048]           BF16
+    model.layers.0.self_attn.k_norm.weight               [128]            BF16
+    model.layers.0.self_attn.k_proj.weight               [1024, 2048]     BF16
+    model.layers.0.self_attn.o_proj.weight               [2048, 2048]     BF16
+    model.layers.0.self_attn.q_norm.weight               [128]            BF16
+    model.layers.0.self_attn.q_proj.weight               [2048, 2048]     BF16
+    model.layers.0.self_attn.v_proj.weight               [1024, 2048]     BF16
+
+  注意 q_proj / k_proj / v_proj 是**三个独立张量**。
+  但 0.0 里我们看到 vLLM 用的是一个融合的 QKVParallelLinear ——
+  加载时会把这三个拼成一个大矩阵，好处是一次 GEMM 代替三次。
+  所以「权重名」在磁盘、HF 实现、推理引擎里是三套，加载器负责翻译。
+
+--- 非 layer 的张量 -------------------------------------------------------------
+    model.embed_tokens.weight                            [151936, 2048]   BF16
+    model.norm.weight                                    [2048]           BF16
+
+--- q_norm / k_norm：Qwen3 比 Qwen2 多出来的东西 ------------------------------------
+    model.layers.0.self_attn.k_norm.weight               [128]
+    model.layers.0.self_attn.q_norm.weight               [128]
+    这是 QK-Norm：对 Q 和 K 在 head_dim 上做 RMSNorm 之后再算 attention。
+    shape 是 [head_dim]，不是 [hidden]——说明它作用在每个头内部。
+    实现里漏掉它，模型能跑但输出是错的（4.1 会对齐每一层）。
+
+==============================================================================
+[C] mmap 与零拷贝：get_tensor 到底做了什么
+==============================================================================
+  文件 model-00001-of-00002.safetensors  3281.8 MB
+  张量 model.layers.0.mlp.down_proj.weight
+    shape (2048, 6144)  24.0 MB
+    get_tensor()             0.231 ms  ->    109.0 GB/s
+    之后完整读一遍           9.697 ms  ->      2.6 GB/s
+
+  get_tensor 快得不真实，因为它只建了一个 mmap 视图，**没有读盘**。
+  真正的读发生在你第一次碰那些页的时候（缺页中断）。
+  L1.5 踩过这个坑：给 get_tensor 计时得到「104 GB/s 冷加载」。
+
+--- 加载到 GPU 才是真的搬 -----------------------------------------------------------
+    .to('cuda')            211.612 ms  ->      0.1 GB/s   （PCIe，见 L1.3）
+
+==============================================================================
+[D] tie_word_embeddings：配置说绑定了，文件里却存了两份
+==============================================================================
+
+  Qwen/Qwen3-1.7B
+    config: tie_word_embeddings = True
+    分片数 2，合计 3875.3 MB
+    lm_head.weight                   在 model-00002-of-00002.safetensors
+    model.embed_tokens.weight        在 model-00001-of-00002.safetensors
+    两者 shape (151936, 2048)，逐位完全相同: True
+    max|diff| = 0.0
+    lm_head 那份 593.5 MB，占 checkpoint 的 15.3%
+
+  Qwen/Qwen3-8B
+    config: tie_word_embeddings = False
+    分片数 5，合计 15622.6 MB
+    lm_head.weight                   在 model-00005-of-00005.safetensors
+    model.embed_tokens.weight        在 model-00001-of-00005.safetensors
+    两者 shape (151936, 4096)，逐位完全相同: False
+    max|diff| = 0.9637451171875
+    lm_head 那份 1187.0 MB，占 checkpoint 的 7.6%
+
+  读出来的事实：Qwen3-1.7B 的 config 写着 tie=True，
+  但 checkpoint **确实存了一份独立的 lm_head.weight**，
+  而且和 embed_tokens **逐位相同**。它单独占了一个分片。
+
+  所以「绑定就不存第二份」这个说法对这个 checkpoint 不成立。
+  这 593.5 MB 是**冗余**的：加载器按 tie=True 走绑定路径时不会用它。
+  教训：config 的字段描述的是**模型结构**，不是**文件内容**。
+  想知道文件里有什么，只能去读文件。
+
+--- 这一份权重有多大 ----------------------------------------------------------------
+    vocab=151936  hidden=2048  ->  311164928 个参数 = 593.5 MB (bf16)
+    占 1.7B 模型参数量的 18.3%
+    小模型上 embedding 占比特别高（词表大、hidden 小），
+    这也是小模型更倾向于用 tie 的原因。
+
+==============================================================================
+[E] 量化 checkpoint：多存了什么，少存了什么
+==============================================================================
+
+  === Qwen/Qwen2.5-1.5B-Instruct-AWQ ===
+  quantization_config: {"bits": 4, "group_size": 128, "modules_to_not_convert": null, "quant_method": "awq", "version": "gemm", "zero_point": true}
+  文件合计 1539.8 MB，张量 731 个
+  第 0 层 q_proj 相关的张量：
+    model.layers.0.self_attn.q_proj.bias             [1536]           F16         3.0 KB
+    model.layers.0.self_attn.q_proj.qweight          [1536, 192]      I32      1152.0 KB
+    model.layers.0.self_attn.q_proj.qzeros           [12, 192]        I32         9.0 KB
+    model.layers.0.self_attn.q_proj.scales           [12, 1536]       F16        36.0 KB
+
+  === Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4 ===
+  quantization_config: {"batch_size": 1, "bits": 4, "block_name_to_quantize": null, "cache_block_outputs": true, "damp_percent": 0.01, "dataset": null, "desc_act": false, "exllama_config": {"version": 1}, "group_size": 128, "max_input_length": null, "model_seqlen": null, "module_name_preceding_first_block": null, "modules_in_block_to_quantize": null, "pad_token_id": null, "quant_method": "gptq", "sym": true, "tokenizer": null, "true_sequential": true, "use_cuda_fp16": false, "use_exllama": true}
+  文件合计 1096.6 MB，张量 926 个
+  第 0 层 q_proj 相关的张量：
+    model.layers.0.self_attn.q_proj.bias             [1536]           F16         3.0 KB
+    model.layers.0.self_attn.q_proj.g_idx            [1536]           I32         6.0 KB
+    model.layers.0.self_attn.q_proj.qweight          [192, 1536]      I32      1152.0 KB
+    model.layers.0.self_attn.q_proj.qzeros           [12, 192]        I32         9.0 KB
+    model.layers.0.self_attn.q_proj.scales           [12, 1536]       F16        36.0 KB
+
+--- 对照：未量化的同一个位置 ------------------------------------------------------------
+    model.layers.0.self_attn.q_proj.weight           [2048, 2048]     BF16     8192.0 KB
+
+  读法：量化格式把一个 [out, in] 的 bf16 矩阵拆成三样东西 ——
+    qweight  打包好的低位整数（多个权重塞进一个 int32）
+    scales   每组一个缩放系数（组大小就是 group_size）
+    qzeros   每组一个零点（非对称量化才有）
+  所以「4 bit 量化」的实际每权重位数要把 scales/qzeros 算进去，
+  下一节按 group_size 算一下真实的等效位宽。
+
+--- 两个文件差 443 MB，差在哪 --------------------------------------------------------
+
+  Qwen2.5-1.5B-Instruct-AWQ  tie=True  总 1539.7 MB
+    dtype 分布 {'I32': 392, 'F16': 339}
+    lm_head.weight                             [151936, 1536]     F16     445.1 MB
+    model.embed_tokens.weight                  [151936, 1536]     F16     445.1 MB
+    model.layers.0.mlp.down_proj.qweight       [8960, 192]        I32       6.6 MB
+
+  Qwen2.5-1.5B-Instruct-GPTQ-Int4  tie=True  总 1096.5 MB
+    dtype 分布 {'I32': 588, 'F16': 338}
+    model.embed_tokens.weight                  [151936, 1536]     F16     445.1 MB
+    model.layers.0.mlp.down_proj.qweight       [1120, 1536]       I32       6.6 MB
+    model.layers.0.mlp.gate_proj.qweight       [192, 8960]        I32       6.6 MB
+
+  两处：
+  1. **AWQ 那份多存了一个 lm_head.weight（445.1 MB）**，尽管 tie=True；
+     GPTQ 那份没有。443 MB 的差额基本就是这一项。
+     这和 [D] 节 Qwen3-1.7B 是同一个模式 —— 不是个例。
+  2. **embedding 表根本没有被量化**，两边都是 F16 的 445.1 MB。
+     GPTQ 文件 1096.5 MB 里它占 41%。所以「4 bit 模型」这个说法
+     只描述了线性层；词表大、模型小的时候，未量化的部分才是大头。
+
+--- 真实等效位宽 ------------------------------------------------------------------
+  Qwen2.5-1.5B-Instruct-AWQ            bits=4 group_size=128 -> 等效 4.16 bit/权重 (压缩比 3.85× vs bf16)
+  Qwen2.5-1.5B-Instruct-GPTQ-Int4      bits=4 group_size=128 -> 等效 4.16 bit/权重 (压缩比 3.85× vs bf16)

@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.3 调度：continuous batching 与 chunked prefill</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">5.3</div>
+  <div class="sidebar-title">调度：continuous batching 与 chunked prefill</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#step">一 · 一个 step 里有什么</a></li>
+<li><a href="#prefill">二 · 长 prefill 插进来会怎样</a></li>
+<li><a href="#_2">三 · 切多细：一个几乎免费的交易</a></li>
+<li><a href="#max_num_batched_tokens">四 · max_num_batched_tokens 到底管什么</a></li>
+<li><a href="#_3">五 · 设计取舍</a><ul>
+<li><a href="#51-token">5.1 为什么调度的粒度是 token 而不是请求</a></li>
+<li><a href="#52">5.2 尾延迟与吞吐通常是交易，这次不是</a></li>
+<li><a href="#53">5.3 参数的"无效区间"比"有效区间"更常被误用</a></li>
+</ul>
+</li>
+<li><a href="#lab">六 · 动手 lab</a></li>
+<li><a href="#_4">七 · 陷阱</a></li>
+<li><a href="#_5">八 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
+  <div class="mod-id">5.3</div>
+  <h1>调度：continuous batching 与 chunked prefill</h1>
+  <p class="lede">逐 step 计时看调度：一条 8192 token 的 prefill 让稳态 4.7ms 的步涨到 53ms，连续 5 步所有 decode 停摆。把块切到 512 后尖峰从 165.9 降到 15.9ms，而总时间不变——chunked prefill 在这个配置下近乎免费。max_num_batched_tokens 过了并发数就完全无效（拐点实测）。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · vLLM 0.29.0 · Qwen3-1.7B</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 5.1（两相的性质）· 5.2（KV 分页）· 0.1（引擎的调用栈）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>5.1 证明了 prefill 与 decode 的要求相反。调度器就是处理这个矛盾的地方。</p>
+<ol>
+<li>一个 step 里到底发生了什么？</li>
+<li>一条长 prompt 插进来时，正在 decode 的请求会被拖多久？</li>
+<li><code>max_num_batched_tokens</code> 到底管什么？调小了会伤害什么？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的方法：逐 step 计时</p>
+<p>不用 <code>LLM.generate</code>（它把整个批跑完才返回），而是用底层的
+<code>add_request</code> + <code>step()</code>，<strong>每一步单独计时</strong>。
+调度的行为只有在这个粒度上才看得见——平均值会把所有尖峰抹平。</p>
+</div>
+<hr />
+<h2 id="step">一 · 一个 step 里有什么</h2>
+<p>三条请求（prompt 64，生成 6）：</p>
+<div class="highlight"><pre><span></span><code> step     耗时 ms     运行中     等待中
+    0     6.051          3       0
+    1     5.064          3       0
+    2     4.692          3       0
+    3     4.632          3       0
+    4     4.583          3       0
+    5     4.631          3       0
+    6     0.300          0       0
+</code></pre></div>
+
+<p>第 0 步 6.051 ms（含三条的 prefill），之后每步 ~4.6 ms 给三条各出一个 token。
+最后一步 0.300 ms 是收尾。</p>
+<p><strong>"运行中/等待中"这两个数就是调度器的全部状态。</strong> 等待中不为 0
+意味着有请求排队——那段时间全部算进它的 TTFT（5.1 §三）。</p>
+<hr />
+<h2 id="prefill">二 · 长 prefill 插进来会怎样</h2>
+<p>先让 8 条短请求进入 decode 稳态，再插入一条 8192 token 的 prefill：</p>
+<div class="highlight"><pre><span></span><code>稳态每步中位数 4.735 ms（8 条 decode）
+插入一条 8192 token 的 prefill 之后：
+  最慢的一步 53.326 ms（是稳态的 11.3×）
+  超过稳态 2 倍的步数：5 / 40
+  前 12 步: [4.76, 31.38, 41.02, 47.18, 53.33, 49.86, 5.39, 4.9, 4.81, 5.03, 4.77, 4.9]
+</code></pre></div>
+
+<p>看那串数字：<code>4.76</code> 之后连续 5 步是 31/41/47/53/50 ms，然后回到 ~4.9。</p>
+<p><strong>这 5 步里，8 条正在 decode 的请求一个 token 都没出。</strong>
+它们的 TPOT 在这段时间被拉长了 10 倍。用户看到的就是"字突然卡住一下"。</p>
+<div class="admonition note">
+<p class="admonition-title">一个观察：默认已经在切了</p>
+<p>我原本写的是"一条长 prefill 会占住一整个 step"。但数据显示是 <strong>5 步</strong>，
+不是 1 步——说明这个版本的 vLLM <strong>默认就开了 chunked prefill</strong>，
+只是每块还是很大（8192 / 5 ≈ 1638 token/块）。</p>
+<p>所以问题不是"要不要切"，而是"<strong>切多细</strong>"。</p>
+</div>
+<hr />
+<h2 id="_2">三 · 切多细：一个几乎免费的交易</h2>
+<p>同样的实验，只改 <code>max_num_batched_tokens</code>：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align: right;">稳态 ms</th>
+<th style="text-align: right;">最慢一步 ms</th>
+<th style="text-align: right;">尖峰倍数</th>
+<th style="text-align: right;">吸收长 prefill 共用 ms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>不切分（16384）</td>
+<td style="text-align: right;">4.607</td>
+<td style="text-align: right;"><strong>165.852</strong></td>
+<td style="text-align: right;">36.0×</td>
+<td style="text-align: right;">529.5</td>
+</tr>
+<tr>
+<td>切分成 2048</td>
+<td style="text-align: right;">4.679</td>
+<td style="text-align: right;">53.624</td>
+<td style="text-align: right;">11.5×</td>
+<td style="text-align: right;">539.6</td>
+</tr>
+<tr>
+<td>切分成 512</td>
+<td style="text-align: right;">4.651</td>
+<td style="text-align: right;"><strong>15.926</strong></td>
+<td style="text-align: right;"><strong>3.4×</strong></td>
+<td style="text-align: right;">514.6</td>
+</tr>
+</tbody>
+</table>
+<p>尾延迟从 165.9 ms 降到 15.9 ms，<strong>降了一个数量级</strong>。</p>
+<div class="admonition warning">
+<p class="admonition-title">我预期这里会有一个交易，结果没有</p>
+<p>我写这一节时的假设是"切得越细，总时间越长"——把尾延迟换成吞吐。
+<strong>最后一列否定了它</strong>：吸收整条 prefill 的总时间是 529.5 / 539.6 / 514.6 ms，
+三档相差在噪声范围内，切得最细的那档反而最快。</p>
+<p>所以在这个配置下 <strong>chunked prefill 近乎免费</strong>：
+尾延迟降一个数量级，总吞吐没有可测的损失。</p>
+<p>理论上切得更细会有代价——每块的 GEMM 变瘦，而 2.7 §六 量过瘦长 GEMM 的效率
+远低于方阵。切到 512 还没看到这个代价，<strong>要更细才会显现</strong>。
+这是一个明确的、可以自己去找的边界（见消融 2）。</p>
+</div>
+<hr />
+<h2 id="max_num_batched_tokens">四 · <code>max_num_batched_tokens</code> 到底管什么</h2>
+<p>它同时管两件事：</p>
+<ol>
+<li><strong>一个 step 最多处理多少 token</strong>（prefill 被切成多大块，第三节）</li>
+<li><strong>decode 的批能凑多大</strong>——每条 decode 每步只贡献 <strong>1 个</strong> token</li>
+</ol>
+<p>第 2 条意味着：它只在 <code>max_num_batched_tokens &lt; 并发数</code> 时才限制 decode。
+固定并发 64，把这个参数扫过 64 这条线：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">max_num_batched_tokens</th>
+<th style="text-align: right;">能否喂满</th>
+<th style="text-align: right;">稳态 ms</th>
+<th style="text-align: right;">tok/s</th>
+<th style="text-align: right;">相对最好</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">否</td>
+<td style="text-align: right;">4.387</td>
+<td style="text-align: right;">3647</td>
+<td style="text-align: right;"><strong>0.26×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">否</td>
+<td style="text-align: right;">4.436</td>
+<td style="text-align: right;">7214</td>
+<td style="text-align: right;"><strong>0.52×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;"><strong>64</strong></td>
+<td style="text-align: right;">是</td>
+<td style="text-align: right;">4.574</td>
+<td style="text-align: right;"><strong>13993</strong></td>
+<td style="text-align: right;"><strong>1.00×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">是</td>
+<td style="text-align: right;">5.247</td>
+<td style="text-align: right;">12197</td>
+<td style="text-align: right;">0.87×</td>
+</tr>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">是</td>
+<td style="text-align: right;">5.178</td>
+<td style="text-align: right;">12361</td>
+<td style="text-align: right;">0.88×</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">是</td>
+<td style="text-align: right;">5.162</td>
+<td style="text-align: right;">12399</td>
+<td style="text-align: right;">0.89×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>在 64 以下是线性的</strong>（16→0.26×、32→0.52×，正好是 16/64 和 32/64），
+因为每步只有那么多条请求能前进。</p>
+<p><strong>过了 64 就完全平了</strong>（甚至略降）——decode 每步只需要 64 个 token，
+给它 8192 的预算也用不上。</p>
+<div class="admonition warning">
+<p class="admonition-title">我第一版把这个测错了</p>
+<p>第一版用并发 32 去扫 256/512/2048/8192，四档结果全在 6277–6408 tok/s，
+差 2%。我据此写了"太小会限制 decode 的并发"——<strong>但那四档全都大于 32，
+根本没碰到限制</strong>。</p>
+<p>要测一个参数的影响，必须让扫描<strong>跨过它起作用的那条线</strong>。
+把并发提到 64、把参数扫到 16 才看见那条线。</p>
+</div>
+<hr />
+<h2 id="_3">五 · 设计取舍</h2>
+<h3 id="51-token">5.1 为什么调度的粒度是 token 而不是请求</h3>
+<p>朴素的想法是"一批凑够 N 条请求就跑"。vLLM 的预算单位是 <strong>token</strong>，
+不是请求。原因从上面两节就能读出来：</p>
+<ul>
+<li>一条 decode 请求这一步只要 1 个 token</li>
+<li>一条 prefill 请求这一步可能要 8192 个</li>
+</ul>
+<p><strong>用请求数当预算，两者的成本相差三个数量级</strong>，
+一个混合批的耗时会完全不可预测（第二节那个 11.3× 的尖峰就是这么来的）。</p>
+<p>用 token 当预算，每一步的工作量就有了上界，<strong>step 时间因此可控</strong>。
+这是 chunked prefill 能成立的前提：prefill 可以被切成任意大小的块，
+正好填满预算的空隙。</p>
+<p><strong>判据：调度的预算单位应该选那个与耗时成正比的量。</strong>
+选错了，SLA 就无法保证。</p>
+<h3 id="52">5.2 尾延迟与吞吐通常是交易，这次不是</h3>
+<p>第三节的结果值得单独说：切细 32 倍，尾延迟降 10 倍，吞吐没有可测损失。</p>
+<p>为什么这么便宜？因为被切的是 <strong>prefill</strong>，而 5.1 证明了 prefill
+在 batch=1 时就已经算力受限——切成 512 一块，每块仍然有 512 的算术强度，
+<strong>远高于 144 的平衡点</strong>。它还在算力一侧，效率没掉。</p>
+<p>所以这个"免费"是有条件的：<strong>块大到还能保持算力受限</strong>。
+块小到进入带宽一侧（或者小到 launch 开销显著，<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 的 2.68 µs）就不免费了。</p>
+<p>一般化：<strong>当一个操作在很宽的规模范围内都保持同一种瓶颈时，
+沿这个维度切分几乎是免费的。</strong> 先确认瓶颈不变，再谈切分。</p>
+<h3 id="53">5.3 参数的"无效区间"比"有效区间"更常被误用</h3>
+<p>第四节那张表有一个很大的平台区（64 以上全一样）。
+一个只在 128/512/8192 之间比较的人会得出"这个参数没用"，
+一个只在 16/32 之间比较的人会得出"越大越好"。<strong>两个结论都是错的。</strong></p>
+<p><strong>扫描必须跨过拐点。</strong> 而拐点在哪里，要先从机制推——
+这里是"并发数"，因为每条 decode 每步只要 1 个 token。
+先有机制假设，再设计扫描范围，是 <span class="xref pending" title="可信性能测量（尚未写）">M2</span> 会讲的核心方法。</p>
+<hr />
+<h2 id="lab">六 · 动手 lab</h2>
+<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L5 &amp;&amp; /scratch/learn/envs/serve/bin/python scheduling.py'</span>
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/engine/53_scheduling.txt</code>。</p>
+<details class="fold srcfold"><summary>labs/L5/scheduling.py 全文（291 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L5.3 —— 调度：continuous batching 与 chunked prefill。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">5.1 证明了 prefill 与 decode 的性质相反。这一章看调度器怎么处理这个矛盾。</span>
+<span class="linenos">  5</span><span class="sd">关键手段是**逐 step 计时**：用底层的 add_request + step 接口，</span>
+<span class="linenos">  6</span><span class="sd">把每一步的耗时和这一步在算什么全部记下来。</span>
+<span class="linenos">  7</span>
+<span class="linenos">  8</span><span class="sd">  [A] 一个 step 里到底有什么：把调度决策打印出来</span>
+<span class="linenos">  9</span><span class="sd">  [B] 长 prefill 插进来时，decode 的每步时间会不会抖</span>
+<span class="linenos"> 10</span><span class="sd">  [C] chunked prefill 开/关的对照</span>
+<span class="linenos"> 11</span><span class="sd">  [D] max_num_batched_tokens 的作用</span>
+<span class="linenos"> 12</span>
+<span class="linenos"> 13</span><span class="sd">用法：</span>
+<span class="linenos"> 14</span><span class="sd">    python scheduling.py</span>
+<span class="linenos"> 15</span><span class="sd">    python scheduling.py B C</span>
+<span class="linenos"> 16</span><span class="sd">"""</span>
+<span class="linenos"> 17</span>
+<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos"> 21</span>
+<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 23</span>
+<span class="linenos"> 24</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"HF_HUB_OFFLINE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
+<span class="linenos"> 25</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_ENABLE_V1_MULTIPROCESSING"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
+<span class="linenos"> 26</span>
+<span class="linenos"> 27</span><span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos"> 28</span><span class="n">MODEL</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"L53_MODEL"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen3-1.7B"</span><span class="p">)</span>
+<span class="linenos"> 29</span>
+<span class="linenos"> 30</span>
+<span class="linenos"> 31</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 32</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos"> 33</span>
+<span class="linenos"> 34</span>
+<span class="linenos"> 35</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 36</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos"> 37</span>
+<span class="linenos"> 38</span>
+<span class="linenos"> 39</span><span class="k">def</span><span class="w"> </span><span class="nf">safe_util</span><span class="p">(</span><span class="n">reserve_gib</span><span class="o">=</span><span class="mf">4.0</span><span class="p">,</span> <span class="n">cap</span><span class="o">=</span><span class="mf">0.55</span><span class="p">):</span>
+<span class="linenos"> 40</span>    <span class="n">free</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
+<span class="linenos"> 41</span>    <span class="n">gib</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">**</span> <span class="mi">3</span>
+<span class="linenos"> 42</span>    <span class="n">util</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span><span class="n">free</span> <span class="o">/</span> <span class="n">gib</span> <span class="o">-</span> <span class="n">reserve_gib</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">total</span> <span class="o">/</span> <span class="n">gib</span><span class="p">))</span>
+<span class="linenos"> 43</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  [显存] 空闲 </span><span class="si">{</span><span class="n">free</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">gib</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">gib</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GiB -&gt; util=</span><span class="si">{</span><span class="n">util</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 44</span>    <span class="k">return</span> <span class="n">util</span>
+<span class="linenos"> 45</span>
+<span class="linenos"> 46</span>
+<span class="linenos"> 47</span><span class="k">def</span><span class="w"> </span><span class="nf">make_engine</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">):</span>
+<span class="linenos"> 48</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">EngineArgs</span>
+<span class="linenos"> 49</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm.v1.engine.llm_engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLMEngine</span>
+<span class="linenos"> 50</span>    <span class="n">args</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">MODEL</span><span class="p">,</span> <span class="n">gpu_memory_utilization</span><span class="o">=</span><span class="n">safe_util</span><span class="p">(),</span>
+<span class="linenos"> 51</span>                <span class="n">max_model_len</span><span class="o">=</span><span class="mi">16384</span><span class="p">,</span> <span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos"> 52</span>                <span class="n">enable_prefix_caching</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">disable_log_stats</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 53</span>    <span class="n">args</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">kw</span><span class="p">)</span>
+<span class="linenos"> 54</span>    <span class="k">return</span> <span class="n">LLMEngine</span><span class="o">.</span><span class="n">from_engine_args</span><span class="p">(</span><span class="n">EngineArgs</span><span class="p">(</span><span class="o">**</span><span class="n">args</span><span class="p">))</span>
+<span class="linenos"> 55</span>
+<span class="linenos"> 56</span>
+<span class="linenos"> 57</span><span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="n">eng</span><span class="p">):</span>
+<span class="linenos"> 58</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos"> 59</span>        <span class="n">eng</span><span class="o">.</span><span class="n">engine_core</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+<span class="linenos"> 60</span>    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>                                         <span class="c1"># noqa: BLE001</span>
+<span class="linenos"> 61</span>        <span class="k">pass</span>
+<span class="linenos"> 62</span>    <span class="k">del</span> <span class="n">eng</span>
+<span class="linenos"> 63</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">gc</span>
+<span class="linenos"> 64</span>    <span class="n">gc</span><span class="o">.</span><span class="n">collect</span><span class="p">()</span>
+<span class="linenos"> 65</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos"> 66</span>
+<span class="linenos"> 67</span>
+<span class="linenos"> 68</span><span class="k">def</span><span class="w"> </span><span class="nf">rand_ids</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">rng</span><span class="p">):</span>
+<span class="linenos"> 69</span>    <span class="k">return</span> <span class="p">[</span><span class="n">rng</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">60000</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)]</span>
+<span class="linenos"> 70</span>
+<span class="linenos"> 71</span>
+<span class="linenos"> 72</span><span class="k">def</span><span class="w"> </span><span class="nf">run_steps</span><span class="p">(</span><span class="n">eng</span><span class="p">,</span> <span class="n">reqs</span><span class="p">,</span> <span class="n">max_steps</span><span class="o">=</span><span class="mi">100000</span><span class="p">):</span>
+<span class="linenos"> 73</span><span class="w">    </span><span class="sd">"""手动驱动引擎，逐 step 记录耗时与该步处理的 token 数。"""</span>
+<span class="linenos"> 74</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos"> 75</span>    <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">ids</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">reqs</span><span class="p">:</span>
+<span class="linenos"> 76</span>        <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">ids</span><span class="p">),</span>
+<span class="linenos"> 77</span>                        <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">n</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos"> 78</span>                                       <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos"> 79</span>    <span class="n">trace</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos"> 80</span>    <span class="n">step</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos"> 81</span>    <span class="k">while</span> <span class="n">eng</span><span class="o">.</span><span class="n">has_unfinished_requests</span><span class="p">()</span> <span class="ow">and</span> <span class="n">step</span> <span class="o">&lt;</span> <span class="n">max_steps</span><span class="p">:</span>
+<span class="linenos"> 82</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos"> 83</span>        <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos"> 84</span>        <span class="n">dt</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos"> 85</span>        <span class="n">trace</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">dt</span><span class="p">)</span>
+<span class="linenos"> 86</span>        <span class="n">step</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos"> 87</span>    <span class="k">return</span> <span class="n">trace</span>
+<span class="linenos"> 88</span>
+<span class="linenos"> 89</span>
+<span class="linenos"> 90</span><span class="k">def</span><span class="w"> </span><span class="nf">stats</span><span class="p">(</span><span class="n">t</span><span class="p">):</span>
+<span class="linenos"> 91</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">statistics</span>
+<span class="linenos"> 92</span>    <span class="n">s</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">t</span><span class="p">)</span>
+<span class="linenos"> 93</span>    <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="n">n</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">t</span><span class="p">),</span> <span class="n">mean</span><span class="o">=</span><span class="n">statistics</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">t</span><span class="p">),</span> <span class="n">p50</span><span class="o">=</span><span class="n">s</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">],</span>
+<span class="linenos"> 94</span>                <span class="n">p99</span><span class="o">=</span><span class="n">s</span><span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)</span> <span class="o">*</span> <span class="mf">0.99</span><span class="p">)],</span> <span class="n">mx</span><span class="o">=</span><span class="n">s</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+<span class="linenos"> 95</span>
+<span class="linenos"> 96</span>
+<span class="linenos"> 97</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos"> 98</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos"> 99</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 一个 step 里到底有什么"</span><span class="p">)</span>
+<span class="linenos">100</span>
+<span class="linenos">101</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos">102</span>    <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">103</span>    <span class="n">eng</span> <span class="o">=</span> <span class="n">make_engine</span><span class="p">()</span>
+<span class="linenos">104</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos">105</span>
+<span class="linenos">106</span>    <span class="c1"># 3 条短请求</span>
+<span class="linenos">107</span>    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">):</span>
+<span class="linenos">108</span>        <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="sa">f</span><span class="s2">"r</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="n">rng</span><span class="p">)),</span>
+<span class="linenos">109</span>                        <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">6</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos">110</span>                                       <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos">111</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  加了 3 条请求（prompt 64，生成 6）"</span><span class="p">)</span>
+<span class="linenos">112</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'step'</span><span class="si">:</span><span class="s2">&gt;5</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'耗时 ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'本步调度的 token'</span><span class="si">:</span><span class="s2">&gt;18</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">113</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'运行中'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'等待中'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">114</span>    <span class="n">sched</span> <span class="o">=</span> <span class="n">eng</span><span class="o">.</span><span class="n">engine_core</span><span class="o">.</span><span class="n">engine_core</span><span class="o">.</span><span class="n">scheduler</span>
+<span class="linenos">115</span>    <span class="n">step</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos">116</span>    <span class="k">while</span> <span class="n">eng</span><span class="o">.</span><span class="n">has_unfinished_requests</span><span class="p">()</span> <span class="ow">and</span> <span class="n">step</span> <span class="o">&lt;</span> <span class="mi">20</span><span class="p">:</span>
+<span class="linenos">117</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos">118</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">119</span>        <span class="n">dt</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos">120</span>        <span class="c1"># 从 scheduler 读上一次的调度状态</span>
+<span class="linenos">121</span>        <span class="n">nrun</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">sched</span><span class="o">.</span><span class="n">running</span><span class="p">)</span>
+<span class="linenos">122</span>        <span class="n">nwait</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">sched</span><span class="o">.</span><span class="n">waiting</span><span class="p">)</span>
+<span class="linenos">123</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">step</span><span class="si">:</span><span class="s2">&gt;5</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">dt</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'—'</span><span class="si">:</span><span class="s2">&gt;18</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">nrun</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">nwait</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">124</span>        <span class="n">step</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos">125</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  前几步是 prefill（每条一次），之后每步给所有活跃请求各出一个 token。"</span><span class="p">)</span>
+<span class="linenos">126</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  「等待中」不为 0 说明有请求排队 —— 这就是 TTFT 里的排队部分（5.1）。"</span><span class="p">)</span>
+<span class="linenos">127</span>    <span class="n">shutdown</span><span class="p">(</span><span class="n">eng</span><span class="p">)</span>
+<span class="linenos">128</span>
+<span class="linenos">129</span>
+<span class="linenos">130</span><span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos">131</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos">132</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 长 prefill 插进来时，decode 的每步时间会不会抖"</span><span class="p">)</span>
+<span class="linenos">133</span>
+<span class="linenos">134</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos">135</span>    <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">136</span>    <span class="n">LONG</span> <span class="o">=</span> <span class="mi">8192</span>
+<span class="linenos">137</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kw</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"默认（本版本 chunked prefill 行为见输出）"</span><span class="p">,</span> <span class="p">{})]:</span>
+<span class="linenos">138</span>        <span class="n">eng</span> <span class="o">=</span> <span class="n">make_engine</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">)</span>
+<span class="linenos">139</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">140</span>        <span class="c1"># 先让 8 条短请求进入 decode 稳态</span>
+<span class="linenos">141</span>        <span class="n">base_reqs</span> <span class="o">=</span> <span class="p">[(</span><span class="sa">f</span><span class="s2">"d</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">rand_ids</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="n">rng</span><span class="p">),</span> <span class="mi">200</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">)]</span>
+<span class="linenos">142</span>        <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos">143</span>        <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">ids</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">base_reqs</span><span class="p">:</span>
+<span class="linenos">144</span>            <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">ids</span><span class="p">),</span>
+<span class="linenos">145</span>                            <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">n</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos">146</span>                                           <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos">147</span>        <span class="n">warm</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">148</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">30</span><span class="p">):</span>
+<span class="linenos">149</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">150</span>            <span class="n">warm</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
+<span class="linenos">151</span>        <span class="n">base_ms</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">warm</span><span class="p">[</span><span class="mi">10</span><span class="p">:])[</span><span class="nb">len</span><span class="p">(</span><span class="n">warm</span><span class="p">[</span><span class="mi">10</span><span class="p">:])</span> <span class="o">//</span> <span class="mi">2</span><span class="p">]</span>
+<span class="linenos">152</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    稳态每步中位数 </span><span class="si">{</span><span class="n">base_ms</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms（8 条 decode）"</span><span class="p">)</span>
+<span class="linenos">153</span>
+<span class="linenos">154</span>        <span class="c1"># 插入一条超长 prefill</span>
+<span class="linenos">155</span>        <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="s2">"LONG"</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="n">LONG</span><span class="p">,</span> <span class="n">rng</span><span class="p">)),</span>
+<span class="linenos">156</span>                        <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos">157</span>                                       <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos">158</span>        <span class="n">after</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">159</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">40</span><span class="p">):</span>
+<span class="linenos">160</span>            <span class="k">if</span> <span class="ow">not</span> <span class="n">eng</span><span class="o">.</span><span class="n">has_unfinished_requests</span><span class="p">():</span>
+<span class="linenos">161</span>                <span class="k">break</span>
+<span class="linenos">162</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">163</span>            <span class="n">after</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
+<span class="linenos">164</span>        <span class="n">mx</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">after</span><span class="p">)</span>
+<span class="linenos">165</span>        <span class="n">spike_steps</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="mi">1</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">after</span> <span class="k">if</span> <span class="n">x</span> <span class="o">&gt;</span> <span class="n">base_ms</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos">166</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    插入一条 </span><span class="si">{</span><span class="n">LONG</span><span class="si">}</span><span class="s2"> token 的 prefill 之后："</span><span class="p">)</span>
+<span class="linenos">167</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      最慢的一步 </span><span class="si">{</span><span class="n">mx</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms（是稳态的 </span><span class="si">{</span><span class="n">mx</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">base_ms</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">×）"</span><span class="p">)</span>
+<span class="linenos">168</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      超过稳态 2 倍的步数：</span><span class="si">{</span><span class="n">spike_steps</span><span class="si">}</span><span class="s2"> / </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">after</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">169</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      前 12 步: </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">after</span><span class="p">[:</span><span class="mi">12</span><span class="p">]]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">170</span>        <span class="n">shutdown</span><span class="p">(</span><span class="n">eng</span><span class="p">)</span>
+<span class="linenos">171</span>
+<span class="linenos">172</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  一条长 prefill 会占住一整个 step。这段时间**所有 decode 请求都不出 token**，"</span><span class="p">)</span>
+<span class="linenos">173</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  它们的 TPOT 直接被拉长这么多 —— 这是交互式服务里最刺眼的抖动来源。"</span><span class="p">)</span>
+<span class="linenos">174</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  chunked prefill 的作用就是把这一大步切成若干小步。"</span><span class="p">)</span>
+<span class="linenos">175</span>
+<span class="linenos">176</span>
+<span class="linenos">177</span><span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos">178</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos">179</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] chunked prefill 开 / 关的对照"</span><span class="p">)</span>
+<span class="linenos">180</span>
+<span class="linenos">181</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos">182</span>    <span class="n">LONG</span> <span class="o">=</span> <span class="mi">8192</span>
+<span class="linenos">183</span>    <span class="n">results</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">184</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kw</span> <span class="ow">in</span> <span class="p">[</span>
+<span class="linenos">185</span>            <span class="p">(</span><span class="s2">"不切分（max_num_batched_tokens 足够大）"</span><span class="p">,</span>
+<span class="linenos">186</span>             <span class="nb">dict</span><span class="p">(</span><span class="n">max_num_batched_tokens</span><span class="o">=</span><span class="mi">16384</span><span class="p">)),</span>
+<span class="linenos">187</span>            <span class="p">(</span><span class="s2">"切分成 2048"</span><span class="p">,</span>
+<span class="linenos">188</span>             <span class="nb">dict</span><span class="p">(</span><span class="n">max_num_batched_tokens</span><span class="o">=</span><span class="mi">2048</span><span class="p">)),</span>
+<span class="linenos">189</span>            <span class="p">(</span><span class="s2">"切分成 512"</span><span class="p">,</span>
+<span class="linenos">190</span>             <span class="nb">dict</span><span class="p">(</span><span class="n">max_num_batched_tokens</span><span class="o">=</span><span class="mi">512</span><span class="p">))]:</span>
+<span class="linenos">191</span>        <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos">192</span>        <span class="k">try</span><span class="p">:</span>
+<span class="linenos">193</span>            <span class="n">eng</span> <span class="o">=</span> <span class="n">make_engine</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">)</span>
+<span class="linenos">194</span>        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                              <span class="c1"># noqa: BLE001</span>
+<span class="linenos">195</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">: 启动失败 </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">100</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">);</span> <span class="k">continue</span>
+<span class="linenos">196</span>        <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos">197</span>        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">):</span>
+<span class="linenos">198</span>            <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="sa">f</span><span class="s2">"d</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="n">rng</span><span class="p">)),</span>
+<span class="linenos">199</span>                            <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">300</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos">200</span>                                           <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos">201</span>        <span class="n">warm</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">202</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">30</span><span class="p">):</span>
+<span class="linenos">203</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">204</span>            <span class="n">warm</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
+<span class="linenos">205</span>        <span class="n">base_ms</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">warm</span><span class="p">[</span><span class="mi">10</span><span class="p">:])[</span><span class="nb">len</span><span class="p">(</span><span class="n">warm</span><span class="p">[</span><span class="mi">10</span><span class="p">:])</span> <span class="o">//</span> <span class="mi">2</span><span class="p">]</span>
+<span class="linenos">206</span>        <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="s2">"LONG"</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="n">LONG</span><span class="p">,</span> <span class="n">rng</span><span class="p">)),</span>
+<span class="linenos">207</span>                        <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos">208</span>                                       <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos">209</span>        <span class="n">after</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">210</span>        <span class="n">t_start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos">211</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">80</span><span class="p">):</span>
+<span class="linenos">212</span>            <span class="k">if</span> <span class="ow">not</span> <span class="n">eng</span><span class="o">.</span><span class="n">has_unfinished_requests</span><span class="p">():</span>
+<span class="linenos">213</span>                <span class="k">break</span>
+<span class="linenos">214</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">215</span>            <span class="n">after</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
+<span class="linenos">216</span>        <span class="n">total</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t_start</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos">217</span>        <span class="n">results</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">base_ms</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span><span class="n">after</span><span class="p">),</span> <span class="n">total</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">after</span><span class="p">))</span>
+<span class="linenos">218</span>        <span class="n">shutdown</span><span class="p">(</span><span class="n">eng</span><span class="p">)</span>
+<span class="linenos">219</span>
+<span class="linenos">220</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'配置'</span><span class="si">:</span><span class="s2">&lt;38</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'稳态 ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'最慢一步 ms'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">221</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'尖峰倍数'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'吸收长 prefill 共用 ms'</span><span class="si">:</span><span class="s2">&gt;22</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">222</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">m</span><span class="p">,</span> <span class="n">tot</span><span class="p">,</span> <span class="n">n</span><span class="p">)</span> <span class="ow">in</span> <span class="n">results</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<span class="linenos">223</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">:</span><span class="s2">&lt;38</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">b</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">m</span><span class="si">:</span><span class="s2">&gt;13.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">m</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">b</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2">× </span><span class="si">{</span><span class="n">tot</span><span class="si">:</span><span class="s2">&gt;22.1f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">224</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  切得越细，最慢的一步越短：165.9 -&gt; 53.6 -&gt; 15.9 ms。"</span><span class="p">)</span>
+<span class="linenos">225</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  我原本预期这是一个「尾延迟换总时间」的交易，但最后一列否定了它："</span><span class="p">)</span>
+<span class="linenos">226</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  吸收整条 prefill 的**总时间几乎不变**（三档相差在噪声范围内）。"</span><span class="p">)</span>
+<span class="linenos">227</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  也就是说在这个配置下 **chunked prefill 近乎免费**："</span><span class="p">)</span>
+<span class="linenos">228</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  尾延迟降一个数量级，总吞吐没有可测的损失。"</span><span class="p">)</span>
+<span class="linenos">229</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  （切得更细时每块的 GEMM 变瘦，理论上效率会降 —— 2.7 §六 量过瘦长 GEMM。"</span><span class="p">)</span>
+<span class="linenos">230</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"   本轮切到 512 还没看到这个代价，要更细才会显现。）"</span><span class="p">)</span>
+<span class="linenos">231</span>
+<span class="linenos">232</span>
+<span class="linenos">233</span><span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos">234</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos">235</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] max_num_batched_tokens 什么时候才真的限制 decode"</span><span class="p">)</span>
+<span class="linenos">236</span>
+<span class="linenos">237</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos">238</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这个参数同时管两件事："</span><span class="p">)</span>
+<span class="linenos">239</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    1. 一个 step 最多处理多少 token（prefill 被切成多大块，见 [C]）"</span><span class="p">)</span>
+<span class="linenos">240</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    2. decode 的批能凑多大 —— **每条 decode 每步只贡献 1 个 token**"</span><span class="p">)</span>
+<span class="linenos">241</span>    <span class="nb">print</span><span class="p">()</span>
+<span class="linenos">242</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以它只在 max_num_batched_tokens &lt; 并发数 时才限制 decode。"</span><span class="p">)</span>
+<span class="linenos">243</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  下面固定并发 64，把这个参数扫过 64 这条线。"</span><span class="p">)</span>
+<span class="linenos">244</span>
+<span class="linenos">245</span>    <span class="n">B</span> <span class="o">=</span> <span class="mi">64</span>
+<span class="linenos">246</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  并发 </span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> 条纯 decode"</span><span class="p">)</span>
+<span class="linenos">247</span>    <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">248</span>    <span class="k">for</span> <span class="n">mnbt</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">8192</span><span class="p">]:</span>
+<span class="linenos">249</span>        <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">3</span><span class="p">)</span>
+<span class="linenos">250</span>        <span class="k">try</span><span class="p">:</span>
+<span class="linenos">251</span>            <span class="n">eng</span> <span class="o">=</span> <span class="n">make_engine</span><span class="p">(</span><span class="n">max_num_batched_tokens</span><span class="o">=</span><span class="n">mnbt</span><span class="p">)</span>
+<span class="linenos">252</span>        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                              <span class="c1"># noqa: BLE001</span>
+<span class="linenos">253</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">mnbt</span><span class="si">:</span><span class="s2">&gt;24</span><span class="si">}</span><span class="s2">  启动失败 </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">50</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">);</span> <span class="k">continue</span>
+<span class="linenos">254</span>        <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos">255</span>        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">):</span>
+<span class="linenos">256</span>            <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="sa">f</span><span class="s2">"d</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="n">rng</span><span class="p">)),</span>
+<span class="linenos">257</span>                            <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">150</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos">258</span>                                           <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos">259</span>        <span class="n">ts</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">260</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">80</span><span class="p">):</span>
+<span class="linenos">261</span>            <span class="k">if</span> <span class="ow">not</span> <span class="n">eng</span><span class="o">.</span><span class="n">has_unfinished_requests</span><span class="p">():</span>
+<span class="linenos">262</span>                <span class="k">break</span>
+<span class="linenos">263</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">264</span>            <span class="n">ts</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
+<span class="linenos">265</span>        <span class="n">tail</span> <span class="o">=</span> <span class="n">ts</span><span class="p">[</span><span class="mi">25</span><span class="p">:]</span> <span class="ow">or</span> <span class="n">ts</span>
+<span class="linenos">266</span>        <span class="n">steady</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">tail</span><span class="p">)[</span><span class="nb">len</span><span class="p">(</span><span class="n">tail</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">]</span>
+<span class="linenos">267</span>        <span class="c1"># 每步真正出多少 token：受 mnbt 限制时只有 mnbt 条能前进</span>
+<span class="linenos">268</span>        <span class="n">eff</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">mnbt</span><span class="p">,</span> <span class="n">B</span><span class="p">)</span>
+<span class="linenos">269</span>        <span class="n">tps</span> <span class="o">=</span> <span class="n">eff</span> <span class="o">/</span> <span class="p">(</span><span class="n">steady</span> <span class="o">/</span> <span class="mi">1000</span><span class="p">)</span>
+<span class="linenos">270</span>        <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">mnbt</span><span class="p">,</span> <span class="n">steady</span><span class="p">,</span> <span class="n">tps</span><span class="p">))</span>
+<span class="linenos">271</span>        <span class="n">shutdown</span><span class="p">(</span><span class="n">eng</span><span class="p">)</span>
+<span class="linenos">272</span>
+<span class="linenos">273</span>    <span class="n">best</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">)</span> <span class="k">if</span> <span class="n">rows</span> <span class="k">else</span> <span class="mf">1.0</span>
+<span class="linenos">274</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'max_num_batched_tokens'</span><span class="si">:</span><span class="s2">&gt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'能否喂满'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'稳态 ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">275</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'tok/s'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对最好'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">276</span>    <span class="k">for</span> <span class="n">mnbt</span><span class="p">,</span> <span class="n">steady</span><span class="p">,</span> <span class="n">tps</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">:</span>
+<span class="linenos">277</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">mnbt</span><span class="si">:</span><span class="s2">&gt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'否'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">mnbt</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">B</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'是'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">steady</span><span class="si">:</span><span class="s2">&gt;10.3f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">278</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">tps</span><span class="si">:</span><span class="s2">&gt;10.0f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tps</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">best</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">279</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  超过并发数之后再加这个参数没有任何作用 —— decode 每步只要 B 个 token。"</span><span class="p">)</span>
+<span class="linenos">280</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  它真正的用途是 [C] 里那个：**控制 prefill 的切块大小**。"</span><span class="p">)</span>
+<span class="linenos">281</span>
+<span class="linenos">282</span>
+<span class="linenos">283</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span> <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">}</span>
+<span class="linenos">284</span>
+<span class="linenos">285</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">286</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos">287</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  model </span><span class="si">{</span><span class="n">MODEL</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">288</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos">289</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos">290</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos">291</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L5/scheduling.py 全文（291 行）</code><a href="../code/labs/L5/scheduling.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p><strong>建议的消融</strong></p>
+<ol>
+<li><strong>找到 chunked prefill 开始收费的那个块大小</strong>：把 [C] 的
+   <code>max_num_batched_tokens</code> 继续往下扫 256/128/64，看"总时间"那一列
+   什么时候开始明显上升。按 §5.2 的分析，块的算术强度掉到 144 附近时应该出现。</li>
+<li>[B] 里把长 prompt 从 8192 改成 32768，看尖峰倍数怎么变。</li>
+<li>[D] 把并发从 64 改成 8 和 256，确认拐点确实跟着并发数走。</li>
+<li>打开 <code>enable_prefix_caching=True</code> 重跑 [B]，
+   第二次插入同样的长 prompt 时尖峰应该消失（5.2）。</li>
+</ol>
+<hr />
+<h2 id="_4">七 · 陷阱</h2>
+<ol>
+<li><strong>用 <code>LLM.generate</code> 看不到调度行为。</strong> 它把整批跑完才返回，
+   所有尖峰被平均掉。要逐 step 计时。</li>
+<li><strong>一条长 prefill 会让所有 decode 停住。</strong> 本章实测 5 步共约 220 ms。</li>
+<li><strong>vLLM v1 默认已经在切 prefill</strong>，问题是切多细，不是切不切。</li>
+<li><strong>参数扫描必须跨过拐点。</strong> 本章第一版在 <code>max_num_batched_tokens</code>
+   的平台区里扫，得出"没影响"的错误结论。</li>
+<li><strong><code>max_num_batched_tokens</code> 过了并发数就没有作用。</strong> 调大它不会提高 decode 吞吐。</li>
+<li><strong>别假设"细粒度 = 更慢"。</strong> 本章实测切细 32 倍总时间不变。
+   先量，再下结论。</li>
+</ol>
+<hr />
+<h2 id="_5">八 · 自测题</h2>
+<details>
+<summary>1. 为什么调度预算的单位是 token 而不是请求数？</summary>
+<p>因为<strong>成本与 token 数成正比，与请求数无关</strong>。</p>
+<p>一条 decode 请求这一步要 1 个 token；一条 prefill 请求可能要 8192 个。
+用请求数当预算，一个"8 条请求"的批可能是 8 个 token，也可能是 65536 个——
+耗时相差三个数量级，step 时间完全不可控。</p>
+<p>用 token 当预算，每步的工作量有上界，<strong>step 时间可预测</strong>，
+才谈得上保证 TPOT 的 SLA。</p>
+<p>这也让 chunked prefill 成为可能：prefill 可以切成任意大小填进预算的空隙。</p>
+</details>
+<details>
+<summary>2. 用户反馈"输出偶尔会卡一下"，怎么定位？</summary>
+<p>大概率是<strong>长 prefill 插队</strong>。诊断步骤：</p>
+<ol>
+<li>逐 step 记录耗时（不能用平均值，本章第二节的方法）。</li>
+<li>找出超过稳态 2 倍的那些 step。</li>
+<li>看这些 step 前后有没有新请求进入 prefill。</li>
+</ol>
+<p>本章实测：一条 8192 token 的 prefill 让稳态 4.735 ms 的步涨到 53.3 ms，
+连续 5 步——期间所有 decode 一个 token 都不出。</p>
+<p>缓解：调小 <code>max_num_batched_tokens</code>。本章实测切到 512 时尖峰从 165.9
+降到 15.9 ms，而总吞吐没有可测损失。</p>
+<p>（如果尖峰与新请求无关，再查抢占/换出——那是 5.8 的内容。）</p>
+</details>
+<details>
+<summary>3. 你调大了 max_num_batched_tokens 但 decode 吞吐没变，为什么？</summary>
+<p>因为它已经大于你的并发数了。<strong>decode 每条请求每步只贡献 1 个 token</strong>，
+所以并发 64 时每步最多只需要 64 个 token 的预算。</p>
+<p>本章实测：并发 64 时，64 / 128 / 512 / 8192 四档的吞吐分别是
+13993 / 12197 / 12361 / 12399 tok/s——过了 64 就是平的。</p>
+<p>反过来，如果设成 16，只有 16 条能前进，吞吐直接掉到 0.26×。</p>
+<p><strong>要测一个参数有没有用，扫描范围必须跨过它起作用的那条线。</strong>
+这条线在哪，要先从机制推出来。</p>
+</details>
+<details>
+<summary>4. 为什么把 prefill 切细几乎不损失吞吐？这个"免费"什么时候结束？</summary>
+<p>因为 prefill 在很宽的规模范围内<strong>都是算力受限</strong>的（5.1）。
+一块 512 token 的 prefill，算术强度仍是 512，远高于平衡点 144——
+它还在 roofline 的算力一侧，效率没掉。</p>
+<p>所以切分只是把同样的工作换个顺序做，总量不变。
+本章实测：16384 / 2048 / 512 三档，总时间 529.5 / 539.6 / 514.6 ms，无差别。</p>
+<p><strong>"免费"在块小到瓶颈改变时结束</strong>：
+- 块的算术强度掉到 144 以下 → 进入带宽一侧
+- 块小到 kernel launch 开销（2.68 µs，<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a>）占比显著</p>
+<p>消融 1 就是让你去找这个边界。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.2-kv-cache-paged.html">&#8592; 5.2 KV cache 管理：PagedAttention 与 prefix cache</a><a class="nav-next" href="../L5/5.4-execution-layer.html">5.4 执行层：CUDA Graph 与流水重叠 &#8594;</a></nav>
+</main>
+</body>
+</html>

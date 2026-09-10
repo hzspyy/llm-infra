@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.2 KV cache 管理：PagedAttention 与 prefix cache</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">5.2</div>
+  <div class="sidebar-title">KV cache 管理：PagedAttention 与 prefix cache</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#kv-cache">心智模型：把 KV cache 当虚拟内存</a></li>
+<li><a href="#_2">机制拆解</a><ul>
+<li><a href="#_3">为什么必须分页：量化「不分页」的代价</a></li>
+<li><a href="#token">复用的粒度是「块」，不是「token」</a></li>
+<li><a href="#_4">块哈希：为什么必须"滚动"</a></li>
+</ul>
+</li>
+<li><a href="#_5">工程实现 · 源码走读</a><ul>
+<li><a href="#a-vllm">A. vLLM：块哈希表 + 双向链表空闲池</a></li>
+<li><a href="#b-sglang">B. SGLang：基数树</a></li>
+<li><a href="#c">C. 两种方案的取舍表</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a><ul>
+<li><a href="#_7">怎样检查这个最小实现</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab：比较前缀复用预测与调用耗时</a><ul>
+<li><a href="#a-vs">实验 A：命中 vs 未命中</a></li>
+<li><a href="#b">实验 B：共享前缀长度扫描</a></li>
+<li><a href="#2026-09-10crater">补测：把命中量直接读出来（2026-09-10，crater）</a></li>
+<li><a href="#_8">这条结果的工程含义</a></li>
+<li><a href="#_9">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
+  <div class="mod-id">5.2</div>
+  <h1>KV cache 管理：PagedAttention 与 prefix cache</h1>
+  <p class="lede">分页的动机与实现；**vLLM PagedAttention 与 SGLang RadixAttention 并置**：block table、allocator、碎片、copy-on-write、前缀树复用的不同取舍。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D) · vLLM 0.29.0 · SGLang 0.5.19</span><span class="chip">数据日期 2026-09-09</span><span class="chip">前置 L0.2（KV 账本）· L0.1（调用栈第 10–11 阶段）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>KV cache 为什么必须<strong>分页</strong>？不分页会发生什么，能量化吗？</li>
+<li>两个请求共享一段前缀时，KV 复用的<strong>粒度</strong>是什么？我能不能<strong>测</strong>出这个粒度？</li>
+<li>vLLM 的<strong>块哈希表</strong>和 SGLang 的<strong>基数树</strong>，各自换来了什么、放弃了什么？</li>
+</ol>
+<p>这一章把两个问题分开：分页解决 KV 放在哪里，前缀缓存解决哪些 KV 可以再次使用。
+block table 记录逻辑块对应的物理块编号；哈希表或基数树帮助寻找可复用的前缀。
+本章包含一个最小分配器和已有的耗时记录。块数的理论预测与引擎实际命中量
+不是同一份证据，下文会明确区分。<strong>2026-09-10 补测已把命中量直接读出来</strong>
+（见「动手 lab」末尾的补测一节）：块数与公式逐点一致，
+但"每少算一块省多少时间"仍然只是预测。</p>
+<hr />
+<h2 id="kv-cache">心智模型：把 KV cache 当虚拟内存</h2>
+<figure>
+<svg viewBox="0 0 740 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PagedAttention 的逻辑块到物理块映射">
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">逻辑视角：三条序列</text>
+
+    <!-- seq A -->
+    <text x="12" y="48">序列 A</text>
+    <g stroke="currentColor" stroke-width="1" fill="none">
+      <rect x="70" y="36" width="44" height="18"/><rect x="114" y="36" width="44" height="18"/>
+      <rect x="158" y="36" width="44" height="18"/><rect x="202" y="36" width="44" height="18"/>
+    </g>
+    <text x="78" y="49" font-size="9.5">blk0</text><text x="122" y="49" font-size="9.5">blk1</text>
+    <text x="166" y="49" font-size="9.5">blk2</text><text x="210" y="49" font-size="9.5">blk3</text>
+
+    <!-- seq B -->
+    <text x="12" y="84">序列 B</text>
+    <g stroke="currentColor" stroke-width="1" fill="none">
+      <rect x="70" y="72" width="44" height="18"/><rect x="114" y="72" width="44" height="18"/>
+      <rect x="158" y="72" width="44" height="18"/>
+    </g>
+    <text x="78" y="85" font-size="9.5">blk0</text><text x="122" y="85" font-size="9.5">blk1</text>
+    <text x="166" y="85" font-size="9.5">blk2'</text>
+
+    <!-- seq C -->
+    <text x="12" y="120">序列 C</text>
+    <g stroke="currentColor" stroke-width="1" fill="none">
+      <rect x="70" y="108" width="44" height="18"/><rect x="114" y="108" width="44" height="18"/>
+    </g>
+    <text x="78" y="121" font-size="9.5">blk0</text><text x="122" y="121" font-size="9.5">blk1'</text>
+
+    <text x="262" y="49" font-size="10" opacity="0.8">A、B、C 共享同一段 system prompt</text>
+    <text x="262" y="66" font-size="10" opacity="0.8">→ blk0 三者相同</text>
+    <text x="262" y="84" font-size="10" opacity="0.8">→ blk1 只有 A、B 相同</text>
+
+    <!-- block table -->
+    <line x1="12" y1="146" x2="728" y2="146" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="170" font-size="12.5" font-weight="600">block table（每条序列一张：逻辑块号 → 物理块号）</text>
+    <text x="12" y="194" font-family="ui-monospace, monospace" font-size="10.5">A: [ 7, 3, 12, 5 ]    B: [ 7, 3, 19 ]    C: [ 7, 22 ]</text>
+    <text x="12" y="212" font-size="10" opacity="0.75">物理块 7 的 ref_cnt = 3；物理块 3 的 ref_cnt = 2 —— 复用就是「多张表指向同一个物理块」</text>
+
+    <!-- physical -->
+    <line x1="12" y1="232" x2="728" y2="232" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="256" font-size="12.5" font-weight="600">物理视角：显存里的 KV 块池（本机实测 4064 块 × 16 token）</text>
+    <g stroke="currentColor" stroke-width="1" fill="none">
+      <rect x="12" y="270" width="34" height="26"/><rect x="46" y="270" width="34" height="26"/>
+      <rect x="80" y="270" width="34" height="26"/><rect x="114" y="270" width="34" height="26"/>
+      <rect x="148" y="270" width="34" height="26"/><rect x="182" y="270" width="34" height="26"/>
+      <rect x="216" y="270" width="34" height="26"/><rect x="250" y="270" width="34" height="26"/>
+    </g>
+    <g font-family="ui-monospace, monospace" font-size="9">
+      <text x="24" y="287">0</text><text x="58" y="287">1</text><text x="92" y="287">2</text>
+      <text x="124" y="287">3</text><text x="158" y="287">4</text><text x="192" y="287">5</text>
+      <text x="226" y="287">6</text><text x="258" y="287">7</text>
+    </g>
+    <text x="300" y="287" font-size="10.5" opacity="0.8">… 共 4064 块，物理上互不相邻也没关系</text>
+
+    <text x="12" y="326" font-size="11">空闲块用**双向链表**串起来（LRU 序），分配 = popleft，释放 = 逆序 append</text>
+    <text x="12" y="348" font-size="11">已缓存的块另有一张**哈希表** hash → block，用于跨请求前缀复用</text>
+    <text x="12" y="376" font-size="11.5" font-weight="600">一句话：这就是操作系统的分页，只不过页里装的是 K 和 V。</text>
+  </g>
+</svg>
+<figcaption>逻辑块 → block table → 物理块。复用体现为多张 block table 指向同一个物理块（ref_cnt &gt; 1）。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_2">机制拆解</h2>
+<h3 id="_3">为什么必须分页：量化「不分页」的代价</h3>
+<p>假设不分页——每条序列的 KV 必须是<strong>一整段连续显存</strong>。那么你必须在请求到达时就
+按 <code>max_model_len</code> 预留空间（因为你不知道它会生成多长）。</p>
+<p>用 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的账本算（Qwen3-1.7B，<code>max_model_len=40960</code>）：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>每条序列预留</mtext><mo>&#x0003D;</mo><mn>40960</mn><mo>&#x000D7;</mo><mn>114.69</mn><mspace width="0.167em" /><mtext>KB</mtext><mo>&#x0003D;</mo><mn>4.70</mn><mtext>&#x000A0;</mtext><mtext>GB</mtext></mrow></math></div></p>
+<p>一张 32 GB 卡去掉 3.44 GB 权重与杂项，剩约 25 GB，<strong>只能开 5 条并发</strong>。
+而实际请求平均可能只用 2048 token —— <strong>95% 的预留是浪费的</strong>。</p>
+<p>这就是 PagedAttention 论文里说的两类碎片：</p>
+<ul>
+<li><strong>内部碎片</strong>：预留 40960，实际用 2048 → 浪费 38912 个 token 的空间</li>
+<li><strong>外部碎片</strong>：连续块之间的空隙无法被别的序列使用</li>
+</ul>
+<p>分页把两者同时消掉：按需分配 16 token 的小块，内部碎片上界是 <strong>15 个 token</strong>
+（最后一块没填满），外部碎片直接消失（因为不要求连续）。</p>
+<p><strong>本机实测</strong>：<code>gpu_memory_utilization=0.35</code> 时引擎报 <code>num_gpu_blocks = 4064</code>。
+反推 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4064</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x0003D;</mo><mn>65</mn><mspace width="0.167em" /><mn>024</mn></mrow></math></span> 个 token 的 KV，即 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>65024</mn><mo>&#x000D7;</mo><mn>114.69</mn><mtext>KB</mtext><mo>&#x0003D;</mo><mn>7.46</mn></mrow></math></span> GB。
+而 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>33.7</mn><mo>&#x000D7;</mo><mn>0.35</mn><mo>&#x02212;</mo><mn>3.44</mn><mo stretchy="false">&#x00028;</mo><mtext>权重</mtext><mo stretchy="false">&#x00029;</mo><mo>&#x02212;</mo><mtext>杂项</mtext><mo>&#x02248;</mo><mn>7.5</mn></mrow></math></span> GB —— <strong>和 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的账本对上了</strong>。</p>
+<h3 id="token">复用的粒度是「块」，不是「token」</h3>
+<p>一个块只有<strong>填满</strong>（16 个 token）才会被哈希、才能被复用。这意味着：</p>
+<ul>
+<li>共享 16 个 token 的前缀 → 复用 <strong>1 块</strong></li>
+<li>共享 31 个 token 的前缀 → 也只复用 <strong>1 块</strong>（第二块只有 15 个 token，没填满）</li>
+</ul>
+<p><strong>这可以直接测出来</strong>，而且是本章最漂亮的实验（下面 lab 一节）。</p>
+<h3 id="_4">块哈希：为什么必须"滚动"</h3>
+<p><code>hash_block_tokens</code> 的签名很说明问题：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">hash_block_tokens</span><span class="p">(</span><span class="n">hash_function</span><span class="p">,</span> <span class="n">parent_block_hash</span><span class="p">,</span> <span class="n">curr_block_token_ids</span><span class="p">,</span> <span class="n">extra_keys</span><span class="p">):</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">parent_block_hash</span><span class="p">:</span>
+        <span class="n">parent_block_hash</span> <span class="o">=</span> <span class="n">NONE_HASH</span>
+    <span class="k">return</span> <span class="n">BlockHash</span><span class="p">(</span><span class="n">hash_function</span><span class="p">((</span><span class="n">parent_block_hash</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">curr_block_token_ids</span><span class="p">),</span> <span class="n">extra_keys</span><span class="p">)))</span>
+</code></pre></div>
+
+<p>哈希的输入包含 <strong>父块的哈希</strong>。所以第 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 块的哈希实际上编码了「前 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>16</mn><mi>k</mi></mrow></math></span> 个 token 的完整内容」。</p>
+<p>为什么必须这样？因为 KV 是<strong>上下文相关</strong>的：同样 16 个 token，跟在不同前缀后面，
+算出来的 K/V 完全不同（attention 要看前面所有 token）。
+如果只哈希块内容，就会错误复用——<strong>这是正确性问题，不是优化问题</strong>。</p>
+<p><code>extra_keys</code> 是给多模态和 LoRA 用的：同样的 token id，配不同的图片或不同的 LoRA adapter，
+KV 也不同，必须进哈希（<span class="xref pending" title="VLM（一）：图像与视频预处理（尚未写）">L4.5</span> 会回到这里）。</p>
+<p>还有一个细节：<code>NONE_HASH</code> 由一个可配置的 seed 派生，代码注释写着
+「Components that must agree on NONE_HASH across processes (the P2P tier…)」——
+<strong>因为 PD 分离时，prefill 机器算出的块哈希必须和 decode 机器一致</strong>，
+否则 KV 传过去认不出来（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>）。一个种子的设计，牵着整个分离架构。</p>
+<hr />
+<h2 id="_5">工程实现 · 源码走读</h2>
+<h3 id="a-vllm">A. vLLM：块哈希表 + 双向链表空闲池</h3>
+<p><strong>块的元数据</strong>（<code>v1/core/kv_cache_utils.py:166</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">KVCacheBlock</span><span class="p">:</span>
+    <span class="n">block_id</span><span class="p">:</span> <span class="nb">int</span>                    <span class="c1"># 0 .. num_gpu_blocks-1</span>
+    <span class="n">ref_cnt</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>                 <span class="c1"># 有几条序列在引用它</span>
+    <span class="n">_block_hash</span><span class="p">:</span> <span class="n">BlockHashWithGroupId</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>   <span class="c1"># 满块且已缓存时才有</span>
+    <span class="n">_block_hash_num_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">prev_free_block</span><span class="p">:</span> <span class="s2">"KVCacheBlock | None"</span> <span class="o">=</span> <span class="kc">None</span>     <span class="c1"># 空闲链表指针</span>
+    <span class="n">next_free_block</span><span class="p">:</span> <span class="s2">"KVCacheBlock | None"</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">is_null</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+</code></pre></div>
+
+<p>注意 <code>ref_cnt</code> 与两个链表指针在<strong>同一个对象</strong>上。这是有意的——见下面。</p>
+<p><strong>空闲池是手写的双向链表</strong>（<code>v1/core/kv_cache_utils.py</code>，<code>FreeKVCacheBlockQueue</code> 的 docstring
+把理由写得很清楚）：</p>
+<div class="highlight"><pre><span></span><code>This class organizes a list of KVCacheBlock objects to a doubly linked
+list of free blocks. We implement this class instead of using Python
+builtin deque to support removing a block in the middle of the queue
+in O(1) time. To close the performance gap to the builtin deque which is
+implemented in C++, this class does not allocate any Python objects when
+manipulating the linked list. Instead, this class manipulates the
+prev_free_block and next_free_block attributes of the given blocks.
+</code></pre></div>
+
+<p>三个设计决策，每个都有代价：</p>
+<ol>
+<li><strong>不用 <code>collections.deque</code></strong>，因为要支持「从队列中间 O(1) 删除」——
+   一个已缓存的空闲块被命中复用时，要立刻从空闲链表里摘掉，它可能在任意位置。</li>
+<li><strong>不新建任何 Python 对象</strong>——指针直接存在 <code>KVCacheBlock</code> 上。
+   因为这是<strong>每步都跑的热路径</strong>，Python 对象分配的开销会直接变成 TPOT。
+   （<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 测过：decode 每步只有 4.3 ms，其中约 1.24 ms 已经被 kernel launch 吃掉。）</li>
+<li>代价是<strong>耦合</strong>：块对象既是数据又是链表节点，不能同时挂在两个链表上。</li>
+</ol>
+<p><strong>LRU 顺序也是手工维护的</strong>，同一段 docstring：</p>
+<div class="highlight"><pre><span></span><code>The queue is ordered by block ID in the beginning. When a block is allocated
+and then freed, it will be appended back with the eviction order:
+1. The least recent used block is at the front (LRU).
+2. If two blocks have the same last accessed time (allocated by the
+   same sequence), the one with more hash tokens (the tail of a block
+   chain) is at the front.
+Note that we maintain this order by reversing the block order when free
+blocks of a request.
+</code></pre></div>
+
+<p>第 2 条很妙：同一条序列释放的多个块，<strong>尾部的块先被淘汰</strong>。
+因为前缀（头部块）更可能被别的请求复用，尾部块是这条序列独有的。
+实现方式是「释放时把块列表反转再 append」——一行 <code>reversed()</code> 承载了一条缓存策略。</p>
+<p><strong>分配</strong>（<code>v1/core/block_pool.py:647</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_new_blocks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_blocks</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">KVCacheBlock</span><span class="p">]:</span>
+    <span class="k">if</span> <span class="n">num_blocks</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_num_free_blocks</span><span class="p">():</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cannot get </span><span class="si">{</span><span class="n">num_blocks</span><span class="si">}</span><span class="s2"> free blocks from the pool"</span><span class="p">)</span>
+    <span class="n">ret</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_block_queue</span><span class="o">.</span><span class="n">popleft_n</span><span class="p">(</span><span class="n">num_blocks</span><span class="p">)</span>
+
+    <span class="c1"># In order to only iterate the list once, we duplicated code a bit</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_caching</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">ret</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_evict_cached_block</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>   <span class="c1"># 从哈希表里摘掉旧内容</span>
+            <span class="k">assert</span> <span class="n">block</span><span class="o">.</span><span class="n">ref_cnt</span> <span class="o">==</span> <span class="mi">0</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">ref_cnt</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="o">...</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">ret</span><span class="p">:</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">ref_cnt</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="o">...</span>
+</code></pre></div>
+
+<p>那句注释 <code>we duplicated code a bit</code> 值得注意：<strong>为了少遍历一次列表而故意写重复代码</strong>。
+这不是坏品味，是热路径上的自觉取舍——这个函数每个 decode step 都会被调用。</p>
+<p><code>_maybe_evict_cached_block</code> 做的是：这个块被重新分配前，如果它还挂在
+<code>cached_block_hash_to_block</code> 里（即"内容还在，只是没人引用"），
+就把哈希条目摘掉并发出淘汰事件。<strong>"空闲"和"已缓存"是两个正交状态</strong>：
+一个块可以既空闲又缓存着有效内容——这正是 prefix cache 能跨请求命中的原因。</p>
+<h3 id="b-sglang">B. SGLang：基数树</h3>
+<p><code>mem_cache/radix_cache.py:238</code> 的 <code>TreeNode</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">TreeNode</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">priority</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">children</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span><span class="n">TreeNode</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">parent</span><span class="p">:</span> <span class="n">TreeNode</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">key</span><span class="p">:</span> <span class="n">RadixKey</span> <span class="o">=</span> <span class="kc">None</span>            <span class="c1"># 这个节点覆盖的 token 片段</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>   <span class="c1"># 对应的 KV 槽位索引</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lock_ref</span> <span class="o">=</span> <span class="mi">0</span>                    <span class="c1"># 相当于 vLLM 的 ref_cnt</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">last_access_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hit_count</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># ↓ 这三行是「KV 分级存储」，vLLM 的块对象里没有对应物</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_ref_counter</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>   <span class="c1"># 卸载到主机内存的副本</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">write_through_pending_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hash_value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>      <span class="c1"># 每页的哈希（对外发事件用）</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">priority</span> <span class="o">=</span> <span class="n">priority</span>             <span class="c1"># 支持优先级感知的淘汰</span>
+</code></pre></div>
+
+<p><code>host_value</code> / <code>host_ref_counter</code> 那三行很关键：<strong>SGLang 的树节点原生支持把 KV 卸载到主机内存</strong>
+（<code>backuped</code> 属性、<code>protect_host()</code> / <code>release_host()</code>）。
+在 vLLM 里这是一个外挂的 connector 层；在 SGLang 里它长在数据结构上。
+这直接对应 <span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>「KV 作为数据平面」——树本身就是 HBM/DRAM 两级的目录。</p>
+<p><strong>匹配前缀</strong>（<code>radix_cache.py:679</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_match_prefix_helper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="n">TreeNode</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="n">RadixKey</span><span class="p">):</span>
+    <span class="n">access_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+    <span class="n">node</span><span class="o">.</span><span class="n">last_access_time</span> <span class="o">=</span> <span class="n">access_time</span>
+    <span class="n">child_key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">child_key</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+    <span class="n">value</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="n">key</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">child_key</span> <span class="ow">in</span> <span class="n">node</span><span class="o">.</span><span class="n">children</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+        <span class="n">child</span> <span class="o">=</span> <span class="n">node</span><span class="o">.</span><span class="n">children</span><span class="p">[</span><span class="n">child_key</span><span class="p">]</span>
+        <span class="n">child</span><span class="o">.</span><span class="n">last_access_time</span> <span class="o">=</span> <span class="n">access_time</span>
+        <span class="n">prefix_len</span> <span class="o">=</span> <span class="n">child</span><span class="o">.</span><span class="n">key</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">page_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">prefix_len</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">child</span><span class="o">.</span><span class="n">key</span><span class="p">):</span>
+            <span class="n">new_node</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_split_node</span><span class="p">(</span><span class="n">child</span><span class="o">.</span><span class="n">key</span><span class="p">,</span> <span class="n">child</span><span class="p">,</span> <span class="n">prefix_len</span><span class="p">)</span>   <span class="c1"># ← 部分匹配就劈开</span>
+            <span class="n">value</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">new_node</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+            <span class="n">node</span> <span class="o">=</span> <span class="n">new_node</span>
+            <span class="k">break</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">value</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">child</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+            <span class="n">node</span> <span class="o">=</span> <span class="n">child</span>
+            <span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="p">[</span><span class="n">prefix_len</span><span class="p">:]</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">key</span><span class="p">):</span>
+                <span class="n">child_key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">child_key</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">value</span><span class="p">,</span> <span class="n">node</span>
+</code></pre></div>
+
+<p><strong><code>_split_node</code> 是基数树相对普通字典树的全部精髓。</strong> 当新请求和已有节点只匹配了一部分，
+就把那个节点<strong>从中间劈成两个</strong>：公共部分变成父节点（可以被两边共享），
+剩余部分变成子节点。这样树的节点数始终等于"分叉数"，而不是 token 数。</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_split_node</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="n">RadixKey</span><span class="p">,</span> <span class="n">child</span><span class="p">:</span> <span class="n">TreeNode</span><span class="p">,</span> <span class="n">split_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+    <span class="n">new_node</span> <span class="o">=</span> <span class="n">TreeNode</span><span class="p">(</span><span class="n">priority</span><span class="o">=</span><span class="n">child</span><span class="o">.</span><span class="n">priority</span><span class="p">)</span>
+    <span class="n">new_node</span><span class="o">.</span><span class="n">hit_count</span> <span class="o">=</span> <span class="n">child</span><span class="o">.</span><span class="n">hit_count</span>
+    <span class="n">new_node</span><span class="o">.</span><span class="n">children</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="p">[</span><span class="n">split_len</span><span class="p">:]</span><span class="o">.</span><span class="n">child_key</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">):</span> <span class="n">child</span><span class="p">}</span>
+    <span class="n">new_node</span><span class="o">.</span><span class="n">parent</span> <span class="o">=</span> <span class="n">child</span><span class="o">.</span><span class="n">parent</span>
+    <span class="n">new_node</span><span class="o">.</span><span class="n">lock_ref</span> <span class="o">=</span> <span class="n">child</span><span class="o">.</span><span class="n">lock_ref</span>
+    <span class="n">new_node</span><span class="o">.</span><span class="n">key</span>   <span class="o">=</span> <span class="n">child</span><span class="o">.</span><span class="n">key</span><span class="p">[:</span><span class="n">split_len</span><span class="p">]</span>
+    <span class="n">new_node</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">child</span><span class="o">.</span><span class="n">value</span><span class="p">[:</span><span class="n">split_len</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+    <span class="n">child</span><span class="o">.</span><span class="n">parent</span> <span class="o">=</span> <span class="n">new_node</span>
+    <span class="n">child</span><span class="o">.</span><span class="n">key</span>   <span class="o">=</span> <span class="n">child</span><span class="o">.</span><span class="n">key</span><span class="p">[</span><span class="n">split_len</span><span class="p">:]</span>
+    <span class="n">child</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">child</span><span class="o">.</span><span class="n">value</span><span class="p">[</span><span class="n">split_len</span><span class="p">:]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+    <span class="n">new_node</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">children</span><span class="p">[</span><span class="n">key</span><span class="o">.</span><span class="n">child_key</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">)]</span> <span class="o">=</span> <span class="n">new_node</span>
+    <span class="n">new_node</span><span class="o">.</span><span class="n">hash_value</span><span class="p">,</span> <span class="n">child</span><span class="o">.</span><span class="n">hash_value</span> <span class="o">=</span> <span class="n">split_node_hash_value</span><span class="p">(</span>
+        <span class="n">child</span><span class="o">.</span><span class="n">hash_value</span><span class="p">,</span> <span class="n">split_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">new_node</span>
+</code></pre></div>
+
+<p>注意 <code>lock_ref</code> 被<strong>原样继承</strong>给父节点：劈开后，原来引用 child 的请求现在
+同时依赖 new_node 和 child，两者都不能被淘汰。</p>
+<h3 id="c">C. 两种方案的取舍表</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>vLLM 块哈希表</th>
+<th>SGLang 基数树</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>查一个前缀</td>
+<td>O(块数) 次哈希查表，每次 O(1)</td>
+<td>O(前缀长度) 树遍历 + 可能的节点劈分</td>
+</tr>
+<tr>
+<td>复用粒度</td>
+<td>块（16 token）</td>
+<td>页（可配），且节点可劈分</td>
+</tr>
+<tr>
+<td>能否表达前缀间的<strong>包含关系</strong></td>
+<td><strong>不能</strong>——每个块独立</td>
+<td><strong>能</strong>——父子节点即前缀关系</td>
+</tr>
+<tr>
+<td>淘汰粒度</td>
+<td>单块 LRU（双向链表）</td>
+<td><strong>整棵子树</strong> LRU（叶子优先）</td>
+</tr>
+<tr>
+<td>调度器能利用吗</td>
+<td>只知道"块在不在"</td>
+<td><strong>能做 LPM（最长前缀优先）选批</strong></td>
+</tr>
+<tr>
+<td>分级存储（DRAM/SSD）</td>
+<td>外挂 connector</td>
+<td><strong>长在节点上</strong>（<code>host_value</code>）</td>
+</tr>
+<tr>
+<td>实现复杂度</td>
+<td>低（约 700 行）</td>
+<td>高（约 900 行 + 分裂/合并逻辑）</td>
+</tr>
+<tr>
+<td>热路径开销</td>
+<td>极低（无对象分配）</td>
+<td>树遍历有指针追逐</td>
+</tr>
+</tbody>
+</table>
+<p><strong>没有哪个"更好"。</strong> 哈希表在高吞吐、前缀关系简单的场景下更快；
+基数树在多轮对话、agent 会话树、few-shot 分支这类<strong>前缀高度嵌套</strong>的场景下赢面大——
+因为它能让调度器"看见"请求之间的相似性。</p>
+<hr />
+<h2 id="_6">工程实现 · 自己写一遍</h2>
+<p>一个能跑的最小块分配器 + 前缀缓存，约 60 行。三个数据结构对应三件事：</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">MiniBlockPool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""把 vLLM 的三件核心机制压到最小：ref_cnt、LRU 空闲链、块哈希表。"""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_blocks</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">block_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="n">block_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ref_cnt</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_blocks</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">block_hash</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_blocks</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free</span> <span class="o">=</span> <span class="n">collections</span><span class="o">.</span><span class="n">deque</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">num_blocks</span><span class="p">))</span>   <span class="c1"># 真实实现用手写双链表</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hash_to_block</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>            <span class="c1"># 已缓存：hash -&gt; block_id</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_rolling_hash</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">parent</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># 必须带上父块哈希：同样的 16 个 token 跟在不同前缀后，KV 完全不同</span>
+        <span class="k">return</span> <span class="nb">hash</span><span class="p">((</span><span class="n">parent</span><span class="p">,</span> <span class="n">tokens</span><span class="p">))</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">match</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""返回 (可复用的物理块列表, 已覆盖的 token 数)。"""</span>
+        <span class="n">blocks</span><span class="p">,</span> <span class="n">parent</span><span class="p">,</span> <span class="n">n</span> <span class="o">=</span> <span class="p">[],</span> <span class="kc">None</span><span class="p">,</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">):</span>
+            <span class="n">chunk</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">token_ids</span><span class="p">[</span><span class="n">i</span><span class="p">:</span><span class="n">i</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">])</span>
+            <span class="n">h</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rolling_hash</span><span class="p">(</span><span class="n">parent</span><span class="p">,</span> <span class="n">chunk</span><span class="p">)</span>
+            <span class="n">bid</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">hash_to_block</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">h</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">bid</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">break</span>                       <span class="c1"># 前缀一断，后面全部作废</span>
+            <span class="n">blocks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">bid</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ref_cnt</span><span class="p">[</span><span class="n">bid</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="n">bid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">free</span><span class="p">:</span>            <span class="c1"># 命中一个"空闲但仍缓存"的块 → 从空闲链摘掉</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">free</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">bid</span><span class="p">)</span>
+            <span class="n">parent</span><span class="p">,</span> <span class="n">n</span> <span class="o">=</span> <span class="n">h</span><span class="p">,</span> <span class="n">i</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span>
+        <span class="k">return</span> <span class="n">blocks</span><span class="p">,</span> <span class="n">n</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">alloc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">n</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">MemoryError</span><span class="p">(</span><span class="s2">"没有空闲块了——真实引擎在这里会去抢占别的请求"</span><span class="p">)</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+            <span class="n">bid</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_hash</span><span class="p">[</span><span class="n">bid</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>        <span class="c1"># 复用一个仍带缓存内容的块</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">hash_to_block</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">block_hash</span><span class="p">[</span><span class="n">bid</span><span class="p">],</span> <span class="kc">None</span><span class="p">)</span>   <span class="c1"># 先摘旧哈希</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">block_hash</span><span class="p">[</span><span class="n">bid</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ref_cnt</span><span class="p">[</span><span class="n">bid</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
+            <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">bid</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">out</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">free_blocks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">blocks</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 逆序归还：尾部块排在前面，优先被淘汰（前缀更可能被复用）</span>
+        <span class="k">for</span> <span class="n">bid</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">(</span><span class="n">blocks</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ref_cnt</span><span class="p">[</span><span class="n">bid</span><span class="p">]</span> <span class="o">-=</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">ref_cnt</span><span class="p">[</span><span class="n">bid</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">free</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">bid</span><span class="p">)</span>       <span class="c1"># 内容与哈希保留 → 之后仍可能被命中</span>
+</code></pre></div>
+
+<p>三处值得反复看的地方：</p>
+<ol>
+<li><strong><code>match</code> 里的 <code>break</code></strong>：前缀一旦断掉，后面就算内容相同也不能用——因为 KV 上下文相关。</li>
+<li><strong><code>free_blocks</code> 不清哈希</strong>：块归还到空闲链，但内容和哈希还留着。
+   这就是"空闲 ≠ 失效"，也是跨请求命中的来源。真正清除发生在 <code>alloc</code> 里被重新分配时。</li>
+<li><strong><code>reversed()</code></strong>：一行代码 = 一条缓存策略。</li>
+</ol>
+<h3 id="_7">怎样检查这个最小实现</h3>
+<p>这里先检查数据结构的不变量：不同上下文不能误复用，块引用要正确释放，
+满块才能进入缓存，淘汰时不能释放仍在使用的块。这个模型不计算真实 KV，
+也没有实现完整推理引擎，因此不能仅凭模拟曲线就断言它与 vLLM 行为等价。</p>
+<p><code>labs/L5/mini_block_pool.py</code> 带四个自测和一个块数预测示例：</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/mini_block_pool.py
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code>自测：
+  ✓ 滚动哈希阻止了跨前缀误复用
+  ✓ 复用粒度确实是块：共享 15 个 token 与共享 0 个等价
+  ✓ 空闲 ≠ 失效；重新分配时才真正淘汰
+  ✓ 淘汰优先打尾部，前缀被保住
+
+  阶梯模拟（block_size=16, prompt=2048）
+      共享前缀      可复用块    需重算token   真机 TTFT ms
+         0         0        2048        36.80
+         1         0        2048        38.27
+         8         0        2048        37.19
+        15         0        2048        36.72
+        16         1        2032        37.04
+        17         1        2032        38.42
+        24         1        2032        37.37
+        31         1        2032        37.90
+        32         2        2016        38.29
+        64         4        1984        36.11
+       128         8        1920        34.00
+       256        16        1792        32.78
+       512        32        1536        29.36
+      1024        64        1024        22.61
+      1536        96         512        13.06
+      2032       127          16         7.93
+</code></pre></div>
+
+<p>以上保留初稿中的历史输出。左边三列来自 mini 模型，最右一列是离线调用耗时，
+不是引擎报告的块命中数。两组耗时相互重叠，尚不能从中分辨相邻块边界。
+修订后的脚本明确标注“预测”和“历史耗时”，不再输出“台阶验证成功”的结论。</p>
+<p>四个自测里最值得看的是第一个——它测的是<strong>正确性而不是性能</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_rolling_hash_prevents_wrong_reuse</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""B 的首块已缓存；只允许复用首块，不允许复用来自 A 的第二块。"""</span>
+    <span class="n">pool</span> <span class="o">=</span> <span class="n">MiniBlockPool</span><span class="p">(</span><span class="n">num_blocks</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+    <span class="n">tail</span> <span class="o">=</span> <span class="p">[</span><span class="mi">900</span><span class="p">,</span> <span class="mi">901</span><span class="p">,</span> <span class="mi">902</span><span class="p">,</span> <span class="mi">903</span><span class="p">]</span>
+    <span class="n">a</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">tail</span>
+    <span class="n">b</span> <span class="o">=</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">]</span> <span class="o">+</span> <span class="n">tail</span>
+    <span class="n">ra</span> <span class="o">=</span> <span class="n">pool</span><span class="o">.</span><span class="n">serve</span><span class="p">(</span><span class="n">a</span><span class="p">);</span> <span class="n">pool</span><span class="o">.</span><span class="n">free_blocks</span><span class="p">(</span><span class="n">ra</span><span class="p">[</span><span class="s2">"blocks"</span><span class="p">])</span>
+    <span class="n">rb_head</span> <span class="o">=</span> <span class="n">pool</span><span class="o">.</span><span class="n">serve</span><span class="p">(</span><span class="n">b</span><span class="p">[:</span><span class="mi">4</span><span class="p">]);</span> <span class="n">pool</span><span class="o">.</span><span class="n">free_blocks</span><span class="p">(</span><span class="n">rb_head</span><span class="p">[</span><span class="s2">"blocks"</span><span class="p">])</span>
+    <span class="n">rb</span> <span class="o">=</span> <span class="n">pool</span><span class="o">.</span><span class="n">serve</span><span class="p">(</span><span class="n">b</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">rb</span><span class="p">[</span><span class="s2">"reused_blocks"</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span>
+    <span class="n">pool</span><span class="o">.</span><span class="n">free_blocks</span><span class="p">(</span><span class="n">rb</span><span class="p">[</span><span class="s2">"blocks"</span><span class="p">])</span>
+</code></pre></div>
+
+<p>为什么要先缓存 B 的首块？否则查询 B 时，首块未命中就会退出，
+测试根本到不了第二块。旧测试因此检不出“去掉 parent”的错误。
+修订后，正确实现只能复用 B 的首块；若只按块内容哈希，就会错误复用 A 的尾块。
+这才是一个真正检查上下文身份的测试。</p>
+<hr />
+<h2 id="lab">动手 lab：比较前缀复用预测与调用耗时</h2>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/prefix_probe.py<span class="w"> </span>--model<span class="w"> </span><span class="nv">$MODEL</span><span class="w"> </span>--prefix-len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>results/prefix_probe_5090.json
+</code></pre></div>
+
+<p>引擎报告：<strong>块大小 = 16 token，GPU 块数 = 4064</strong>。</p>
+<h3 id="a-vs">实验 A：命中 vs 未命中</h3>
+<div class="highlight"><pre><span></span><code>[A] 前缀 2048 token
+    冷（首次，无命中）    41.46 ms
+    热（完全命中）         7.58 ms   加速 5.47×
+
+[C] 关掉前缀缓存，同样 prompt 重复跑：37.16 ms
+    ⇒ 前缀缓存省了 80%
+</code></pre></div>
+
+<p>7.58 ms 是本次热请求的离线调用耗时，不是“完全不计算 prompt”的固定下限。
+vLLM 0.29.0 的 <code>get_computed_blocks()</code> 将命中长度限制在
+<code>request.num_tokens - 1</code>：还需要计算末 token 的 logits 来产生首个输出。
+按本例 16-token 块对齐，2048-token prompt 最多复用 2032 token，仍需处理末块。
+首个输出由 prompt 前向的 logits 采样产生，不应再额外计一次 decode 前向。
+参见 <a href="https://docs.vllm.ai/en/v0.29.0/api/vllm/v1/core/kv_cache_manager/">该版本的 KVCacheManager</a>。</p>
+<p>引擎自己报的指标（不要自己猜命中率）：</p>
+<div class="highlight"><pre><span></span><code>vllm:prefix_cache_queries = 14336
+vllm:prefix_cache_hits    = 12192      → 命中率 85.0%
+vllm:kv_cache_usage_perc  = 0.0        （测完已释放）
+</code></pre></div>
+
+<h3 id="b">实验 B：共享前缀长度扫描</h3>
+<p>构造「前 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 个 token 与已缓存的 base 相同、之后全部随机」的 prompt，扫 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span>，
+记录每个新后缀的首次调用耗时。脚本按 <code>shared // block_size</code> 预测可复用块数；
+预测呈阶梯，但耗时是否足以分辨这个阶梯，是另一个需要验证的问题。</p>
+<div class="highlight"><pre><span></span><code>   共享前缀   可复用块   需重算token   首次TTFT ms
+        0        0        2048          36.80
+        1        0        2048          38.27
+        8        0        2048          37.19
+       15        0        2048          36.72     ← 共享 15 个 token = 白共享
+       16        1        2032          37.04
+       17        1        2032          38.42
+       24        1        2032          37.37
+       31        1        2032          37.90     ← 共享 31 个也只复用 1 块
+       32        2        2016          38.29
+       ...
+       64        4        1984          36.11
+      128        8        1920          34.00
+      256       16        1792          32.78
+      512       32        1536          29.36
+     1024       64        1024          22.61
+     1536       96         512          13.06
+     2032      127          16           7.93     ← 只剩 16 个 token 要算
+</code></pre></div>
+
+<p>读表时先区分来源：“可复用块”和“需重算 token”是公式预测，只有耗时是测量值。
+0、16、32 token 三点的耗时分别为 36.80、37.04、38.29 ms，
+并没有显示对应的下降台阶。同组内没有明显趋势，也不能证明组内严格等价。</p>
+<p>现有数据支持的是：共享前缀增加到较大范围时，调用耗时下降。
+要验证精确块边界，应逐请求采集真实命中量或调度 token 数。</p>
+<h3 id="2026-09-10crater">补测：把命中量直接读出来（2026-09-10，crater）</h3>
+<p>不再从计时反推。挂两个钩子，把引擎自己的账取出来：</p>
+<ul>
+<li><code>KVCacheManager.get_computed_blocks(request)</code> 的第二个返回值
+  = 这次请求真正命中的 token 数（一定块对齐）</li>
+<li><code>SchedulerOutput.num_scheduled_tokens[req_id]</code>
+  = 这一步真正送去算的 token 数</li>
+</ul>
+<p><code>block_size = 16</code>，Qwen3-1.7B，<code>enable_prefix_caching=True</code>。</p>
+<p><strong>完全相同的 prompt 连发三次</strong>：</p>
+<div class="highlight"><pre><span></span><code>  第0次  prompt=  281  命中 token=    0 (= 0 块 × 16)  首步调度 token=  281
+  第1次  prompt=  281  命中 token=  272 (= 17 块 × 16)  首步调度 token=    9
+  第2次  prompt=  281  命中 token=  272 (= 17 块 × 16)  首步调度 token=    9
+</code></pre></div>
+
+<p><strong>完整命中之后仍要算 9 个 token，不是 1 个。</strong> 这正是本章前面引用的那段
+vLLM 注释所说的：<code>max_cache_hit_length = num_tokens - 1</code> = 280，
+280 向下块对齐到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>17</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x0003D;</mo><mn>272</mn></mrow></math></span>，于是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>281</mn><mo>&#x02212;</mo><mn>272</mn><mo>&#x0003D;</mo><mn>9</mn></mrow></math></span>。
+"重算的是一整块，不是最后一个 token"——这里是 9 个，量出来了。</p>
+<p><strong>共享前缀扫过一个块边界</strong>（尾巴换成不同 token）：</p>
+<div class="highlight"><pre><span></span><code>        共享前缀长度  prompt   命中token     命中块      首步调度        公式预测命中块
+            46      54        32       2        22              2
+            47      55        32       2        23              2
+            48      56        48       3         8              3
+            49      57        48       3         9              3
+            50      58        48       3        10              3
+            51      59        48       3        11              3
+            52      60        48       3        12              3
+            53      61        48       3        13              3
+</code></pre></div>
+
+<p><strong>实测命中块与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x0230A;</mi><mtext>共享长度</mtext><mo>&#x0002F;</mo><mn>16</mn><mi>&#x0230B;</mi></mrow></math></span> 逐点一致</strong>，
+台阶精确落在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>48</mn><mo>&#x0003D;</mo><mn>3</mn><mo>&#x000D7;</mo><mn>16</mn></mrow></math></span>。首步调度 token 在同一点从 23 掉到 8。</p>
+<p>所以本节开头那句「可复用块是公式预测」现在可以收窄了：
+<strong>块数这一项已由引擎内部计数直接证实</strong>；仍然只是预测的是
+"每少算一块能省多少时间"——耗时与命中量之间的关系依旧受
+attention 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 项干扰，见下一段。</p>
+<p>再看跨块的趋势：需重算 2048 → 1024 → 512 → 16 对应 36.8 → 22.6 → 13.1 → 7.9 ms。
+注意<strong>不是严格线性</strong>：因为新 token 仍要 attend 到全部 2048 的上下文，
+attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 项）。</p>
+<h3 id="_8">这条结果的工程含义</h3>
+<p><strong>把变化的内容放在 prompt 末尾。</strong> 一个真实的例子：</p>
+<div class="highlight"><pre><span></span><code>❌  system: 当前时间 2026-09-09 17:36:21，用户 ID 8823...
+    &lt;5000 token 的文档&gt;
+    user: 问题
+
+✅  system: &lt;5000 token 的文档&gt;
+    user: 当前时间 2026-09-09 17:36:21，用户 ID 8823... 问题
+</code></pre></div>
+
+<p>第一种写法里，时间戳每次都变 → <strong>第 0 块的哈希就变了 → 后面 312 块全部作废</strong>
+（滚动哈希，前缀一断全断）。TTFT 从 7.6 ms 变回 41 ms。</p>
+<p>这个例子说明前缀位置会影响复用机会，但这里没有对这两条具体文本请求做过对照。
+前面的 5.47× 来自另一组冷/热调用，不能直接作为这次 prompt 改写的收益。</p>
+<h3 id="_9">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--block-size 32</code> / <code>64</code></td>
+<td>台阶变宽。块越大，"零头浪费"越多，但 block table 越短、寻址开销越小</td>
+</tr>
+<tr>
+<td><code>--block-size 1</code></td>
+<td>退化成 token 级复用（台阶消失）。观察 TTFT 是否因元数据开销变大而变慢</td>
+</tr>
+<tr>
+<td>把随机后缀改成<strong>相同</strong>后缀但不同中段</td>
+<td>验证"前缀一断全断"：即使后面完全相同也无法复用</td>
+</tr>
+<tr>
+<td>起两个进程跑相同 system prompt</td>
+<td>观察跨请求命中率（<code>vllm:prefix_cache_hits</code>）</td>
+</tr>
+<tr>
+<td>换 SGLang 跑同样的扫描</td>
+<td>对照基数树的曲线形状。它的 <code>page_size</code> 语义与 vLLM 的 <code>block_size</code> 不完全等价</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_10">原始现场</h2>
+<details>
+<summary>① 引擎启动时关于 KV cache 的原始日志</summary>
+<div class="highlight"><pre><span></span><code>块大小 = 16 token；GPU 块数 = 4064
+</code></pre></div>
+
+<p>从 <code>llm.llm_engine.vllm_config.cache_config</code> 读出来的，不是我算的。
+反推验证（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的账本）：</p>
+<div class="highlight"><pre><span></span><code>4064 块 × 16 token = 65,024 token 的 KV 容量
+65,024 × 114.69 KB = 7.46 GB
+预算 = 33.7 GB × 0.35 - 3.44 GB(权重) - 杂项 ≈ 7.5 GB   ✓
+</code></pre></div>
+
+<p><strong>账本和引擎对上了。</strong> 这种交叉验证要养成习惯——它同时检查了你的公式和你对配置的理解。</p>
+</details>
+<details>
+<summary>② 引擎暴露的 KV 指标全名</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"vllm:kv_cache_usage_perc"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"vllm:prefix_cache_queries"</span><span class="p">:</span><span class="w"> </span><span class="mi">14336</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"vllm:prefix_cache_hits"</span><span class="p">:</span><span class="w"> </span><span class="mi">12192</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"vllm:external_prefix_cache_queries"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"vllm:external_prefix_cache_hits"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>注意有 <code>external_</code> 前缀的一对。它们对应<strong>引擎外部的 KV 存储</strong>
+（LMCache / Mooncake Store / NIXL 拉回来的块）。本机是 0，因为没接外部层。
+<strong>这两个指标的存在本身就说明 vLLM 已经把「KV 来自别的机器」当成一等公民</strong>——<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span> 会用到。</p>
+<p><code>kv_cache_usage_perc</code> 是 0，因为采样时所有请求已完成、块已释放。
+要看真实占用率必须在压测<strong>过程中</strong>采（<span class="xref pending" title="可观测性与正确的压测（尚未写）">L8.3</span>）。</p>
+</details>
+<details>
+<summary>③ SGLang 的 TreeNode 完整字段（原样）</summary>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">TreeNode</span><span class="p">:</span>
+    <span class="n">counter</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">priority</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">children</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span><span class="n">TreeNode</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">parent</span><span class="p">:</span> <span class="n">TreeNode</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">key</span><span class="p">:</span> <span class="n">RadixKey</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lock_ref</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">last_access_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">creation_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hit_count</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># indicating the node is locked to protect from eviction</span>
+        <span class="c1"># incremented when the node is referenced by a storage operation</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_ref_counter</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># store the host indices of KV cache</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">write_through_pending_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># store hash values of each pages</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hash_value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># Namespace-aware hashes used only for external KV events.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event_hash_value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># priority for priority-aware eviction</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">priority</span> <span class="o">=</span> <span class="n">priority</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">id</span> <span class="o">=</span> <span class="n">TreeNode</span><span class="o">.</span><span class="n">counter</span> <span class="k">if</span> <span class="nb">id</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">id</span>
+        <span class="n">TreeNode</span><span class="o">.</span><span class="n">counter</span> <span class="o">+=</span> <span class="mi">1</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">evicted</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">backuped</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+</code></pre></div>
+
+<p><code>evicted</code> 与 <code>backuped</code> 这两个属性把状态空间说清楚了：一个节点可以是
+<strong>在 GPU 上</strong>（value 非空）、<strong>只在主机内存里</strong>（value 空但 host_value 非空）、
+或<strong>彻底没了</strong>。三态，不是两态。</p>
+<p><code>event_hash_value</code> 的注释 "Namespace-aware hashes used only for external KV events"
+—— 对外广播 KV 事件时用带命名空间的哈希，这是多租户下防止跨租户误复用的设计（<span class="xref pending" title="路由与网关（尚未写）">L8.1</span>）。</p>
+</details>
+<details>
+<summary>④ vLLM 空闲链表的完整 docstring（设计理由都写在里面）</summary>
+<div class="highlight"><pre><span></span><code>class FreeKVCacheBlockQueue:
+    """This class organizes a list of KVCacheBlock objects to a doubly linked
+    list of free blocks. We implement this class instead of using Python
+    builtin deque to support removing a block in the middle of the queue
+    in O(1) time. To close the performance gap to the builtin deque which is
+    implemented in C++, this class does not allocate any Python objects when
+    manipulating the linked list. Instead, this class manipulates the
+    prev_free_block and next_free_block attributes of the given blocks.
+
+    The queue is ordered by block ID in the beginning. When a block is allocated
+    and then freed, it will be appended back with the eviction order:
+    1. The least recent used block is at the front (LRU).
+    2. If two blocks have the same last accessed time (allocated by the
+       same sequence), the one with more hash tokens (the tail of a block
+       chain) is at the front.
+    Note that we maintain this order by reversing the block order when free
+    blocks of a request. This operation is outside of this class.
+    """
+</code></pre></div>
+
+<p><strong>读源码时，写得好的 docstring 比代码本身信息量大。</strong> 这一段把
+「为什么不用标准库」「为什么不建对象」「淘汰顺序是什么」「顺序在哪里维护」
+四件事全说了。找这种 docstring 是 <span class="xref pending" title="如何读一个十万行的混合代码库（尚未写）">M1</span>（读大型代码库）的核心技巧之一。</p>
+</details>
+<hr />
+<h2 id="_11">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>在改本章的哪一处</th>
+<th>代表工作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>KV 分级存储</strong></td>
+<td>块/节点不再只在 HBM</td>
+<td>Mooncake（HBM/DRAM/SSD 三级）、LMCache、vLLM 的 <code>v1/kv_offload/</code>、SGLang 的 <code>host_value</code></td>
+</tr>
+<tr>
+<td><strong>KV 作为数据平面</strong></td>
+<td>PD 分离后，块哈希必须跨机器一致</td>
+<td>NIXL、Mooncake Store；这解释了 <code>NONE_HASH</code> 种子为什么要跨进程一致（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>）</td>
+</tr>
+<tr>
+<td><strong>agentic 负载的淘汰策略</strong></td>
+<td>纯 LRU 对 agent 会话是病态的</td>
+<td>会话亲和路由 + 上下文感知保留；SGLang 的 <code>priority</code> 字段是这个方向的钩子</td>
+</tr>
+<tr>
+<td><strong>前缀感知路由</strong></td>
+<td>把复用决策提到引擎之外</td>
+<td>vLLM production-stack / SGLang router 的 prefix-aware routing（<span class="xref pending" title="路由与网关（尚未写）">L8.1</span>）</td>
+</tr>
+<tr>
+<td><strong>异构 KV</strong></td>
+<td>「一种 KV」的假设正在瓦解</td>
+<td>量化 KV、VLM 的 encoder 状态、投机解码的 draft KV、Mamba 状态——见 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 里 SGLang <code>pool_configurator.py</code> 的那一串分支</td>
+</tr>
+<tr>
+<td><strong>块级去重与压缩</strong></td>
+<td>同内容不同前缀能否共享</td>
+<td>研究阶段；难点正是本章说的"KV 上下文相关"</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>上表中除本站实测外的内容来自各自论文与源码，<strong>加速比未在本站复现</strong><span class="unverified">未实测</span>。</p>
+</blockquote>
+<hr />
+<h2 id="_12">陷阱</h2>
+<p><strong>1. 混淆共享长度、命中长度和耗时。</strong> 本例只缓存满块，但同样的预测块数
+不保证调用耗时相同；调度、采样和测量波动也会影响时间。</p>
+<p><strong>2. 把变化的内容放在 prompt 开头。</strong> 滚动哈希意味着前缀一断全断。
+时间戳、请求 ID、随机 few-shot 顺序放在开头 = 缓存全废。</p>
+<p><strong>3. 测前缀缓存时忘了它已经命中。</strong> 本章第一版实验就是这么翻车的：
+<code>ttft_ms()</code> 里的预热调用把完整 prompt 也写进了缓存，
+于是阶梯变成一条水平线（7.7–7.9 ms 恒定）。
+<strong>测「首次命中」必须真的只跑一次，且每次换新后缀。</strong></p>
+<p><strong>4. 用平均值报 TTFT。</strong> 冷启动那一次比后面慢 5.5 倍，混进平均值会把结论毁掉。
+本章全部用中位数，并把冷/热分开报。</p>
+<p><strong>5. 以为 <code>enable_prefix_caching=False</code> 就没有复用。</strong> 关掉后实测 37.16 ms，
+而开着但完全未命中是 41.46 ms——<strong>关掉反而略快</strong>，因为省掉了哈希计算与查表开销。
+这说明前缀缓存本身有成本，只有在有命中的负载下才划算。</p>
+<p><strong>6. 同进程建第二个引擎不释放第一个。</strong> 会报
+<code>Free memory on device cuda:0 (12.45/31.36 GiB) is less than desired</code>。
+<code>del</code> 不够，要 <code>engine_core.shutdown()</code>。</p>
+<hr />
+<h2 id="_13">自测题</h2>
+<details>
+<summary>1. 为什么块哈希必须包含父块哈希？举一个不包含会出错的具体例子。</summary>
+<p>因为 KV 是上下文相关的。</p>
+<p><strong>反例</strong>：block_size=16。
+- 请求 A 的 token 是 <code>[X…X(16个), "今天天气"…]</code>
+- 请求 B 的 token 是 <code>[Y…Y(16个), "今天天气"…]</code></p>
+<p>第二块的内容完全相同（都是 <code>"今天天气"…</code>），但 A 的第二块要 attend 到 16 个 X，
+B 的要 attend 到 16 个 Y。<strong>算出的 K、V 数值完全不同。</strong></p>
+<p>如果只哈希块内容，B 会命中 A 缓存的第二块，直接读到错误的 K/V —— 输出会是错的，
+而且<strong>不会报错</strong>，只是悄悄地生成垃圾。这是正确性 bug，不是性能问题。</p>
+<p>带上父块哈希后，两个第二块的哈希不同，不会误命中。</p>
+</details>
+<details>
+<summary>2. 一个块被释放（ref_cnt=0）后，它的内容还能被命中吗？在什么时刻才真正失效？</summary>
+<p><strong>能。</strong> <code>free_blocks</code> 只把块归还到空闲链表，<strong>不清 <code>_block_hash</code>，也不从哈希表里摘掉</strong>。
+所以一个"空闲但仍缓存"的块可以被后来的请求命中并复活（此时要从空闲链表中间 O(1) 摘掉它——
+这正是 vLLM 手写双向链表而不用 <code>deque</code> 的原因）。</p>
+<p><strong>真正失效的时刻</strong>是它被 <code>get_new_blocks</code> 重新分配给别的用途时，
+<code>_maybe_evict_cached_block()</code> 才把哈希条目摘掉并发出淘汰事件。</p>
+<p><strong>所以 "空闲" 和 "有效缓存" 是两个正交状态。</strong> 这是 prefix cache 能跨请求生效的全部机制：
+缓存容量 = 全部块，而不只是"没被引用的那些"。</p>
+</details>
+<details>
+<summary>3. block_size 从 16 改成 64，有哪些收益和代价？在什么负载下你会改大？</summary>
+<p><strong>收益</strong>：
+- block table 变短 4 倍 → <code>_prepare_inputs</code> 里的 CPU 指针算术变少（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 第 14 阶段）
+- attention kernel 的块寻址开销变小
+- 元数据（每块一个 Python 对象 + 哈希条目）少 4 倍</p>
+<p><strong>代价</strong>：
+- <strong>内部碎片上界从 15 个 token 涨到 63 个</strong>。1000 条并发就是最多浪费 63000 个 token 的空间
+- <strong>复用粒度变粗</strong>：共享 63 个 token 的前缀变成完全白共享（本章的阶梯变宽 4 倍）
+- 抢占时被换出的粒度也变粗</p>
+<p><strong>改大的场景</strong>：长序列、少并发、前缀共享少（比如长文档批量摘要）。
+此时碎片占比小，而元数据开销的节省是实打实的。</p>
+<p><strong>改小的场景</strong>：多轮对话、agent（前缀高度共享且长度零碎）、短请求高并发。</p>
+<p>顺带：这也解释了为什么 SGLang 的 radix tree 在 <code>page_size=1</code> 时最灵活——
+它可以做真正的 token 级复用，代价是树更深、遍历更慢。</p>
+</details>
+<details>
+<summary>4. 我的服务有 1000 个用户，每人一个 3000 token 的私有 system prompt，之后是短问题。前缀缓存能帮上忙吗？</summary>
+<p><strong>跨用户帮不上</strong>（每人的 system prompt 不同，没有公共前缀），
+<strong>同一用户的多次请求能帮上</strong>（第二次起 3000 token 全命中）。</p>
+<p>但有个容量问题：1000 × 3000 token × 114.69 KB = <strong>328 GB</strong> 的 KV，
+远超单卡 25 GB。所以缓存会不停被 LRU 淘汰，命中率取决于<strong>用户请求的时间局部性</strong>。</p>
+<p><strong>工程解法</strong>（都指向后面的章节）：
+1. <strong>会话亲和路由</strong>（<span class="xref pending" title="路由与网关（尚未写）">L8.1</span>）：把同一用户路由到同一台机器，让局部性变强。
+2. <strong>KV 分级存储</strong>（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>）：把冷的 3000-token 前缀卸到 DRAM/SSD，命中时拉回来。
+   拉回来的成本是 344 MB / PCIe 47.5 GB/s ≈ 7 ms，<strong>仍然远快于重算的 41 ms</strong>。
+   这就是 Mooncake 那条路线的经济学。
+3. <strong>重排 prompt</strong>：如果 system prompt 里有公共部分（比如统一的工具定义），
+   把它提到最前面，让 1000 个用户至少共享那一段。</p>
+<p>顺带：这道题也说明为什么 <code>vllm:external_prefix_cache_hits</code> 这个指标存在。</p>
+</details>
+<details>
+<summary>5. SGLang 的基数树在什么负载下明显赢过 vLLM 的哈希表？在什么负载下反而是负担？</summary>
+<p><strong>赢的场景 —— 前缀高度嵌套的树状结构</strong>：
+- 多轮对话：第 1 轮是第 2 轮的前缀，第 2 轮是第 3 轮的前缀……天然是一条链
+- agent 的分支探索：同一个上下文分叉出多条推理路径
+- few-shot 的不同组合：共享前 k 个示例</p>
+<p>这些场景下，树不仅能命中，还能让<strong>调度器按最长公共前缀选批</strong>（LPM），
+让共享同一子树的请求同批执行，KV 只读一次。哈希表方案给不出"这两个请求有多像"这个信息。</p>
+<p><strong>是负担的场景</strong>：
+- 前缀几乎不共享（每个请求独立的长文档）→ 树退化成一堆独立的链，
+  遍历开销和节点分裂纯属额外成本
+- 极高 QPS 的短请求 → 树遍历是指针追逐（cache 不友好），
+  而哈希表是 O(1) 且无对象分配</p>
+<p><strong>判断方法</strong>：先测你的负载的<strong>前缀共享率</strong>（可以用本章的 <code>prefix_cache_hits/queries</code>），
+再决定。这比读任何 benchmark 都可靠——因为 benchmark 用的是别人的负载。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.1-prefill-decode.html">&#8592; 5.1 prefill 与 decode 的系统性质</a><a class="nav-next" href="../L5/5.3-scheduling.html">5.3 调度：continuous batching 与 chunked prefill &#8594;</a></nav>
+</main>
+</body>
+</html>

@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.2 FlashAttention 1 → 2 → 3 → 4</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">3.2</div>
+  <div class="sidebar-title">FlashAttention 1 → 2 → 3 → 4</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#fa1">一 · FA1 之后还剩什么：三个可测的瓶颈</a><ul>
+<li><a href="#11-fa1-fa2">1.1 并行度不够（FA1 → FA2 的主要改动）</a></li>
+<li><a href="#12-mask">1.2 因果 mask 的收益没有拿满</a></li>
+<li><a href="#13-exp-fa4">1.3 exp 有多贵：FA4 的出发点</a></li>
+</ul>
+</li>
+<li><a href="#_2">二 · 四代各自解决什么</a><ul>
+<li><a href="#21-fa2">2.1 FA2 的循环顺序为什么要换</a></li>
+<li><a href="#22-fa4-13">2.2 FA4 与 §1.3 的联系</a></li>
+</ul>
+</li>
+<li><a href="#_3">三 · 广度：同一批形状上的几种实现</a></li>
+<li><a href="#_4">四 · 设计取舍</a><ul>
+<li><a href="#41">4.1 为什么四代都在改调度，而不是改算法</a></li>
+<li><a href="#42">4.2 一个可带走的判断</a></li>
+</ul>
+</li>
+<li><a href="#lab">五 · 动手 lab</a></li>
+<li><a href="#_5">六 · 陷阱</a></li>
+<li><a href="#_6">七 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L3 · Attention 与序列核心</div>
+  <div class="mod-id">3.2</div>
+  <h1>FlashAttention 1 → 2 → 3 → 4</h1>
+  <p class="lede">每一代针对的具体硬件矛盾，只讲能测的。实测：kernel 在 B·H=1 时已达峰值 46%，证明它沿序列切分（FA1→FA2 的核心改动）；标定后 SFU exp = 16/clk/SM 对 tensor core 511 FLOP/clk/SM，一次 exp 抵 31 次浮点运算（FA4 的动机）。FA3/FA4 在 sm_120 上有硬性 cc 门槛，跑不了，正文明确标注未验证部分。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · vLLM 0.29.0</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 3.1（分块与 online softmax）· 1.2（tensor core 世代）· 2.6（profiling）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>3.1 已经证明分块 attention 是精确的，而且能把算术强度从 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0002F;</mo><mn>3</mn></mrow></math></span> 提到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0002F;</mo><mn>2</mn></mrow></math></span>。
+既然第一代就解决了内存墙，为什么还要有第二、三、四代？</p>
+<ol>
+<li>FA1 之后还剩什么瓶颈？能不能量出来？</li>
+<li>每一代针对的是<strong>哪一个具体的硬件矛盾</strong>？</li>
+<li>这些代际差异在我这张卡上有多少是能验证的，多少不能？</li>
+</ol>
+<div class="admonition warning">
+<p class="admonition-title">本章的硬件边界要先讲清楚</p>
+<p><code>vllm_flash_attn</code> 自带的版本门（<code>flash_attn_interface.py:52-85</code>）直接给出了答案。
+在 crater（sm_120，compute capability 12.0）上实际查询：</p>
+<div class="highlight"><pre><span></span><code>本卡 sm_120  (compute capability 12.0)
+  FA2: True
+  FA3: False   FA3 is only supported on devices with compute capability 9.x
+  FA4: False   FA4 is only supported on devices with compute capability 9.x, 10.x, or 11.x
+</code></pre></div>
+
+<p><strong>FA3 是 Hopper 专有；FA4 覆盖 9.x/10.x/11.x，同样把消费级 Blackwell(12.0) 排除在外。</strong>
+所以本章能实测的只有 FA2 一代。FA3/FA4 的机制只作源码与文档层面的陈述，
+并明确标注哪些是我<strong>没有验证过</strong>的。</p>
+</div>
+<hr />
+<h2 id="fa1">一 · FA1 之后还剩什么：三个可测的瓶颈</h2>
+<h3 id="11-fa1-fa2">1.1 并行度不够（FA1 → FA2 的主要改动）</h3>
+<p>FA1 只沿 <strong>batch × head</strong> 切分：并行单元数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span>。
+这张卡有 170 个 SM，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x0003C;</mo><mn>170</mn></mrow></math></span> 时一部分 SM 无事可做，<strong>与序列多长无关</strong>。
+FA2 增加了沿<strong>查询块</strong>的切分，并行单元数变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x000B7;</mo><mi>&#x02308;</mi><mi>S</mi><mo>&#x0002F;</mo><msub><mi>B</mi><mi>q</mi></msub><mi>&#x02309;</mi></mrow></math></span>。</p>
+<p>判据很直接：固定 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span>，把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 从远小于 SM 数扫到远大于。
+如果只沿 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 切分，达到的 TFLOP/s 要到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x02248;</mo><mn>170</mn></mrow></math></span> 才饱和。</p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span>, <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>, bf16, causal：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">B·H</th>
+<th style="text-align: right;">占 SM 比例</th>
+<th style="text-align: right;">ms</th>
+<th style="text-align: right;">TFLOP/s</th>
+<th style="text-align: right;">相对峰值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0.01×</td>
+<td style="text-align: right;">0.040</td>
+<td style="text-align: right;"><strong>107.7</strong></td>
+<td style="text-align: right;"><strong>46.4%</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.01×</td>
+<td style="text-align: right;">0.066</td>
+<td style="text-align: right;">130.3</td>
+<td style="text-align: right;">56.1%</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">0.02×</td>
+<td style="text-align: right;">0.120</td>
+<td style="text-align: right;">142.9</td>
+<td style="text-align: right;">61.6%</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0.05×</td>
+<td style="text-align: right;">0.293</td>
+<td style="text-align: right;">117.1</td>
+<td style="text-align: right;">50.5%</td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">0.09×</td>
+<td style="text-align: right;">0.456</td>
+<td style="text-align: right;">150.7</td>
+<td style="text-align: right;">65.0%</td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">0.19×</td>
+<td style="text-align: right;">0.786</td>
+<td style="text-align: right;">174.9</td>
+<td style="text-align: right;">75.4%</td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">0.38×</td>
+<td style="text-align: right;">1.433</td>
+<td style="text-align: right;">191.8</td>
+<td style="text-align: right;">82.7%</td>
+</tr>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">0.75×</td>
+<td style="text-align: right;">2.732</td>
+<td style="text-align: right;">201.2</td>
+<td style="text-align: right;">86.7%</td>
+</tr>
+<tr>
+<td style="text-align: right;">170</td>
+<td style="text-align: right;">1.00×</td>
+<td style="text-align: right;">3.592</td>
+<td style="text-align: right;">203.3</td>
+<td style="text-align: right;">87.6%</td>
+</tr>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">3.01×</td>
+<td style="text-align: right;">10.607</td>
+<td style="text-align: right;">207.3</td>
+<td style="text-align: right;">89.4%</td>
+</tr>
+</tbody>
+</table>
+<p><strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span> 就已经跑到峰值的 46.4%。</strong> 如果并行度只来自 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span>，
+一个并行单元占 1/170 的 SM，应该在 0.6% 附近，不可能是 46%。
+所以 PyTorch 用的这个 kernel <strong>确实沿序列切分了</strong>——它是 FA2 之后的形态。</p>
+<p>固定总工作量、把并行度在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 之间挪动，也能看到同一件事：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">B·H</th>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">总 FLOP(G)</th>
+<th style="text-align: right;">ms</th>
+<th style="text-align: right;">TFLOP/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">16384</td>
+<td style="text-align: right;">274.9</td>
+<td style="text-align: right;">1.755</td>
+<td style="text-align: right;">156.6</td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">274.9</td>
+<td style="text-align: right;">1.533</td>
+<td style="text-align: right;">179.3</td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">274.9</td>
+<td style="text-align: right;">1.437</td>
+<td style="text-align: right;">191.2</td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">274.9</td>
+<td style="text-align: right;">1.438</td>
+<td style="text-align: right;">191.1</td>
+</tr>
+</tbody>
+</table>
+<p>同样的 FLOP，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 从 256 降到 4 只慢 1.22×。
+只沿 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 切分的实现在这里会慢几十倍。</p>
+<div class="admonition note">
+<p class="admonition-title">一个我没解释的非单调</p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>8</mn></mrow></math></span> 那一行（117.1）比 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>4</mn></mrow></math></span>（142.9）<strong>更慢</strong>，
+打断了整体的上升趋势。这不是笔误，重跑仍在。
+最可能是 wave quantization（2.6 里量过：1020→1021 个 block 慢 16%），
+但我没有验证。判据：用 ncu 读 <code>sm__warps_active</code> 的分布，
+或者用 2.6 那个 <code>%smid</code> 自制 profiler 看 block 到 SM 的分配。
+在验证之前，<strong>不要用这一行说明任何事</strong>。</p>
+</div>
+<h3 id="12-mask">1.2 因果 mask 的收益没有拿满</h3>
+<p>因果 attention 只需算下三角，理想省一半。块粒度下有个可算的损失：
+设 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi><mo>&#x0003D;</mo><mi>S</mi><mo>&#x0002F;</mo><msub><mi>B</mi><mi>k</mi></msub></mrow></math></span> 个 key 块，query 块 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi></mrow></math></span> 要算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span> 个 key 块，于是</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><mtext>因果块数</mtext></mrow><mrow><mtext>非因果块数</mtext></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><mi>N</mi><mo stretchy="false">&#x00028;</mo><mi>N</mi><mo>&#x0002B;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo><mo>&#x0002F;</mo><mn>2</mn></mrow><mrow><msup><mi>N</mi><mn>2</mn></msup></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><mn>1</mn></mrow><mrow><mn>2</mn></mrow></mfrac><mo>&#x0002B;</mo><mfrac><mrow><mn>1</mn></mrow><mrow><mn>2</mn><mi>N</mi></mrow></mfrac></mrow></math></div></p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 越大，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><mo stretchy="false">&#x00028;</mo><mn>2</mn><mi>N</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 越可以忽略。实测（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>，假设 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>B</mi><mi>k</mi></msub><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">非因果 ms</th>
+<th style="text-align: right;">因果 ms</th>
+<th style="text-align: right;">实测比</th>
+<th style="text-align: right;">块粒度预测</th>
+<th style="text-align: right;">差额</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">0.060</td>
+<td style="text-align: right;">0.046</td>
+<td style="text-align: right;">0.760</td>
+<td style="text-align: right;">0.625</td>
+<td style="text-align: right;">+0.135</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">0.113</td>
+<td style="text-align: right;">0.084</td>
+<td style="text-align: right;">0.746</td>
+<td style="text-align: right;">0.562</td>
+<td style="text-align: right;">+0.183</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">0.215</td>
+<td style="text-align: right;">0.154</td>
+<td style="text-align: right;">0.714</td>
+<td style="text-align: right;">0.531</td>
+<td style="text-align: right;">+0.183</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">0.420</td>
+<td style="text-align: right;">0.294</td>
+<td style="text-align: right;">0.699</td>
+<td style="text-align: right;">0.516</td>
+<td style="text-align: right;">+0.183</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">0.832</td>
+<td style="text-align: right;">0.572</td>
+<td style="text-align: right;">0.688</td>
+<td style="text-align: right;">0.508</td>
+<td style="text-align: right;">+0.180</td>
+</tr>
+<tr>
+<td style="text-align: right;">16384</td>
+<td style="text-align: right;">1.661</td>
+<td style="text-align: right;">1.101</td>
+<td style="text-align: right;">0.663</td>
+<td style="text-align: right;">0.504</td>
+<td style="text-align: right;"><strong>+0.159</strong></td>
+</tr>
+</tbody>
+</table>
+<p>实测比一路下降，方向和预测一致——说明<strong>整块在未来的块确实被跳过了</strong>。
+但差额没有收敛到 0：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>16384</mn></mrow></math></span> 时块粒度只该贡献 0.004，实测仍高出 0.16。</p>
+<p><strong>所以还有别的原因，而我没有验证它是什么。</strong> 最可能的是负载不均：
+因果下 query 块 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi></mrow></math></span> 的工作量正比于 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span>，最后一个块是第一个块的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 倍。
+如果块按简单顺序分给 SM，整个 kernel 要等最重的那几个块结束。
+（这也正是后续代际反复调整调度的原因之一。）</p>
+<p>差额在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>1024</mn><mo>&#x0002E;</mo><mi>.8192</mi></mrow></math></span> 上稳定在 <strong>+0.18</strong>，几乎不随 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 变——
+这种"常数偏移"的形状本身就提示是结构性原因而不是噪声。</p>
+<p>判据：用 2.6 那个 <code>%smid</code> + <code>%globaltimer</code> 的自制 profiler 记录每个 block 的起止，
+看尾部是否被少数重块拖住。<strong>在做这件事之前，上面那段只是假设。</strong></p>
+<h3 id="13-exp-fa4">1.3 exp 有多贵：FA4 的出发点</h3>
+<p>FA1 把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 从 DRAM 里赶走之后，attention 就落到算力一侧了（3.1 实测 85% 峰值）。
+那么下一个问题是：算力这一侧，<strong>softmax 和矩阵乘各占多少</strong>？</p>
+<p>矩阵乘走 tensor core，softmax 的 <code>exp</code> 走 SFU（特殊功能单元）。
+这两条流水的宽度完全不同。用 1.2 的同一套方法测（8 条独立链，测吞吐不是延迟）：</p>
+<div class="highlight"><pre><span></span><code>运算                         G op/s 每 SM 每周期     相对 FMA
+--------------------------------------------------------------------
+__expf  (SFU 快速)           7334.4            17.92         0.129×
+exp2f   (SFU 原生)           7441.6            18.19         0.131×
+expf    (精确)               5799.1            14.17         0.102×
+__frcp_rn (SFU)                2836.8             6.93         0.050×
+FMA     (普通流水)        56918.7           139.10         1.000×
+</code></pre></div>
+
+<p>FMA 测出 139.10/clk/SM，而 FP32 FMA 的硬件发射率是确定的
+（每 SM 128 条 FP32 lane，即 128/clk/SM）。用它反标定真实频率：</p>
+<div class="highlight"><pre><span></span><code>标定：FMA 实测 139.10/clk/SM，硬件确定值 128/clk/SM
+      =&gt; 被测区间真实频率约 2.62 GHz（标称 2.41 GHz）
+
+运算                 标定后 每 SM 每周期
+--------------------------------------------
+__expf  (SFU 快速)                  16.49
+exp2f   (SFU 原生)                  16.73
+expf    (精确)                      13.04
+__frcp_rn (SFU)                        6.38
+FMA     (普通流水)               128.00
+</code></pre></div>
+
+<p>标定之后 <code>__expf</code> 与 <code>exp2f</code> 都落在 <strong>16/clk/SM</strong>——正是 SFU 的硬件宽度
+（每个处理分区 4 个 SFU × 4 个分区）。这个自洽性说明标定是对的。</p>
+<div class="admonition note">
+<p class="admonition-title">这个标定方法本身值得记</p>
+<p>标称 boost 时钟（2.41 GHz）不等于被测区间的真实频率（2.62 GHz）——
+1.2 踩过这个坑的反面（那次是测得太低）。
+<strong>用一个硬件发射率已知的运算当尺子反标定时钟</strong>，比信任标称值可靠得多。
+判据是标定之后别的量应该落到整数上：这里 16.49 和 16.73 都指向 16。</p>
+</div>
+<p>对照 1.2 在同一张卡上实测的 bf16 tensor core <strong>511 FLOP/clk/SM</strong>（标称 512）：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><mn>511</mn></mrow><mrow><mn>16</mn></mrow></mfrac><mo>&#x02248;</mo><mn>31</mn></mrow></math></div></p>
+<p><strong>一次 <code>exp</code> 的时间里，tensor core 能做约 31 次浮点运算。</strong></p>
+<p>每个打分元素 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo stretchy="false">[</mo><mi>i</mi><mo>&#x0002C;</mo><mi>j</mi><mo stretchy="false">]</mo></mrow></math></span> 需要：矩阵乘一侧 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4</mn><mi>D</mi></mrow></math></span> 次浮点运算（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></math></span> 贡献 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>D</mi></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mi>V</mi></mrow></math></span> 贡献 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>D</mi></mrow></math></span>），
+softmax 一侧 1 次 <code>exp</code>（还有 max/加/乘若干，这里只算 <code>exp</code>，是下界）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">D</th>
+<th style="text-align: right;">矩阵乘 (clk)</th>
+<th style="text-align: right;">exp (clk)</th>
+<th style="text-align: right;">exp 占比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">0.2505</td>
+<td style="text-align: right;">0.0606</td>
+<td style="text-align: right;"><strong>24.2%</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">0.5010</td>
+<td style="text-align: right;">0.0606</td>
+<td style="text-align: right;">12.1%</td>
+</tr>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">1.0020</td>
+<td style="text-align: right;">0.0606</td>
+<td style="text-align: right;">6.1%</td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">2.0039</td>
+<td style="text-align: right;">0.0606</td>
+<td style="text-align: right;">3.0%</td>
+</tr>
+</tbody>
+</table>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>（最常见）时 <code>exp</code> 只占 6.1%，看起来不多。
+但注意两件事：</p>
+<ol>
+<li>这是<strong>下界</strong>——只算了 <code>exp</code>，没算 max、求和、修正因子、除法。</li>
+<li>这个比值会随硬件代际<strong>变差</strong>：tensor core 每代大幅加宽，SFU 基本不变。</li>
+</ol>
+<div class="admonition warning">
+<p class="admonition-title">第 2 条我只在一张卡上测了一个点</p>
+<p>"tensor core 变宽而 SFU 不变"是一个我<strong>没有跨代验证</strong>的趋势。
+要证实它，需要在至少两代卡上跑同一个 <code>exp_throughput.cu</code>，
+比较 (tensor core FLOP/clk/SM) / (SFU exp/clk/SM) 这个比值。
+手上 worldvln 是 sm_89、spark 是 sm_121，可以补两个点。
+<strong>在补上之前，本章只断言 sm_120 上的 31 这个数。</strong></p>
+</div>
+<hr />
+<h2 id="_2">二 · 四代各自解决什么</h2>
+<p>把上面三个可测的瓶颈和各代的改动对上。<strong>带 ✅ 的是我实测过的，
+带 ⚪ 的是我读源码/文档得到、但在这张卡上无法验证的。</strong></p>
+<table>
+<thead>
+<tr>
+<th>代</th>
+<th>针对的矛盾</th>
+<th>主要手段</th>
+<th>本章证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>FA1</strong></td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 过 DRAM，算术强度被钉在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0002F;</mo><mn>3</mn></mrow></math></span></td>
+<td>分块 + online softmax + 反向重算</td>
+<td>✅ 3.1 全章</td>
+</tr>
+<tr>
+<td><strong>FA2</strong></td>
+<td>① 并行度只有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span>；② 非矩阵乘运算太多；③ warp 间共享内存往返</td>
+<td>增加序列维切分；调换内外循环（Q 在外）；减少 rescale 次数</td>
+<td>✅ 并行度（1.1 节）；⚪ 后两项</td>
+</tr>
+<tr>
+<td><strong>FA3</strong></td>
+<td>Hopper 的异步能力闲置：TMA、wgmma、warp specialization</td>
+<td>生产者/消费者 warp 分工、ping-pong 调度、FP8</td>
+<td>⚪ <strong>本卡不支持（cc 必须 9.x）</strong></td>
+</tr>
+<tr>
+<td><strong>FA4</strong></td>
+<td>tensor core 与 SFU 的宽度差越拉越大</td>
+<td>用矩阵乘流水去仿真 <code>exp</code>、更细的软件流水</td>
+<td>⚪ 本卡不支持（cc 需 9.x/10.x/11.x）；但 §1.3 的 31× 是它的动机</td>
+</tr>
+</tbody>
+</table>
+<h3 id="21-fa2">2.1 FA2 的循环顺序为什么要换</h3>
+<p>FA1 外层遍历 K/V 块、内层遍历 Q 块；FA2 反过来。
+3.1 里我写的 <code>flash_like</code> 用的就是 FA2 的顺序：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">190</span>    <span class="k">def</span><span class="w"> </span><span class="nf">flash_like</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">block</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+<span class="linenos">191</span><span class="w">        </span><span class="sd">"""分块 attention。Q/K/V: [B, H, S, D]。只用基本张量运算。"""</span>
+<span class="linenos">192</span>        <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="n">Q</span><span class="o">.</span><span class="n">shape</span>
+<span class="linenos">193</span>        <span class="n">scale</span> <span class="o">=</span> <span class="n">D</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
+<span class="linenos">194</span>        <span class="n">O</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">Q</span><span class="p">)</span>
+<span class="linenos">195</span>        <span class="c1"># 外层遍历 Q 的块（FA2 的顺序），内层遍历 K/V 的块</span>
+<span class="linenos">196</span>        <span class="k">for</span> <span class="n">q0</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">block</span><span class="p">):</span>
+<span class="linenos">197</span>            <span class="n">q1</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">q0</span> <span class="o">+</span> <span class="n">block</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+<span class="linenos">198</span>            <span class="n">Qb</span> <span class="o">=</span> <span class="n">Q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">q0</span><span class="p">:</span><span class="n">q1</span><span class="p">]</span>                          <span class="c1"># [B,H,bq,D]</span>
+<span class="linenos">199</span>            <span class="n">m</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">q1</span> <span class="o">-</span> <span class="n">q0</span><span class="p">),</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+<span class="linenos">200</span>                           <span class="n">dtype</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L3/online_softmax.py 第 190–200 行</code><a href="../code/labs/L3/online_softmax.py.html#labs-L3-online_softmax-py-L-190">在完整文件中打开 &rarr;</a></div></div>
+<p>差别在<strong>谁需要在外层维护状态</strong>：</p>
+<ul>
+<li><strong>Q 在外</strong>（FA2）：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span> 累加器都属于当前 Q 块，
+  在内层循环里一直待在寄存器/共享内存里，最后写一次 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span>。</li>
+<li><strong>K/V 在外</strong>（FA1）：每个 K/V 块要对<strong>所有</strong> Q 块更新一次 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi><mo>&#x0002C;</mo><mi>l</mi><mo>&#x0002C;</mo><mi>O</mi></mrow></math></span>，
+  这些状态没法一直留在片上，要反复读写。</li>
+</ul>
+<p>所以换方向之后，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span> 的读写次数从 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msub><mi>N</mi><mi>q</mi></msub><msub><mi>N</mi><mi>k</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></math></span> 降到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msub><mi>N</mi><mi>q</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></math></span>。
+这是 FA2 论文里"减少非矩阵乘运算与共享内存往返"的具体含义。</p>
+<p><strong>我没有实测这一条</strong>——要测需要两个真实 kernel 的对照，
+而我手上只有 FA2 之后的实现。3.1 的消融建议 4 让你在 python 版本上
+把方向换过来，那能验证"结果不变"，但验证不了访存差异
+（python 版本的中间量本来就在显存里）。</p>
+<h3 id="22-fa4-13">2.2 FA4 与 §1.3 的联系</h3>
+<p>FA4 的一个公开做法是<strong>用矩阵乘流水去仿真指数函数</strong>——
+既然 tensor core 有 31 倍于 SFU 的吞吐，把一部分 <code>exp</code> 的工作挪到
+tensor core 上做，即使算法上更绕，总时间也可能更短。</p>
+<p>§1.3 那个 31 就是这个取舍的分母。<strong>这是我能给出的、支持 FA4 动机的直接证据</strong>，
+但 FA4 本身在这张卡上跑不了，它的实际收益我没有测过。</p>
+<hr />
+<h2 id="_3">三 · 广度：同一批形状上的几种实现</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">B·H</th>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">SDPA-FLASH</th>
+<th style="text-align: right;">SDPA-CUDNN</th>
+<th style="text-align: right;">SDPA-EFF</th>
+<th style="text-align: right;">FlashInfer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">0.295</td>
+<td style="text-align: right;">0.274</td>
+<td style="text-align: right;">0.530</td>
+<td style="text-align: right;">0.410</td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">0.238</td>
+<td style="text-align: right;">0.223</td>
+<td style="text-align: right;">0.471</td>
+<td style="text-align: right;">0.267</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">0.571</td>
+<td style="text-align: right;">0.534</td>
+<td style="text-align: right;">1.035</td>
+<td style="text-align: right;">0.707</td>
+</tr>
+</tbody>
+</table>
+<p>三条能说的：</p>
+<ul>
+<li><strong>EFFICIENT 后端稳定慢约 1.8×</strong>，三个形状一致。它是 xformers 血统的
+  memory-efficient attention，不是 FlashAttention。</li>
+<li><strong>CUDNN 稳定略快于 FLASH（3–7%）</strong>，但这个差距在单次测量下不构成结论（见 <span class="xref pending" title="可信性能测量（尚未写）">M2</span>）。</li>
+<li><strong>FlashInfer 在这组单请求 prefill 形状上不占优。</strong> 这不意外——
+  FlashInfer 的设计目标是<strong>服务端的变长批与分页 KV</strong>（3.3 的主题），
+  单条定长 prefill 不是它的主场。用这张表说"FlashInfer 慢"是误用。</li>
+</ul>
+<hr />
+<h2 id="_4">四 · 设计取舍</h2>
+<h3 id="41">4.1 为什么四代都在改调度，而不是改算法</h3>
+<p>FA1 之后，算法本身（分块 + online softmax）<strong>没有再变过</strong>。
+FA2/3/4 改的全是：怎么切分、谁在外层、哪些 warp 干什么、
+用哪条流水做哪一步。</p>
+<p>原因在 3.1 §7.1 已经埋下：分块之所以能被普遍采用，
+是因为它<strong>结果不变</strong>。任何一代只要还保持这个性质，
+就可以直接替换掉上一代，不需要任何人重新评估质量。
+一旦某一代改了数值语义，它就要重新走一遍"证明质量"的流程。</p>
+<p><strong>代价是每一代都强绑定硬件。</strong> 本章开头那个版本门就是账单：
+FA3 只能跑在 cc 9.x，FA4 排除了 12.0。
+上层框架因此必须维护一个"按硬件选实现"的分发层——
+2.0 §3 的 dispatcher、0.3 的后端选择、3.3 会讲的 vLLM attention backend，
+都是这一层的不同侧面。</p>
+<h3 id="42">4.2 一个可带走的判断</h3>
+<p>FA 的演进史给出了一条可复用的判据：<strong>当算法已经把某个资源用满之后，
+下一步的收益来自把"闲着的那部分硬件"用起来，而不是继续优化那个已经用满的资源。</strong></p>
+<ul>
+<li>FA1 用满了片上存储 → 但 SM 有一半闲着（并行度不够）→ FA2</li>
+<li>FA2 用满了 SM → 但 Hopper 的异步单元闲着 → FA3</li>
+<li>FA3 用满了 tensor core → 但 SFU 成了新瓶颈（§1.3 的 31×）→ FA4</li>
+</ul>
+<p>每一步都要先<strong>量出哪个部件闲着</strong>。这正是 2.6 那一整章的方法：
+先有计数器，再谈优化。没有测量的"我觉得这里可以优化"，
+在这条链上一次都没有出现过。</p>
+<hr />
+<h2 id="lab">五 · 动手 lab</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># exp 与 tensor core 的宽度差（需要 nvcc）</span>
+ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L3 &amp;&amp; nvcc -O3 -arch=sm_120 exp_throughput.cu -o /tmp/exp_tp &amp;&amp; /tmp/exp_tp'</span>
+
+<span class="c1"># 并行度、因果收益、后端对照</span>
+ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L3 &amp;&amp; /scratch/learn/envs/serve/bin/python fa_generations.py'</span>
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/attn/32_exp_throughput.txt</code>（36 行）、
+<code>results/crater/attn/32_fa_generations.txt</code>（72 行）。</p>
+<details class="fold srcfold"><summary>labs/L3/exp_throughput.cu 全文（142 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="c1">// L3.2 —— softmax 里的 exp 到底有多贵。</span>
+<span class="linenos">  2</span><span class="c1">//</span>
+<span class="linenos">  3</span><span class="c1">// FlashAttention 每一代的取舍，最后都绕回一个比值：</span>
+<span class="linenos">  4</span><span class="c1">// **一次 exp 的时间里，tensor core 能做多少次乘加。**</span>
+<span class="linenos">  5</span><span class="c1">// L1.2 已经测出 bf16 tensor core 的纯发射率（crater: 511 FLOP/clk/SM）。</span>
+<span class="linenos">  6</span><span class="c1">// 这里用同样的方法测 exp 一侧：SFU（特殊功能单元）的发射率。</span>
+<span class="linenos">  7</span><span class="c1">//</span>
+<span class="linenos">  8</span><span class="c1">// 测的是**吞吐**不是延迟，所以每个线程维护 8 条互不依赖的链</span>
+<span class="linenos">  9</span><span class="c1">// （L1.1 踩坑 #11：用依赖链测吞吐会测成延迟）。</span>
+<span class="linenos"> 10</span><span class="c1">//</span>
+<span class="linenos"> 11</span><span class="c1">// 编译：</span>
+<span class="linenos"> 12</span><span class="c1">//   nvcc -O3 -arch=sm_120 exp_throughput.cu -o exp_throughput</span>
+<span class="linenos"> 13</span><span class="c1">// 运行：</span>
+<span class="linenos"> 14</span><span class="c1">//   ./exp_throughput</span>
+<span class="linenos"> 15</span>
+<span class="linenos"> 16</span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstdio&gt;</span>
+<span class="linenos"> 17</span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cuda_runtime.h&gt;</span>
+<span class="linenos"> 18</span>
+<span class="linenos"> 19</span><span class="cp">#define CHECK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \</span>
+<span class="linenos"> 20</span><span class="cp">    printf("CUDA error %s at %d\n", cudaGetErrorString(e), __LINE__); \</span>
+<span class="linenos"> 21</span><span class="cp">    return 1; } } while (0)</span>
+<span class="linenos"> 22</span>
+<span class="linenos"> 23</span><span class="cp">#define CHAINS 8</span>
+<span class="linenos"> 24</span>
+<span class="linenos"> 25</span><span class="c1">// 每种「运算」一个 kernel，主体结构完全一样，只换中间那一行。</span>
+<span class="linenos"> 26</span><span class="cp">#define MAKE_KERNEL(NAME, OP)                                            \</span>
+<span class="linenos"> 27</span><span class="cp">__global__ void NAME(int iters, float* sink) {                           \</span>
+<span class="linenos"> 28</span><span class="cp">    float a[CHAINS];                                                     \</span>
+<span class="linenos"> 29</span><span class="cp">    for (int c = 0; c &lt; CHAINS; ++c)                                     \</span>
+<span class="linenos"> 30</span><span class="cp">        a[c] = 0.001f * (threadIdx.x + c + 1);                           \</span>
+<span class="linenos"> 31</span><span class="cp">    for (int i = 0; i &lt; iters; ++i) {                                    \</span>
+<span class="linenos"> 32</span><span class="cp">        _Pragma("unroll")                                                \</span>
+<span class="linenos"> 33</span><span class="cp">        for (int c = 0; c &lt; CHAINS; ++c) a[c] = OP;                      \</span>
+<span class="linenos"> 34</span><span class="cp">    }                                                                    \</span>
+<span class="linenos"> 35</span><span class="cp">    float s = 0.f;                                                       \</span>
+<span class="linenos"> 36</span><span class="cp">    for (int c = 0; c &lt; CHAINS; ++c) s += a[c];                          \</span>
+<span class="linenos"> 37</span><span class="cp">    if (s == 1234.5678f) sink[0] = s;   </span><span class="cm">/* 防止被优化掉，但几乎不会执行 */</span><span class="cp"> \</span>
+<span class="linenos"> 38</span><span class="cp">}</span>
+<span class="linenos"> 39</span>
+<span class="linenos"> 40</span><span class="c1">// __expf: 走 SFU 的快速版本（PTX 里是 ex2.approx.f32 + 一次乘）</span>
+<span class="linenos"> 41</span><span class="n">MAKE_KERNEL</span><span class="p">(</span><span class="n">k_fast_exp</span><span class="p">,</span><span class="w">  </span><span class="n">__expf</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="n">c</span><span class="p">])</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">0.5f</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mf">0.001f</span><span class="p">)</span>
+<span class="linenos"> 42</span><span class="c1">// expf: 精确版本，走软件展开</span>
+<span class="linenos"> 43</span><span class="n">MAKE_KERNEL</span><span class="p">(</span><span class="n">k_exact_exp</span><span class="p">,</span><span class="w"> </span><span class="n">expf</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="n">c</span><span class="p">])</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">0.5f</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mf">0.001f</span><span class="p">)</span>
+<span class="linenos"> 44</span><span class="c1">// exp2f: 底为 2，SFU 原生指令，少一次乘</span>
+<span class="linenos"> 45</span><span class="n">MAKE_KERNEL</span><span class="p">(</span><span class="n">k_exp2</span><span class="p">,</span><span class="w">      </span><span class="n">exp2f</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="n">c</span><span class="p">])</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">0.5f</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mf">0.001f</span><span class="p">)</span>
+<span class="linenos"> 46</span><span class="c1">// 参照：纯 FMA，走普通 FP32 流水</span>
+<span class="linenos"> 47</span><span class="n">MAKE_KERNEL</span><span class="p">(</span><span class="n">k_fma</span><span class="p">,</span><span class="w">       </span><span class="n">a</span><span class="p">[</span><span class="n">c</span><span class="p">]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1.0001f</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mf">0.001f</span><span class="p">)</span>
+<span class="linenos"> 48</span><span class="c1">// 参照：rcp（也走 SFU），用来确认 SFU 这条路的宽度</span>
+<span class="linenos"> 49</span><span class="n">MAKE_KERNEL</span><span class="p">(</span><span class="n">k_rcp</span><span class="p">,</span><span class="w">       </span><span class="n">__frcp_rn</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="n">c</span><span class="p">])</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">0.5f</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mf">0.001f</span><span class="p">)</span>
+<span class="linenos"> 50</span>
+<span class="linenos"> 51</span><span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">K</span><span class="o">&gt;</span>
+<span class="linenos"> 52</span><span class="k">static</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">measure</span><span class="p">(</span><span class="n">K</span><span class="w"> </span><span class="n">kernel</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">sm_count</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">iters</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">blocks_per_sm</span><span class="p">,</span>
+<span class="linenos"> 53</span><span class="w">                      </span><span class="kt">int</span><span class="w"> </span><span class="n">threads</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 54</span><span class="w">    </span><span class="kt">float</span><span class="o">*</span><span class="w"> </span><span class="n">d_sink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">nullptr</span><span class="p">;</span>
+<span class="linenos"> 55</span><span class="w">    </span><span class="n">cudaMalloc</span><span class="p">(</span><span class="o">&amp;</span><span class="n">d_sink</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">float</span><span class="p">));</span>
+<span class="linenos"> 56</span><span class="w">    </span><span class="kt">dim3</span><span class="w"> </span><span class="nf">grid</span><span class="p">(</span><span class="n">sm_count</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">blocks_per_sm</span><span class="p">),</span><span class="w"> </span><span class="n">block</span><span class="p">(</span><span class="n">threads</span><span class="p">);</span>
+<span class="linenos"> 57</span><span class="w">    </span><span class="n">kernel</span><span class="o">&lt;&lt;&lt;</span><span class="n">grid</span><span class="p">,</span><span class="w"> </span><span class="n">block</span><span class="o">&gt;&gt;&gt;</span><span class="p">(</span><span class="n">iters</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">10</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">d_sink</span><span class="p">);</span><span class="w">     </span><span class="c1">// 预热</span>
+<span class="linenos"> 58</span><span class="w">    </span><span class="n">cudaDeviceSynchronize</span><span class="p">();</span>
+<span class="linenos"> 59</span>
+<span class="linenos"> 60</span><span class="w">    </span><span class="n">cudaEvent_t</span><span class="w"> </span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">;</span>
+<span class="linenos"> 61</span><span class="w">    </span><span class="n">cudaEventCreate</span><span class="p">(</span><span class="o">&amp;</span><span class="n">a</span><span class="p">);</span><span class="w"> </span><span class="n">cudaEventCreate</span><span class="p">(</span><span class="o">&amp;</span><span class="n">b</span><span class="p">);</span>
+<span class="linenos"> 62</span><span class="w">    </span><span class="n">cudaEventRecord</span><span class="p">(</span><span class="n">a</span><span class="p">);</span>
+<span class="linenos"> 63</span><span class="w">    </span><span class="n">kernel</span><span class="o">&lt;&lt;&lt;</span><span class="n">grid</span><span class="p">,</span><span class="w"> </span><span class="n">block</span><span class="o">&gt;&gt;&gt;</span><span class="p">(</span><span class="n">iters</span><span class="p">,</span><span class="w"> </span><span class="n">d_sink</span><span class="p">);</span>
+<span class="linenos"> 64</span><span class="w">    </span><span class="n">cudaEventRecord</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+<span class="linenos"> 65</span><span class="w">    </span><span class="n">cudaDeviceSynchronize</span><span class="p">();</span>
+<span class="linenos"> 66</span><span class="w">    </span><span class="kt">float</span><span class="w"> </span><span class="n">ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.f</span><span class="p">;</span><span class="w"> </span><span class="n">cudaEventElapsedTime</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ms</span><span class="p">,</span><span class="w"> </span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">);</span>
+<span class="linenos"> 67</span><span class="w">    </span><span class="n">cudaFree</span><span class="p">(</span><span class="n">d_sink</span><span class="p">);</span>
+<span class="linenos"> 68</span><span class="w">    </span><span class="n">cudaEventDestroy</span><span class="p">(</span><span class="n">a</span><span class="p">);</span><span class="w"> </span><span class="n">cudaEventDestroy</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+<span class="linenos"> 69</span>
+<span class="linenos"> 70</span><span class="w">    </span><span class="c1">// 总运算次数 = 线程数 × iters × CHAINS</span>
+<span class="linenos"> 71</span><span class="w">    </span><span class="kt">double</span><span class="w"> </span><span class="n">ops</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)</span><span class="n">grid</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">threads</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">iters</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">CHAINS</span><span class="p">;</span>
+<span class="linenos"> 72</span><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">ops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">ms</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e-3</span><span class="p">);</span><span class="w">                            </span><span class="c1">// ops/s</span>
+<span class="linenos"> 73</span><span class="p">}</span>
+<span class="linenos"> 74</span>
+<span class="linenos"> 75</span><span class="kt">int</span><span class="w"> </span><span class="n">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 76</span><span class="w">    </span><span class="n">cudaDeviceProp</span><span class="w"> </span><span class="n">p</span><span class="p">;</span>
+<span class="linenos"> 77</span><span class="w">    </span><span class="n">CHECK</span><span class="p">(</span><span class="n">cudaGetDeviceProperties</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">));</span>
+<span class="linenos"> 78</span><span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">sm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">p</span><span class="p">.</span><span class="n">multiProcessorCount</span><span class="p">;</span>
+<span class="linenos"> 79</span><span class="w">    </span><span class="c1">// CUDA 13 起 cudaDeviceProp 不再有 clockRate，改用属性查询。</span>
+<span class="linenos"> 80</span><span class="w">    </span><span class="c1">// 这是标称 boost 时钟，不是被测区间的真实频率（L1.2 踩坑 #12）。</span>
+<span class="linenos"> 81</span><span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">clock_khz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="linenos"> 82</span><span class="w">    </span><span class="n">CHECK</span><span class="p">(</span><span class="n">cudaDeviceGetAttribute</span><span class="p">(</span><span class="o">&amp;</span><span class="n">clock_khz</span><span class="p">,</span><span class="w"> </span><span class="n">cudaDevAttrClockRate</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">));</span>
+<span class="linenos"> 83</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"GPU: %s  sm_%d%d  SM 数 %d  标称时钟 %.2f GHz</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+<span class="linenos"> 84</span><span class="w">           </span><span class="n">p</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">p</span><span class="p">.</span><span class="n">major</span><span class="p">,</span><span class="w"> </span><span class="n">p</span><span class="p">.</span><span class="n">minor</span><span class="p">,</span><span class="w"> </span><span class="n">sm</span><span class="p">,</span><span class="w"> </span><span class="n">clock_khz</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="p">);</span>
+<span class="linenos"> 85</span>
+<span class="linenos"> 86</span><span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">iters</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">20000</span><span class="p">,</span><span class="w"> </span><span class="n">threads</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span><span class="w"> </span><span class="n">bps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="linenos"> 87</span><span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">name</span><span class="p">;</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">ops</span><span class="p">;</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="n">r</span><span class="p">[</span><span class="mi">5</span><span class="p">];</span>
+<span class="linenos"> 88</span><span class="w">    </span><span class="n">r</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">"__expf  (SFU 快速)"</span><span class="p">,</span><span class="w"> </span><span class="n">measure</span><span class="p">(</span><span class="n">k_fast_exp</span><span class="p">,</span><span class="w">  </span><span class="n">sm</span><span class="p">,</span><span class="w"> </span><span class="n">iters</span><span class="p">,</span><span class="w"> </span><span class="n">bps</span><span class="p">,</span><span class="w"> </span><span class="n">threads</span><span class="p">)};</span>
+<span class="linenos"> 89</span><span class="w">    </span><span class="n">r</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">"exp2f   (SFU 原生)"</span><span class="p">,</span><span class="w"> </span><span class="n">measure</span><span class="p">(</span><span class="n">k_exp2</span><span class="p">,</span><span class="w">      </span><span class="n">sm</span><span class="p">,</span><span class="w"> </span><span class="n">iters</span><span class="p">,</span><span class="w"> </span><span class="n">bps</span><span class="p">,</span><span class="w"> </span><span class="n">threads</span><span class="p">)};</span>
+<span class="linenos"> 90</span><span class="w">    </span><span class="n">r</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">"expf    (精确)"</span><span class="p">,</span><span class="w">     </span><span class="n">measure</span><span class="p">(</span><span class="n">k_exact_exp</span><span class="p">,</span><span class="w"> </span><span class="n">sm</span><span class="p">,</span><span class="w"> </span><span class="n">iters</span><span class="p">,</span><span class="w"> </span><span class="n">bps</span><span class="p">,</span><span class="w"> </span><span class="n">threads</span><span class="p">)};</span>
+<span class="linenos"> 91</span><span class="w">    </span><span class="n">r</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">"__frcp_rn (SFU)"</span><span class="p">,</span><span class="w">    </span><span class="n">measure</span><span class="p">(</span><span class="n">k_rcp</span><span class="p">,</span><span class="w">       </span><span class="n">sm</span><span class="p">,</span><span class="w"> </span><span class="n">iters</span><span class="p">,</span><span class="w"> </span><span class="n">bps</span><span class="p">,</span><span class="w"> </span><span class="n">threads</span><span class="p">)};</span>
+<span class="linenos"> 92</span><span class="w">    </span><span class="n">r</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">"FMA     (普通流水)"</span><span class="p">,</span><span class="w"> </span><span class="n">measure</span><span class="p">(</span><span class="n">k_fma</span><span class="p">,</span><span class="w">       </span><span class="n">sm</span><span class="p">,</span><span class="w"> </span><span class="n">iters</span><span class="p">,</span><span class="w"> </span><span class="n">bps</span><span class="p">,</span><span class="w"> </span><span class="n">threads</span><span class="p">)};</span>
+<span class="linenos"> 93</span>
+<span class="linenos"> 94</span><span class="w">    </span><span class="kt">double</span><span class="w"> </span><span class="n">ghz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">clock_khz</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="p">;</span>
+<span class="linenos"> 95</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\n</span><span class="s">%-22s %14s %16s %14s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="s">"运算"</span><span class="p">,</span><span class="w"> </span><span class="s">"G op/s"</span><span class="p">,</span><span class="w"> </span><span class="s">"每 SM 每周期"</span><span class="p">,</span><span class="w"> </span><span class="s">"相对 FMA"</span><span class="p">);</span>
+<span class="linenos"> 96</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"%s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="s">"--------------------------------------------------------------------"</span><span class="p">);</span>
+<span class="linenos"> 97</span><span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 98</span><span class="w">        </span><span class="kt">double</span><span class="w"> </span><span class="n">per_sm_clk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">r</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">ops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">sm</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ghz</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e9</span><span class="p">);</span>
+<span class="linenos"> 99</span><span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"%-22s %14.1f %16.2f %13.3f×</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+<span class="linenos">100</span><span class="w">               </span><span class="n">r</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">ops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="p">,</span><span class="w"> </span><span class="n">per_sm_clk</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">ops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">r</span><span class="p">[</span><span class="mi">4</span><span class="p">].</span><span class="n">ops</span><span class="p">);</span>
+<span class="linenos">101</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos">102</span>
+<span class="linenos">103</span><span class="w">    </span><span class="c1">// ---- 用 FMA 反标定真实时钟 ----</span>
+<span class="linenos">104</span><span class="w">    </span><span class="c1">// FP32 FMA 的硬件发射率是确定的：每 SM 128 条 FP32 lane，即 128/clk/SM。</span>
+<span class="linenos">105</span><span class="w">    </span><span class="c1">// 用它反推被测区间的真实频率，比信标称 boost 时钟可靠（L1.2 踩坑 #12）。</span>
+<span class="linenos">106</span><span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">FMA_PER_CLK_SM</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">128.0</span><span class="p">;</span>
+<span class="linenos">107</span><span class="w">    </span><span class="kt">double</span><span class="w"> </span><span class="n">fma_measured</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">r</span><span class="p">[</span><span class="mi">4</span><span class="p">].</span><span class="n">ops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">sm</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ghz</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e9</span><span class="p">);</span>
+<span class="linenos">108</span><span class="w">    </span><span class="kt">double</span><span class="w"> </span><span class="n">real_ghz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ghz</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">fma_measured</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">FMA_PER_CLK_SM</span><span class="p">;</span>
+<span class="linenos">109</span><span class="w">    </span><span class="kt">double</span><span class="w"> </span><span class="n">cal</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FMA_PER_CLK_SM</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">fma_measured</span><span class="p">;</span>
+<span class="linenos">110</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\n</span><span class="s">标定：FMA 实测 %.2f/clk/SM，硬件确定值 %.0f/clk/SM</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+<span class="linenos">111</span><span class="w">           </span><span class="n">fma_measured</span><span class="p">,</span><span class="w"> </span><span class="n">FMA_PER_CLK_SM</span><span class="p">);</span>
+<span class="linenos">112</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"      =&gt; 被测区间真实频率约 %.2f GHz（标称 %.2f GHz）</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">real_ghz</span><span class="p">,</span><span class="w"> </span><span class="n">ghz</span><span class="p">);</span>
+<span class="linenos">113</span>
+<span class="linenos">114</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\n</span><span class="s">%-22s %20s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="s">"运算"</span><span class="p">,</span><span class="w"> </span><span class="s">"标定后 每 SM 每周期"</span><span class="p">);</span>
+<span class="linenos">115</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"%s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="s">"--------------------------------------------"</span><span class="p">);</span>
+<span class="linenos">116</span><span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span>
+<span class="linenos">117</span><span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"%-22s %20.2f</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">name</span><span class="p">,</span>
+<span class="linenos">118</span><span class="w">               </span><span class="n">r</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">ops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">sm</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ghz</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e9</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">cal</span><span class="p">);</span>
+<span class="linenos">119</span>
+<span class="linenos">120</span><span class="w">    </span><span class="c1">// ---- 与 tensor core 对照 ----</span>
+<span class="linenos">121</span><span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">TC_FLOP_PER_CLK_SM</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">511.0</span><span class="p">;</span><span class="w">   </span><span class="c1">// L1.2 在同一张卡上实测</span>
+<span class="linenos">122</span><span class="w">    </span><span class="kt">double</span><span class="w"> </span><span class="n">exp_clk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">r</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">ops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">sm</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ghz</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e9</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">cal</span><span class="p">;</span>
+<span class="linenos">123</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\n</span><span class="s">参照 L1.2 实测：bf16 tensor core %.0f FLOP/clk/SM（= NVIDIA 标称 512）</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+<span class="linenos">124</span><span class="w">           </span><span class="n">TC_FLOP_PER_CLK_SM</span><span class="p">);</span>
+<span class="linenos">125</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"SFU 的 exp 标定后约 %.0f/clk/SM。</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">exp_clk</span><span class="p">);</span>
+<span class="linenos">126</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"=&gt; **一次 exp 的时间里，tensor core 能做约 %.0f 次浮点运算。**</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+<span class="linenos">127</span><span class="w">           </span><span class="n">TC_FLOP_PER_CLK_SM</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">exp_clk</span><span class="p">);</span>
+<span class="linenos">128</span>
+<span class="linenos">129</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\n</span><span class="s">对 attention 的账（每个打分元素 S[i,j]）：</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="linenos">130</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"  矩阵乘一侧：QK^T 贡献 2D FLOP，PV 贡献 2D FLOP，合计 4D</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="linenos">131</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"  softmax 一侧：1 次 exp（还有 max/加/乘若干，这里只算 exp）</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="linenos">132</span><span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">D</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">32</span><span class="p">;</span><span class="w"> </span><span class="n">D</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="mi">256</span><span class="p">;</span><span class="w"> </span><span class="n">D</span><span class="w"> </span><span class="o">*=</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">133</span><span class="w">        </span><span class="kt">double</span><span class="w"> </span><span class="n">t_mm</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="mf">4.0</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">D</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">TC_FLOP_PER_CLK_SM</span><span class="p">;</span><span class="w">   </span><span class="c1">// 周期</span>
+<span class="linenos">134</span><span class="w">        </span><span class="kt">double</span><span class="w"> </span><span class="n">t_exp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">1.0</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">exp_clk</span><span class="p">;</span>
+<span class="linenos">135</span><span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"  D=%3d : 矩阵乘 %.4f clk, exp %.4f clk  -&gt; exp 占 %.1f%%</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+<span class="linenos">136</span><span class="w">               </span><span class="n">D</span><span class="p">,</span><span class="w"> </span><span class="n">t_mm</span><span class="p">,</span><span class="w"> </span><span class="n">t_exp</span><span class="p">,</span><span class="w"> </span><span class="mf">100.0</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">t_exp</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_mm</span><span class="p">);</span>
+<span class="linenos">137</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos">138</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\n</span><span class="s">D 越小，exp 占比越高。而且这个比值会随硬件代际**变差**：</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="linenos">139</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"tensor core 每代大幅加宽，SFU 基本不变。</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="linenos">140</span><span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"（本条趋势只在 sm_120 上测过一个点，跨代对比需要别的卡，见正文「待验证」。）</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="linenos">141</span><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="linenos">142</span><span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>labs/L3/exp_throughput.cu 全文（142 行）</code><a href="../code/labs/L3/exp_throughput.cu.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p><strong>建议的消融</strong></p>
+<ol>
+<li><strong>补上跨代的点</strong>（§1.3 那条待验证）：把 <code>exp_throughput.cu</code> 在 worldvln(sm_89)
+   和 spark(sm_121) 上各跑一次，算出各自的
+   (tensor core FLOP/clk/SM) / (exp/clk/SM)。三个点就能看出趋势方向。</li>
+<li><strong>验证负载不均那个假设</strong>（§1.2）：用 2.6 的 <code>mini_profiler.cu</code> 思路，
+   给一个自写的因果分块 kernel 加 <code>%smid</code>+<code>%globaltimer</code> 探针，
+   画出每个 block 的起止时间，看尾部形状。</li>
+<li>把 §1.1 的扫描换成 <code>H=8, B</code> 变化（真实服务里 H 固定、B 才变），
+   看饱和点是否一致。</li>
+<li>把 <code>exp_throughput.cu</code> 里的 <code>CHAINS</code> 从 8 改成 1，
+   看测出来的是吞吐还是延迟——这是 1.1 踩坑 #11 的直接复现。</li>
+</ol>
+<hr />
+<h2 id="_5">六 · 陷阱</h2>
+<ol>
+<li><strong>别用「相对峰值」判断 kernel 好坏而不看形状。</strong> 本章 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span> 时 46.4%，
+   <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>512</mn></mrow></math></span> 时 89.4%，同一个 kernel。</li>
+<li><strong>标称 boost 时钟不是被测区间的真实频率</strong>（本章 2.41 vs 标定出的 2.62 GHz）。
+   用一个硬件发射率已知的运算（FP32 FMA = 128/clk/SM）反标定。</li>
+<li><strong>测吞吐必须用独立链。</strong> <code>CHAINS=1</code> 测出来的是延迟。</li>
+<li><strong>CUDA 13 起 <code>cudaDeviceProp</code> 没有 <code>clockRate</code></strong>，要用
+   <code>cudaDeviceGetAttribute(..., cudaDevAttrClockRate, ...)</code>。</li>
+<li><strong>因果的时间比不会等于 0.5。</strong> 本章 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>16384</mn></mrow></math></span> 实测 0.663，
+   块粒度只解释 0.004，其余未验证。<strong>不要把"接近一半"当成"拿满了收益"。</strong></li>
+<li><strong>FA3/FA4 不是"更新所以更好"，它们有硬性的 cc 门槛。</strong>
+   sm_120 两者都不支持。写代码时要查 <code>is_fa_version_supported</code>，
+   不要假定装上就能用。</li>
+<li><strong>FlashInfer 在单条定长 prefill 上不占优不代表它慢。</strong> 它的目标是变长批 + 分页 KV。
+   拿错场景比较是常见误用。</li>
+<li><strong>非单调的数据点要么解释、要么标注。</strong> 本章 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>8</mn></mrow></math></span> 那一行没解释，
+   已明确标为不可引用。</li>
+</ol>
+<hr />
+<h2 id="_6">七 · 自测题</h2>
+<details>
+<summary>1. 你测到某个 attention kernel 在 B·H=1 时达到峰值的 46%。这能说明什么？</summary>
+<p>能说明它<strong>沿序列维切分了</strong>，不只沿 batch×head。</p>
+<p>如果并行度只来自 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span>，那么 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span> 意味着只有 1 个并行单元，
+在 170 个 SM 上最多用掉 1/170 ≈ 0.6%。测出 46% 与之矛盾。</p>
+<p>不能说明的是：具体切成了多少块、用了什么调度、是不是 FA2 的官方实现。
+要确认这些得看 kernel 名或反汇编（2.2 的方法）。</p>
+</details>
+<details>
+<summary>2. 为什么用 FP32 FMA 来标定时钟，而不是直接用 <code>nvidia-smi</code> 报的频率？</summary>
+<p>因为要的是<strong>被测 kernel 运行那一小段时间内的实际频率</strong>，
+而不是空闲时或平均的频率。GPU 会随负载和温度调频，
+<code>nvidia-smi</code> 采样点和 kernel 执行区间对不上。</p>
+<p>FP32 FMA 的硬件发射率是结构决定的（每 SM 128 条 FP32 lane，1 op/clk/lane），
+不随频率变化。所以「实测 ops/s ÷ 128 ÷ SM 数」就是真实频率。</p>
+<p>自检方法：标定之后别的量应该落在硬件的整数上。本章标定后
+<code>__expf</code> 是 16.49、<code>exp2f</code> 是 16.73，都指向 SFU 宽度 16——这说明标定合理。
+如果标定后出来 11.3 这种数，说明标定或测量有问题。</p>
+</details>
+<details>
+<summary>3. exp 只占矩阵乘时间的 6%（D=128），为什么还值得为它专门做一代优化？</summary>
+<p>三个理由，前两个本章有数据，第三个没有：</p>
+<ol>
+<li><strong>6% 是下界。</strong> 只算了 <code>exp</code>，没算 max、求和、修正因子的乘法、最后的除法。
+   真实的非矩阵乘开销更高。</li>
+<li><strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 小时占比迅速上升</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>64</mn></mrow></math></span> 是 12.1%，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>32</mn></mrow></math></span> 是 24.2%。
+   而 MLA、GQA 等结构会让有效 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 变小（3.3）。</li>
+<li><strong>代际趋势</strong>：tensor core 每代加宽，SFU 基本不变，比值会持续恶化。
+   <strong>这一条本章只测了一个点，是待验证项。</strong></li>
+</ol>
+<p>另外 6% 放在一个已经跑到峰值 85% 的 kernel 上，
+意味着它占了剩余可优化空间的相当一部分。</p>
+</details>
+<details>
+<summary>4. 因果 attention 实测时间比是 0.663，块粒度只能解释 0.004。你会怎么查剩下的 0.16？</summary>
+<p>先看这个差额的形状：它在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>1024</mn><mo>&#x0002E;</mo><mi>.8192</mi></mrow></math></span> 上稳定在 +0.18，几乎不随 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 变。
+<strong>常数偏移提示结构性原因，不是随 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 增长的某种开销。</strong></p>
+<p>按可查性排：</p>
+<ol>
+<li><strong>负载不均</strong>（我的主要假设）：query 块 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi></mrow></math></span> 的工作量 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0221D;</mo><mi>i</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span>。
+   查法：用 <code>%smid</code>+<code>%globaltimer</code> 记录每个 block 起止，看尾部是否被重块拖住。</li>
+<li><strong>固定开销不halve</strong>：Q/O 的读写、kernel launch、尾块处理。
+   查法：把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 加大（矩阵乘占比上升），看差额是否下降。</li>
+<li><strong>两条路径走了不同 kernel</strong>：causal 与非 causal 可能命中不同的模板实例。
+   查法：nsys 抓 kernel 名对比（2.6 的方法）。</li>
+</ol>
+<p>第 3 条最便宜，应该先做——如果 kernel 名就不同，前两条的分析前提都不成立。</p>
+</details>
+<details>
+<summary>5. 有人建议"升级到 FA3 提升性能"。在动手之前你要先确认什么？</summary>
+<p>先确认<strong>硬件支不支持</strong>。<code>vllm_flash_attn</code> 的门是明写的：
+FA3 要求 compute capability <strong>family 9.x</strong>（Hopper）。
+本章在 sm_120 上查询直接得到
+<code>FA3 is only supported on devices with compute capability 9.x</code>。</p>
+<p>所以在消费级 Blackwell、Ada、Ampere 上，"升级到 FA3"这句话没有意义。
+FA4 的门是 9.x/10.x/11.x，同样排除 12.0。</p>
+<p>确认支持之后还要问：你的瓶颈是不是 FA3 针对的那个？
+FA3 优化的是 Hopper 的异步单元利用率。如果你的负载是
+小 batch decode（3.3），瓶颈根本不在这里，换代不会有收益。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L3/3.1-attention-memory-wall.html">&#8592; 3.1 从 attention 数学到内存墙</a><a class="nav-next" href="../L3/3.3-decode-attention.html">3.3 Decode 侧 attention &#8594;</a></nav>
+</main>
+</body>
+</html>

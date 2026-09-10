@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.1 CUDA 执行模型与 CUDA Graph</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">2.1</div>
+  <div class="sidebar-title">CUDA 执行模型与 CUDA Graph</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：三层调度，每层都有自己的"整数倍"</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#602-8">分支发散：实测 6.02×，理论 8×</a></li>
+<li><a href="#1-2-2-6">占用率：1 → 2 有用，2 → 6 无用</a></li>
+<li><a href="#kernel-gpu">多流并发：只有 kernel 占不满 GPU 时才有意义</a></li>
+<li><a href="#_4">尾效应：耗时是阶梯，不是斜线</a></li>
+</ul>
+</li>
+<li><a href="#grid">工程实现 · 源码走读：引擎在哪里对齐 grid</a><ul>
+<li><a href="#1-vllm-reshape_and_cache_flash">1. vLLM 的 reshape_and_cache_flash</a></li>
+<li><a href="#2-flashattention-tile-scheduler">2. FlashAttention 的 tile scheduler</a></li>
+<li><a href="#3-cudaoccupancymaxactiveblockspermultiprocessor">3. cudaOccupancyMaxActiveBlocksPerMultiprocessor</a></li>
+</ul>
+</li>
+<li><a href="#_5">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_6">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_7">原始现场</a></li>
+<li><a href="#_8">前沿</a></li>
+<li><a href="#_9">陷阱</a></li>
+<li><a href="#_10">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="mod-id">2.1</div>
+  <h1>CUDA 执行模型与 CUDA Graph</h1>
+  <p class="lede">从 thread、block、grid 的组织方式理解分支、占用率、多流和尾效应；区分驻留容量、硬件忙碌程度与实际运行时间。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（内存层次与 Little&#x27;s Law）· L1.4（launch 路径）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>warp 分支发散的代价是不是"N 路发散就慢 N 倍"？实测和理论差多少，为什么？</li>
+<li><strong>占用率（occupancy）越高越快吗</strong>？memory-bound 与 compute-bound 的答案一样吗？</li>
+<li>为什么 <code>grid = 1021</code> 会比 <code>grid = 1020</code> <strong>慢 17%</strong>？</li>
+</ol>
+<p>CUDA 用三个层次组织工作：线程执行代码，线程组成 block，多个 block 组成 grid。
+GPU 的 SM 接收并执行 block；资源允许时，一个 SM 可以同时容纳多个 block。
+occupancy（占用率）描述常驻 warp 数相对于硬件上限的比例，
+并不直接表示 GPU 有多忙，也不直接表示程序有多快。</p>
+<hr />
+<h2 id="_2">心智模型：三层调度，每层都有自己的"整数倍"</h2>
+<figure>
+<svg viewBox="0 0 740 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CUDA 三层调度模型">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">你写的 grid / block，硬件是这样消化的（crater 实测参数）</text>
+
+    <!-- grid -->
+    <rect x="12" y="34" width="716" height="52" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <text x="24" y="52" font-size="11.5">grid：你要跑的全部 block</text>
+    <text x="24" y="70" font-size="10.5" opacity="0.8">调度器一"波"能放下 <tspan font-weight="600">170 SM × 6 block/SM = 1020 个</tspan>；多 1 个就要开新的一波</text>
+    <text x="560" y="62" font-size="10.5" opacity="0.85">→ 尾效应</text>
+
+    <!-- sm -->
+    <rect x="12" y="96" width="350" height="76" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <text x="24" y="114" font-size="11.5">SM：block 的容器（共 170 个）</text>
+    <text x="24" y="132" font-size="10.5" opacity="0.8">每 SM 最多 1536 线程 = 48 warp</text>
+    <text x="24" y="149" font-size="10.5" opacity="0.8">寄存器 / 共享内存 决定能塞几个 block</text>
+    <text x="24" y="166" font-size="10.5" opacity="0.85">→ <tspan font-weight="600">占用率 = 实际驻留 warp / 48</tspan></text>
+
+    <rect x="378" y="96" width="350" height="76" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <text x="390" y="114" font-size="11.5">warp：真正的调度单位（32 线程）</text>
+    <text x="390" y="132" font-size="10.5" opacity="0.8">一条指令，32 个线程同时执行（SIMT）</text>
+    <text x="390" y="149" font-size="10.5" opacity="0.8">卡住就换另一个就绪 warp —— 这是掩盖延迟的唯一手段</text>
+    <text x="390" y="166" font-size="10.5" opacity="0.85">→ <tspan font-weight="600">分支发散</tspan></text>
+
+    <!-- measured -->
+    <line x1="12" y1="188" x2="728" y2="188" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="212" font-size="12" font-weight="600">本章三个实测结论</text>
+
+    <text x="12" y="238" font-size="11">① 8 路发散实测 <tspan font-weight="600">6.02×</tspan>（理论 8×）—— 编译器用谓词执行省掉了跳转</text>
+
+    <text x="12" y="266" font-size="11">② 占用率：<tspan font-weight="600">1 → 2 block/SM 涨 9%，2 → 6 完全不涨</tspan></text>
+    <rect x="30" y="276" width="94" height="16" fill="currentColor" opacity="0.4"/>
+    <text x="132" y="289" font-size="10">1 blk/SM · 1546 GB/s</text>
+    <rect x="290" y="276" width="103" height="16" fill="currentColor" opacity="0.72"/>
+    <text x="401" y="289" font-size="10">2–6 blk/SM · 1690 GB/s（打满）</text>
+
+    <text x="12" y="322" font-size="11">③ 尾效应：grid 1020 → 1.080 ms，grid <tspan font-weight="600">1021 → 1.263 ms（+17%）</tspan></text>
+    <g stroke="currentColor" stroke-width="1.6" fill="none">
+      <path d="M40,344 L200,344"/><path d="M200,344 L200,332"/><path d="M200,332 L340,332"/>
+      <path d="M340,332 L340,320"/><path d="M340,320 L480,320"/>
+    </g>
+    <text x="60" y="360" font-size="10" opacity="0.75">1 波</text>
+    <text x="250" y="360" font-size="10" opacity="0.75">2 波</text>
+    <text x="390" y="360" font-size="10" opacity="0.75">3 波</text>
+    <text x="500" y="338" font-size="10.5" opacity="0.85">耗时是阶梯，不是斜线</text>
+
+    <text x="12" y="392" font-size="11" opacity="0.85">三者的共同点：<tspan font-weight="600">硬件按固定粒度分配资源</tspan>，</text>
+    <text x="12" y="410" font-size="11" opacity="0.85">你的参数一旦跨过粒度边界，代价是跳变的而不是连续的。</text>
+  </g>
+</svg>
+<figcaption>grid / SM / warp 三层调度，以及各自的"整数倍"效应。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="602-8">分支发散：实测 6.02×，理论 8×</h3>
+<p>理解分支发散时，可以先看同一 warp 中哪些线程在执行哪条路径。
+不同路径可能需要分开发射，并用活跃掩码控制参与线程。
+现代 GPU 的独立线程调度不能简单等同于“32 个线程始终共用一个程序计数器”。</p>
+<p>实验：让每条分支做<strong>完全相同</strong>的工作量（一条 <code>fmaf</code>），唯一的区别是有几条路：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">branch</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="mi">32</span><span class="p">)</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">ways</span><span class="p">;</span><span class="w">      </span><span class="c1">// ways=1 时全 warp 走同一条</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">iters</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">it</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">switch</span><span class="w"> </span><span class="p">(</span><span class="n">branch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">case</span><span class="w"> </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="n">acc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fmaf</span><span class="p">(</span><span class="n">acc</span><span class="p">,</span><span class="w"> </span><span class="mf">1.0001f</span><span class="p">,</span><span class="w"> </span><span class="mf">0.1f</span><span class="p">);</span><span class="w"> </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="k">case</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="n">acc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fmaf</span><span class="p">(</span><span class="n">acc</span><span class="p">,</span><span class="w"> </span><span class="mf">1.0002f</span><span class="p">,</span><span class="w"> </span><span class="mf">0.2f</span><span class="p">);</span><span class="w"> </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="p">...</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>实测：</p>
+<table>
+<thead>
+<tr>
+<th>发散路数</th>
+<th>耗时 ms</th>
+<th>相对 1 路</th>
+<th>理论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>3.912</td>
+<td>1.00×</td>
+<td>1×</td>
+</tr>
+<tr>
+<td>2</td>
+<td>5.653</td>
+<td><strong>1.45×</strong></td>
+<td>2×</td>
+</tr>
+<tr>
+<td>4</td>
+<td>12.838</td>
+<td><strong>3.28×</strong></td>
+<td>4×</td>
+</tr>
+<tr>
+<td>8</td>
+<td>23.544</td>
+<td><strong>6.02×</strong></td>
+<td>8×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>实测始终低于理论。</strong> 原因是编译器把短分支转成了<strong>谓词执行（predication）</strong>：
+不跳转，两条路的指令都发，用谓词寄存器决定哪些线程的结果生效。</p>
+<p>这样省掉了分支指令与流水线冲刷，但<strong>算力照付</strong>——所以还是慢，只是没那么慢。
+<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 SASS 原始现场里那 273 条 <code>FSEL</code>（条件选择）和 225 条 <code>ISETP</code>（置谓词），
+就是谓词执行的实物。</p>
+<div class="admonition note">
+<p class="admonition-title">什么时候真的会跳转</p>
+<p>分支体足够长时，编译器会判断"两边都算"不划算，改用真正的跳转 + 掩码
+（SASS 里是 <code>BSSY</code>/<code>BSYNC</code> 配对）。这时代价才接近 N 倍。</p>
+<p><strong>一般规律：短分支 ≈ 谓词执行（算力惩罚），长分支 ≈ 真发散（时间惩罚）。</strong>
+两种都要避免，但前者温和得多。</p>
+</div>
+<h3 id="1-2-2-6">占用率：1 → 2 有用，2 → 6 无用</h3>
+<p>「提高占用率」是最常被误当成目标的指标。用共享内存做旋钮
+（只改占用率、算法完全不变）实测：</p>
+<table>
+<thead>
+<tr>
+<th>smem/block</th>
+<th>驻留 block/SM</th>
+<th>memory-bound (GB/s)</th>
+<th>compute-bound (TFLOPS)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>96 KB（动态）</td>
+<td><strong>1</strong></td>
+<td><strong>1545.0</strong></td>
+<td>—</td>
+</tr>
+<tr>
+<td>64 KB（动态）</td>
+<td><strong>1</strong></td>
+<td><strong>1546.1</strong></td>
+<td>—</td>
+</tr>
+<tr>
+<td>48 KB</td>
+<td>2</td>
+<td><strong>1678.8</strong></td>
+<td>115.5</td>
+</tr>
+<tr>
+<td>32 KB</td>
+<td>3</td>
+<td>1687.3</td>
+<td>115.6</td>
+</tr>
+<tr>
+<td>16 KB</td>
+<td>5</td>
+<td>1694.5</td>
+<td>115.9</td>
+</tr>
+<tr>
+<td>8 KB</td>
+<td>6</td>
+<td>1699.3</td>
+<td>116.4</td>
+</tr>
+<tr>
+<td>1 KB</td>
+<td>6</td>
+<td>1685.1</td>
+<td>116.2</td>
+</tr>
+</tbody>
+</table>
+<p>两个结论：</p>
+<p><strong>(1) 1 → 2 block/SM 涨 9%，2 → 6 完全不涨。</strong>
+这精确复现了 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 的 Little's Law 结果：带宽-延迟积是 536 KB，
+2 block/SM（2720 warp × 512 B 在途）就已经超过它。<strong>再多的 warp 无处可用。</strong></p>
+<p><strong>(2) compute-bound 对占用率几乎完全不敏感</strong>（115.5 → 116.4，差 0.8%）。</p>
+<p>因为它靠的不是线程级并行，而是<strong>指令级并行（ILP）</strong>——kernel 里写了 4 条独立的 FMA 链：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">float</span><span class="w"> </span><span class="n">x0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">x1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">x2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="n">x3</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span><span class="w">   </span><span class="c1">// 4 条独立链填流水</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">iters</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">x0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fmaf</span><span class="p">(</span><span class="n">x0</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="n">c</span><span class="p">);</span><span class="w"> </span><span class="n">x1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fmaf</span><span class="p">(</span><span class="n">x1</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="n">c</span><span class="p">);</span>
+<span class="w">    </span><span class="n">x2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fmaf</span><span class="p">(</span><span class="n">x2</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="n">c</span><span class="p">);</span><span class="w"> </span><span class="n">x3</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fmaf</span><span class="p">(</span><span class="n">x3</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="n">c</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>一个 warp 自己就能填满 FMA 流水线，不需要别的 warp 来接力。</p>
+<p>顺带一个数字：<strong>116 TFLOPS 是 CUDA core 的 FP32 吞吐</strong>。
+对照 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 测出的 tensor core bf16 251.9 TFLOPS —— <strong>tensor core 快 2.2 倍</strong>。
+核算一下：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>170</mn><mtext>&#x000A0;</mtext><mtext>SM</mtext><mo>&#x000D7;</mo><mn>128</mn><mtext>&#x000A0;</mtext><mtext>FP32&#x000A0;单元</mtext><mo>&#x000D7;</mo><mn>2</mn><mtext>&#x000A0;</mtext><mtext>FLOP</mtext><mo>&#x000D7;</mo><mn>2.9</mn><mtext>&#x000A0;</mtext><mtext>GHz</mtext><mo>&#x0003D;</mo><mn>126</mn></mrow></math></span> TFLOPS，
+实测 116 = <strong>92%</strong>，对得上。</p>
+<div class="admonition warning">
+<p class="admonition-title">「提高占用率」不是目标</p>
+<p>占用率是<strong>掩盖延迟的手段</strong>。一旦延迟已经被掩盖住（本机 2 block/SM 就够了），
+再提高它只会挤占寄存器和共享内存，<strong>反而伤害每线程的工作效率</strong>。</p>
+<p><a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 的自测题 4 讲过同一件事：GEMM 的 tile 从 128×128 缩到 64×64 能让占用率翻倍，
+但数据复用率减半，净效果是变慢。<strong>唯一的目标是墙钟时间。</strong></p>
+</div>
+<h3 id="kernel-gpu">多流并发：只有 kernel 占不满 GPU 时才有意义</h3>
+<p>用一个只占 24% SM 的小 kernel（42 blocks / 170 SM）：</p>
+<table>
+<thead>
+<tr>
+<th>并发 kernel 数</th>
+<th>同一条流</th>
+<th>各自一条流</th>
+<th>重叠倍数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>0.316 ms</td>
+<td>0.330 ms</td>
+<td><strong>0.96×</strong>（略亏）</td>
+</tr>
+<tr>
+<td>2</td>
+<td>0.627 ms</td>
+<td>0.322 ms</td>
+<td><strong>1.95×</strong></td>
+</tr>
+<tr>
+<td>4</td>
+<td>1.254 ms</td>
+<td>0.333 ms</td>
+<td><strong>3.77×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>1 个 kernel 时多流是净亏损</strong>（多一次流切换开销）。
+2 个和 4 个时接近线性加速——因为 4 × 24% = 96%，正好把 GPU 填满。</p>
+<p><strong>这直接对应推理里的场景</strong>：decode 每步有 444 个 kernel（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 实测），
+其中 RMSNorm、RoPE、SwiGLU 这些小算子在 batch=1 时根本占不满 GPU。
+理论上可以多流并发，但实际上它们之间有数据依赖（层与层串行），
+所以真正的解法是<strong>融合</strong>（<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）而不是并发。</p>
+<p>多流真正有用的地方是<strong>无依赖的工作</strong>：H2D 传输与计算重叠（<a class="xref" href="../L1/1.3-host-pcie-numa.html" title="主机侧：NUMA、PCIe 与 DMA">L1.3</a>）、
+不同请求的 prefill 与 decode 重叠、以及 CPU 侧调度与 GPU 执行重叠（<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a>）。</p>
+<h3 id="_4">尾效应：耗时是阶梯，不是斜线</h3>
+<p>这是本章最实用的一个结论。</p>
+<p>一"波"能同时驻留的 block 数 = <code>SM 数 × 每 SM 可驻留 block 数</code>。
+本机对这个 kernel 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>170</mn><mo>&#x000D7;</mo><mn>6</mn><mo>&#x0003D;</mo><mn>1020</mn></mrow></math></span>。扫描 grid 大小：</p>
+<div class="highlight"><pre><span></span><code>每 SM 可驻留 6 个 block ⇒ 一波 = 1020 个 block
+blocks    波数    耗时 ms    每 block 摊销 µs
+510       0.50      0.611        1.20
+1018      1.00      1.074        1.05
+1019      1.00      1.075        1.06
+1020      1.00      1.080        1.06
+1021      1.00      1.263        1.24    ← 跨过波次边界，跳了一台阶
+1022      1.00      1.265        1.24
+2039      2.00      2.096        1.03
+2040      2.00      2.096        1.03
+2041      2.00      2.264        1.11    ← 又一个台阶
+3060      3.00      3.100        1.01
+3061      3.00      3.271        1.07    ← 又一个
+</code></pre></div>
+
+<p><strong>1020 → 1021 只多了 1 个 block，耗时涨了 17%。</strong>
+新增 block 需要等某个 SM 释放足够资源后才能开始。
+这里的“波”是分析并发容量的模型，不是所有 block 之间存在全局屏障。</p>
+<p>而 1018 / 1019 / 1020 三者耗时几乎相同（1.074 / 1.075 / 1.080）——
+<strong>波内加 block 是免费的</strong>。</p>
+<p>这解释了三件事：</p>
+<ol>
+<li><strong>grid 要按「SM 数 × 每 SM 可驻留 block 数」对齐。</strong>
+   多一个 block 的代价可能是整整一波。</li>
+<li><strong>persistent kernel 的动机</strong>：固定开一波 block，内部循环取任务。
+   这样永远只有一波，没有尾效应。FlashAttention-4 的
+   "longest-processing-time-first tile scheduler" 就是在做这件事（<a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a>）。</li>
+<li><strong>小 batch 推理为什么效率低</strong>：batch=1 时很多 kernel 的 grid 远小于一波，
+   GPU 大部分 SM 空着。这是 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 里"算力利用率不到 6%"的另一个侧面。</li>
+</ol>
+<hr />
+<h2 id="grid">工程实现 · 源码走读：引擎在哪里对齐 grid</h2>
+<h3 id="1-vllm-reshape_and_cache_flash">1. vLLM 的 <code>reshape_and_cache_flash</code></h3>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 trace 里这个 kernel 每步调用 28 次（每层一次）。
+它的 grid 是<strong>按 token 数</strong>决定的：batch=1 时只有 1 个 block，
+170 个 SM 里 169 个闲着。</p>
+<p>这就是为什么小算子在 decode 阶段的<strong>绝对时间</strong>很小（0.8% 的 GPU 时间），
+但<strong>launch 次数</strong>却是大头（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 测出 444 次 × 2.68 µs = 1.19 ms）。
+<strong>问题不在 kernel 慢，在 kernel 太多太小。</strong></p>
+<h3 id="2-flashattention-tile-scheduler">2. FlashAttention 的 tile scheduler</h3>
+<p><a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 走读过 <code>Flash_fwd_kernel_traits&lt;128, 64, 128, 4&gt;</code>。
+grid 维度是 <code>(ceil(seqlen_q / 64), batch, heads)</code>。</p>
+<p>对 Qwen3-1.7B、seqlen=1024、batch=1：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x02308;</mi><mn>1024</mn><mo>&#x0002F;</mo><mn>64</mn><mi>&#x02309;</mi><mo>&#x000D7;</mo><mn>1</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x0003D;</mo><mn>256</mn></mrow></math></span> 个 block。
+不能用前一个测试 kernel 的 1020-block 容量评估这个 attention kernel。
+每个 kernel 的寄存器、共享内存和 block 大小不同，需要单独计算可驻留 block 数。</p>
+<p>而 <code>flash_fwd_splitkv_kernel</code>（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> trace 里 decode 用的那个）之所以要 split-K，
+正是因为 decode 时 seqlen_q=1，不 split 的话 grid 只有 <code>1 × batch × heads</code>，
+远远填不满 GPU。<strong>split-K 是在制造并行度</strong>（<a class="xref" href="../L3/3.3-decode-attention.html" title="Decode 侧 attention">L3.3</a>）。</p>
+<h3 id="3-cudaoccupancymaxactiveblockspermultiprocessor">3. <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code></h3>
+<p>本章的实验和引擎都用同一个 API 来问"一个 SM 能塞几个 block"：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">blocks_per_sm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="n">cudaOccupancyMaxActiveBlocksPerMultiprocessor</span><span class="p">(</span><span class="o">&amp;</span><span class="n">blocks_per_sm</span><span class="p">,</span><span class="w"> </span><span class="n">kernel</span><span class="p">,</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span><span class="w"> </span><span class="n">smem_bytes</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">grid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SMS</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">blocks_per_sm</span><span class="p">;</span><span class="w">         </span><span class="c1">// 正好一波</span>
+</code></pre></div>
+
+<p>这是写 persistent kernel 的标准起手式。<strong>不要硬编码 grid 大小</strong>——
+它依赖于 kernel 的寄存器用量，而寄存器用量会随编译器版本变化。</p>
+<hr />
+<h2 id="_5">工程实现 · 自己写一遍</h2>
+<p>三个实验设计上的要点。</p>
+<p><strong>(1) 测发散要让每条路工作量相同。</strong></p>
+<p>否则你测的是"工作量不同"而不是"发散本身"。本实验每条分支都是一条 <code>fmaf</code>，
+只是常数不同（避免编译器合并它们）。</p>
+<p><strong>(2) 用共享内存当占用率旋钮，而不是改 block 大小。</strong></p>
+<p>改 block 大小会同时改变很多东西（每 block 的工作量、访存模式、尾效应）。
+共享内存是唯一一个<strong>只影响驻留 block 数</strong>的旋钮：</p>
+<div class="highlight"><pre><span></span><code><span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="kt">int</span><span class="w"> </span><span class="n">SMEM_KB</span><span class="o">&gt;</span>
+<span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">occupancy_mem_kernel</span><span class="p">(...)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">__shared__</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">pad</span><span class="p">[</span><span class="n">SMEM_KB</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">];</span>
+<span class="w">    </span><span class="n">pad</span><span class="p">[</span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">char</span><span class="p">)</span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="p">;</span><span class="w">      </span><span class="c1">// 防止 smem 被优化掉</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>那行 <code>pad[threadIdx.x] = ...</code> 是必需的——不写的话编译器发现 <code>pad</code> 没被用，
+直接把 <code>__shared__</code> 声明删掉，占用率根本不会变。</p>
+<p><strong>(3) 突破 48 KB 静态上限要显式 opt-in。</strong></p>
+<p>静态 <code>__shared__</code> 最多 48 KB。想压到 1 block/SM 必须用动态共享内存：</p>
+<div class="highlight"><pre><span></span><code><span class="k">extern</span><span class="w"> </span><span class="n">__shared__</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">dpad</span><span class="p">[];</span><span class="w">              </span><span class="c1">// 动态</span>
+<span class="p">...</span>
+<span class="n">CK</span><span class="p">(</span><span class="n">cudaFuncSetAttribute</span><span class="p">(</span><span class="n">occ_mem_dyn</span><span class="p">,</span>
+<span class="w">       </span><span class="n">cudaFuncAttributeMaxDynamicSharedMemorySize</span><span class="p">,</span><span class="w"> </span><span class="mi">96</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">));</span>
+<span class="n">occ_mem_dyn</span><span class="o">&lt;&lt;&lt;</span><span class="n">grid</span><span class="p">,</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span><span class="w"> </span><span class="n">kb</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="o">&gt;&gt;&gt;</span><span class="p">(...);</span><span class="w">  </span><span class="c1">// 第三个参数是动态 smem 字节数</span>
+</code></pre></div>
+
+<p>这就是 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 里讲的 <code>sharedMemPerBlockOptin</code> —— 所有现代 attention/GEMM kernel
+都要调这个 API，忘了调会在启动时报 <code>invalid argument</code>。</p>
+<p><strong>(4) 波长要现场问，不能算。</strong></p>
+<div class="highlight"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">bps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="n">cudaOccupancyMaxActiveBlocksPerMultiprocessor</span><span class="p">(</span><span class="o">&amp;</span><span class="n">bps</span><span class="p">,</span><span class="w"> </span><span class="n">tail_kernel</span><span class="p">,</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">wave</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SMS</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">bps</span><span class="p">;</span><span class="w">                       </span><span class="c1">// 一"波"</span>
+</code></pre></div>
+
+<p>本机这个 kernel 是 6 block/SM，但换个 kernel（寄存器多一点）可能就是 4。
+<strong>写死数字的实验第二天就不对了。</strong></p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-Xptxas<span class="w"> </span>-v<span class="w"> </span>-o<span class="w"> </span>exec_model<span class="w"> </span>labs/L2/exec_model.cu
+./exec_model
+</code></pre></div>
+
+<p><code>-Xptxas -v</code> 会打印每个 kernel 的寄存器与共享内存用量——这是判断占用率的第一手信息。</p>
+<h3 id="_6">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>把发散实验的分支体加长（每条 10 条 <code>fmaf</code>）</td>
+<td>编译器改用真跳转，倍数应该更接近理论的 N×</td>
+</tr>
+<tr>
+<td>把 <code>pad[threadIdx.x] = ...</code> 那行删掉</td>
+<td>占用率不再变化——<strong>亲手见一次"编译器把你的实验删了"</strong></td>
+</tr>
+<tr>
+<td>把 compute-bound kernel 的 4 条独立链改成 1 条</td>
+<td>ILP 消失，此时占用率<strong>才会</strong>开始起作用</td>
+</tr>
+<tr>
+<td>多流实验里把 <code>small_grid</code> 改成 <code>SMS * 6</code>（占满）</td>
+<td>重叠倍数应该掉到 1×——满负载时多流无意义</td>
+</tr>
+<tr>
+<td>用 <code>compute-sanitizer ./exec_model</code> 跑一遍</td>
+<td>检查有没有越界访问、竞态。本机已装（<code>nvidia/cu13/bin/compute-sanitizer</code>）</td>
+</tr>
+</tbody>
+</table>
+<p>第二行是本章最值得亲手做的一个实验：它让你对"编译器会做什么"有实感。</p>
+<hr />
+<h2 id="_7">原始现场</h2>
+<details>
+<summary>① 完整输出</summary>
+<div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D  sm_120  SM=170  每SM最大线程=1536  smem/block(optin)=99 KB
+
+[A] warp 分支发散的代价（每条分支工作量相同，只是要不要串行）
+    发散路数 耗时 ms    相对 1 路 理论
+    1          3.912        1.00 x    1x
+    2          5.653        1.45 x    2x
+    4          12.838       3.28 x    4x
+    8          23.544       6.02 x    8x
+
+[B] 占用率 vs 性能（用共享内存压低占用率，算法完全不变）
+    smem/block   驻留 block/SM   memory-bound GB/s   compute-bound TFLOPS
+    1            6               1685.1              116.2
+    8            6               1699.3              116.4
+    16           5               1694.5              115.9
+    32           3               1687.3              115.6
+    48           2               1678.8              115.5
+    64           1               1546.1              -        (动态 smem)
+    96           1               1545.0              -        (动态 smem)
+
+[D] 多流并发：独立 kernel 能同时跑吗
+    1 个 kernel（每个 42 blocks，占 24% 的 SM）：同流 0.316 ms，多流 0.330 ms，重叠 0.96×
+    2 个 kernel（每个 42 blocks，占 24% 的 SM）：同流 0.627 ms，多流 0.322 ms，重叠 1.95×
+    4 个 kernel（每个 42 blocks，占 24% 的 SM）：同流 1.254 ms，多流 0.333 ms，重叠 3.77×
+
+[E] 尾效应：扫描 grid 大小，看波次边界上的台阶
+    每 SM 可驻留 6 个 block ⇒ 一波 = 1020 个 block
+    blocks    波数    耗时 ms    每 block 摊销 µs
+    510       0.50      0.611        1.20
+    1018      1.00      1.074        1.05
+    1019      1.00      1.075        1.06
+    1020      1.00      1.080        1.06
+    1021      1.00      1.263        1.24   ← 跨过波次边界
+    1022      1.00      1.265        1.24
+    2039      2.00      2.096        1.03
+    2040      2.00      2.096        1.03
+    2041      2.00      2.264        1.11   ← 又一个台阶
+    3060      3.00      3.100        1.01
+    3061      3.00      3.271        1.07   ← 又一个
+</code></pre></div>
+
+<p>原始文件：<code>results/crater/exec_model_5090.txt</code></p>
+</details>
+<details>
+<summary>② <code>-Xptxas -v</code> 的输出：寄存器与共享内存的真相</summary>
+<div class="highlight"><pre><span></span><code>ptxas info    : Used 12 registers, used 0 barriers, 49152 bytes smem
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers, 49152 bytes smem
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 12 registers, used 0 barriers, 32768 bytes smem
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers, 16384 bytes smem
+</code></pre></div>
+
+<p>四个字段，每个都直接决定性能：</p>
+<ul>
+<li><strong><code>Used N registers</code></strong>：每线程用了多少寄存器。每 SM 的寄存器文件是 64K 个 32 位寄存器，
+  所以最多能驻留 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>65536</mn><mo>&#x0002F;</mo><mi>N</mi></mrow></math></span> 个线程。本例只用 12–16 个，不是瓶颈。</li>
+<li><strong><code>bytes smem</code></strong>：静态共享内存。本例是我们故意加的旋钮。</li>
+<li><strong><code>stack frame</code> / <code>spill stores</code> / <code>spill loads</code></strong>：<strong>寄存器溢出</strong>。
+  全为 0 说明没溢出。一旦不为 0，说明寄存器不够用，变量被踢到 local memory
+  （其实在显存里，延迟 929 周期——<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测），性能会断崖式下跌。</li>
+</ul>
+<p><strong>写 kernel 时第一件事就是看这四行。</strong> 尤其是 spill：
+它不会报错，只会让你的 kernel 莫名其妙慢 3 倍。<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 优化 GEMM 时会反复用到。</p>
+</details>
+<details>
+<summary>③ 本机可用与不可用的 profiling 工具（诚实清单）</summary>
+<div class="highlight"><pre><span></span><code>ncu (Nsight Compute)      不可用   PyPI 上没有对应的包
+nsys (Nsight Systems)     不可用   同上
+nvprof                    不可用   已被 NVIDIA 废弃
+compute-sanitizer         可用     nvidia/cu13/bin/compute-sanitizer
+cuobjdump                 可用     triton/backends/nvidia/bin/cuobjdump
+nvdisasm                  可用     nvidia/cu13/bin/nvdisasm
+CUPTI 硬件计数器           不可用   torch profiler 的 profiler_metrics 在本 build 上取不到值
+</code></pre></div>
+
+<p><code>cuda-toolkit</code> 这个 pip 包提供的 extras 全清单（<code>Provides-Extra</code>）：</p>
+<div class="highlight"><pre><span></span><code>all, cccl, crt, cublas, cudart, cufft, cufile, culibos, cupti, curand,
+cusolver, cusparse, cuxxfilt, npp, nvcc, nvfatbin, nvjitlink, nvjpeg,
+nvml, nvptxcompiler, nvrtc, nvtx, nvvm, opencl, profiler, sanitizer
+</code></pre></div>
+
+<p><strong>没有 nsight-compute / nsight-systems。</strong> 它们要通过 NVIDIA 的官方安装包
+（.run / apt / 独立下载）获得，pip 装不了。</p>
+<p>所以本站的 <a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a>（Profiling）会建立在<strong>可用的手段</strong>上：
+<code>-Xptxas -v</code>、<code>clock64()</code> 在 kernel 内计时、torch profiler 的 kernel 时间与计数、
+以及贯穿全站的 roofline 分析。这些足以覆盖 90% 的诊断需求；
+ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</strong>，会在 <a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 里说明它补的是哪一块。</p>
+</details>
+<hr />
+<h2 id="_8">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Thread Block Cluster（Hopper 起）</strong></td>
+<td>在 grid 与 block 之间新增一层"cluster"，同 cluster 的 block 可以访问彼此的共享内存（DSMEM）。等于把本章的"一波"概念显式化，并让 tile 可以更大。<strong>sm_120 不支持</strong>（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a>）</td>
+</tr>
+<tr>
+<td><strong>Cluster Launch Control（Blackwell）</strong></td>
+<td>让 kernel 在运行时动态获取下一批 tile，硬件层面的 persistent kernel。<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 前沿提到的 sm_120 NVFP4 GEMM 达到 80% 效率就用了它</td>
+</tr>
+<tr>
+<td><strong>persistent kernel + 软件流水</strong></td>
+<td>固定开一波，内部循环取任务，彻底消灭尾效应。FA4 的 LPT（最长处理时间优先）tile 调度器是这条路线的代表（<a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a>）</td>
+</tr>
+<tr>
+<td><strong>warp specialization</strong></td>
+<td>同一个 block 里不同 warp 干不同的活（一组搬数据、一组算），用 <code>__syncthreads</code> 或 named barrier 协调。这是 Hopper/Blackwell 上高性能 kernel 的标准结构（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>、<a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a>）</td>
+</tr>
+<tr>
+<td><strong>CUDA Graph 条件节点</strong></td>
+<td>图里能带分支与循环，减少"形状一变就要重新捕获"。vLLM 目前用 piecewise graph 折中（<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a>）</td>
+</tr>
+<tr>
+<td><strong>绿色上下文 / MPS 分区</strong></td>
+<td>把 SM 划分给不同的上下文，让本章的"占不满 GPU"问题在多租户下有解（<span class="xref pending" title="编排：K8s / Ray / Slurm（尚未写）">L8.2</span>）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>除本站实测外的内容来自各自文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+</blockquote>
+<hr />
+<h2 id="_9">陷阱</h2>
+<p><strong>1. 把占用率当目标。</strong> 本机 2 block/SM 就打满带宽，再高无用。
+占用率是手段，墙钟时间才是目标。</p>
+<p><strong>2. 忘了防优化。</strong> 共享内存不被读就会被删掉，占用率实验会完全失效。
+compute-bound 的累加值不被使用，整个循环会被删掉。</p>
+<p><strong>3. 用改 block 大小来调占用率。</strong> 它同时改变了太多变量，实验不干净。
+共享内存是唯一的单变量旋钮。</p>
+<p><strong>4. 硬编码 grid 大小。</strong> 波长取决于 kernel 的寄存器用量，
+换个编译器版本就变了。用 <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> 现场问。</p>
+<p><strong>5. 以为多流总是有用。</strong> 单个 kernel 已经占满 GPU 时，多流是净亏损（实测 0.96×）。</p>
+<p><strong>6. 忽略 <code>-Xptxas -v</code> 里的 spill。</strong> 寄存器溢出不报错，只会让 kernel 悄悄慢几倍。</p>
+<p><strong>7. 以为发散一定慢 N 倍。</strong> 短分支会被转成谓词执行，实测 8 路只慢 6.02×。
+但这不代表可以随便写发散——6 倍也是 6 倍。</p>
+<hr />
+<h2 id="_10">自测题</h2>
+<details>
+<summary>1. 我的 kernel 用了 64 个寄存器，block 是 256 线程，没有共享内存。每 SM 能驻留几个 block？</summary>
+<p>每 SM 的寄存器文件是 <strong>65536 个 32 位寄存器</strong>（Blackwell 消费级）。</p>
+<p>每 block 需要：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>256</mn><mtext>&#x000A0;</mtext><mtext>线程</mtext><mo>&#x000D7;</mo><mn>64</mn><mtext>&#x000A0;</mtext><mtext>寄存器</mtext><mo>&#x0003D;</mo><mn>16384</mn></mrow></math></span> 个。</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>65536</mn><mo>&#x0002F;</mo><mn>16384</mn><mo>&#x0003D;</mo><mn>4</mn><mtext>&#x000A0;</mtext><mtext>个&#x000A0;block</mtext></mrow></math></div></p>
+<p>但还要检查另外两个上限：
+- 每 SM 最大线程 1536 → <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1536</mn><mo>&#x0002F;</mo><mn>256</mn><mo>&#x0003D;</mo><mn>6</mn></mrow></math></span> 个 block
+- 每 SM 最大 block 数（通常 16–32）</p>
+<p><strong>取三者最小值 = 4 个 block/SM</strong>，对应 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4</mn><mo>&#x000D7;</mo><mn>256</mn><mo>&#x0002F;</mo><mn>32</mn><mo>&#x0003D;</mo><mn>32</mn></mrow></math></span> 个 warp，
+占用率 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>32</mn><mo>&#x0002F;</mo><mn>48</mn><mo>&#x0003D;</mo><mn>67</mn><mi>&#x00025;</mi></mrow></math></span>。</p>
+<p><strong>但请注意</strong>：本章实测显示 2 block/SM 就够打满带宽了。
+所以 67% 的占用率<strong>完全够用</strong>，不必为了提高它去砍寄存器——
+砍寄存器很可能触发 spill，那才是灾难。</p>
+<p>（实际写代码时不用手算，直接调 <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code>。）</p>
+</details>
+<details>
+<summary>2. 我把 grid 从 1020 改成 1024（凑成 2 的幂，看起来更整齐）。会发生什么？</summary>
+<p><strong>会慢 17%。</strong> 因为一波是 1020，1024 要开第二波来跑那 4 个 block，
+而那 4 个 block 独占一整波的时间。</p>
+<p>本章实测：1020 → 1.080 ms，1021 → 1.263 ms。1024 会在同一个台阶上。</p>
+<p><strong>"凑成 2 的幂"在 GPU 上是个坏习惯。</strong> 该对齐的是
+<code>SM 数 × 每 SM 可驻留 block 数</code>，本机是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>170</mn><mo>&#x000D7;</mo><mn>6</mn><mo>&#x0003D;</mo><mn>1020</mn></mrow></math></span> —— 
+一个既不是 2 的幂也不好看的数。</p>
+<p><strong>唯一正确的做法是问 API，不是猜。</strong></p>
+</details>
+<details>
+<summary>3. 为什么 compute-bound kernel 对占用率不敏感，而 memory-bound 从 1 到 2 block/SM 会涨 9%？</summary>
+<p>因为两者掩盖延迟的方式不同。</p>
+<p><strong>memory-bound</strong>：延迟是访存的 929 周期（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测），
+必须靠<strong>足够多的在途请求</strong>掩盖。按 Little's Law，需要 536 KB 在途。
+1 block/SM 时只有 1360 warp × 512 B = 0.70 MB —— 看起来够，
+但考虑到不是所有 warp 时刻都有未完成的 load，边际上不足，所以掉到 1546 GB/s。
+2 block/SM 时富余，打满 1690 GB/s。</p>
+<p><strong>compute-bound</strong>：延迟是 FMA 的几个周期，而 kernel 里写了 <strong>4 条独立的 FMA 链</strong>，
+<strong>一个 warp 自己就能填满流水线</strong>（ILP）。不需要别的 warp 来接力，所以占用率无关。</p>
+<p><strong>推论</strong>：如果把那 4 条链改成 1 条（纯依赖链），ILP 消失，
+compute-bound 就会变得和 memory-bound 一样依赖占用率。
+<strong>这正是本章建议你做的消融之一。</strong></p>
+</details>
+<details>
+<summary>4. decode 每步有 444 个 kernel，很多都很小、占不满 GPU。既然多流能重叠 3.77×，为什么引擎不用多流跑它们？</summary>
+<p>因为<strong>它们之间有数据依赖</strong>。</p>
+<p>Transformer 的一层是严格串行的：
+<code>RMSNorm → QKV投影 → RoPE → attention → O投影 → 残差 → RMSNorm → SwiGLU</code>。
+每一步的输入是上一步的输出，没有并发空间。</p>
+<p>本章的多流实验之所以能重叠 3.77×，是因为那 4 个 kernel <strong>完全独立</strong>。</p>
+<p><strong>真正的解法是融合（<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）</strong>：把 RMSNorm + 残差加合成一个 kernel
+（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> trace 里的 <code>fused_add_rms_norm</code> 就是），把 SwiGLU 的 silu 与 mul 合成一个
+（<code>act_and_mul_kernel</code>）。融合同时减少 launch 次数和访存往返。</p>
+<p><strong>多流在推理里真正有用的地方</strong>是无依赖的工作：
+- H2D 权重加载与计算重叠（<a class="xref" href="../L1/1.3-host-pcie-numa.html" title="主机侧：NUMA、PCIe 与 DMA">L1.3</a>）
+- 不同请求的 prefill 与 decode 重叠（chunked prefill，<a class="xref" href="../L5/5.3-scheduling.html" title="调度：continuous batching 与 chunked prefill">L5.3</a>）
+- CPU 调度与 GPU 执行重叠（<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a>）</p>
+</details>
+<details>
+<summary>5. 我写了一个 attention kernel，<code>-Xptxas -v</code> 显示 <code>Used 168 registers, 48 bytes spill stores</code>。该怎么办？</summary>
+<p><strong>先确认 spill 有多严重，再决定。</strong></p>
+<p>48 字节的 spill 很少（大约 12 个寄存器），可能只在某个冷路径上。
+但 spill 写的是 <strong>local memory，物理上在显存里</strong>（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测延迟 929 周期），
+如果它在内循环里，代价是灾难性的。</p>
+<p><strong>诊断顺序</strong>：</p>
+<ol>
+<li><strong>看 spill 在哪</strong>：用 <code>-Xptxas -v --generate-line-info</code> 加上 SASS 反汇编
+   （<code>nvdisasm</code>，本机可用），找 <code>LDL</code>/<code>STL</code>（local load/store）指令在哪一行。</li>
+<li><strong>如果在内循环</strong>：必须消除。手段是减少活跃变量——
+   比如把 accumulator 分块、把常量移出循环、或者缩小 tile。</li>
+<li><strong>如果在冷路径</strong>（初始化、收尾）：可以忽略。</li>
+</ol>
+<p><strong>不要用 <code>__launch_bounds__</code> 强行限制寄存器来"解决"它</strong>——
+那只会让编译器 spill 得更多。<code>__launch_bounds__</code> 是告诉编译器
+"我需要这个占用率"，编译器会为此牺牲寄存器，是<strong>用 spill 换占用率</strong>。
+按本章的结论，本机 2 block/SM 就够了，<strong>没必要为占用率牺牲寄存器</strong>。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.0-tensor-and-framework.html">&#8592; 2.0 框架内部：storage、stride、view 与 dispatcher</a><a class="nav-next" href="../L2/2.2-toolchain-ptx-sass.html">2.2 编译工具链：nvcc → PTX → SASS &#8594;</a></nav>
+</main>
+</body>
+</html>

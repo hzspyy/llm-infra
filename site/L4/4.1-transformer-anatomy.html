@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.1 Transformer 层解剖与从零实现</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">4.1</div>
+  <div class="sidebar-title">Transformer 层解剖与从零实现</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">一 · 配置里每个数字的含义</a></li>
+<li><a href="#_3">二 · 一层里的每个张量</a></li>
+<li><a href="#_4">三 · 三个容易写错的算子</a><ul>
+<li><a href="#rmsnorm">RMSNorm</a></li>
+<li><a href="#rope">RoPE</a></li>
+<li><a href="#swiglu">SwiGLU</a></li>
+</ul>
+</li>
+<li><a href="#_5">四 · 逐层对齐</a><ul>
+<li><a href="#_6">注意「均方根」那一列</a></li>
+</ul>
+</li>
+<li><a href="#flop">五 · 参数量与 FLOP</a></li>
+<li><a href="#_7">六 · 设计取舍</a><ul>
+<li><a href="#61-mlp-75-attention-25">6.1 为什么 MLP 是 75% 而 attention 只有 25%</a></li>
+<li><a href="#62-qk-norm">6.2 QK-Norm：一个很小的张量，漏了就全错</a></li>
+<li><a href="#63">6.3 逐层对齐为什么必须是验收标准</a></li>
+</ul>
+</li>
+<li><a href="#lab">七 · 动手 lab</a></li>
+<li><a href="#_8">八 · 陷阱</a></li>
+<li><a href="#_9">九 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L4 · 模型架构与数值</div>
+  <div class="mod-id">4.1</div>
+  <h1>Transformer 层解剖与从零实现</h1>
+  <p class="lede">直接从 safetensors 读权重、只用基本算子手写一遍 Qwen3，逐层与 HF 对齐：29 个对照点全部逐位相同，logits 也逐位相同。每个中间张量的 shape/dtype/stride 全打印。参数量解析模型与文件实际差 0；MLP 占每层 75%、attention 25%。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · Qwen3-1.7B</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 0.0（最小模型）· 2.0（stride）· 3.3（GQA）· 4.0（权重文件）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>0.0 手写过一个玩具 Transformer。这一章把同样的事情做在<strong>真实权重</strong>上：
+直接从 <code>.safetensors</code> 读 Qwen3-1.7B 的张量，只用 torch 的基本算子写一遍前向，
+然后<strong>逐层</strong>和 HuggingFace 对齐。</p>
+<ol>
+<li>从 token id 到 logits，每一步的张量是什么形状、什么 dtype、什么 stride？</li>
+<li>我的实现和 HF 的差多少？只比最终 logits 够不够？</li>
+<li>参数量和 FLOP 能不能从 config 精确算出来？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的验收标准</p>
+<p><strong>每一层的输出都要和 HF 对上，不只是最终 logits。</strong>
+中间某一层错了、后面被 norm 拉回来、logits 看起来还行——这种情况很常见，
+只比最后一步会漏掉。</p>
+<p>实测结果：<strong>29 个对照点全部逐位相同（max|diff| = 0.000000）。</strong></p>
+</div>
+<hr />
+<h2 id="_2">一 · 配置里每个数字的含义</h2>
+<div class="highlight"><pre><span></span><code>hidden_size                2048
+intermediate_size          6144
+num_hidden_layers          28
+num_attention_heads        16
+num_key_value_heads        8
+head_dim                   128
+rms_norm_eps               1e-06
+rope_theta                 1000000
+vocab_size                 151936
+tie_word_embeddings        True
+hidden_act                 silu
+
+GQA 分组数 g = nq/nkv = 16/8 = 2
+hidden_size = nq×head_dim = 2048 ✓
+</code></pre></div>
+
+<p>注意 <code>hidden_size = nq × head_dim</code> 这条<strong>不是恒等式</strong>，只是这个模型恰好成立。
+有些模型（例如某些 MLA 变体）两者不等，实现时不能默认 <code>head_dim = H/nq</code>——
+config 里给了 <code>head_dim</code> 就用它。</p>
+<hr />
+<h2 id="_3">二 · 一层里的每个张量</h2>
+<p><code>B=1, S=7</code> 的一次前向，每个中间量的 shape / dtype / stride：</p>
+<div class="highlight"><pre><span></span><code>token ids                        (1, 7)            int64     stride=(7, 1)                连续
+embed_tokens 权重                 (151936, 2048)    bfloat16  stride=(2048, 1)             连续
+x = emb[ids]                     (1, 7, 2048)      bfloat16  stride=(14336, 2048, 1)      连续   &lt;- gather，不是矩阵乘
+rope cos                         (7, 128)          bfloat16  stride=(128, 1)              连续
+rope sin                         (7, 128)          bfloat16  stride=(128, 1)              连续
+
+--- attention 分支 ---
+input_layernorm 之后              (1, 7, 2048)      bfloat16  stride=(14336, 2048, 1)      连续
+q = h @ Wq^T                     (1, 7, 2048)      bfloat16  stride=(14336, 2048, 1)      连续
+k = h @ Wk^T                     (1, 7, 1024)      bfloat16  stride=(7168, 1024, 1)       连续   &lt;- 只有 q 的一半宽（GQA）
+v = h @ Wv^T                     (1, 7, 1024)      bfloat16  stride=(7168, 1024, 1)       连续
+q.view(B,S,nq,hd).transpose(1,2) (1, 16, 7, 128)   bfloat16  stride=(14336, 128, 2048, 1) 不连续 &lt;- 2.0 说过
+k 同上                            (1, 8, 7, 128)    bfloat16  stride=(7168, 128, 1024, 1)  不连续
+QK-Norm 之后的 q                  (1, 16, 7, 128)   bfloat16  stride=(14336, 128, 2048, 1) 不连续 &lt;- 权重形状 (128,)
+RoPE 之后的 q                     (1, 16, 7, 128)   bfloat16  stride=(14336, 128, 2048, 1) 不连续
+attention 输出                    (1, 16, 7, 128)   bfloat16  stride=(14336, 128, 2048, 1) 不连续
+reshape 回 [B,S,nq*hd]            (1, 7, 2048)      bfloat16  stride=(14336, 2048, 1)      连续   &lt;- reshape 静默拷贝了
+o_proj 权重                       (2048, 2048)      bfloat16  stride=(2048, 1)             连续
+
+--- MLP 分支 ---
+post_attention_layernorm 之后     (1, 7, 2048)      bfloat16  stride=(14336, 2048, 1)      连续
+gate_proj 输出                    (1, 7, 6144)      bfloat16  stride=(43008, 6144, 1)      连续
+up_proj 输出                      (1, 7, 6144)      bfloat16  stride=(43008, 6144, 1)      连续
+silu(gate)*up                    (1, 7, 6144)      bfloat16  stride=(43008, 6144, 1)      连续
+down_proj 权重                    (2048, 6144)      bfloat16  stride=(6144, 1)             连续
+</code></pre></div>
+
+<p>几处值得停：</p>
+<ul>
+<li><strong><code>transpose(1,2)</code> 之后 stride 变成 <code>(14336, 128, 2048, 1)</code>，不连续。</strong>
+  这正是 2.0 §1 那张表——0.0 里留的那个 <code>contig=否</code> 的问题在这里落地。</li>
+<li><strong><code>reshape 回 [B,S,nq*hd]</code> 之后又连续了。</strong> 因为源张量不连续，
+  <code>reshape</code> <strong>静默做了一次拷贝</strong>（2.0 §2 的陷阱 1）。
+  这里是必要的：<code>o_proj</code> 那次 GEMM 需要连续输入。</li>
+<li><strong><code>k</code> 只有 <code>q</code> 的一半宽</strong>（1024 vs 2048），因为 8 个 KV 头 vs 16 个 query 头。</li>
+<li><strong>QK-Norm 的权重是 <code>(128,)</code></strong>，作用在 head_dim 上，不是 hidden 上。</li>
+</ul>
+<hr />
+<h2 id="_4">三 · 三个容易写错的算子</h2>
+<h3 id="rmsnorm">RMSNorm</h3>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mrow><mi mathvariant="normal">R</mi><mi mathvariant="normal">M</mi><mi mathvariant="normal">S</mi><mi mathvariant="normal">N</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">m</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mfrac><mrow><mi>x</mi></mrow><mrow><msqrt><mrow><mfrac><mrow><mn>1</mn></mrow><mrow><mi>d</mi></mrow></mfrac><msub><mo>&#x02211;</mo><mi>i</mi></msub><msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup><mo>&#x0002B;</mo><mi>&#x003F5;</mi></mrow></msqrt></mrow></mfrac><mo>&#x02299;</mo><mi>w</mi></mrow></math></div></p>
+<p>比 LayerNorm 少一次归约——<strong>不减均值</strong>，也没有 bias。</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">62</span><span class="k">def</span><span class="w"> </span><span class="nf">rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">):</span>
+<span class="linenos">63</span><span class="w">    </span><span class="sd">"""RMSNorm：不减均值，只除以均方根。比 LayerNorm 少一次归约。"""</span>
+<span class="linenos">64</span>    <span class="n">dt</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span>
+<span class="linenos">65</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">66</span>    <span class="n">var</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">67</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">var</span> <span class="o">+</span> <span class="n">eps</span><span class="p">)</span>
+<span class="linenos">68</span>    <span class="k">return</span> <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dt</span><span class="p">)</span> <span class="o">*</span> <span class="n">weight</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L4/qwen3_from_scratch.py 第 62–68 行</code><a href="../code/labs/L4/qwen3_from_scratch.py.html#labs-L4-qwen3_from_scratch-py-L-62">在完整文件中打开 &rarr;</a></div></div>
+<p>两个实现细节决定了能不能对上 HF：</p>
+<ol>
+<li><strong>中间必须升到 fp32</strong>。bf16 只有 8 位尾数，平方和累加会丢精度。
+   HF 也是这么做的，所以不升 fp32 就对不上。</li>
+<li><strong><code>x.to(dt) * weight</code>，先转回 bf16 再乘权重</strong>——顺序不同结果就不同。</li>
+</ol>
+<h3 id="rope">RoPE</h3>
+<div class="highlight"><pre><span></span><code><span class="n">inv</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">base</span> <span class="o">**</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">/</span> <span class="n">head_dim</span><span class="p">))</span>
+<span class="n">freqs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">outer</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="n">inv</span><span class="p">)</span>                 <span class="c1"># [S, head_dim/2]</span>
+<span class="n">emb</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">freqs</span><span class="p">,</span> <span class="n">freqs</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>       <span class="c1"># [S, head_dim]  &lt;- HF 的排布</span>
+</code></pre></div>
+
+<p>关键在最后一行：HF 把 <code>freqs</code> <strong>重复两遍拼起来</strong>，
+配合 <code>rotate_half</code>（把后一半取负移到前面）。
+这等价于把 <code>head_dim</code> 拆成前后两半配对，而不是相邻两个配对。</p>
+<p><strong>另一种常见排布是相邻配对</strong>（<code>[x0,x1], [x2,x3], ...</code>），
+数学上等价但<strong>权重不通用</strong>——用错排布，模型能跑、loss 不炸、输出是错的。
+3.4 §四 的频率表就是这里的 <code>inv</code>。</p>
+<h3 id="swiglu">SwiGLU</h3>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">P</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><msub><mi>W</mi><mrow><mtext>down</mtext></mrow></msub><mo minsize="1.2em" maxsize="1.2em">(</mo><mrow><mi mathvariant="normal">s</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">l</mi><mi mathvariant="normal">u</mi></mrow><mo stretchy="false">&#x00028;</mo><msub><mi>W</mi><mrow><mtext>gate</mtext></mrow></msub><mspace width="0.167em" /><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x02299;</mo><msub><mi>W</mi><mrow><mtext>up</mtext></mrow></msub><mspace width="0.167em" /><mi>x</mi><mo minsize="1.2em" maxsize="1.2em">)</mo></mrow></math></div></p>
+<p>三个矩阵而不是两个。<code>gate</code> 和 <code>up</code> 形状相同、都是 <code>[6144, 2048]</code>，
+但<strong>不能互换</strong>：silu 只作用在 gate 那一路。</p>
+<hr />
+<h2 id="_5">四 · 逐层对齐</h2>
+<div class="highlight"><pre><span></span><code>HF 给出 29 个 hidden_states（embedding + 28 层）
+手写实现给出 29 个
+（HF 的最后一个 hidden_state 已含 final norm，这里对齐了再比）
+
+   层       HF 的均方根     max|diff|         相对误差     判定
+   0       0.02602      0.000000       0.00%      ✓
+   1       0.26121      0.000000       0.00%      ✓
+   2       0.52872      0.000000       0.00%      ✓
+  26      22.19865      0.000000       0.00%      ✓
+  27      24.11804      0.000000       0.00%      ✓
+  28       1.16100      0.000000       0.00%      ✓
+... 共 29 个对照点，29 个通过
+其中 **逐位完全相同** 的有 29 个
+</code></pre></div>
+
+<p><strong>全部逐位相同，不是"在容差内"。</strong></p>
+<p>最终 logits：</p>
+<div class="highlight"><pre><span></span><code>手写 logits   (1, 10, 151936)
+HF   logits   (1, 10, 151936)
+max|diff| = 0.000000
+argmax 相同: True
+手写 top5 id: [374, 13, 11, 198, 624]
+HF   top5 id: [374, 13, 11, 198, 624]
+</code></pre></div>
+
+<div class="admonition warning">
+<p class="admonition-title">第一次跑的时候最后一行是 165473% 的相对误差</p>
+<p>我以为实现错了。查下去发现是<strong>比较方式</strong>错了：
+HF 的 <code>output_hidden_states</code> 最后一个元素<strong>已经过了 final norm</strong>，
+而我的列表最后一个是第 27 层的原始输出。
+两者的均方根一个是 1.16、一个是 24.12——差 20 倍，
+但那是两个不同的量，本来就不该相等。</p>
+<p>对齐之后 29 个全部逐位相同。<strong>在怀疑实现之前，先确认你比的是同一个东西。</strong>
+（同一类错误在 4.0 §5 也出现过一次：那次是我预期错了。）</p>
+</div>
+<h3 id="_6">注意「均方根」那一列</h3>
+<p>从 0.026 一路涨到 24.12，<strong>放大了将近 1000 倍</strong>。
+这是 pre-norm 残差流的正常形态：每层都往残差流里加东西，
+而残差本身不被归一化，所以幅度单调增长。
+最后靠 final norm 一次拉回到 1.16。</p>
+<p>这条曲线是诊断训练问题的常用信号——如果某一层的跳变特别大，
+通常那一层有问题。</p>
+<hr />
+<h2 id="flop">五 · 参数量与 FLOP</h2>
+<div class="highlight"><pre><span></span><code>每层：
+  q_proj  2048×2048   =    4,194,304
+  k_proj  2048×1024   =    2,097,152
+  v_proj  2048×1024   =    2,097,152
+  o_proj  2048×2048   =    4,194,304
+  q/k_norm  2×128     =          256
+  attn 小计                12,583,168  (25.0%)
+  gate/up/down 3×2048×6144 = 37,748,736  (75.0%)
+  2 个 RMSNorm                  4,096
+  每层合计                 50,336,000
+
+28 层           1,409,408,000
+embedding         311,164,928  (18.1%)
+final norm              2,048
+tie=True，lm_head 复用 embedding
+---------------------------------
+解析模型总计     1,720,574,976
+文件里实际       1,720,574,976   差 +0
+</code></pre></div>
+
+<p><strong>精确对上，差 0。</strong> 这说明 config 里的几个数字完全决定了参数量——
+不需要加载模型就能算。</p>
+<p>两个值得记的比例：</p>
+<ul>
+<li><strong>MLP 占每层参数的 75%</strong>，attention 只占 25%。
+  "Transformer 主要是 attention" 是错的印象——<strong>参数在 MLP 里</strong>（0.2 讲过）。</li>
+<li><strong>embedding 占全模型 18.1%</strong>。小模型上这个比例特别高，
+  这也是 4.0 §5 里小模型倾向用 tie 的原因。</li>
+</ul>
+<p>FLOP：</p>
+<div class="highlight"><pre><span></span><code>attention 投影  2×12,582,912 =   25,165,824
+MLP             2×37,748,736 =   75,497,472
+每层小计（不含 attention 本身）    100,663,296
+28 层                           2,818,572,288
+lm_head 2×151936×2048             622,329,856
+
+经验规则：每 token 前向 FLOP ≈ 2 × 参数量 = 3,441,149,952
+上面逐项加起来 = 3,440,902,144
+</code></pre></div>
+
+<p>差 247,808，来自 <strong>embedding 是 gather 不是矩阵乘</strong>（0 FLOP）
+以及 norm 的那些小张量。
+"<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo></mrow></math></span> 参数量"这条经验规则的误差在这里是 <strong>0.007%</strong>。</p>
+<p>它<strong>不含 attention 本身</strong>（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></math></span> 与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mi>V</mi></mrow></math></span>），因为那一项是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span>，
+与序列长度有关——0.2 的账本和 3.1 的推导都在处理这一项。</p>
+<hr />
+<h2 id="_7">六 · 设计取舍</h2>
+<h3 id="61-mlp-75-attention-25">6.1 为什么 MLP 是 75% 而 attention 只有 25%</h3>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>attn</mtext><mo>&#x0003D;</mo><mn>2</mn><mi>H</mi><mo stretchy="false">&#x00028;</mo><msub><mi>n</mi><mi>q</mi></msub><msub><mi>h</mi><mi>d</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mn>2</mn><mi>H</mi><mo stretchy="false">&#x00028;</mo><msub><mi>n</mi><mrow><mi>k</mi><mi>v</mi></mrow></msub><msub><mi>h</mi><mi>d</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x02248;</mo><mn>4</mn><msup><mi>H</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mfrac><mrow><mn>1</mn><mo>&#x0002B;</mo><msup><mi>g</mi><mrow><mo>&#x02212;</mo><mn>1</mn></mrow></msup></mrow><mrow><mn>2</mn></mrow></mfrac><mo>&#x0002C;</mo><mspace width="2em" /><mtext>MLP</mtext><mo>&#x0003D;</mo><mn>3</mn><mi>H</mi><mi>I</mi></mrow></math></div></p>
+<p>Qwen3-1.7B 里 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>I</mi><mo>&#x0003D;</mo><mn>3</mn><mi>H</mi></mrow></math></span>，所以 MLP <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mn>9</mn><msup><mi>H</mi><mn>2</mn></msup></mrow></math></span> 而 attn <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02248;</mo><mn>3</mn><msup><mi>H</mi><mn>2</mn></msup></mrow></math></span>。
+<strong>这个比例是被 <code>intermediate_size</code> 的选择决定的</strong>，不是 Transformer 的固有性质。</p>
+<p><code>I/H = 3</code> 是 SwiGLU 时代的常见取值（因为 SwiGLU 用三个矩阵，
+要保持总参数量与两矩阵的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>I</mi><mo>&#x0002F;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>4</mn></mrow></math></span> 相当，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>3</mn><mo>&#x000D7;</mo><mn>3</mn><mo>&#x0003D;</mo><mn>9</mn><mo>&#x02248;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>4</mn><mo>&#x0003D;</mo><mn>8</mn></mrow></math></span>）。</p>
+<p>含义：<strong>想减参数量，动 MLP 比动 attention 有效得多</strong>；
+而<strong>想减 KV cache / decode 带宽，只能动 attention 侧</strong>（3.3）。
+两个目标压在不同的地方，这是 MoE（4.4）能成立的前提——
+它专门稀疏化那 75%。</p>
+<h3 id="62-qk-norm">6.2 QK-Norm：一个很小的张量，漏了就全错</h3>
+<p><code>q_norm</code>/<code>k_norm</code> 各 128 个参数，整个模型里 28×256 = 7168 个，
+占参数量的 <strong>0.0004%</strong>。但漏掉它，模型输出完全错。</p>
+<p>这类"参数量可忽略、语义不可忽略"的组件在现代模型里越来越多
+（QK-Norm、attention sink 参数、各种 gate）。它们的共同特点是：
+<strong>从参数量清单上看不出重要性，只能从结构上看。</strong></p>
+<p>对写加载器/推理引擎的人来说，这意味着<strong>不能靠"覆盖了 99% 的参数量"
+来判断实现完整</strong>。判据只能是逐层数值对齐——也就是本章第四节做的事。</p>
+<h3 id="63">6.3 逐层对齐为什么必须是验收标准</h3>
+<p>只比最终 logits 有两个漏洞：</p>
+<ol>
+<li><strong>误差可能被 final norm 掩盖。</strong> 残差流的幅度到最后一层是 24，
+   final norm 会把它压回 1.16——一个 5% 的中间误差在这里会被大幅压缩。</li>
+<li><strong>argmax 相同不代表实现正确。</strong> top-1 在多数位置上很稳，
+   一个有 bug 的实现照样能在短文本上给出相同的 argmax。</li>
+</ol>
+<p>逐层对齐能定位到<strong>具体哪一层</strong>，而且一旦某层对上了，
+就可以把该层之前的所有实现视为正确，二分下去很快。</p>
+<p><strong>判据：验收一个重实现，要比中间量，不能只比端到端输出。</strong>
+这和 2.8 §四里"反向写错但前向正确、只有 gradcheck 能抓"是同一个道理。</p>
+<hr />
+<h2 id="lab">七 · 动手 lab</h2>
+<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L4 &amp;&amp; /scratch/learn/envs/serve/bin/python qwen3_from_scratch.py'</span>
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/ckpt/41_from_scratch.txt</code>。</p>
+<details class="fold srcfold"><summary>labs/L4/qwen3_from_scratch.py 全文（370 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L4.1 —— 从 safetensors 直接读权重，手写一遍 Qwen3，逐层和 HF 对齐。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">不用 transformers 的任何 Module，只用 torch 的基本算子。</span>
+<span class="linenos">  5</span><span class="sd">每一步都打印张量的 shape / dtype / stride，然后和 HF 的对应中间结果比。</span>
+<span class="linenos">  6</span>
+<span class="linenos">  7</span><span class="sd">验收标准：**每一层的输出与 HF 的最大绝对误差在 bf16 舍入量级内。**</span>
+<span class="linenos">  8</span><span class="sd">只比最终 logits 是不够的——中间某一层错了、后面又被 norm 拉回来的情况很常见。</span>
+<span class="linenos">  9</span>
+<span class="linenos"> 10</span><span class="sd">  [A] 配置与权重清单</span>
+<span class="linenos"> 11</span><span class="sd">  [B] 一层的每个张量：shape / dtype / stride 全打印</span>
+<span class="linenos"> 12</span><span class="sd">  [C] 逐层对齐：手写 vs HF</span>
+<span class="linenos"> 13</span><span class="sd">  [D] 参数量与 FLOP 的解析模型 vs 实际</span>
+<span class="linenos"> 14</span>
+<span class="linenos"> 15</span><span class="sd">用法：</span>
+<span class="linenos"> 16</span><span class="sd">    python qwen3_from_scratch.py</span>
+<span class="linenos"> 17</span><span class="sd">"""</span>
+<span class="linenos"> 18</span>
+<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">glob</span>
+<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos"> 21</span><span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 23</span><span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="linenos"> 24</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 25</span>
+<span class="linenos"> 26</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 27</span>
+<span class="linenos"> 28</span><span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos"> 29</span><span class="n">HUB</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"HF_HOME"</span><span class="p">,</span> <span class="s2">"/scratch/learn/models/hf"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/hub"</span>
+<span class="linenos"> 30</span><span class="n">REPO</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"L41_MODEL"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen3-1.7B"</span><span class="p">)</span>
+<span class="linenos"> 31</span>
+<span class="linenos"> 32</span>
+<span class="linenos"> 33</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 34</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos"> 35</span>
+<span class="linenos"> 36</span>
+<span class="linenos"> 37</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 38</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos"> 39</span>
+<span class="linenos"> 40</span>
+<span class="linenos"> 41</span><span class="k">def</span><span class="w"> </span><span class="nf">snap</span><span class="p">(</span><span class="n">repo</span><span class="p">):</span>
+<span class="linenos"> 42</span>    <span class="n">d</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">HUB</span><span class="si">}</span><span class="s2">/models--</span><span class="si">{</span><span class="n">repo</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'/'</span><span class="p">,</span><span class="w"> </span><span class="s1">'--'</span><span class="p">)</span><span class="si">}</span><span class="s2">/snapshots"</span>
+<span class="linenos"> 43</span>    <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/*"</span><span class="p">))[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos"> 44</span>
+<span class="linenos"> 45</span>
+<span class="linenos"> 46</span><span class="k">def</span><span class="w"> </span><span class="nf">load_weights</span><span class="p">(</span><span class="n">d</span><span class="p">):</span>
+<span class="linenos"> 47</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">safe_open</span>
+<span class="linenos"> 48</span>    <span class="n">w</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos"> 49</span>    <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/*.safetensors"</span><span class="p">)):</span>
+<span class="linenos"> 50</span>        <span class="k">with</span> <span class="n">safe_open</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">framework</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span> <span class="k">as</span> <span class="n">sf</span><span class="p">:</span>
+<span class="linenos"> 51</span>            <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">sf</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+<span class="linenos"> 52</span>                <span class="n">w</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">=</span> <span class="n">sf</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+<span class="linenos"> 53</span>    <span class="k">return</span> <span class="n">w</span>
+<span class="linenos"> 54</span>
+<span class="linenos"> 55</span>
+<span class="linenos"> 56</span><span class="k">def</span><span class="w"> </span><span class="nf">show</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">note</span><span class="o">=</span><span class="s2">""</span><span class="p">):</span>
+<span class="linenos"> 57</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;40</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">))</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'torch.'</span><span class="p">,</span><span class="s1">''</span><span class="p">)</span><span class="si">:</span><span class="s2">&lt;9</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos"> 58</span>          <span class="sa">f</span><span class="s2">"stride=</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">stride</span><span class="p">())</span><span class="si">:</span><span class="s2">&lt;18</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'连续'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">t</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'不连续'</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">note</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 59</span>
+<span class="linenos"> 60</span>
+<span class="linenos"> 61</span><span class="c1"># ---------------------------------------------------------------- 手写实现</span>
+<span class="linenos"> 62</span><span class="k">def</span><span class="w"> </span><span class="nf">rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">):</span>
+<span class="linenos"> 63</span><span class="w">    </span><span class="sd">"""RMSNorm：不减均值，只除以均方根。比 LayerNorm 少一次归约。"""</span>
+<span class="linenos"> 64</span>    <span class="n">dt</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span>
+<span class="linenos"> 65</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos"> 66</span>    <span class="n">var</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 67</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">var</span> <span class="o">+</span> <span class="n">eps</span><span class="p">)</span>
+<span class="linenos"> 68</span>    <span class="k">return</span> <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dt</span><span class="p">)</span> <span class="o">*</span> <span class="n">weight</span><span class="p">)</span>
+<span class="linenos"> 69</span>
+<span class="linenos"> 70</span>
+<span class="linenos"> 71</span><span class="k">def</span><span class="w"> </span><span class="nf">rope_tables</span><span class="p">(</span><span class="n">seq</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
+<span class="linenos"> 72</span>    <span class="n">inv</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">base</span> <span class="o">**</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">/</span> <span class="n">head_dim</span><span class="p">))</span>
+<span class="linenos"> 73</span>    <span class="n">pos</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">seq</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos"> 74</span>    <span class="n">freqs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">outer</span><span class="p">(</span><span class="n">pos</span><span class="p">,</span> <span class="n">inv</span><span class="p">)</span>                 <span class="c1"># [S, head_dim/2]</span>
+<span class="linenos"> 75</span>    <span class="n">emb</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">freqs</span><span class="p">,</span> <span class="n">freqs</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>       <span class="c1"># [S, head_dim]  HF 的排布</span>
+<span class="linenos"> 76</span>    <span class="k">return</span> <span class="n">emb</span><span class="o">.</span><span class="n">cos</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">),</span> <span class="n">emb</span><span class="o">.</span><span class="n">sin</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+<span class="linenos"> 77</span>
+<span class="linenos"> 78</span>
+<span class="linenos"> 79</span><span class="k">def</span><span class="w"> </span><span class="nf">rotate_half</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+<span class="linenos"> 80</span>    <span class="n">h</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">//</span> <span class="mi">2</span>
+<span class="linenos"> 81</span>    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="o">-</span><span class="n">x</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">h</span><span class="p">:],</span> <span class="n">x</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="p">:</span><span class="n">h</span><span class="p">]],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos"> 82</span>
+<span class="linenos"> 83</span>
+<span class="linenos"> 84</span><span class="k">def</span><span class="w"> </span><span class="nf">apply_rope</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">):</span>
+<span class="linenos"> 85</span>    <span class="c1"># x: [B, H, S, D]   cos/sin: [S, D]</span>
+<span class="linenos"> 86</span>    <span class="k">return</span> <span class="n">x</span> <span class="o">*</span> <span class="n">cos</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">rotate_half</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">*</span> <span class="n">sin</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+<span class="linenos"> 87</span>
+<span class="linenos"> 88</span>
+<span class="linenos"> 89</span><span class="k">class</span><span class="w"> </span><span class="nc">Layer</span><span class="p">:</span>
+<span class="linenos"> 90</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="n">cfg</span><span class="p">):</span>
+<span class="linenos"> 91</span>        <span class="n">p</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"model.layers.</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">."</span>
+<span class="linenos"> 92</span>        <span class="bp">self</span><span class="o">.</span><span class="n">wq</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"self_attn.q_proj.weight"</span><span class="p">]</span>
+<span class="linenos"> 93</span>        <span class="bp">self</span><span class="o">.</span><span class="n">wk</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"self_attn.k_proj.weight"</span><span class="p">]</span>
+<span class="linenos"> 94</span>        <span class="bp">self</span><span class="o">.</span><span class="n">wv</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"self_attn.v_proj.weight"</span><span class="p">]</span>
+<span class="linenos"> 95</span>        <span class="bp">self</span><span class="o">.</span><span class="n">wo</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"self_attn.o_proj.weight"</span><span class="p">]</span>
+<span class="linenos"> 96</span>        <span class="bp">self</span><span class="o">.</span><span class="n">qn</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"self_attn.q_norm.weight"</span><span class="p">]</span>
+<span class="linenos"> 97</span>        <span class="bp">self</span><span class="o">.</span><span class="n">kn</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"self_attn.k_norm.weight"</span><span class="p">]</span>
+<span class="linenos"> 98</span>        <span class="bp">self</span><span class="o">.</span><span class="n">n1</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"input_layernorm.weight"</span><span class="p">]</span>
+<span class="linenos"> 99</span>        <span class="bp">self</span><span class="o">.</span><span class="n">n2</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"post_attention_layernorm.weight"</span><span class="p">]</span>
+<span class="linenos">100</span>        <span class="bp">self</span><span class="o">.</span><span class="n">gate</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"mlp.gate_proj.weight"</span><span class="p">]</span>
+<span class="linenos">101</span>        <span class="bp">self</span><span class="o">.</span><span class="n">up</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"mlp.up_proj.weight"</span><span class="p">]</span>
+<span class="linenos">102</span>        <span class="bp">self</span><span class="o">.</span><span class="n">down</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">p</span> <span class="o">+</span> <span class="s2">"mlp.down_proj.weight"</span><span class="p">]</span>
+<span class="linenos">103</span>        <span class="bp">self</span><span class="o">.</span><span class="n">cfg</span> <span class="o">=</span> <span class="n">cfg</span>
+<span class="linenos">104</span>
+<span class="linenos">105</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">,</span> <span class="n">trace</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+<span class="linenos">106</span>        <span class="n">c</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cfg</span>
+<span class="linenos">107</span>        <span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">H</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span>
+<span class="linenos">108</span>        <span class="n">nq</span><span class="p">,</span> <span class="n">nkv</span><span class="p">,</span> <span class="n">hd</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"nq"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"nkv"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"hd"</span><span class="p">]</span>
+<span class="linenos">109</span>        <span class="n">eps</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"eps"</span><span class="p">]</span>
+<span class="linenos">110</span>
+<span class="linenos">111</span>        <span class="c1"># ---- attention 分支 ----</span>
+<span class="linenos">112</span>        <span class="n">h</span> <span class="o">=</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n1</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span>
+<span class="linenos">113</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">h</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">wq</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">114</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">h</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">wk</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">115</span>        <span class="n">v</span> <span class="o">=</span> <span class="n">h</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">wv</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">116</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">nq</span><span class="p">,</span> <span class="n">hd</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>          <span class="c1"># [B, nq, S, hd]</span>
+<span class="linenos">117</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">nkv</span><span class="p">,</span> <span class="n">hd</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos">118</span>        <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">nkv</span><span class="p">,</span> <span class="n">hd</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos">119</span>        <span class="c1"># QK-Norm：在 head_dim 上做 RMSNorm（Qwen3 特有）</span>
+<span class="linenos">120</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">qn</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span>
+<span class="linenos">121</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kn</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span>
+<span class="linenos">122</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">apply_rope</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+<span class="linenos">123</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">apply_rope</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+<span class="linenos">124</span>        <span class="n">o</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span>
+<span class="linenos">125</span>            <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">is_causal</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">enable_gqa</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">126</span>        <span class="n">o</span> <span class="o">=</span> <span class="n">o</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">nq</span> <span class="o">*</span> <span class="n">hd</span><span class="p">)</span>
+<span class="linenos">127</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="n">o</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">wo</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">128</span>
+<span class="linenos">129</span>        <span class="c1"># ---- MLP 分支 ----</span>
+<span class="linenos">130</span>        <span class="n">h</span> <span class="o">=</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n2</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span>
+<span class="linenos">131</span>        <span class="n">g</span> <span class="o">=</span> <span class="n">h</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">132</span>        <span class="n">u</span> <span class="o">=</span> <span class="n">h</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">up</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">133</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">silu</span><span class="p">(</span><span class="n">g</span><span class="p">)</span> <span class="o">*</span> <span class="n">u</span><span class="p">)</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">down</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">134</span>        <span class="k">if</span> <span class="n">trace</span><span class="p">:</span>
+<span class="linenos">135</span>            <span class="k">return</span> <span class="n">x</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">after_norm1</span><span class="o">=</span><span class="n">h</span><span class="p">,</span> <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">attn_out</span><span class="o">=</span><span class="n">o</span><span class="p">,</span> <span class="n">gate</span><span class="o">=</span><span class="n">g</span><span class="p">,</span> <span class="n">up</span><span class="o">=</span><span class="n">u</span><span class="p">)</span>
+<span class="linenos">136</span>        <span class="k">return</span> <span class="n">x</span>
+<span class="linenos">137</span>
+<span class="linenos">138</span>
+<span class="linenos">139</span><span class="k">def</span><span class="w"> </span><span class="nf">build</span><span class="p">(</span><span class="n">repo</span><span class="o">=</span><span class="n">REPO</span><span class="p">):</span>
+<span class="linenos">140</span>    <span class="n">d</span> <span class="o">=</span> <span class="n">snap</span><span class="p">(</span><span class="n">repo</span><span class="p">)</span>
+<span class="linenos">141</span>    <span class="n">cfg_j</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/config.json"</span><span class="p">))</span>
+<span class="linenos">142</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">load_weights</span><span class="p">(</span><span class="n">d</span><span class="p">)</span>
+<span class="linenos">143</span>    <span class="n">cfg</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
+<span class="linenos">144</span>        <span class="n">nq</span><span class="o">=</span><span class="n">cfg_j</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">],</span> <span class="n">nkv</span><span class="o">=</span><span class="n">cfg_j</span><span class="p">[</span><span class="s2">"num_key_value_heads"</span><span class="p">],</span>
+<span class="linenos">145</span>        <span class="n">hd</span><span class="o">=</span><span class="n">cfg_j</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"head_dim"</span><span class="p">,</span> <span class="n">cfg_j</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span> <span class="o">//</span> <span class="n">cfg_j</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">]),</span>
+<span class="linenos">146</span>        <span class="n">eps</span><span class="o">=</span><span class="n">cfg_j</span><span class="p">[</span><span class="s2">"rms_norm_eps"</span><span class="p">],</span> <span class="n">base</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">cfg_j</span><span class="p">[</span><span class="s2">"rope_theta"</span><span class="p">]),</span>
+<span class="linenos">147</span>        <span class="n">L</span><span class="o">=</span><span class="n">cfg_j</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">],</span> <span class="n">H</span><span class="o">=</span><span class="n">cfg_j</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span>
+<span class="linenos">148</span>        <span class="n">I</span><span class="o">=</span><span class="n">cfg_j</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">],</span> <span class="n">V</span><span class="o">=</span><span class="n">cfg_j</span><span class="p">[</span><span class="s2">"vocab_size"</span><span class="p">],</span>
+<span class="linenos">149</span>        <span class="n">tie</span><span class="o">=</span><span class="n">cfg_j</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"tie_word_embeddings"</span><span class="p">,</span> <span class="kc">False</span><span class="p">))</span>
+<span class="linenos">150</span>    <span class="k">return</span> <span class="n">d</span><span class="p">,</span> <span class="n">cfg_j</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="n">w</span>
+<span class="linenos">151</span>
+<span class="linenos">152</span>
+<span class="linenos">153</span><span class="k">def</span><span class="w"> </span><span class="nf">run_mine</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="n">upto</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="linenos">154</span>    <span class="n">dev</span> <span class="o">=</span> <span class="n">ids</span><span class="o">.</span><span class="n">device</span>
+<span class="linenos">155</span>    <span class="n">emb</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="s2">"model.embed_tokens.weight"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">156</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">emb</span><span class="p">[</span><span class="n">ids</span><span class="p">]</span>
+<span class="linenos">157</span>    <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="n">rope_tables</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"hd"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"base"</span><span class="p">],</span> <span class="n">dev</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+<span class="linenos">158</span>    <span class="n">outs</span> <span class="o">=</span> <span class="p">[</span><span class="n">x</span><span class="p">]</span>
+<span class="linenos">159</span>    <span class="n">n</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"L"</span><span class="p">]</span> <span class="k">if</span> <span class="n">upto</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">upto</span>
+<span class="linenos">160</span>    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos">161</span>        <span class="n">lay</span> <span class="o">=</span> <span class="n">Layer</span><span class="p">({</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">w</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+<span class="linenos">162</span>                     <span class="k">if</span> <span class="n">k</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="sa">f</span><span class="s2">"model.layers.</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">."</span><span class="p">)},</span> <span class="n">i</span><span class="p">,</span> <span class="n">cfg</span><span class="p">)</span>
+<span class="linenos">163</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">lay</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+<span class="linenos">164</span>        <span class="n">outs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">165</span>    <span class="k">return</span> <span class="n">x</span><span class="p">,</span> <span class="n">outs</span>
+<span class="linenos">166</span>
+<span class="linenos">167</span>
+<span class="linenos">168</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos">169</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos">170</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 配置与权重清单"</span><span class="p">)</span>
+<span class="linenos">171</span>    <span class="n">d</span><span class="p">,</span> <span class="n">cfg_j</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">build</span><span class="p">()</span>
+<span class="linenos">172</span>    <span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">,</span> <span class="s2">"intermediate_size"</span><span class="p">,</span> <span class="s2">"num_hidden_layers"</span><span class="p">,</span>
+<span class="linenos">173</span>            <span class="s2">"num_attention_heads"</span><span class="p">,</span> <span class="s2">"num_key_value_heads"</span><span class="p">,</span> <span class="s2">"head_dim"</span><span class="p">,</span>
+<span class="linenos">174</span>            <span class="s2">"rms_norm_eps"</span><span class="p">,</span> <span class="s2">"rope_theta"</span><span class="p">,</span> <span class="s2">"vocab_size"</span><span class="p">,</span> <span class="s2">"tie_word_embeddings"</span><span class="p">,</span>
+<span class="linenos">175</span>            <span class="s2">"hidden_act"</span><span class="p">]</span>
+<span class="linenos">176</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">REPO</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">177</span>    <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">:</span>
+<span class="linenos">178</span>        <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">cfg_j</span><span class="p">:</span>
+<span class="linenos">179</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">k</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">cfg_j</span><span class="p">[</span><span class="n">k</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">180</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  GQA 分组数 g = nq/nkv = </span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'nq'</span><span class="p">]</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'nkv'</span><span class="p">]</span><span class="si">}</span><span class="s2"> = "</span>
+<span class="linenos">181</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'nq'</span><span class="p">]</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="n">cfg</span><span class="p">[</span><span class="s1">'nkv'</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">182</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  注意 hidden_size(</span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'H'</span><span class="p">]</span><span class="si">}</span><span class="s2">) != nq×head_dim"</span>
+<span class="linenos">183</span>          <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'nq'</span><span class="p">]</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'hd'</span><span class="p">]</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'nq'</span><span class="p">]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">cfg</span><span class="p">[</span><span class="s1">'hd'</span><span class="p">]</span><span class="si">}</span><span class="s2">)"</span>
+<span class="linenos">184</span>          <span class="k">if</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"H"</span><span class="p">]</span> <span class="o">!=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"nq"</span><span class="p">]</span> <span class="o">*</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"hd"</span><span class="p">]</span> <span class="k">else</span>
+<span class="linenos">185</span>          <span class="sa">f</span><span class="s2">"  hidden_size = nq×head_dim = </span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'nq'</span><span class="p">]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">cfg</span><span class="p">[</span><span class="s1">'hd'</span><span class="p">]</span><span class="si">}</span><span class="s2"> ✓"</span><span class="p">)</span>
+<span class="linenos">186</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  权重张量共 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">w</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个"</span><span class="p">)</span>
+<span class="linenos">187</span>
+<span class="linenos">188</span>
+<span class="linenos">189</span><span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos">190</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos">191</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 一层里每个张量的 shape / dtype / stride"</span><span class="p">)</span>
+<span class="linenos">192</span>    <span class="n">d</span><span class="p">,</span> <span class="n">cfg_j</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">build</span><span class="p">()</span>
+<span class="linenos">193</span>    <span class="n">dev</span> <span class="o">=</span> <span class="s2">"cuda"</span>
+<span class="linenos">194</span>    <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">785</span><span class="p">,</span> <span class="mi">6722</span><span class="p">,</span> <span class="mi">315</span><span class="p">,</span> <span class="mi">9625</span><span class="p">,</span> <span class="mi">374</span><span class="p">,</span> <span class="mi">12095</span><span class="p">,</span> <span class="mi">13</span><span class="p">]],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">195</span>    <span class="n">B</span><span class="p">,</span> <span class="n">S</span> <span class="o">=</span> <span class="n">ids</span><span class="o">.</span><span class="n">shape</span>
+<span class="linenos">196</span>    <span class="n">emb</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="s2">"model.embed_tokens.weight"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">197</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">emb</span><span class="p">[</span><span class="n">ids</span><span class="p">]</span>
+<span class="linenos">198</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  输入 </span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> 个 token"</span><span class="p">)</span>
+<span class="linenos">199</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"token ids"</span><span class="p">,</span> <span class="n">ids</span><span class="p">)</span>
+<span class="linenos">200</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"embed_tokens 权重"</span><span class="p">,</span> <span class="n">emb</span><span class="p">)</span>
+<span class="linenos">201</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"x = emb[ids]"</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="s2">"&lt;- 这是一次 gather，不是矩阵乘"</span><span class="p">)</span>
+<span class="linenos">202</span>
+<span class="linenos">203</span>    <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="n">rope_tables</span><span class="p">(</span><span class="n">S</span><span class="p">,</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"hd"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"base"</span><span class="p">],</span> <span class="n">dev</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+<span class="linenos">204</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"rope cos"</span><span class="p">,</span> <span class="n">cos</span><span class="p">)</span>
+<span class="linenos">205</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"rope sin"</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+<span class="linenos">206</span>
+<span class="linenos">207</span>    <span class="n">lay</span> <span class="o">=</span> <span class="n">Layer</span><span class="p">({</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">w</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+<span class="linenos">208</span>                 <span class="k">if</span> <span class="n">k</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"model.layers.0."</span><span class="p">)},</span> <span class="mi">0</span><span class="p">,</span> <span class="n">cfg</span><span class="p">)</span>
+<span class="linenos">209</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"attention 分支"</span><span class="p">)</span>
+<span class="linenos">210</span>    <span class="n">h</span> <span class="o">=</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">lay</span><span class="o">.</span><span class="n">n1</span><span class="p">,</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"eps"</span><span class="p">])</span>
+<span class="linenos">211</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"input_layernorm 之后"</span><span class="p">,</span> <span class="n">h</span><span class="p">)</span>
+<span class="linenos">212</span>    <span class="n">q</span> <span class="o">=</span> <span class="n">h</span> <span class="o">@</span> <span class="n">lay</span><span class="o">.</span><span class="n">wq</span><span class="o">.</span><span class="n">T</span><span class="p">;</span> <span class="n">k</span> <span class="o">=</span> <span class="n">h</span> <span class="o">@</span> <span class="n">lay</span><span class="o">.</span><span class="n">wk</span><span class="o">.</span><span class="n">T</span><span class="p">;</span> <span class="n">v</span> <span class="o">=</span> <span class="n">h</span> <span class="o">@</span> <span class="n">lay</span><span class="o">.</span><span class="n">wv</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">213</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"q = h @ Wq^T"</span><span class="p">,</span> <span class="n">q</span><span class="p">)</span>
+<span class="linenos">214</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"k = h @ Wk^T"</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="s2">"&lt;- 只有 q 的一半宽（GQA）"</span><span class="p">)</span>
+<span class="linenos">215</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"v = h @ Wv^T"</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+<span class="linenos">216</span>    <span class="n">nq</span><span class="p">,</span> <span class="n">nkv</span><span class="p">,</span> <span class="n">hd</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"nq"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"nkv"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"hd"</span><span class="p">]</span>
+<span class="linenos">217</span>    <span class="n">q4</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">nq</span><span class="p">,</span> <span class="n">hd</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos">218</span>    <span class="n">k4</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">nkv</span><span class="p">,</span> <span class="n">hd</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos">219</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"q.view(B,S,nq,hd).transpose(1,2)"</span><span class="p">,</span> <span class="n">q4</span><span class="p">,</span> <span class="s2">"&lt;- 2.0 说过：transpose 之后不连续"</span><span class="p">)</span>
+<span class="linenos">220</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"k 同上"</span><span class="p">,</span> <span class="n">k4</span><span class="p">)</span>
+<span class="linenos">221</span>    <span class="n">q4</span> <span class="o">=</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">q4</span><span class="p">,</span> <span class="n">lay</span><span class="o">.</span><span class="n">qn</span><span class="p">,</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"eps"</span><span class="p">])</span>
+<span class="linenos">222</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"QK-Norm 之后的 q"</span><span class="p">,</span> <span class="n">q4</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"&lt;- 权重形状 </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">lay</span><span class="o">.</span><span class="n">qn</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">，作用在 head_dim 上"</span><span class="p">)</span>
+<span class="linenos">223</span>    <span class="n">q4</span> <span class="o">=</span> <span class="n">apply_rope</span><span class="p">(</span><span class="n">q4</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+<span class="linenos">224</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"RoPE 之后的 q"</span><span class="p">,</span> <span class="n">q4</span><span class="p">)</span>
+<span class="linenos">225</span>    <span class="n">v4</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">nkv</span><span class="p">,</span> <span class="n">hd</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos">226</span>    <span class="n">o</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span>
+<span class="linenos">227</span>        <span class="n">q4</span><span class="p">,</span> <span class="n">k4</span><span class="p">,</span> <span class="n">v4</span><span class="p">,</span> <span class="n">is_causal</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">enable_gqa</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">228</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"attention 输出"</span><span class="p">,</span> <span class="n">o</span><span class="p">)</span>
+<span class="linenos">229</span>    <span class="n">o2</span> <span class="o">=</span> <span class="n">o</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">nq</span> <span class="o">*</span> <span class="n">hd</span><span class="p">)</span>
+<span class="linenos">230</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"reshape 回 [B,S,nq*hd]"</span><span class="p">,</span> <span class="n">o2</span><span class="p">,</span> <span class="s2">"&lt;- 这里必须先 contiguous，reshape 会静默拷贝"</span><span class="p">)</span>
+<span class="linenos">231</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"o_proj 权重"</span><span class="p">,</span> <span class="n">lay</span><span class="o">.</span><span class="n">wo</span><span class="p">)</span>
+<span class="linenos">232</span>
+<span class="linenos">233</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"MLP 分支"</span><span class="p">)</span>
+<span class="linenos">234</span>    <span class="n">x2</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="n">o2</span> <span class="o">@</span> <span class="n">lay</span><span class="o">.</span><span class="n">wo</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">235</span>    <span class="n">h2</span> <span class="o">=</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">x2</span><span class="p">,</span> <span class="n">lay</span><span class="o">.</span><span class="n">n2</span><span class="p">,</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"eps"</span><span class="p">])</span>
+<span class="linenos">236</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"post_attention_layernorm 之后"</span><span class="p">,</span> <span class="n">h2</span><span class="p">)</span>
+<span class="linenos">237</span>    <span class="n">g</span> <span class="o">=</span> <span class="n">h2</span> <span class="o">@</span> <span class="n">lay</span><span class="o">.</span><span class="n">gate</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">238</span>    <span class="n">u</span> <span class="o">=</span> <span class="n">h2</span> <span class="o">@</span> <span class="n">lay</span><span class="o">.</span><span class="n">up</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">239</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"gate_proj 输出"</span><span class="p">,</span> <span class="n">g</span><span class="p">)</span>
+<span class="linenos">240</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"up_proj 输出"</span><span class="p">,</span> <span class="n">u</span><span class="p">)</span>
+<span class="linenos">241</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"silu(gate)*up"</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">silu</span><span class="p">(</span><span class="n">g</span><span class="p">)</span> <span class="o">*</span> <span class="n">u</span><span class="p">)</span>
+<span class="linenos">242</span>    <span class="n">show</span><span class="p">(</span><span class="s2">"down_proj 权重"</span><span class="p">,</span> <span class="n">lay</span><span class="o">.</span><span class="n">down</span><span class="p">)</span>
+<span class="linenos">243</span>
+<span class="linenos">244</span>
+<span class="linenos">245</span><span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos">246</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos">247</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 逐层对齐：手写实现 vs HF"</span><span class="p">)</span>
+<span class="linenos">248</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForCausalLM</span>
+<span class="linenos">249</span>    <span class="n">d</span><span class="p">,</span> <span class="n">cfg_j</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">build</span><span class="p">()</span>
+<span class="linenos">250</span>    <span class="n">dev</span> <span class="o">=</span> <span class="s2">"cuda"</span>
+<span class="linenos">251</span>    <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">785</span><span class="p">,</span> <span class="mi">6722</span><span class="p">,</span> <span class="mi">315</span><span class="p">,</span> <span class="mi">9625</span><span class="p">,</span> <span class="mi">374</span><span class="p">,</span> <span class="mi">12095</span><span class="p">,</span> <span class="mi">13</span><span class="p">,</span>
+<span class="linenos">252</span>                         <span class="mi">21806</span><span class="p">,</span> <span class="mi">25</span><span class="p">,</span> <span class="mi">12095</span><span class="p">]],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">253</span>
+<span class="linenos">254</span>    <span class="n">hf</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+<span class="linenos">255</span>        <span class="n">REPO</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">attn_implementation</span><span class="o">=</span><span class="s2">"sdpa"</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<span class="linenos">256</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">257</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">hf</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="n">output_hidden_states</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">258</span>    <span class="n">hs</span> <span class="o">=</span> <span class="n">out</span><span class="o">.</span><span class="n">hidden_states</span>           <span class="c1"># tuple: L+1 个 [B,S,H]，第 0 个是 embedding</span>
+<span class="linenos">259</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  HF 给出 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">hs</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个 hidden_states（embedding + </span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'L'</span><span class="p">]</span><span class="si">}</span><span class="s2"> 层）"</span><span class="p">)</span>
+<span class="linenos">260</span>
+<span class="linenos">261</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">262</span>        <span class="n">mine</span><span class="p">,</span> <span class="n">outs</span> <span class="o">=</span> <span class="n">run_mine</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">cfg</span><span class="p">)</span>
+<span class="linenos">263</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  手写实现给出 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">outs</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个"</span><span class="p">)</span>
+<span class="linenos">264</span>
+<span class="linenos">265</span>    <span class="c1"># 注意：HF 的 hidden_states 最后一个**已经过了 final norm**，</span>
+<span class="linenos">266</span>    <span class="c1"># 而我的 outs 最后一个是第 L-1 层的原始输出。不处理这一点会看到</span>
+<span class="linenos">267</span>    <span class="c1"># 最后一行相对误差 165473% —— 那是对比方式错了，不是实现错了。</span>
+<span class="linenos">268</span>    <span class="n">outs_cmp</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">outs</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span> <span class="o">+</span> <span class="p">[</span>
+<span class="linenos">269</span>        <span class="n">rms_norm</span><span class="p">(</span><span class="n">outs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">w</span><span class="p">[</span><span class="s2">"model.norm.weight"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">),</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"eps"</span><span class="p">])]</span>
+<span class="linenos">270</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  （HF 的最后一个 hidden_state 已含 final norm，这里对齐了再比）"</span><span class="p">)</span>
+<span class="linenos">271</span>
+<span class="linenos">272</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'层'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'HF 的均方根'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'max|diff|'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对误差'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'判定'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">273</span>    <span class="n">bad</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos">274</span>    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">outs_cmp</span><span class="p">,</span> <span class="n">hs</span><span class="p">)):</span>
+<span class="linenos">275</span>        <span class="n">diff</span> <span class="o">=</span> <span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">-</span> <span class="n">b</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">276</span>        <span class="n">scale</span> <span class="o">=</span> <span class="n">b</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">277</span>        <span class="n">rel</span> <span class="o">=</span> <span class="n">diff</span> <span class="o">/</span> <span class="nb">max</span><span class="p">(</span><span class="n">scale</span><span class="p">,</span> <span class="mf">1e-9</span><span class="p">)</span>
+<span class="linenos">278</span>        <span class="n">ok</span> <span class="o">=</span> <span class="n">rel</span> <span class="o">&lt;</span> <span class="mf">0.05</span>
+<span class="linenos">279</span>        <span class="n">bad</span> <span class="o">+=</span> <span class="p">(</span><span class="ow">not</span> <span class="n">ok</span><span class="p">)</span>
+<span class="linenos">280</span>        <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">3</span> <span class="ow">or</span> <span class="n">i</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">outs_cmp</span><span class="p">)</span> <span class="o">-</span> <span class="mi">4</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">:</span>
+<span class="linenos">281</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">i</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">scale</span><span class="si">:</span><span class="s2">&gt;13.5f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">diff</span><span class="si">:</span><span class="s2">&gt;13.6f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">rel</span><span class="si">:</span><span class="s2">&gt;11.2%</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">282</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'✓'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'✗'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">283</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  ... 共 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">outs_cmp</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个对照点，</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">outs_cmp</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">bad</span><span class="si">}</span><span class="s2"> 个通过"</span><span class="p">)</span>
+<span class="linenos">284</span>    <span class="n">exact</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="mi">1</span> <span class="k">for</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">outs_cmp</span><span class="p">,</span> <span class="n">hs</span><span class="p">)</span>
+<span class="linenos">285</span>                <span class="k">if</span> <span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">-</span> <span class="n">b</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">==</span> <span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos">286</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  其中 **逐位完全相同** 的有 </span><span class="si">{</span><span class="n">exact</span><span class="si">}</span><span class="s2"> 个"</span><span class="p">)</span>
+<span class="linenos">287</span>
+<span class="linenos">288</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"最终 logits"</span><span class="p">)</span>
+<span class="linenos">289</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">290</span>        <span class="n">fin</span> <span class="o">=</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">mine</span><span class="p">,</span> <span class="n">w</span><span class="p">[</span><span class="s2">"model.norm.weight"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">),</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"eps"</span><span class="p">])</span>
+<span class="linenos">291</span>        <span class="n">head</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"lm_head.weight"</span><span class="p">,</span> <span class="n">w</span><span class="p">[</span><span class="s2">"model.embed_tokens.weight"</span><span class="p">])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">292</span>        <span class="n">my_logits</span> <span class="o">=</span> <span class="n">fin</span> <span class="o">@</span> <span class="n">head</span><span class="o">.</span><span class="n">T</span>
+<span class="linenos">293</span>    <span class="n">hf_logits</span> <span class="o">=</span> <span class="n">out</span><span class="o">.</span><span class="n">logits</span>
+<span class="linenos">294</span>    <span class="n">diff</span> <span class="o">=</span> <span class="p">(</span><span class="n">my_logits</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">-</span> <span class="n">hf_logits</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">295</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  手写 logits   </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">my_logits</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">296</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  HF   logits   </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">hf_logits</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">297</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  max|diff| = </span><span class="si">{</span><span class="n">diff</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">   (bf16 在这个量级的分辨率约 "</span>
+<span class="linenos">298</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="mi">2</span><span class="w"> </span><span class="o">**</span><span class="w"> </span><span class="o">-</span><span class="mi">8</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">hf_logits</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">299</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  argmax 相同: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">my_logits</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">),</span><span class="w"> </span><span class="n">hf_logits</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">300</span>    <span class="n">top</span> <span class="o">=</span> <span class="n">my_logits</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="mi">5</span><span class="p">)</span>
+<span class="linenos">301</span>    <span class="n">top_hf</span> <span class="o">=</span> <span class="n">hf_logits</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="mi">5</span><span class="p">)</span>
+<span class="linenos">302</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  手写 top5 id: </span><span class="si">{</span><span class="n">top</span><span class="o">.</span><span class="n">indices</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">303</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  HF   top5 id: </span><span class="si">{</span><span class="n">top_hf</span><span class="o">.</span><span class="n">indices</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">304</span>    <span class="k">del</span> <span class="n">hf</span>
+<span class="linenos">305</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">306</span>
+<span class="linenos">307</span>
+<span class="linenos">308</span><span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos">309</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos">310</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 参数量与 FLOP 的解析模型"</span><span class="p">)</span>
+<span class="linenos">311</span>    <span class="n">d</span><span class="p">,</span> <span class="n">cfg_j</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">build</span><span class="p">()</span>
+<span class="linenos">312</span>    <span class="n">H</span><span class="p">,</span> <span class="n">I</span><span class="p">,</span> <span class="n">L</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"H"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"I"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"L"</span><span class="p">]</span>
+<span class="linenos">313</span>    <span class="n">nq</span><span class="p">,</span> <span class="n">nkv</span><span class="p">,</span> <span class="n">hd</span><span class="p">,</span> <span class="n">V</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"nq"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"nkv"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"hd"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"V"</span><span class="p">]</span>
+<span class="linenos">314</span>
+<span class="linenos">315</span>    <span class="n">p_q</span> <span class="o">=</span> <span class="n">H</span> <span class="o">*</span> <span class="n">nq</span> <span class="o">*</span> <span class="n">hd</span>
+<span class="linenos">316</span>    <span class="n">p_k</span> <span class="o">=</span> <span class="n">H</span> <span class="o">*</span> <span class="n">nkv</span> <span class="o">*</span> <span class="n">hd</span>
+<span class="linenos">317</span>    <span class="n">p_v</span> <span class="o">=</span> <span class="n">H</span> <span class="o">*</span> <span class="n">nkv</span> <span class="o">*</span> <span class="n">hd</span>
+<span class="linenos">318</span>    <span class="n">p_o</span> <span class="o">=</span> <span class="n">nq</span> <span class="o">*</span> <span class="n">hd</span> <span class="o">*</span> <span class="n">H</span>
+<span class="linenos">319</span>    <span class="n">p_attn</span> <span class="o">=</span> <span class="n">p_q</span> <span class="o">+</span> <span class="n">p_k</span> <span class="o">+</span> <span class="n">p_v</span> <span class="o">+</span> <span class="n">p_o</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">hd</span>            <span class="c1"># +q_norm,k_norm</span>
+<span class="linenos">320</span>    <span class="n">p_mlp</span> <span class="o">=</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">I</span>
+<span class="linenos">321</span>    <span class="n">p_norm</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">H</span>
+<span class="linenos">322</span>    <span class="n">p_layer</span> <span class="o">=</span> <span class="n">p_attn</span> <span class="o">+</span> <span class="n">p_mlp</span> <span class="o">+</span> <span class="n">p_norm</span>
+<span class="linenos">323</span>    <span class="n">p_emb</span> <span class="o">=</span> <span class="n">V</span> <span class="o">*</span> <span class="n">H</span>
+<span class="linenos">324</span>    <span class="n">total</span> <span class="o">=</span> <span class="n">L</span> <span class="o">*</span> <span class="n">p_layer</span> <span class="o">+</span> <span class="n">p_emb</span> <span class="o">+</span> <span class="n">H</span> <span class="o">+</span> <span class="p">(</span><span class="mi">0</span> <span class="k">if</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"tie"</span><span class="p">]</span> <span class="k">else</span> <span class="n">V</span> <span class="o">*</span> <span class="n">H</span><span class="p">)</span>
+<span class="linenos">325</span>
+<span class="linenos">326</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  每层："</span><span class="p">)</span>
+<span class="linenos">327</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    q_proj  </span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">nq</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">hd</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">p_q</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">328</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    k_proj  </span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">nkv</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">hd</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">p_k</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">329</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    v_proj  </span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">nkv</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">hd</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">p_v</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">330</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    o_proj  </span><span class="si">{</span><span class="n">nq</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">hd</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">H</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">p_o</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">331</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    q/k_norm  2×</span><span class="si">{</span><span class="n">hd</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">hd</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">332</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    attn 小计               </span><span class="si">{</span><span class="n">p_attn</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">p_attn</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">p_layer</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">333</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    gate/up/down 3×</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">I</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">p_mlp</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">p_mlp</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">p_layer</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">334</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    2 个 RMSNorm            </span><span class="si">{</span><span class="n">p_norm</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">335</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    每层合计                </span><span class="si">{</span><span class="n">p_layer</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">336</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="n">L</span><span class="si">}</span><span class="s2"> 层           </span><span class="si">{</span><span class="n">L</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">p_layer</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">337</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  embedding        </span><span class="si">{</span><span class="n">p_emb</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">p_emb</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">total</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">338</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  final norm       </span><span class="si">{</span><span class="n">H</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">339</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  tie=</span><span class="si">{</span><span class="n">cfg</span><span class="p">[</span><span class="s1">'tie'</span><span class="p">]</span><span class="si">}</span><span class="s2">，lm_head </span><span class="si">{</span><span class="s1">'复用 embedding'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">cfg</span><span class="p">[</span><span class="s1">'tie'</span><span class="p">]</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'单独一份'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">340</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  ---------------------------------"</span><span class="p">)</span>
+<span class="linenos">341</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  解析模型总计     </span><span class="si">{</span><span class="n">total</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">342</span>
+<span class="linenos">343</span>    <span class="n">real</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">w</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+<span class="linenos">344</span>               <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">cfg</span><span class="p">[</span><span class="s2">"tie"</span><span class="p">]</span> <span class="ow">and</span> <span class="n">k</span> <span class="o">==</span> <span class="s2">"lm_head.weight"</span><span class="p">))</span>
+<span class="linenos">345</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  文件里实际       </span><span class="si">{</span><span class="n">real</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">   差 </span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">real</span><span class="si">:</span><span class="s2">+,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">346</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  （tie=True 时把文件里那份冗余的 lm_head 排除，见 4.0 §5）"</span><span class="p">)</span>
+<span class="linenos">347</span>
+<span class="linenos">348</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"FLOP：一次前向，每个 token"</span><span class="p">)</span>
+<span class="linenos">349</span>    <span class="n">f_attn_proj</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="n">p_q</span> <span class="o">+</span> <span class="n">p_k</span> <span class="o">+</span> <span class="n">p_v</span> <span class="o">+</span> <span class="n">p_o</span><span class="p">)</span>
+<span class="linenos">350</span>    <span class="n">f_mlp</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">p_mlp</span>
+<span class="linenos">351</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    attention 投影  2×</span><span class="si">{</span><span class="n">p_q</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">p_k</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">p_v</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">p_o</span><span class="si">:</span><span class="s2">,</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">f_attn_proj</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">352</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    MLP             2×</span><span class="si">{</span><span class="n">p_mlp</span><span class="si">:</span><span class="s2">,</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">f_mlp</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">353</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    每层小计（不含 attention 本身）     </span><span class="si">{</span><span class="n">f_attn_proj</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">f_mlp</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">354</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">L</span><span class="si">}</span><span class="s2"> 层                             </span><span class="si">{</span><span class="n">L</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="p">(</span><span class="n">f_attn_proj</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">f_mlp</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">355</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    lm_head 2×</span><span class="si">{</span><span class="n">V</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">                  </span><span class="si">{</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">V</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">H</span><span class="si">:</span><span class="s2">&gt;12,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">356</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  经验规则：每 token 前向 FLOP ≈ 2 × 参数量 = </span><span class="si">{</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">total</span><span class="si">:</span><span class="s2">,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">357</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  上面逐项加起来 = </span><span class="si">{</span><span class="n">L</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="p">(</span><span class="n">f_attn_proj</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">f_mlp</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">V</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">H</span><span class="si">:</span><span class="s2">,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">358</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  差在 embedding（gather 不是矩阵乘，0 FLOP）与 attention 本身"</span><span class="p">)</span>
+<span class="linenos">359</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  （后者是 O(S²)，与 S 有关，见 0.2 与 3.1）。"</span><span class="p">)</span>
+<span class="linenos">360</span>
+<span class="linenos">361</span>
+<span class="linenos">362</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span> <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">}</span>
+<span class="linenos">363</span>
+<span class="linenos">364</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">365</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos">366</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  model </span><span class="si">{</span><span class="n">REPO</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">367</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos">368</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos">369</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos">370</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L4/qwen3_from_scratch.py 全文（370 行）</code><a href="../code/labs/L4/qwen3_from_scratch.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p><strong>建议的消融</strong>（每一条都会破坏对齐，先预测在第几层出现、误差多大）</p>
+<ol>
+<li><strong>去掉 QK-Norm</strong>（把 <code>rms_norm(q4, lay.qn, eps)</code> 注释掉）。
+   预测：第 0 层就开始偏，且逐层放大。</li>
+<li><strong>RoPE 换成相邻配对</strong>（改 <code>rotate_half</code> 的切法）。
+   预测：短序列上误差小，长序列上迅速变大——因为位置越大角度差越明显。</li>
+<li><strong>RMSNorm 不升 fp32</strong>（去掉 <code>x.float()</code>）。
+   预测：误差在 bf16 舍入量级，逐层累积但不发散。<strong>这一条最有教学价值</strong>：
+   它是"能跑、看起来对、但不是逐位相同"的典型。</li>
+<li><strong><code>gate</code> 和 <code>up</code> 互换</strong>。预测：完全错。这验证 SwiGLU 的不对称性。</li>
+<li>把 <code>intermediate_size</code> 那一项按 §6.1 的公式重算一遍，
+   换成 <code>I/H = 4</code>、两矩阵 MLP，看 attention 占比会变成多少。</li>
+</ol>
+<hr />
+<h2 id="_8">八 · 陷阱</h2>
+<ol>
+<li><strong><code>head_dim</code> 不一定等于 <code>hidden_size / num_attention_heads</code>。</strong> config 给了就用。</li>
+<li><strong>RoPE 的两种排布数学等价但权重不通用。</strong> 用错排布不报错，输出静默错误。</li>
+<li><strong>RMSNorm 中间不升 fp32 会对不上 HF。</strong> bf16 尾数只有 8 位。</li>
+<li><strong>HF 的 <code>hidden_states</code> 最后一个已含 final norm。</strong> 直接和你的层输出比会看到巨大误差。</li>
+<li><strong>只比最终 logits 不足以验收。</strong> final norm 会压缩中间误差。</li>
+<li><strong><code>transpose</code> 之后 <code>reshape</code> 会静默拷贝</strong>（2.0）。这里是必要的，但要知道它发生了。</li>
+<li><strong>QK-Norm 这类张量参数量可忽略、语义不可忽略。</strong> 别用参数量覆盖率判断实现完整性。</li>
+<li><strong><code>gate</code> 与 <code>up</code> 不可互换</strong>，silu 只作用在 gate 一路。</li>
+</ol>
+<hr />
+<h2 id="_9">九 · 自测题</h2>
+<details>
+<summary>1. 你重实现了一个模型，最终 logits 的 argmax 和 HF 完全一致。能说明实现正确吗？</summary>
+<p>不能。两个理由：</p>
+<ol>
+<li><strong>final norm 会压缩中间误差。</strong> 本章实测残差流的幅度从 0.026 涨到 24.12，
+   最后被 norm 压回 1.16。一个 5% 的中间层误差在这里会被大幅衰减。</li>
+<li><strong>argmax 很稳。</strong> 在多数位置上 top-1 的 logit 领先第二名不少，
+   一个有 bug 的实现照样能在短文本上给出相同的 argmax。</li>
+</ol>
+<p>正确的验收是<strong>逐层比中间量</strong>（本章第四节），
+这样还能直接定位到出错的层。</p>
+</details>
+<details>
+<summary>2. 一个 1.7B 模型，MLP 和 attention 各占多少参数？这个比例是固定的吗？</summary>
+<p>本章实测：每层 MLP 75.0%、attention 25.0%。</p>
+<p><strong>不是固定的</strong>，它由 <code>intermediate_size / hidden_size</code> 决定。
+Qwen3-1.7B 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>I</mi><mo>&#x0002F;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>6144</mn><mo>&#x0002F;</mo><mn>2048</mn><mo>&#x0003D;</mo><mn>3</mn></mrow></math></span>，SwiGLU 三个矩阵，所以 MLP <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mn>9</mn><msup><mi>H</mi><mn>2</mn></msup></mrow></math></span>；
+attention（GQA <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>g</mi><mo>&#x0003D;</mo><mn>2</mn></mrow></math></span>）约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>3</mn><msup><mi>H</mi><mn>2</mn></msup></mrow></math></span>。</p>
+<p>如果换成两矩阵 MLP、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>I</mi><mo>&#x0002F;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>4</mn></mrow></math></span>，MLP 就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>8</mn><msup><mi>H</mi><mn>2</mn></msup></mrow></math></span>，比例会变。</p>
+<p>含义：<strong>减参数量要动 MLP，减 KV cache 要动 attention</strong>——
+两个目标压在不同的地方。这是 MoE 只稀疏化 MLP 的原因。</p>
+</details>
+<details>
+<summary>3. RMSNorm 里为什么要升到 fp32？不升会怎样？</summary>
+<p>因为要算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02211;</mo><msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup></mrow></math></span>，在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x0003D;</mo><mn>2048</mn></mrow></math></span> 上累加。bf16 只有 8 位尾数（相对精度 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>2</mn><mrow><mo>&#x02212;</mo><mn>8</mn></mrow></msup><mo>&#x02248;</mo><mn>0.4</mn><mi>&#x00025;</mi></mrow></math></span>），
+累加 2048 项会有明显的舍入累积，而且平方会放大动态范围。</p>
+<p>不升 fp32 的后果是：<strong>能跑、结果看起来合理、但和 HF 对不上位</strong>。
+误差在 bf16 舍入量级，逐层累积但通常不发散——所以它是最难发现的一类 bug。</p>
+<p>本章的实现升了 fp32，所以 29 个对照点全部<strong>逐位相同</strong>。
+这也说明 HF 内部同样升了 fp32——逐位相同不只验证了公式，
+也验证了数值路径一致。</p>
+</details>
+<details>
+<summary>4. QK-Norm 只占参数量的 0.0004%，为什么漏掉会让模型完全失效？</summary>
+<p>因为它改变的是<strong>数值尺度</strong>而不是加一点偏移。RMSNorm 把 q、k 每个头归一化到
+单位均方根，之后的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>q</mi><mo>&#x000B7;</mo><mi>k</mi></mrow></math></span> 打分分布完全不同。</p>
+<p>模型是在"打分已经被归一化"的前提下训练的。去掉这一步，
+打分的方差会随训练学到的权重尺度自由漂移，softmax 之后可能过度尖锐或过度平坦。</p>
+<p>一般规律：<strong>参数量与重要性无关。</strong> 判断实现是否完整不能靠
+"覆盖了多少参数"，只能靠逐层数值对齐。
+现代模型里这类小而关键的组件越来越多（QK-Norm、各种 gate、sink 参数）。</p>
+</details>
+<details>
+<summary>5. "每 token 前向 FLOP ≈ 2 × 参数量" 这条规则的误差来自哪里？</summary>
+<p>本章实测：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo></mrow></math></span> 参数量 = 3,441,149,952，逐项加起来 = 3,440,902,144，
+差 247,808，即 <strong>0.007%</strong>。</p>
+<p>差额来自两处：
+- <strong>embedding 是 gather 不是矩阵乘</strong>，0 FLOP，但它的参数被算进了"参数量"。
+  （本章 tie=True，embedding 那 311M 参数在 lm_head 那里确实做了矩阵乘，
+  所以没有全额漏掉。）
+- norm 的那些小张量是逐元素乘，不是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo></mrow></math></span>。</p>
+<p>更重要的是这条规则<strong>不含 attention 本身</strong>（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></math></span> 和 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mi>V</mi></mrow></math></span>）。
+那一项是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span>，短序列可忽略、长序列会主导——
+0.2 的账本和 3.1 的推导处理的正是这一项。</p>
+<p>所以：算权重搬运和 GEMM 用这条规则很准；
+算长上下文的总计算量，必须单独加 attention 项。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L4/4.0-checkpoint-format.html">&#8592; 4.0 模型文件到底是什么：safetensors 字节布局与加载路径</a><a class="nav-next" href="../L4/4.2-numerics.html">4.2 数值系统与确定性 &#8594;</a></nav>
+</main>
+</body>
+</html>

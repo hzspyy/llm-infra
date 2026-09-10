@@ -1,0 +1,68 @@
+torch 2.13.0+cu130  cuda 13.0
+gpu   NVIDIA GeForce RTX 5090 D
+PYTORCH_CUDA_ALLOC_CONF = (未设置)
+
+==============================================================================
+[G] caching allocator：del 之后显存还给驱动了吗
+==============================================================================
+
+--- 0. CUDA context 本身要多少显存 -------------------------------------------------
+  1) torch.cuda 尚未初始化        nvidia-smi 已用 =     4 MiB
+  2) torch.cuda.init() 之后       nvidia-smi 已用 =     4 MiB   (+0)
+  3) cudaDeviceSynchronize 之后   nvidia-smi 已用 =   508 MiB   (+504)
+  4) 第一次 torch.empty(1) 之后   nvidia-smi 已用 =   510 MiB   (+2)
+
+  -> torch.cuda.init() 是惰性的，它 **没有** 建 context（+0 MiB）。
+  -> context 在第一次真正碰 GPU 时才建，代价 ≈ 504 MiB。
+  -> 之后 allocator 的第一个 segment 只占 2 MiB。
+  -> 也就是说，一个什么都没干的 torch 进程已经吃掉 506 MiB 显存。
+  torch 自己看到的: free=31600.1 / 32109.2 MiB
+
+--- 1. 分配 4 字节，看看真的动了多少 -----------------------------------------------------
+  起点                                 allocated=    0.000 MiB  reserved=    0.000 MiB  驱动可见空闲= 31602.1 MiB
+  torch.empty(1)  = 4 字节             allocated=    0.000 MiB  reserved=    2.000 MiB  驱动可见空闲= 31600.1 MiB
+  -> allocated 是 512 字节，不是 4。分配粒度被向上取整到 512。
+  -> reserved 是 2 MiB，因为 small pool 一次向驱动要 2 MiB。
+  共 1 个 segment
+           address type        total      alloc  stream  blocks(size/state)
+    0x7c0cbf000000 small       2048K         0K       0  0K/allocated 2048K/inactive
+
+--- 2. 再要 100 个小块：全部从同一个 2 MiB segment 里切 -----------------------------------
+  100 × 1 KiB                        allocated=    0.098 MiB  reserved=    2.000 MiB  驱动可见空闲= 31600.1 MiB
+  共 1 个 segment
+           address type        total      alloc  stream  blocks(size/state)
+    0x7c0cbf000000 small       2048K       100K       0  0K/allocated 1K/allocated 1K/allocated 1K/allocated 1K/allocated 1K/allocated ...
+
+--- 3. 一个 3 MiB 的大块：走 large pool，另开 segment ---------------------------------
+  + 3 MiB                            allocated=    3.098 MiB  reserved=   22.000 MiB  驱动可见空闲= 31580.1 MiB
+  共 2 个 segment
+           address type        total      alloc  stream  blocks(size/state)
+    0x7c0cbf000000 small       2048K       100K       0  0K/allocated 1K/allocated 1K/allocated 1K/allocated 1K/allocated 1K/allocated ...
+    0x7c0cc4400000 large      20480K      3072K       0  3072K/allocated 17408K/inactive
+
+--- 4. del 大块 —— allocated 掉了，reserved 没掉 -----------------------------------
+  del big                            allocated=    0.098 MiB  reserved=   22.000 MiB  驱动可见空闲= 31580.1 MiB
+  显存一个字节都没还给驱动。它被挂回 allocator 的空闲链表，等下一次复用。
+  共 2 个 segment
+           address type        total      alloc  stream  blocks(size/state)
+    0x7c0cbf000000 small       2048K       100K       0  0K/allocated 1K/allocated 1K/allocated 1K/allocated 1K/allocated 1K/allocated ...
+    0x7c0cc4400000 large      20480K         0K       0  20480K/inactive
+
+--- 5. 同样大小的请求直接命中缓存（没有 cudaMalloc） -----------------------------------------
+  num_alloc_retries      0 -> 0
+  segment.all.allocated  3 -> 3   (没有新增 = 没有调 cudaMalloc)
+  reserved_bytes.all.current 不变: True
+
+--- 6. empty_cache() 才真的还给驱动 ------------------------------------------------
+  del 全部                             allocated=    0.000 MiB  reserved=   22.000 MiB  驱动可见空闲= 31580.1 MiB
+  empty_cache()                      allocated=    0.000 MiB  reserved=    0.000 MiB  驱动可见空闲= 31602.1 MiB
+  驱动可见空闲回涨了 —— 这才是真的 cudaFree。
+
+--- 7. memory_stats 里值得记住的几行 ------------------------------------------------
+  allocated_bytes.all.peak                3,248,640  (3.1 MiB)
+  reserved_bytes.all.peak                23,068,672  (22.0 MiB)
+  active_bytes.all.peak                   3,248,640  (3.1 MiB)
+  allocation.all.allocated                      104
+  segment.all.allocated                           3
+  num_alloc_retries                               0
+  num_ooms                                        0

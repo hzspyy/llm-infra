@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.5 现代 kernel 编写栈横评</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">2.5</div>
+  <div class="sidebar-title">现代 kernel 编写栈横评</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：三个轴上的取舍</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#_4">实测结果</a></li>
+<li><a href="#dsl">为什么 DSL 能赢：看它生成了什么</a></li>
+<li><a href="#12-python-857-ptx">从 12 行 Python 到 857 行 PTX</a></li>
+<li><a href="#_5">代价一：编译时间差三个数量级</a></li>
+<li><a href="#triton-tile-708">代价二：Triton 手调 tile 只有 70.8%</a></li>
+<li><a href="#dsl_1">四种 DSL 的抽象层次</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 源码走读：真实项目怎么选</a><ul>
+<li><a href="#1-vllmtriton-cuda">1. vLLM：Triton + CUDA 混用</a></li>
+<li><a href="#2-deepseek-tilelang">2. DeepSeek 用 TileLang</a></li>
+<li><a href="#3-flashattention-4-cute-dsl">3. FlashAttention-4 用 CuTe-DSL</a></li>
+</ul>
+</li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_8">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_9">原始现场</a></li>
+<li><a href="#_10">前沿</a></li>
+<li><a href="#_11">陷阱</a></li>
+<li><a href="#_12">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="mod-id">2.5</div>
+  <h1>现代 kernel 编写栈横评</h1>
+  <p class="lede">用同一 GEMM 比较 CUDA、Triton、TileLang、Helion 与 Inductor 的表达方式、生成代码和调优成本；CuTe-DSL 的完整实验仍待补充。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Triton 3.7.1 · TileLang 0.1.12 · Helion 1.4.0 · CUTLASS-DSL 4.6.2</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L2.4（手写 CUDA 的 GEMM 阶梯）· L2.2（编译工具链）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>现代 kernel DSL 声称"几十行 Python 拿到接近 cuBLAS 的性能"。<strong>是真的吗</strong>？</li>
+<li>它们各自的代价是什么？代码量、编译时间、可控性怎么权衡？</li>
+<li>这些 DSL 到底<strong>生成了什么</strong>？它们做对了我手写时没做的哪件事？</li>
+</ol>
+<p>DSL 是领域专用语言。这里的几种 DSL 都用于描述 GPU 计算，
+但把不同的决策交给了编译器：有的要求你指定 tile 和流水，
+有的还会自动搜索这些参数。本章用同一个 GEMM 比较这些分工，
+并检查生成代码。表中的表现只代表列出的实现和配置，不是语言本身的固定排名。</p>
+<hr />
+<h2 id="_2">心智模型：三个轴上的取舍</h2>
+<figure>
+<svg viewBox="0 0 740 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="kernel DSL 横评">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">同一个 4096³ bf16 GEMM，五种写法（本机实测）</text>
+
+    <!-- perf bars -->
+    <text x="12" y="44" font-size="11" opacity="0.8">性能（分母 = tensor core 纯发射上限 251.9 TFLOPS，L1.2 实测）</text>
+    <g font-size="10.5">
+      <text x="12" y="66">手写 CUDA v6</text>
+      <rect x="160" y="55" width="212" height="14" fill="currentColor" opacity="0.45"/>
+      <text x="380" y="66">144.9 · 57.5%</text>
+      <text x="12" y="86">Triton</text>
+      <rect x="160" y="75" width="261" height="14" fill="currentColor" opacity="0.6"/>
+      <text x="429" y="86">178.4 · 70.8%</text>
+      <text x="12" y="106">TileLang</text>
+      <rect x="160" y="95" width="301" height="14" fill="currentColor" opacity="0.72"/>
+      <text x="469" y="106">205.4 · 81.5%</text>
+      <text x="12" y="126">Helion</text>
+      <rect x="160" y="115" width="318" height="14" fill="currentColor" opacity="0.85"/>
+      <text x="486" y="126" font-weight="600">217.3 · 86.3%</text>
+      <text x="12" y="146">torch.compile</text>
+      <rect x="160" y="135" width="318" height="14" fill="currentColor" opacity="0.85"/>
+      <text x="486" y="146">217.3 · 86.2%</text>
+      <text x="12" y="166">cuBLAS</text>
+      <rect x="160" y="155" width="320" height="14" fill="currentColor" opacity="0.55"/>
+      <text x="488" y="166">218.9 · 86.9%</text>
+    </g>
+
+    <!-- code size -->
+    <line x1="12" y1="184" x2="728" y2="184" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="206" font-size="11" opacity="0.8">kernel 代码行数（对数刻度示意）</text>
+    <g font-size="10.5">
+      <text x="12" y="228">Helion 12 行</text><rect x="160" y="217" width="20" height="14" fill="currentColor" opacity="0.85"/>
+      <text x="12" y="248">TileLang 18 行</text><rect x="160" y="237" width="30" height="14" fill="currentColor" opacity="0.72"/>
+      <text x="12" y="268">Triton 34 行</text><rect x="160" y="257" width="57" height="14" fill="currentColor" opacity="0.6"/>
+      <text x="12" y="288">手写 CUDA ~400 行 C++</text><rect x="160" y="277" width="400" height="14" fill="currentColor" opacity="0.45"/>
+    </g>
+
+    <!-- compile time -->
+    <line x1="12" y1="306" x2="728" y2="306" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="328" font-size="11" opacity="0.8">首次编译时间</text>
+    <g font-size="10.5">
+      <text x="12" y="350">Triton 0.5 s</text>
+      <text x="180" y="350">TileLang ~1 s</text>
+      <text x="360" y="350" font-weight="600">Helion 492.8 s（自动调优 752 个配置）</text>
+    </g>
+
+    <line x1="12" y1="366" x2="728" y2="366" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="390" font-size="12" font-weight="600">最有说服力的一条：12 行 Python 打过 400 行 C++ 50%</text>
+    <text x="12" y="410" font-size="10.5" opacity="0.85">因为 DSL 自动生成了我手写时缺的两样：<tspan font-family="ui-monospace,monospace" font-size="10">cp.async.bulk.tensor</tspan>（TMA）与 mbarrier 流水。</text>
+    <text x="12" y="428" font-size="10.5" opacity="0.85">代价是失去对生成代码的直接控制，以及（Helion）8 分钟的调优时间。</text>
+  </g>
+</svg>
+<figcaption>性能、代码量、编译时间三个轴上的取舍。所有数字为本机实测。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="_4">实测结果</h3>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th>耗时 ms</th>
+<th>TFLOPS</th>
+<th>占上限</th>
+<th>kernel 行数</th>
+<th>首次编译 s</th>
+<th>相对误差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>torch.matmul</code>（cuBLAS）</td>
+<td>0.628</td>
+<td><strong>218.9</strong></td>
+<td>86.9%</td>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td><strong>Helion</strong></td>
+<td>0.632</td>
+<td><strong>217.3</strong></td>
+<td>86.3%</td>
+<td><strong>12</strong></td>
+<td><strong>492.8</strong></td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>torch.compile</code>（Inductor）</td>
+<td>0.633</td>
+<td>217.3</td>
+<td>86.2%</td>
+<td>1</td>
+<td>0.1*</td>
+<td>0</td>
+</tr>
+<tr>
+<td><strong>TileLang</strong></td>
+<td>0.669</td>
+<td><strong>205.4</strong></td>
+<td>81.5%</td>
+<td><strong>18</strong></td>
+<td>~1</td>
+<td>0</td>
+</tr>
+<tr>
+<td>Triton（手调 tile）</td>
+<td>0.770</td>
+<td>178.4</td>
+<td>70.8%</td>
+<td>34</td>
+<td>0.5</td>
+<td>0</td>
+</tr>
+<tr>
+<td><strong>手写 CUDA v6</strong>（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）</td>
+<td>0.948</td>
+<td><strong>144.9</strong></td>
+<td>57.5%</td>
+<td><strong>~400 行 C++</strong></td>
+<td>—</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>* 命中了上一次运行的编译缓存</p>
+<p><strong>结论很直接：三种 DSL 全部打过我手写的 CUDA，最好的（Helion）快 50%。</strong></p>
+<p>这次输出中的相对误差为 <strong>0</strong>，说明所用比较方法在该样本上没有发现差异。
+这不等于已经确认所有实现使用相同的累加顺序，也不保证换输入后仍然一致。
+区分输出观察与实现机制的方法见 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>。</p>
+<h3 id="dsl">为什么 DSL 能赢：看它生成了什么</h3>
+<p><a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 结尾我自己列过 v6 缺的东西：</p>
+<blockquote>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>我们有吗</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>双缓冲 / 软件流水</td>
+<td>✗</td>
+</tr>
+<tr>
+<td><code>cp.async</code> 异步拷贝</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>XOR swizzle</td>
+<td>✗（只用了 padding）</td>
+</tr>
+<tr>
+<td>tile 尺寸 autotuning</td>
+<td>✗（写死 128×128×32）</td>
+</tr>
+</tbody>
+</table>
+</blockquote>
+<p>去看 Helion 生成的 PTX（Triton 缓存目录里）：</p>
+<div class="highlight"><pre><span></span><code>=== 里面的 tensor core 指令
+     64 mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+
+=== 异步拷贝与同步
+      4 cp.async.bulk.tensor.2d.shared      ← TMA！
+      2 cp.async.bulk.commit_group
+      2 cp.async.bulk.wait_group.read
+      2 barrier.arrive.expect_tx.shared     ← mbarrier 异步同步
+      1 barrier.init.shared
+      1 barrier.try_wait.parity.shared
+</code></pre></div>
+
+<p><strong><code>cp.async.bulk.tensor.2d.shared</code> 就是 TMA</strong>（Tensor Memory Accelerator）：
+把整块 2D tile 的搬运交给专用硬件，不占寄存器、不阻塞计算。
+配合 <code>barrier.arrive.expect_tx</code> 这套 mbarrier 机制做异步流水。</p>
+<p>这里看到了与手写版本相同的 mma 指令类型，以及不同的数据搬运与同步安排。
+这说明搬运和流水值得优先检查，但仅凭指令列表不能把全部性能差距归到它们。
+还要考虑 tile、寄存器、调度和编译配置的差异。</p>
+<h3 id="12-python-857-ptx">从 12 行 Python 到 857 行 PTX</h3>
+<p>Helion 的 kernel 只有 12 行：</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@helion</span><span class="o">.</span><span class="n">kernel</span><span class="p">(</span><span class="n">static_shapes</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">helion_gemm</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">y</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="n">m</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">()</span>
+    <span class="n">k2</span><span class="p">,</span> <span class="n">n</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">size</span><span class="p">()</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">([</span><span class="n">m</span><span class="p">,</span> <span class="n">n</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">promote_types</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">y</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span>
+                      <span class="n">device</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">tile_m</span><span class="p">,</span> <span class="n">tile_n</span> <span class="ow">in</span> <span class="n">hl</span><span class="o">.</span><span class="n">tile</span><span class="p">([</span><span class="n">m</span><span class="p">,</span> <span class="n">n</span><span class="p">]):</span>          <span class="c1"># ← 只声明"要分块"</span>
+        <span class="n">acc</span> <span class="o">=</span> <span class="n">hl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">tile_m</span><span class="p">,</span> <span class="n">tile_n</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">tile_k</span> <span class="ow">in</span> <span class="n">hl</span><span class="o">.</span><span class="n">tile</span><span class="p">(</span><span class="n">k</span><span class="p">):</span>
+            <span class="n">acc</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">addmm</span><span class="p">(</span><span class="n">acc</span><span class="p">,</span> <span class="n">x</span><span class="p">[</span><span class="n">tile_m</span><span class="p">,</span> <span class="n">tile_k</span><span class="p">],</span> <span class="n">y</span><span class="p">[</span><span class="n">tile_k</span><span class="p">,</span> <span class="n">tile_n</span><span class="p">])</span>
+        <span class="n">out</span><span class="p">[</span><span class="n">tile_m</span><span class="p">,</span> <span class="n">tile_n</span><span class="p">]</span> <span class="o">=</span> <span class="n">acc</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">out</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">out</span>
+</code></pre></div>
+
+<p>注意它<strong>没有说 tile 多大</strong>——<code>hl.tile</code> 只表达"这一维要分块"，
+具体尺寸、流水级数、warp 数、索引方式全部交给自动调优器搜索。</p>
+<p>生成的产物逐级展开：</p>
+<div class="highlight"><pre><span></span><code>_helion_helion_gemm.source     19 041 B   Triton 源码（Helion 生成的）
+_helion_helion_gemm.ttir       108 行     Triton IR
+_helion_helion_gemm.ttgir      148 行     TritonGPU IR（带 layout）
+_helion_helion_gemm.llir     1 047 行     LLVM IR
+_helion_helion_gemm.ptx        857 行     PTX
+_helion_helion_gemm.cubin   52 400 B     SASS
+</code></pre></div>
+
+<p><strong>12 行 Python → 857 行 PTX。</strong> 中间隔着两个编译器（Helion→Triton，Triton→LLVM→PTX）。</p>
+<h3 id="_5">代价一：编译时间差三个数量级</h3>
+<table>
+<thead>
+<tr>
+<th>DSL</th>
+<th>首次编译</th>
+<th>做了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Triton（手指定 tile）</td>
+<td><strong>0.5 s</strong></td>
+<td>只编译你给的那一组参数</td>
+</tr>
+<tr>
+<td>TileLang</td>
+<td>~1 s</td>
+<td>同上，但多一层 TVM 风格的调度变换</td>
+</tr>
+<tr>
+<td><strong>Helion</strong></td>
+<td><strong>492.8 s</strong></td>
+<td><strong>自动调优 752 个配置</strong>，遗传算法搜索</td>
+</tr>
+</tbody>
+</table>
+<p>Helion 的调优日志（原文）：</p>
+<div class="highlight"><pre><span></span><code>[306s] Fitting surrogate: 752 points, 752 targets
+[306s] Copy 3 finish because of no improvement
+[307s] Generation 10 starting: 53 neighbors, 3 active search path(s)
+Generation 10: precompiling 100% ━━━━━━━━━━━ 55/55  15.3 configs/s
+</code></pre></div>
+
+<p>它在搜的参数包括（从日志里摘的）：</p>
+<div class="highlight"><pre><span></span><code>block_sizes, range_num_stages, range_multi_buffers, range_flattens,
+load_eviction_policies, num_warps, num_stages,
+indexing = ['pointer', 'tensor_descriptor', 'tensor_descriptor'],
+pid_type = 'flat', epilogue_subtile = 2
+</code></pre></div>
+
+<p><strong><code>indexing = 'tensor_descriptor'</code> 就是选择用 TMA</strong>（tensor descriptor 是 TMA 的 API）。
+这个选择是<strong>搜出来的</strong>，不是人写的。</p>
+<div class="admonition warning">
+<p class="admonition-title">8 分钟的编译时间意味着什么</p>
+<p>对<strong>离线的、形状固定的</strong>场景（比如一个固定尺寸的模型层），
+调一次用一年，8 分钟完全可以接受，而且结果缓存下来。</p>
+<p>对<strong>在线服务</strong>就是灾难：LLM 推理的 GEMM 形状随 batch 变化，
+每个新形状都要重调 8 分钟，服务根本起不来。</p>
+<p><strong>所以生产引擎的做法是</strong>：
+- 预先离线调好一批常见形状，把配置固化进代码（vLLM 的 <code>configs/*.json</code> 就是）
+- 或者用 cuBLAS 这种运行时启发式选择（快但未必最优）
+- 或者像 cuBLASLt 那样用 <code>nvjet</code> 做轻量 JIT（<a class="xref" href="../L2/2.2-toolchain-ptx-sass.html" title="编译工具链：nvcc → PTX → SASS">L2.2</a> 发现的）</p>
+</div>
+<h3 id="triton-tile-708">代价二：Triton 手调 tile 只有 70.8%</h3>
+<p>Triton 的 34 行里我<strong>写死了</strong> tile：</p>
+<div class="highlight"><pre><span></span><code><span class="n">BM</span><span class="p">,</span> <span class="n">BN</span><span class="p">,</span> <span class="n">BK</span><span class="p">,</span> <span class="n">GROUP</span> <span class="o">=</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">8</span>
+<span class="o">...</span>
+<span class="n">num_stages</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">num_warps</span><span class="o">=</span><span class="mi">8</span>
+</code></pre></div>
+
+<p>结果 178.4 TFLOPS，只有 70.8%。</p>
+<p>而 <code>torch.compile</code> 用的<strong>也是 Triton</strong>，但它跑了 autotune，实测日志：</p>
+<div class="highlight"><pre><span></span><code>triton_mm_9  0.6221 ms 100.0%  BLOCK_M=64,  BLOCK_N=128, BLOCK_K=32, num_stages=3, num_warps=4
+triton_mm_11 0.6226 ms  99.9%  BLOCK_M=64,  BLOCK_N=128, BLOCK_K=64, num_stages=3, num_warps=4
+mm           0.6308 ms  98.6%  ← ATen 的 cuBLAS 后端
+triton_mm_16 0.6649 ms  93.6%  BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, num_stages=3, num_warps=4
+</code></pre></div>
+
+<p><strong>最优是 <code>64×128×32, num_warps=4</code>，而我猜的是 <code>128×256×64, num_warps=8</code>。</strong>
+猜错的代价是 23%。</p>
+<p>而且注意：<strong>autotune 选出的 Triton kernel（0.6221 ms）比 cuBLAS（0.6308）快 1.4%。</strong>
+这是 Inductor 默认会同时评估 ATen 与 Triton 两条路的原因。</p>
+<p><strong>Triton 不是"比 cuBLAS 慢"，是"不调参就比 cuBLAS 慢"。</strong></p>
+<h3 id="dsl_1">四种 DSL 的抽象层次</h3>
+<table>
+<thead>
+<tr>
+<th>DSL</th>
+<th>你要写什么</th>
+<th>编译器负责什么</th>
+<th>抽象层次</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CUDA C++</strong></td>
+<td>线程索引、共享内存布局、同步、指令选择</td>
+<td>寄存器分配、指令调度</td>
+<td>最低</td>
+</tr>
+<tr>
+<td><strong>CUTLASS / CuTe-DSL</strong></td>
+<td>tile 层次结构、layout 代数</td>
+<td>布局变换、指令选择、流水</td>
+<td>低（但抽象好）</td>
+</tr>
+<tr>
+<td><strong>Triton</strong></td>
+<td>block 级的张量操作、显式 tile 尺寸</td>
+<td>线程映射、smem 布局、同步、swizzle</td>
+<td>中</td>
+</tr>
+<tr>
+<td><strong>TileLang</strong></td>
+<td>tile 操作 + 显式流水级数</td>
+<td>同上 + 自动 layout 推导</td>
+<td>中高</td>
+</tr>
+<tr>
+<td><strong>Helion</strong></td>
+<td><strong>只说"这一维要分块"</strong></td>
+<td>全部，包括 tile 尺寸搜索</td>
+<td>最高</td>
+</tr>
+</tbody>
+</table>
+<p><strong>抽象越高，写得越少、越容易接近最优，但你越不知道它做了什么，也越难在它做错时干预。</strong></p>
+<p>TileLang 的 18 行正好在中间：</p>
+<div class="highlight"><pre><span></span><code><span class="k">with</span> <span class="n">T</span><span class="o">.</span><span class="n">Kernel</span><span class="p">(</span><span class="n">T</span><span class="o">.</span><span class="n">ceildiv</span><span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="n">BN</span><span class="p">),</span> <span class="n">T</span><span class="o">.</span><span class="n">ceildiv</span><span class="p">(</span><span class="n">M</span><span class="p">,</span> <span class="n">BM</span><span class="p">),</span> <span class="n">threads</span><span class="o">=</span><span class="n">threads</span><span class="p">)</span> <span class="k">as</span> <span class="p">(</span><span class="n">bx</span><span class="p">,</span> <span class="n">by</span><span class="p">):</span>
+    <span class="n">As</span> <span class="o">=</span> <span class="n">T</span><span class="o">.</span><span class="n">alloc_shared</span><span class="p">((</span><span class="n">BM</span><span class="p">,</span> <span class="n">BK</span><span class="p">),</span> <span class="s2">"bfloat16"</span><span class="p">)</span>
+    <span class="n">Bs</span> <span class="o">=</span> <span class="n">T</span><span class="o">.</span><span class="n">alloc_shared</span><span class="p">((</span><span class="n">BK</span><span class="p">,</span> <span class="n">BN</span><span class="p">),</span> <span class="s2">"bfloat16"</span><span class="p">)</span>
+    <span class="n">Cl</span> <span class="o">=</span> <span class="n">T</span><span class="o">.</span><span class="n">alloc_fragment</span><span class="p">((</span><span class="n">BM</span><span class="p">,</span> <span class="n">BN</span><span class="p">),</span> <span class="s2">"float"</span><span class="p">)</span>       <span class="c1"># fragment = 寄存器块</span>
+    <span class="n">T</span><span class="o">.</span><span class="n">clear</span><span class="p">(</span><span class="n">Cl</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">T</span><span class="o">.</span><span class="n">Pipelined</span><span class="p">(</span><span class="n">T</span><span class="o">.</span><span class="n">ceildiv</span><span class="p">(</span><span class="n">K</span><span class="p">,</span> <span class="n">BK</span><span class="p">),</span> <span class="n">num_stages</span><span class="o">=</span><span class="n">stages</span><span class="p">):</span>   <span class="c1"># ← 显式流水</span>
+        <span class="n">T</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">A</span><span class="p">[</span><span class="n">by</span> <span class="o">*</span> <span class="n">BM</span><span class="p">,</span> <span class="n">k</span> <span class="o">*</span> <span class="n">BK</span><span class="p">],</span> <span class="n">As</span><span class="p">)</span>             <span class="c1"># 自动生成 cp.async</span>
+        <span class="n">T</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">B</span><span class="p">[</span><span class="n">k</span> <span class="o">*</span> <span class="n">BK</span><span class="p">,</span> <span class="n">bx</span> <span class="o">*</span> <span class="n">BN</span><span class="p">],</span> <span class="n">Bs</span><span class="p">)</span>
+        <span class="n">T</span><span class="o">.</span><span class="n">gemm</span><span class="p">(</span><span class="n">As</span><span class="p">,</span> <span class="n">Bs</span><span class="p">,</span> <span class="n">Cl</span><span class="p">)</span>                         <span class="c1"># 自动选 mma 与布局</span>
+    <span class="n">T</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">Cl</span><span class="p">,</span> <span class="n">C</span><span class="p">[</span><span class="n">by</span> <span class="o">*</span> <span class="n">BM</span><span class="p">,</span> <span class="n">bx</span> <span class="o">*</span> <span class="n">BN</span><span class="p">])</span>
+</code></pre></div>
+
+<p>它<strong>明确区分了 shared / fragment 两种存储</strong>（对应 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 的共享内存与寄存器），
+<strong>显式写出流水级数</strong>（<code>T.Pipelined(..., num_stages=3)</code>），
+但把 layout 推导、swizzle、指令选择交给编译器。</p>
+<p><strong>这个抽象层次和你在 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 手写时的思考层次是对齐的</strong>——
+所以它最容易理解"编译器替我做了什么"。</p>
+<hr />
+<h2 id="_6">工程实现 · 源码走读：真实项目怎么选</h2>
+<h3 id="1-vllmtriton-cuda">1. vLLM：Triton + CUDA 混用</h3>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 kernel trace 里能看到两类 kernel 共存：</p>
+<div class="highlight"><pre><span></span><code>_penalties_kernel                                  ← Triton（L0.1 原始现场 ⑥ 反汇编过）
+vllm::rms_norm_kernel&lt;c10::BFloat16, 8, 3, true&gt;   ← 手写 CUDA
+vllm::reshape_and_cache_flash_kernel&lt;...&gt;          ← 手写 CUDA
+flash::flash_fwd_splitkv_kernel&lt;...&gt;               ← CUTLASS/CUTE
+cutlass_80_tensorop_bf16_s16816gemm_...            ← CUTLASS
+</code></pre></div>
+
+<p>选择规律很清楚：</p>
+<ul>
+<li><strong>形状多变、逻辑复杂、性能不极端</strong>（采样惩罚、各种 mask）→ <strong>Triton</strong></li>
+<li><strong>热路径、形状固定、要榨干性能</strong>（RMSNorm、KV 写入）→ <strong>手写 CUDA</strong></li>
+<li><strong>GEMM / attention</strong> → <strong>CUTLASS 或专用库</strong></li>
+</ul>
+<h3 id="2-deepseek-tilelang">2. DeepSeek 用 TileLang</h3>
+<p>TileLang 在近期的 DeepSeek 开源里被使用。原因可以从本章的数据推测：
+<strong>18 行拿到 81.5%，编译只要 1 秒</strong>——对需要为大量 MoE 形状生成 kernel 的场景，
+这个"性能/开发成本/编译时间"组合很划算。</p>
+<h3 id="3-flashattention-4-cute-dsl">3. FlashAttention-4 用 CuTe-DSL</h3>
+<p>FA4 完全用嵌入 Python 的 CuTe-DSL 写，没有 C++ 部分。
+它的卖点是<strong>编译比 C++ CUTLASS 模板快 20–30×</strong>——
+对照 <a class="xref" href="../L2/2.2-toolchain-ptx-sass.html" title="编译工具链：nvcc → PTX → SASS">L2.2</a> 实测的"预处理膨胀 1761 倍"，这个提速的来源就清楚了：
+<strong>跳过整个 C++ 前端</strong>。</p>
+<div class="admonition note">
+<p class="admonition-title">本章没有测 CuTe-DSL</p>
+<p><code>nvidia-cutlass-dsl 4.6.2</code> 已装在本机，但写一个完整的 CuTe-DSL GEMM
+需要理解 layout algebra（<code>Layout</code>、<code>Tiler</code>、<code>TiledMma</code> 等概念），
+代码量和学习曲线都远超其他三家。</p>
+<p><strong>本站把它标为待补</strong><span class="unverified">未实测</span>。
+它的定位很清楚：<strong>最接近 CUTLASS C++ 的表达力 + Python 的迭代速度</strong>，
+适合要完全控制流水和布局的场景（比如 FA4 那种要手动做 exp() 软件仿真的）。
+<a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a> 讲 FlashAttention-4 时会回到它。</p>
+</div>
+<hr />
+<h2 id="_7">工程实现 · 自己写一遍</h2>
+<p>三个 DSL 的关键差异，浓缩成各自最核心的几行。</p>
+<p><strong>Triton：你管 tile，编译器管线程</strong></p>
+<div class="highlight"><pre><span></span><code><span class="n">acc</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">BM</span><span class="p">,</span> <span class="n">BN</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>      <span class="c1"># 累加器必须 fp32（L4.2）</span>
+<span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">cdiv</span><span class="p">(</span><span class="n">K</span><span class="p">,</span> <span class="n">BK</span><span class="p">)):</span>
+    <span class="n">am</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">a_ptr</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">offs_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">&lt;</span> <span class="n">K</span> <span class="o">-</span> <span class="n">k</span> <span class="o">*</span> <span class="n">BK</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
+    <span class="n">bm</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">b_ptr</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">offs_k</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">&lt;</span> <span class="n">K</span> <span class="o">-</span> <span class="n">k</span> <span class="o">*</span> <span class="n">BK</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
+    <span class="n">acc</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">am</span><span class="p">,</span> <span class="n">bm</span><span class="p">,</span> <span class="n">acc</span><span class="p">)</span>                   <span class="c1"># ← 一行就是 tensor core</span>
+    <span class="n">a_ptr</span> <span class="o">+=</span> <span class="n">BK</span> <span class="o">*</span> <span class="n">sak</span>
+    <span class="n">b_ptr</span> <span class="o">+=</span> <span class="n">BK</span> <span class="o">*</span> <span class="n">sbk</span>
+</code></pre></div>
+
+<p><code>tl.dot</code> 一行就展开成 64 条 <code>mma.sync</code>（实测 PTX 里数出来的）。
+你<strong>看不到</strong>共享内存、看不到 <code>__syncthreads</code>、看不到 warp 映射——
+那些是编译器的事。</p>
+<p>但你<strong>必须</strong>自己写 <code>mask</code>（边界处理）和指针递增，
+还有那段 L2 友好的 block 重排（<code>GROUP</code> 那几行）。</p>
+<p><strong>TileLang：显式区分 shared / fragment，显式写流水</strong></p>
+<div class="highlight"><pre><span></span><code><span class="n">As</span> <span class="o">=</span> <span class="n">T</span><span class="o">.</span><span class="n">alloc_shared</span><span class="p">((</span><span class="n">BM</span><span class="p">,</span> <span class="n">BK</span><span class="p">),</span> <span class="s2">"bfloat16"</span><span class="p">)</span>     <span class="c1"># 共享内存</span>
+<span class="n">Cl</span> <span class="o">=</span> <span class="n">T</span><span class="o">.</span><span class="n">alloc_fragment</span><span class="p">((</span><span class="n">BM</span><span class="p">,</span> <span class="n">BN</span><span class="p">),</span> <span class="s2">"float"</span><span class="p">)</span>      <span class="c1"># 寄存器（fragment）</span>
+<span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">T</span><span class="o">.</span><span class="n">Pipelined</span><span class="p">(</span><span class="n">T</span><span class="o">.</span><span class="n">ceildiv</span><span class="p">(</span><span class="n">K</span><span class="p">,</span> <span class="n">BK</span><span class="p">),</span> <span class="n">num_stages</span><span class="o">=</span><span class="mi">3</span><span class="p">):</span>    <span class="c1"># 3 段流水</span>
+    <span class="n">T</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">A</span><span class="p">[</span><span class="n">by</span> <span class="o">*</span> <span class="n">BM</span><span class="p">,</span> <span class="n">k</span> <span class="o">*</span> <span class="n">BK</span><span class="p">],</span> <span class="n">As</span><span class="p">)</span>
+    <span class="n">T</span><span class="o">.</span><span class="n">gemm</span><span class="p">(</span><span class="n">As</span><span class="p">,</span> <span class="n">Bs</span><span class="p">,</span> <span class="n">Cl</span><span class="p">)</span>
+</code></pre></div>
+
+<p><code>T.Pipelined(..., num_stages=3)</code> 对应 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 里我没做的"双缓冲"，
+对应 CUTLASS kernel 名里的 <code>x3</code>（<a class="xref" href="../L2/2.2-toolchain-ptx-sass.html" title="编译工具链：nvcc → PTX → SASS">L2.2</a> 走读过）。<strong>一个参数替代几十行手写代码。</strong></p>
+<p><strong>Helion：连 tile 尺寸都不写</strong></p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span> <span class="n">tile_m</span><span class="p">,</span> <span class="n">tile_n</span> <span class="ow">in</span> <span class="n">hl</span><span class="o">.</span><span class="n">tile</span><span class="p">([</span><span class="n">m</span><span class="p">,</span> <span class="n">n</span><span class="p">]):</span>        <span class="c1"># 不说多大</span>
+    <span class="n">acc</span> <span class="o">=</span> <span class="n">hl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">tile_m</span><span class="p">,</span> <span class="n">tile_n</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">tile_k</span> <span class="ow">in</span> <span class="n">hl</span><span class="o">.</span><span class="n">tile</span><span class="p">(</span><span class="n">k</span><span class="p">):</span>
+        <span class="n">acc</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">addmm</span><span class="p">(</span><span class="n">acc</span><span class="p">,</span> <span class="n">x</span><span class="p">[</span><span class="n">tile_m</span><span class="p">,</span> <span class="n">tile_k</span><span class="p">],</span> <span class="n">y</span><span class="p">[</span><span class="n">tile_k</span><span class="p">,</span> <span class="n">tile_n</span><span class="p">])</span>
+</code></pre></div>
+
+<p>注意内层直接用了 <strong><code>torch.addmm</code></strong> —— Helion 的 kernel 体里可以写普通的 PyTorch 算子，
+它会被翻译成 tile 级的操作。这是它 12 行的原因。</p>
+<p><strong>一个实操坑</strong>：Helion 要求 kernel 引用的名字是<strong>全局</strong>的，不能是闭包变量。
+本实验第一版把 <code>import helion.language as hl</code> 放在函数里，报：</p>
+<div class="highlight"><pre><span></span><code>ClosuresNotSupported: A closure (('hl',)) was found in the kernel.
+</code></pre></div>
+
+<p>把 import 和 kernel 定义都提到模块级才能用。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L2/dsl_shootout.py<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="m">4096</span>
+
+<span class="c1"># 看 DSL 到底生成了什么</span>
+<span class="nv">D</span><span class="o">=</span><span class="k">$(</span>ls<span class="w"> </span>-dt<span class="w"> </span><span class="nv">$TRITON_CACHE_DIR</span>/*/<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="k">)</span>
+ls<span class="w"> </span>-la<span class="w"> </span><span class="nv">$D</span><span class="w">                                   </span><span class="c1"># ttir / ttgir / llir / ptx / cubin</span>
+grep<span class="w"> </span>-oE<span class="w"> </span><span class="s2">"mma\.sync[a-z0-9._]*"</span><span class="w"> </span><span class="nv">$D</span>/*.ptx<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span><span class="p">|</span><span class="w"> </span>uniq<span class="w"> </span>-c
+grep<span class="w"> </span>-oE<span class="w"> </span><span class="s2">"cp\.async[a-z0-9._]*"</span><span class="w"> </span><span class="nv">$D</span>/*.ptx<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span><span class="p">|</span><span class="w"> </span>uniq<span class="w"> </span>-c
+</code></pre></div>
+
+<p>第二段是本章最值得做的事：<strong>亲眼确认 DSL 生成了 TMA 和 mma</strong>。</p>
+<h3 id="_8">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Triton 的 <code>BM,BN,BK</code> 改成 <code>64,128,32</code>（Inductor 选的最优）</td>
+<td>应该从 178 涨到接近 218 —— <strong>验证"猜 tile 的代价是 23%"</strong></td>
+</tr>
+<tr>
+<td>Triton 的 <code>num_stages</code> 从 3 改成 1</td>
+<td>流水消失，性能应该明显下降（回到接近 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> v6 的水平）</td>
+</tr>
+<tr>
+<td>改成非方阵（如 M=1, N=6144, K=2048，模拟 decode）</td>
+<td>所有 DSL 的优势会缩小——GEMV 是另一个问题（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 自测题 4）</td>
+</tr>
+<tr>
+<td>用 <code>HELION_AUTOTUNE=0</code> 或指定 config 跳过调优</td>
+<td>编译从 493 s 降到几秒，但性能会掉多少？</td>
+</tr>
+<tr>
+<td>对比各 DSL 生成的 <code>.ttgir</code> 里的 layout 标注</td>
+<td>看它们对同一个问题选了什么 layout（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 原始现场 ⑥ 解释过 <code>#blocked</code>）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_9">原始现场</h2>
+<details>
+<summary>① 完整的横评输出</summary>
+<div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D   GEMM 4096x4096x4096 bf16 = 137.4 GFLOP
+    对照：手写 CUDA v6 144.9 / cuBLAS 218.6 / tensor core 上限 251.9 TFLOPS
+
+    实现                              耗时ms    TFLOPS    占上限  kernel行数   编译s    相对误差
+    torch.matmul (cuBLAS)             0.628     218.9    86.9%          1      0.0   0.00e+00
+    Triton                            0.770     178.4    70.8%         34      0.5   0.00e+00
+    TileLang                          0.669     205.4    81.5%         18      0.0*  0.00e+00
+    Helion                            0.632     217.3    86.3%         12    492.8   0.00e+00
+    torch.compile (Inductor)          0.633     217.3    86.2%          1      0.1*  0.00e+00
+
+    参照：手写 CUDA v6 = 144.9 TFLOPS（57.5%），约 60 行 C++ kernel 代码
+          手写 CUDA v0 =   7.6 TFLOPS（3.0%），约 8 行
+</code></pre></div>
+
+<p>* TileLang 与 torch.compile 命中了上一次运行的编译缓存，所以显示接近 0。
+首次运行分别约 1 s 与 2 s。</p>
+<p>此处保留历史误差输出。零误差的适用范围是本样本与当前比较方法，
+不能据此反推不同实现的运算顺序；见 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 的修订解释。</p>
+<p>原始文件：<code>results/crater/dsl_shootout_5090.txt</code></p>
+</details>
+<details>
+<summary>② torch.compile 的 autotune 日志（它在评估什么）</summary>
+<div class="highlight"><pre><span></span><code>triton_mm_9  0.6221 ms 100.0% ACC_TYPE='tl.float32', ALLOW_TF32=False,
+             BLOCK_K=32, BLOCK_M=64, BLOCK_N=128, EVEN_K=True, GROUP_M=8,
+             USE_FAST_ACCUM=False, num_stages=3, num_warps=4
+triton_mm_11 0.6226 ms  99.9% BLOCK_K=64, BLOCK_M=64,  BLOCK_N=128, num_stages=3, num_warps=4
+triton_mm_13 0.6243 ms  99.7% BLOCK_K=32, BLOCK_M=128, BLOCK_N=64,  num_stages=3, num_warps=4
+mm           0.6308 ms  98.6%                          ← ATen 的 cuBLAS 后端
+triton_mm_14 0.6390 ms  97.4% BLOCK_K=32, BLOCK_M=128, BLOCK_N=64,  num_stages=4, num_warps=8
+triton_mm_7  0.6420 ms  96.9% BLOCK_K=64, BLOCK_M=64,  BLOCK_N=64,  num_stages=3, num_warps=8
+triton_mm_6  0.6430 ms  96.7% BLOCK_K=32, BLOCK_M=64,  BLOCK_N=64,  num_stages=2, num_warps=4
+triton_mm_10 0.6504 ms  95.7% BLOCK_K=32, BLOCK_M=64,  BLOCK_N=128, num_stages=4, num_warps=8
+triton_mm_16 0.6649 ms  93.6% BLOCK_K=32, BLOCK_M=128, BLOCK_N=128, num_stages=3, num_warps=4
+triton_mm_15 0.6697 ms  92.9% BLOCK_K=32, BLOCK_M=128, BLOCK_N=128, num_stages=2, num_warps=8
+
+SingleProcess AUTOTUNE benchmarking takes 0.9073 seconds and 0.3146 seconds
+precompiling for 22 choices
+</code></pre></div>
+
+<p>四点：</p>
+<ol>
+<li><strong>最优是 <code>64×128×32, num_warps=4</code></strong>，而我在 Triton 版里猜的是
+   <code>128×256×64, num_warps=8</code> —— 猜错的代价 23%。</li>
+<li><strong>最优的 Triton kernel（0.6221）比 cuBLAS（0.6308）快 1.4%。</strong>
+   所以 Inductor 默认同时评估两条路是有意义的。</li>
+<li><strong>最差与最好只差 7.7%</strong>（0.6697 vs 0.6221）。tile 参数在合理范围内不敏感，
+   但"合理范围"要靠搜索找到。</li>
+<li><code>ALLOW_TF32=False</code>：因为输入已经是 bf16，不涉及 TF32。</li>
+</ol>
+</details>
+<details>
+<summary>③ Helion 生成的 PTX 里有什么</summary>
+<div class="highlight"><pre><span></span><code>PTX 头部：
+    .version 9.1
+    .target sm_120a                        ← 架构专属（L2.2 讲过 a/f/裸的区别）
+
+tensor core 指令：
+     64 mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+        ↑ 和 L2.4 手写的完全一样
+
+异步搬运与同步：
+      4 cp.async.bulk.tensor.2d.shared     ← TMA（我手写时没有）
+      2 cp.async.bulk.commit_group
+      2 cp.async.bulk.wait_group.read
+      2 barrier.arrive.expect_tx.shared    ← mbarrier 事务计数
+      1 barrier.init.shared
+      1 barrier.inval.shared
+      1 barrier.try_wait.parity.shared
+      4 barrier
+</code></pre></div>
+
+<p><strong><code>cp.async.bulk.tensor.2d.shared</code> 是 TMA 指令</strong>：一条指令搬一整块 2D tile，
+由专用硬件（TMA engine）执行，不占 CUDA core、不占寄存器。</p>
+<p><strong><code>barrier.arrive.expect_tx.shared</code> 是 mbarrier</strong>：不是普通的 <code>__syncthreads</code>，
+而是带"事务计数"的异步屏障——等的是"这块数据搬完了"而不是"所有线程到齐了"。
+这套机制才让真正的异步流水成为可能。</p>
+<p><strong>这正是 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 结尾我列的两个缺口。</strong> DSL 自动生成了它们。</p>
+<p>产物大小：</p>
+<div class="highlight"><pre><span></span><code>_helion_helion_gemm.source     19 041 B   Helion 生成的 Triton 源码
+_helion_helion_gemm.ttir       108 行     Triton IR
+_helion_helion_gemm.ttgir      148 行     TritonGPU IR（带 layout 标注）
+_helion_helion_gemm.llir     1 047 行     LLVM IR
+_helion_helion_gemm.ptx        857 行     PTX
+_helion_helion_gemm.cubin   52 400 B     SASS
+</code></pre></div>
+
+<p><strong>12 行 Python → 857 行 PTX。</strong></p>
+</details>
+<details>
+<summary>④ Helion 的自动调优过程（原文）</summary>
+<div class="highlight"><pre><span></span><code>  block_sizes            = ...
+  range_num_stages       = [0, 0]
+  range_multi_buffers    = [None, False]
+  range_flattens         = [None, False]
+  load_eviction_policies = ['last', 'last']
+  num_warps              = 4
+  num_stages             = 2
+  indexing               = ['pointer', 'tensor_descriptor', 'tensor_descriptor']
+  atomic_indexing        = []
+  pid_type               = 'flat'
+  epilogue_subtile       = 2
+
+[306s] Fitting surrogate: 752 points, 752 targets
+[306s] Copy 3 finish because of no improvement
+[307s] Generation 10 starting: 53 neighbors, 3 active search path(s)
+Generation 10: precompiling 100% ━━━━━━━━━━━━━━━━━━━━━ 55/55  15.3 configs/s
+</code></pre></div>
+
+<p>值得注意的几个搜索维度：</p>
+<ul>
+<li><strong><code>indexing = 'tensor_descriptor'</code></strong> —— 就是"用 TMA"。这个选择是<strong>搜出来的</strong>。</li>
+<li><strong><code>load_eviction_policies = ['last', 'last']</code></strong> —— L2 缓存的驱逐策略提示
+  （<code>evict_last</code> 表示"这份数据后面还要用，别急着踢"）。这是 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 提到的
+  L2 驻留控制的一种形式。</li>
+<li><strong><code>epilogue_subtile</code></strong> —— 写回阶段的分块。</li>
+<li>搜索用<strong>遗传算法 + 代理模型</strong>（surrogate），752 个点，10 代。</li>
+</ul>
+<p><strong>总共 492.8 秒。</strong> 这是"零人工调参"的价格。</p>
+</details>
+<hr />
+<h2 id="_10">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>DSL</th>
+<th>定位与现状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Triton</strong></td>
+<td>事实标准。PyTorch Inductor 的后端，vLLM/SGLang 大量使用。跨 NVIDIA/AMD。弱点是对新硬件特性（TMA、wgmma、tcgen05）的支持滞后于 CUTLASS</td>
+</tr>
+<tr>
+<td><strong>CuTe-DSL</strong></td>
+<td>NVIDIA 官方，CUTLASS 4.x 的 Python 前端。<strong>FlashAttention-4 完全用它写</strong>，编译比 C++ 模板快 20–30×，保留寄存器分配与流水调度的控制权。只支持 NVIDIA</td>
+</tr>
+<tr>
+<td><strong>TileLang</strong></td>
+<td>TVM 血统，本章实测 18 行 81.5%。近期 DeepSeek 的开源里在用。跨后端（LLVM/MLIR）</td>
+</tr>
+<tr>
+<td><strong>Helion</strong></td>
+<td>PyTorch 官方的更高层 DSL，编译到 Triton。本章实测 12 行 86.3%，但要 8 分钟自动调优</td>
+</tr>
+<tr>
+<td><strong>ThunderKittens</strong></td>
+<td>2.0 于 2026-01 发布，支持 Blackwell + MXFP8/NVFP4。以 16×16 tile 为基本单位。<strong>本机未装</strong><span class="unverified">未实测</span></td>
+</tr>
+<tr>
+<td><strong>cuda.compute (CCCL)</strong></td>
+<td>NVIDIA 的 Python 并行原语库，2026 登顶过 GPU MODE 排行榜</td>
+</tr>
+<tr>
+<td><strong>AI 写 kernel 的现状</strong></td>
+<td>KernelBench 上前沿模型对 Triton 的 pass@1 尚可，但对 TileLang 低于 20%、ThunderKittens 低于 2% —— 因为公开语料太少（不足 100 万 token）<span class="unverified">未实测</span></td>
+</tr>
+</tbody>
+</table>
+<p>最后一行对你有直接意义：<strong>越新的 DSL，能问 AI 的东西越少，越要读官方 example</strong>。</p>
+<hr />
+<h2 id="_11">陷阱</h2>
+<p><strong>1. 拿"不调参的 Triton"跟 cuBLAS 比。</strong> 本章实测差 23%。
+Triton 的性能高度依赖 tile 参数，必须 autotune。</p>
+<p><strong>2. 以为高层 DSL 一定慢。</strong> 12 行 Helion 打过 400 行手写 CUDA 50%。</p>
+<p><strong>3. 忽略编译时间。</strong> Helion 493 秒。对形状多变的在线服务是致命的。</p>
+<p><strong>4. Helion 的 kernel 里用闭包变量。</strong> 报 <code>ClosuresNotSupported</code>。
+import 和 kernel 定义都要在模块级。</p>
+<p><strong>5. 只看性能不看生成的代码。</strong> 本章最有价值的一步是去 PTX 里
+数 <code>cp.async.bulk.tensor</code> 和 <code>mma.sync</code> —— <strong>那才知道它凭什么快</strong>。</p>
+<p><strong>6. 以为 DSL 免除了硬件知识。</strong> 恰恰相反：TileLang 要你写 <code>num_stages</code>，
+Triton 要你选 <code>BLOCK_M/N/K</code> 和 <code>num_warps</code>。
+<strong>不懂 L1/L2 那些硬件事实，你连参数该往哪调都不知道。</strong></p>
+<p><strong>7. 用方阵 GEMM 的结论去推 decode。</strong> M=1 时全部失效（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 自测题 4）。</p>
+<hr />
+<h2 id="_12">自测题</h2>
+<details>
+<summary>1. 我的项目要给 20 种不同形状的 GEMM 写 kernel，形状在编译期已知。选哪个 DSL？</summary>
+<p><strong>TileLang 或 Helion，取决于你有多少调优时间预算。</strong></p>
+<ul>
+<li><strong>形状编译期已知</strong> → 可以离线调优，Helion 的 493 秒 × 20 = 2.7 小时，一次性成本，可接受。</li>
+<li><strong>要求当天出结果</strong> → TileLang：18 行、1 秒编译、81.5% 性能，够用。</li>
+<li><strong>不要选手写 CUDA</strong>：本章实测它反而最慢，而且 20 种形状 × 400 行 = 8000 行要维护。</li>
+</ul>
+<p><strong>关键判断</strong>：调优是<strong>一次性成本</strong>还是<strong>每次部署都要付</strong>？
+前者选高抽象 + 自动调优，后者选中抽象 + 手工参数。</p>
+<p><strong>还有一个选项</strong>：先用 <code>torch.compile(mode="max-autotune")</code> 试一下。
+本章实测它 0.633 ms（86.2%），而且你一行 kernel 都不用写。
+<strong>在决定手写之前，先确认自动方案确实不够。</strong></p>
+</details>
+<details>
+<summary>2. Helion 生成的 PTX 里有 TMA（<code>cp.async.bulk.tensor</code>），但 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 说 sm_120 不支持 Hopper 的特性。矛盾吗？</summary>
+<p><strong>不矛盾。TMA 与 <code>wgmma</code>/<code>tcgen05</code> 是不同的特性，支持范围不同。</strong></p>
+<p><a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 实测确认 sm_120 <strong>不支持</strong>：
+- <code>wgmma.mma_async</code>（Hopper 的 warp-group MMA）
+- <code>tcgen05.mma</code> + TMEM（数据中心 Blackwell）</p>
+<p>但 <strong>TMA（<code>cp.async.bulk.tensor</code>）在 sm_120 上是支持的</strong> ——
+本章的 PTX 就是证据（<code>.target sm_120a</code> 且含 4 条 <code>cp.async.bulk.tensor.2d.shared</code>，
+而且这个 kernel 确实跑出了 217 TFLOPS）。</p>
+<p><strong>一般教训：不要把一代架构的特性当成一个整体。</strong>
+「Blackwell 有什么」这个问题必须逐条问，而且要以<strong>编译器/实测</strong>为准，
+不是以宣传材料为准。<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 的 <code>tcgen05_probe.cu</code> 就是这类判决性实验的模板。</p>
+</details>
+<details>
+<summary>3. 我的 Triton kernel 只有 cuBLAS 的 70%。在调 tile 之前，我应该先检查什么？</summary>
+<p>按顺序：</p>
+<p><strong>(1) 累加器是不是 fp32。</strong> <code>tl.zeros((BM, BN), dtype=tl.float32)</code>。
+如果写成 bf16，精度会崩（<a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 实测 float 在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>2</mn><mrow><mn>24</mn></mrow></msup></mrow></math></span> 处就失效，bf16 在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>2</mn><mn>8</mn></msup></mrow></math></span>）。</p>
+<p><strong>(2) 有没有 L2 友好的 block 重排（<code>GROUP_M</code>）。</strong> 默认的行主序 block 编号
+会让同时执行的 block 读完全不同的 A 行和 B 列，L2 命中率很低。
+本章的 Triton 版有这段（<code>GROUP = 8</code>），Inductor 选的也是 <code>GROUP_M=8</code>。</p>
+<p><strong>(3) <code>num_stages</code> 是不是 ≥ 3。</strong> 这决定软件流水的深度，对应 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 里我缺的双缓冲。
+Inductor 的最优配置是 <code>num_stages=3</code>。</p>
+<p><strong>(4) 然后才是 tile 尺寸。</strong> 而且<strong>不要猜，要扫</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">autotune</span><span class="p">(</span><span class="n">configs</span><span class="o">=</span><span class="p">[</span>
+    <span class="n">triton</span><span class="o">.</span><span class="n">Config</span><span class="p">({</span><span class="s1">'BM'</span><span class="p">:</span><span class="mi">64</span><span class="p">,</span><span class="s1">'BN'</span><span class="p">:</span><span class="mi">128</span><span class="p">,</span><span class="s1">'BK'</span><span class="p">:</span><span class="mi">32</span><span class="p">},</span> <span class="n">num_stages</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">num_warps</span><span class="o">=</span><span class="mi">4</span><span class="p">),</span>
+    <span class="n">triton</span><span class="o">.</span><span class="n">Config</span><span class="p">({</span><span class="s1">'BM'</span><span class="p">:</span><span class="mi">128</span><span class="p">,</span><span class="s1">'BN'</span><span class="p">:</span><span class="mi">64</span><span class="p">,</span><span class="s1">'BK'</span><span class="p">:</span><span class="mi">32</span><span class="p">},</span> <span class="n">num_stages</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">num_warps</span><span class="o">=</span><span class="mi">4</span><span class="p">),</span>
+    <span class="o">...</span>
+<span class="p">],</span> <span class="n">key</span><span class="o">=</span><span class="p">[</span><span class="s1">'M'</span><span class="p">,</span><span class="s1">'N'</span><span class="p">,</span><span class="s1">'K'</span><span class="p">])</span>
+</code></pre></div>
+
+<p><strong>(5) 最后去看生成的 PTX</strong>：<code>grep mma.sync</code> 确认真的用了 tensor core，
+<code>grep cp.async</code> 确认真的异步搬运了。
+本章实测：这一步能直接告诉你"编译器有没有做到你以为它做的事"。</p>
+</details>
+<details>
+<summary>4. 既然 DSL 这么好，为什么 vLLM 里还有那么多手写 CUDA kernel？</summary>
+<p>三个原因，<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 kernel trace 里都能看到证据。</p>
+<p><strong>(1) 有些算子不是"张量运算"。</strong>
+<code>reshape_and_cache_flash_kernel</code> 要按 slot mapping 把 K/V <strong>散写</strong>到非连续的物理块里
+（<a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a> 的 PagedAttention）。这是<strong>指针操作</strong>，不是 Triton/TileLang 擅长表达的
+block 级张量代数。</p>
+<p><strong>(2) 极端热路径值得手工。</strong>
+<code>rms_norm_kernel</code> 在 decode 每步调用 952 次（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 实测）。
+即使只快 10%，累计也可观。而且它的形状固定（hidden=2048），
+手工调一次用很久。</p>
+<p><strong>(3) 依赖与编译时间。</strong>
+Triton 的 JIT 首次运行要编译（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 实测一次 <code>LLM.generate</code> 产生 41 个 cubin）。
+生产环境不希望冷启动时编译几十个 kernel。手写 CUDA 是 AOT 编译进 <code>.so</code> 的。</p>
+<p><strong>趋势是在变的</strong>：vLLM 里 Triton kernel 的比例在增加，
+新的算子（采样惩罚、各种 mask）基本都用 Triton 写。
+<strong>但"全部用 DSL"短期内不会发生。</strong></p>
+</details>
+<details>
+<summary>5. 本章所有实现的误差都是 0（与 cuBLAS 逐位相同）。这可信吗？我该怎么验证不是测量出了 bug？</summary>
+<p><strong>应该怀疑，而且本站验证过。</strong></p>
+<p><a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 里对手写 WMMA 版做过专门验证（1024³，逐元素比对）：</p>
+<div class="highlight"><pre><span></span><code>参考 RMS = 2.666367
+自写 RMS = 2.666367
+最大绝对差 = 0
+不同的元素数 = 0 / 1048576
+</code></pre></div>
+
+<p><strong>100 万个元素，一个都不差。</strong> 所以"误差 0"是真的。</p>
+<p>应继续验证输出比较本身：确认读取的是本次结果、参考与结果不是同一缓冲、
+比较没有先经过低精度转换，并记录最大绝对误差与不同元素数。
+然后改变输入分布、K 长度和归约路径，检查一致性是否仍成立。
+这些改变可能引入数值差异，但不能保证每个样本一定出现差异。
+不要因为 bf16 输入在一次比较中相等，就认定 fp32 累加总能精确表示所有中间和。</p>
+<p><strong>最后一条是最好的对照</strong>：同样的验证代码，fp32 路径能测出非零误差，
+说明测量方法本身是有效的，bf16 的 0 是真结果。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.4-gemm-ladder.html">&#8592; 2.4 优化阶梯 II：逐步实现 GEMM</a><a class="nav-next" href="../L2/2.6-profiling.html">2.6 Profiling 工程学 &#8594;</a></nav>
+</main>
+</body>
+</html>

@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.6b 算子图的样子：Dynamo FX 图、Inductor 输出与真实文本</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">2.6b</div>
+  <div class="sidebar-title">算子图的样子：Dynamo FX 图、Inductor 输出与真实文本</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：四跳，四种表示</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#dynamo-fx">第一跳：Dynamo 的 FX 图长这样</a></li>
+<li><a href="#aotautograd">第二跳：AOTAutograd 把反向也变成图</a></li>
+<li><a href="#inductor-triton-kernel">第三跳：Inductor 生成一个 Triton kernel</a></li>
+<li><a href="#368">融合的收益：3.68 倍</a></li>
+<li><a href="#item">图断裂：一句 .item() 的代价</a></li>
+</ul>
+</li>
+<li><a href="#vllm-piecewise">工程实现 · 源码走读：vLLM 的 piecewise 图</a><ul>
+<li><a href="#2026-09-10crater">补测：三种模式各是多少次（2026-09-10，crater）</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_5">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="mod-id">2.6b</div>
+  <h1>算子图的样子：Dynamo FX 图、Inductor 输出与真实文本</h1>
+  <p class="lede">从小函数出发，阅读 FX 图、AOTAutograd 前向和反向图以及 Inductor 输出；区分编译分图、kernel 融合与 CUDA Graph 捕获。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L2.3（融合的收益从哪来）· L2.5（Triton）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>“算子图”不是必须画出来的流程图，而是程序的一种数据结构：
+节点表示输入、操作或输出，边表示某个操作使用了另一个操作产生的值。
+本章把同一个小函数交给编译器，逐步查看图的文本表示、反向图和生成的 kernel。
+先理解每一步的输入输出，再读完整打印结果，不需要一次记住所有节点名。</p>
+<ol>
+<li>「torch.compile 会捕获计算图」——<strong>那个图到底长什么样</strong>？能打印出来吗？</li>
+<li>融合 7 个逐元素算子，实际收益是多少？<strong>从哪里来</strong>？</li>
+<li><strong>反向图</strong>长什么样？为什么它比前向图大？</li>
+</ol>
+<p>本章的原则：凡是能打印的，一律打印。不用比喻。</p>
+<hr />
+<h2 id="_2">心智模型：四跳，四种表示</h2>
+<figure>
+<svg viewBox="0 0 740 438" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="torch.compile 的四跳">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">一段 7 行的 RMSNorm，torch.compile 走过的四跳（本机实测）</text>
+
+    <g stroke="currentColor" stroke-width="1.2" fill="none" opacity="0.65">
+      <line x1="176" y1="60" x2="200" y2="60"/><line x1="364" y1="60" x2="388" y2="60"/>
+      <line x1="552" y1="60" x2="576" y2="60"/>
+    </g>
+    <g>
+      <rect x="12" y="38" width="164" height="46" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+      <text x="94" y="57" text-anchor="middle" font-size="11">Python 字节码</text>
+      <text x="94" y="74" text-anchor="middle" font-size="10" opacity="0.75">你写的 7 行</text>
+
+      <rect x="200" y="38" width="164" height="46" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="282" y="53" text-anchor="middle" font-size="11" font-weight="600">Dynamo FX 图</text>
+      <text x="282" y="69" text-anchor="middle" font-size="10" opacity="0.8">11 个节点</text>
+      <text x="282" y="82" text-anchor="middle" font-size="9.5" opacity="0.65">带 shape 与 dtype 标注</text>
+
+      <rect x="388" y="38" width="164" height="46" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="470" y="53" text-anchor="middle" font-size="11" font-weight="600">AOTAutograd</text>
+      <text x="470" y="69" text-anchor="middle" font-size="10" opacity="0.8">前向 11 / 反向 25 节点</text>
+      <text x="470" y="82" text-anchor="middle" font-size="9.5" opacity="0.65">降到 aten 算子</text>
+
+      <rect x="576" y="38" width="152" height="46" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="652" y="53" text-anchor="middle" font-size="11" font-weight="600">Inductor</text>
+      <text x="652" y="69" text-anchor="middle" font-size="10" opacity="0.8">1 个 Triton kernel</text>
+      <text x="652" y="82" text-anchor="middle" font-size="9.5" opacity="0.65">176 行生成代码</text>
+    </g>
+
+    <text x="12" y="108" font-size="10.5" opacity="0.8">再往下就是 L2.2 讲过的 Triton → LLVM IR → PTX → SASS。</text>
+
+    <!-- fusion result -->
+    <line x1="12" y1="126" x2="728" y2="126" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="150" font-size="12" font-weight="600">融合的实测收益</text>
+    <g font-size="10.5">
+      <text x="12" y="176">eager</text>
+      <rect x="96" y="165" width="380" height="15" fill="currentColor" opacity="0.4"/>
+      <text x="484" y="177">8 个 kernel · 0.0858 ms · 391 GB/s</text>
+      <text x="12" y="202">compiled</text>
+      <rect x="96" y="191" width="103" height="15" fill="currentColor" opacity="0.85"/>
+      <text x="207" y="203" font-weight="600">1 个 kernel · 0.0233 ms · 1440 GB/s</text>
+    </g>
+    <text x="12" y="228" font-size="11">加速 <tspan font-weight="600">3.68×</tspan>，有效带宽达到 L1.1 实测上限（1674 GB/s）的 <tspan font-weight="600">86%</tspan>。</text>
+    <text x="12" y="248" font-size="10.5" opacity="0.85">收益全部来自省掉的中间结果往返——和 L2.3 里 fused_add_rms_norm 是同一件事。</text>
+
+    <!-- kernel name -->
+    <line x1="12" y1="268" x2="728" y2="268" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="292" font-size="12" font-weight="600">生成的 kernel 名字本身就是融合清单</text>
+    <text x="24" y="318" font-family="ui-monospace, monospace" font-size="11">triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0</text>
+    <g font-size="9.5" opacity="0.8">
+      <text x="24" y="336">red = reduction</text>
+      <text x="150" y="336">fused = 融合</text>
+      <text x="250" y="336">后面依次是被吞掉的 7 个算子</text>
+    </g>
+
+    <line x1="12" y1="356" x2="728" y2="356" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="380" font-size="11.5" font-weight="600">图断裂：一句 <tspan font-family="ui-monospace,monospace" font-size="10.5">.item()</tspan> 就把图切成两半</text>
+    <text x="12" y="400" font-size="10.5" opacity="0.85">实测：graph_count=2, graph_break_count=1，</text>
+    <text x="12" y="416" font-size="10.5" opacity="0.85">原因 <tspan font-family="ui-monospace,monospace" font-size="10">"Unsupported Tensor.item() call with capture..."</tspan>（呼应 L1.4 实测的 4.76 µs 同步开销）</text>
+  </g>
+</svg>
+<figcaption>四跳的实际产物与融合收益。所有数字与名字均为本机实测。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="dynamo-fx">第一跳：Dynamo 的 FX 图长这样</h3>
+<p>被编译的源码只有 4 行：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">rmsnorm_like</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="n">v</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+    <span class="n">s</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">v</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">s</span> <span class="o">+</span> <span class="mf">1e-6</span><span class="p">))</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="o">*</span> <span class="n">w</span>
+</code></pre></div>
+
+<p>Dynamo 捕获出来的 FX 图（<strong>原样打印</strong>）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">GraphModule</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">L_x_</span><span class="p">:</span> <span class="s2">"bf16[4096, 2048]"</span><span class="p">,</span> <span class="n">L_w_</span><span class="p">:</span> <span class="s2">"bf16[2048]"</span><span class="p">):</span>
+        <span class="n">l_x_</span> <span class="o">=</span> <span class="n">L_x_</span>
+        <span class="n">l_w_</span> <span class="o">=</span> <span class="n">L_w_</span>
+
+        <span class="c1"># code: v = x.float()</span>
+        <span class="n">v</span><span class="p">:</span> <span class="s2">"f32[4096, 2048]"</span> <span class="o">=</span> <span class="n">l_x_</span><span class="o">.</span><span class="n">float</span><span class="p">();</span>  <span class="n">l_x_</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="c1"># code: s = v.pow(2).mean(-1, keepdim=True)</span>
+        <span class="n">pow_1</span><span class="p">:</span> <span class="s2">"f32[4096, 2048]"</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+        <span class="n">s</span><span class="p">:</span> <span class="s2">"f32[4096, 1]"</span> <span class="o">=</span> <span class="n">pow_1</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span> <span class="o">=</span> <span class="kc">True</span><span class="p">);</span>  <span class="n">pow_1</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="c1"># code: return (v * torch.rsqrt(s + 1e-6)).to(x.dtype) * w</span>
+        <span class="n">add</span><span class="p">:</span> <span class="s2">"f32[4096, 1]"</span> <span class="o">=</span> <span class="n">s</span> <span class="o">+</span> <span class="mf">1e-06</span><span class="p">;</span>  <span class="n">s</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">rsqrt</span><span class="p">:</span> <span class="s2">"f32[4096, 1]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">add</span><span class="p">);</span>  <span class="n">add</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">mul</span><span class="p">:</span> <span class="s2">"f32[4096, 2048]"</span> <span class="o">=</span> <span class="n">v</span> <span class="o">*</span> <span class="n">rsqrt</span><span class="p">;</span>  <span class="n">v</span> <span class="o">=</span> <span class="n">rsqrt</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">to</span><span class="p">:</span> <span class="s2">"bf16[4096, 2048]"</span> <span class="o">=</span> <span class="n">mul</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">);</span>  <span class="n">mul</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">mul_1</span><span class="p">:</span> <span class="s2">"bf16[4096, 2048]"</span> <span class="o">=</span> <span class="n">to</span> <span class="o">*</span> <span class="n">l_w_</span><span class="p">;</span>  <span class="n">to</span> <span class="o">=</span> <span class="n">l_w_</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">mul_1</span><span class="p">,)</span>
+</code></pre></div>
+
+<p><strong>这就是"图"</strong> —— 一个合法的 Python 类，每个变量带着精确的 shape 和 dtype 标注。
+三件值得注意的事：</p>
+<ol>
+<li><strong>每一行都标了形状与类型</strong>（<code>"f32[4096, 2048]"</code>）。
+   这是后续所有优化的前提——不知道形状就无法决定 tile 和融合边界。</li>
+<li><strong><code>; x = None</code> 释放生成 Python 代码中的一个引用</strong>。
+   是否能释放或复用底层存储，还要看其他引用、alias、反向保存值和编译器的内存分析，
+   不能只从这条赋值判断显存已经归还。</li>
+<li><strong>注释保留了原始源码行</strong>。所以报错和 profile 能指回你写的那一行。</li>
+</ol>
+<p>节点层面（11 个）：</p>
+<div class="highlight"><pre><span></span><code>placeholder      L_x_
+placeholder      L_w_
+call_method      float          args=(l_x_,)
+call_method      pow            args=(v, 2)
+call_method      mean           args=(pow_1, -1)
+call_function    add            args=(s, 1e-06)
+call_function    rsqrt          args=(add,)
+call_function    mul            args=(v, rsqrt)
+call_method      to             args=(mul, torch.bfloat16)
+call_function    mul            args=(to, l_w_)
+output           output
+</code></pre></div>
+
+<p>这个样例出现了四种 op：<code>placeholder</code>、<code>call_function</code>、<code>call_method</code> 和 <code>output</code>。
+FX 还支持 <code>get_attr</code> 和 <code>call_module</code>，不能把样例里出现的类型当成全部类型。
+完整定义见 <a href="https://docs.pytorch.org/docs/2.13/fx.html">PyTorch 2.13 FX 文档</a>。</p>
+<h3 id="aotautograd">第二跳：AOTAutograd 把反向也变成图</h3>
+<p>如果需要梯度，AOTAutograd 会生成<strong>前向图 + 反向图</strong>。实测节点数：</p>
+<table>
+<thead>
+<tr>
+<th>图</th>
+<th>节点数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>forward</td>
+<td><strong>11</strong></td>
+</tr>
+<tr>
+<td>backward</td>
+<td><strong>25</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>先看前向图的最后一行</strong>——它揭示了整个机制：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">primals_1</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">:</span> <span class="s2">"f32[512]"</span><span class="p">):</span>
+    <span class="n">pow_1</span><span class="p">:</span>  <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">pow</span><span class="o">.</span><span class="n">Tensor_Scalar</span><span class="p">(</span><span class="n">primals_1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+    <span class="n">mean</span><span class="p">:</span>   <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mean</span><span class="o">.</span><span class="n">dim</span><span class="p">(</span><span class="n">pow_1</span><span class="p">,</span> <span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="kc">True</span><span class="p">);</span>  <span class="n">pow_1</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">add</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">add</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mean</span><span class="p">,</span> <span class="mf">1e-06</span><span class="p">);</span>  <span class="n">mean</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">rsqrt</span><span class="p">:</span>  <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">rsqrt</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">add</span><span class="p">);</span>  <span class="n">add</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">detach</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">detach</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">rsqrt</span><span class="p">)</span>
+    <span class="n">mul</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">primals_1</span><span class="p">,</span> <span class="n">rsqrt</span><span class="p">)</span>
+    <span class="n">mul_1</span><span class="p">:</span>  <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">)</span>
+    <span class="n">sum_1</span><span class="p">:</span>  <span class="s2">"f32[]"</span>          <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">sum</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">mul_1</span><span class="p">);</span>  <span class="n">mul_1</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">sum_1</span><span class="p">,</span> <span class="n">primals_1</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">,</span> <span class="n">rsqrt</span><span class="p">,</span> <span class="n">detach</span><span class="p">,</span> <span class="n">mul</span><span class="p">)</span>
+    <span class="c1">#       ↑真正的输出  ↑—————— 这五个是留给反向的 ——————↑</span>
+</code></pre></div>
+
+<p><strong>前向图返回了 6 个值，但函数只有 1 个输出。</strong> 后面五个是
+AOTAutograd 加进去的——反向要用到它们。这是「保存中间值」这件事在图上的样子：
+不是什么隐藏机制，就是<strong>前向图多返回几个张量</strong>。</p>
+<p>（<code>pow_1</code>、<code>mean</code>、<code>add</code>、<code>mul_1</code> 后面跟着 <code>= None</code>，说明它们<strong>不</strong>需要保存，
+可以立刻释放。编译器精确知道哪些能扔。）</p>
+<p>反向图（<strong>原样</strong>，25 个节点）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">primals_1</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">:</span> <span class="s2">"f32[512]"</span><span class="p">,</span>
+            <span class="n">rsqrt</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span><span class="p">,</span> <span class="n">detach</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span><span class="p">,</span>
+            <span class="n">mul</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span><span class="p">,</span> <span class="n">tangents_1</span><span class="p">:</span> <span class="s2">"f32[]"</span><span class="p">):</span>
+    <span class="n">expand</span><span class="p">:</span>   <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">expand</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">tangents_1</span><span class="p">,</span> <span class="p">[</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">512</span><span class="p">])</span>
+    <span class="n">mul_2</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">expand</span><span class="p">,</span> <span class="n">mul</span><span class="p">)</span>
+    <span class="n">mul_3</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">expand</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">)</span>
+    <span class="n">sum_2</span><span class="p">:</span>    <span class="s2">"f32[1, 512]"</span>    <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">sum</span><span class="o">.</span><span class="n">dim_IntList</span><span class="p">(</span><span class="n">mul_2</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="kc">True</span><span class="p">)</span>   <span class="c1"># → dL/dw</span>
+    <span class="n">view</span><span class="p">:</span>     <span class="s2">"f32[512]"</span>       <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">view</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">sum_2</span><span class="p">,</span> <span class="p">[</span><span class="mi">512</span><span class="p">])</span>
+    <span class="n">mul_4</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul_3</span><span class="p">,</span> <span class="n">primals_1</span><span class="p">)</span>
+    <span class="n">mul_5</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul_3</span><span class="p">,</span> <span class="n">rsqrt</span><span class="p">)</span>            <span class="c1"># 路径 A</span>
+    <span class="n">sum_3</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">sum</span><span class="o">.</span><span class="n">dim_IntList</span><span class="p">(</span><span class="n">mul_4</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="kc">True</span><span class="p">)</span>
+    <span class="n">detach_1</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">detach</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">detach</span><span class="p">)</span>
+    <span class="n">pow_2</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">pow</span><span class="o">.</span><span class="n">Tensor_Scalar</span><span class="p">(</span><span class="n">detach_1</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span>      <span class="c1"># rsqrt′</span>
+    <span class="n">mul_6</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Scalar</span><span class="p">(</span><span class="n">sum_3</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.5</span><span class="p">)</span>             <span class="c1"># rsqrt′</span>
+    <span class="n">mul_7</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul_6</span><span class="p">,</span> <span class="n">pow_2</span><span class="p">)</span>
+    <span class="n">expand_1</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">expand</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">mul_7</span><span class="p">,</span> <span class="p">[</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">512</span><span class="p">])</span>
+    <span class="n">div</span><span class="p">:</span>      <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">div</span><span class="o">.</span><span class="n">Scalar</span><span class="p">(</span><span class="n">expand_1</span><span class="p">,</span> <span class="mi">512</span><span class="p">)</span>           <span class="c1"># mean′</span>
+    <span class="n">pow_3</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">pow</span><span class="o">.</span><span class="n">Tensor_Scalar</span><span class="p">(</span><span class="n">primals_1</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>   <span class="c1"># pow(2)′</span>
+    <span class="n">mul_8</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Scalar</span><span class="p">(</span><span class="n">pow_3</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">)</span>              <span class="c1"># pow(2)′</span>
+    <span class="n">mul_9</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">div</span><span class="p">,</span> <span class="n">mul_8</span><span class="p">)</span>              <span class="c1"># 路径 B</span>
+    <span class="n">add_1</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">add</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul_5</span><span class="p">,</span> <span class="n">mul_9</span><span class="p">)</span>            <span class="c1"># A + B 汇合</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">add_1</span><span class="p">,</span> <span class="n">view</span><span class="p">)</span>
+    <span class="c1">#       dL/dx  dL/dw</span>
+</code></pre></div>
+
+<p><strong>每一步都能对应到链式法则的一项</strong>：</p>
+<ul>
+<li><code>pow_2 = detach^3</code> 与 <code>mul_6 = sum_3 × (-0.5)</code>：这是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mfrac><mrow><mi>d</mi></mrow><mrow><mi>d</mi><mi>x</mi></mrow></mfrac><msup><mi>x</mi><mrow><mo>&#x02212;</mo><mn>1</mn><mo>&#x0002F;</mo><mn>2</mn></mrow></msup><mo>&#x0003D;</mo><mo>&#x02212;</mo><mfrac><mrow><mn>1</mn></mrow><mrow><mn>2</mn></mrow></mfrac><msup><mi>x</mi><mrow><mo>&#x02212;</mo><mn>3</mn><mo>&#x0002F;</mo><mn>2</mn></mrow></msup></mrow></math></span></li>
+<li><code>div(..., 512)</code>：<code>mean</code> 的反向是把梯度均摊到 512 个元素</li>
+<li><code>mul_8 = pow_3 × 2.0</code>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mfrac><mrow><mi>d</mi></mrow><mrow><mi>d</mi><mi>x</mi></mrow></mfrac><msup><mi>x</mi><mn>2</mn></msup><mo>&#x0003D;</mo><mn>2</mn><mi>x</mi></mrow></math></span></li>
+<li><code>add_1 = mul_5 + mul_9</code>：因为 <code>v</code> 在前向里被用了<strong>两次</strong>
+  （一次算 <code>s</code>，一次乘 <code>rsqrt</code>），所以反向要<strong>把两条路径的梯度相加</strong></li>
+</ul>
+<p>最后一条是理解反向图的关键：<strong>前向图里一个值被用了 N 次，反向图里就有 N 条梯度路径要汇合。</strong>
+这也是反向图更大的直接原因。</p>
+<p>再数一遍保存的东西：<code>primals_1</code>（输入 x，2 MB）、<code>primals_2</code>（权重 w）、
+<code>rsqrt</code>（1024 个 fp32）、<code>detach</code>（<code>rsqrt</code> 的 view，<strong>不额外占显存</strong>）、
+<code>mul</code>（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1024</mn><mo>&#x000D7;</mo><mn>512</mn></mrow></math></span> fp32，<strong>2 MB</strong>）。</p>
+<p><strong>关键的是 <code>mul</code></strong> —— 它是前向算出的归一化结果，
+一个和输入等大的张量，必须一路活到反向结束。
+一层就 2 MB，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math></span> 层的模型乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math></span> 倍。<strong>这就是训练显存的大头</strong>
+（activation memory，<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span> 会算这笔账；★7.0 会把整个反向过程再拆一遍）。</p>
+<h3 id="inductor-triton-kernel">第三跳：Inductor 生成一个 Triton kernel</h3>
+<p>7 个算子 → <strong>1 个 kernel</strong>。生成的函数名本身就是清单：</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0</span><span class="p">(</span>
+        <span class="n">in_ptr0</span><span class="p">,</span> <span class="n">in_ptr1</span><span class="p">,</span> <span class="n">out_ptr1</span><span class="p">,</span> <span class="n">xnumel</span><span class="p">,</span> <span class="n">r0_numel</span><span class="p">,</span>
+        <span class="n">XBLOCK</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">):</span>
+</code></pre></div>
+
+<p><code>triton_</code> + <code>red</code>（reduction）+ <code>fused_</code> + 被吞掉的算子名依次排列：
+<code>_to_copy</code>、<code>add</code>、<code>mean</code>、<code>mul</code>、<code>pow</code>、<code>rsqrt</code>。</p>
+<p><strong>kernel 体是标准的两遍归约结构</strong>（对照 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的方法论）：</p>
+<div class="highlight"><pre><span></span><code>    <span class="c1"># 第一遍：算平方和</span>
+    <span class="n">_tmp4</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">full</span><span class="p">([</span><span class="n">XBLOCK</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">],</span> <span class="mi">0</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>      <span class="c1"># 累加器 fp32</span>
+    <span class="k">for</span> <span class="n">r0_offset</span> <span class="ow">in</span> <span class="n">tl</span><span class="o">.</span><span class="n">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">r0_numel</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">):</span>
+        <span class="n">tmp0</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">in_ptr0</span> <span class="o">+</span> <span class="p">(</span><span class="n">r0_1</span> <span class="o">+</span> <span class="mi">2048</span><span class="o">*</span><span class="n">x0</span><span class="p">),</span> <span class="n">r0_mask</span><span class="p">,</span>
+                       <span class="n">eviction_policy</span><span class="o">=</span><span class="s1">'evict_last'</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp2</span> <span class="o">=</span> <span class="n">tmp1</span> <span class="o">*</span> <span class="n">tmp1</span>
+        <span class="n">_tmp4</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">r0_mask</span><span class="p">,</span> <span class="n">_tmp4</span> <span class="o">+</span> <span class="n">tmp3</span><span class="p">,</span> <span class="n">_tmp4</span><span class="p">)</span>
+    <span class="n">tmp4</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">_tmp4</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[:,</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="c1"># 第二遍：归一化并写回</span>
+    <span class="k">for</span> <span class="n">r0_offset</span> <span class="ow">in</span> <span class="n">tl</span><span class="o">.</span><span class="n">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">r0_numel</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">):</span>
+        <span class="n">tmp6</span>  <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">in_ptr0</span> <span class="o">+</span> <span class="p">(</span><span class="n">r0_1</span> <span class="o">+</span> <span class="mi">2048</span><span class="o">*</span><span class="n">x0</span><span class="p">),</span> <span class="n">r0_mask</span><span class="p">,</span>
+                        <span class="n">eviction_policy</span><span class="o">=</span><span class="s1">'evict_first'</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp15</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">in_ptr1</span> <span class="o">+</span> <span class="p">(</span><span class="n">r0_1</span><span class="p">),</span> <span class="n">r0_mask</span><span class="p">,</span> <span class="n">eviction_policy</span><span class="o">=</span><span class="s1">'evict_last'</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+        <span class="n">tmp9</span>  <span class="o">=</span> <span class="p">(</span><span class="n">tmp4</span> <span class="o">/</span> <span class="n">tmp8</span><span class="p">)</span>                    <span class="c1"># mean</span>
+        <span class="n">tmp11</span> <span class="o">=</span> <span class="n">tmp9</span> <span class="o">+</span> <span class="n">tmp10</span>                     <span class="c1"># + eps</span>
+        <span class="n">tmp12</span> <span class="o">=</span> <span class="n">libdevice</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">tmp11</span><span class="p">)</span>           <span class="c1"># rsqrt</span>
+        <span class="n">tmp16</span> <span class="o">=</span> <span class="p">(</span><span class="n">tmp7</span> <span class="o">*</span> <span class="n">tmp12</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">*</span> <span class="n">tmp15</span>
+        <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">out_ptr1</span> <span class="o">+</span> <span class="p">(</span><span class="n">r0_1</span> <span class="o">+</span> <span class="mi">2048</span><span class="o">*</span><span class="n">x0</span><span class="p">),</span> <span class="n">tmp16</span><span class="p">,</span> <span class="n">r0_mask</span><span class="p">)</span>
+</code></pre></div>
+
+<p>三个细节值得单独看：</p>
+<p><strong>(1) 累加器是 <code>tl.float32</code></strong>，即使输入输出都是 bf16。
+这正是 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 自测题 5 说的铁律：<strong>读用 bf16，算用 fp32</strong>。
+Inductor 自动做对了。</p>
+<p><strong>(2) <code>eviction_policy='evict_last'</code> / <code>'evict_first'</code></strong> —— 这是 <strong>L2 缓存驱逐提示</strong>：
+- 第一遍读 <code>in_ptr0</code> 时标 <code>evict_last</code>（"这份数据第二遍还要用，别急着踢"）
+- 第二遍读同一块时标 <code>evict_first</code>（"用完就可以丢了"）
+- 权重 <code>in_ptr1</code>（2048 个元素，所有行共用）标 <code>evict_last</code></p>
+<p><strong>编译器在管 L2 缓存。</strong> 这是 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 提到的"L2 驻留控制"的一种实际用法。</p>
+<p><strong>(3) <code>in_ptr0</code> 被读了两遍。</strong> 这是"两遍归约"的固有代价——
+要先知道均值才能归一化。所以理论访存量是
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mtext>读</mtext><mo>&#x0002B;</mo><mn>1</mn><mo>&#x000D7;</mo><mtext>写</mtext></mrow></math></span>，
+而不是朴素以为的 1 读 1 写。</p>
+<h3 id="368">融合的收益：3.68 倍</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>kernel 数</th>
+<th>耗时</th>
+<th>有效带宽</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>eager</td>
+<td><strong>8</strong></td>
+<td>0.0858 ms</td>
+<td>391 GB/s</td>
+</tr>
+<tr>
+<td>compiled</td>
+<td><strong>1</strong></td>
+<td>0.0233 ms</td>
+<td><strong>1440 GB/s</strong></td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td><strong>3.68×</strong></td>
+<td>占上限 86%</td>
+</tr>
+</tbody>
+</table>
+<p>（带宽按"读 x + 写 out"两趟算；实际因为两遍归约还多读一趟，
+所以真实带宽利用率比 86% 更高。）</p>
+<p><strong>收益的来源</strong>：eager 的 8 个 kernel 里，每个都要
+「从显存读中间结果 → 算 → 写回显存」。7 个中间张量（<code>v</code>、<code>pow_1</code>、<code>s</code>、<code>add</code>、
+<code>rsqrt</code>、<code>mul</code>、<code>to</code>）里有 4 个是 <code>[4096, 2048]</code> 的大张量，每个 32 MB（fp32）。</p>
+<p><strong>融合后这些中间值全部留在寄存器里</strong>，一次都不落显存。</p>
+<p>这和 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 走读的 vLLM <code>fused_add_rms_norm</code> 是<strong>完全同一件事</strong>——
+只不过那个是手写的，这个是编译器自动做的。</p>
+<h3 id="item">图断裂：一句 <code>.item()</code> 的代价</h3>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">has_break</span><span class="p">(</span><span class="n">x_</span><span class="p">):</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">x_</span> <span class="o">*</span> <span class="mi">2</span>
+    <span class="k">if</span> <span class="n">y</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>          <span class="c1"># ← 这里断图</span>
+        <span class="n">y</span> <span class="o">=</span> <span class="n">y</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="k">return</span> <span class="n">y</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span>
+</code></pre></div>
+
+<p>实测：</p>
+<div class="highlight"><pre><span></span><code>图数量        2
+断裂次数      1
+断裂原因      "GraphCompileReason(reason='Unsupported Tensor.item() call with capture...'"
+</code></pre></div>
+
+<p>为什么必须断？因为 <code>.item()</code> 要把 GPU 上的值<strong>拿到 CPU</strong>才能判断 <code>&gt; 0</code>。
+Dynamo 是<strong>编译期</strong>工作的，它不知道运行时那个值是多少，
+所以无法把 <code>if</code> 的两个分支都编进一张图。</p>
+<p>后果有三层：</p>
+<ol>
+<li><strong>两张图</strong>，中间要回到 Python 解释器。</li>
+<li><strong>强制同步</strong>：<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 实测 <code>.item()</code> 要 4.76 µs，且会打断 CPU-GPU 流水。</li>
+<li><strong>融合边界</strong>：断裂点两侧的算子<strong>不能互相融合</strong>。</li>
+</ol>
+<p><strong>这就是为什么推理引擎的热路径里绝不写 <code>.item()</code></strong>（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 陷阱 4）。
+vLLM 的采样全在 GPU 上完成，结果通过异步拷贝 + 事件回传。</p>
+<hr />
+<h2 id="vllm-piecewise">工程实现 · 源码走读：vLLM 的 piecewise 图</h2>
+<p>先区分两件事：编译器分图决定哪些算子一起优化，CUDA Graph 捕获决定哪些设备操作
+可以作为一个执行序列重放。二者有关联，但不是同一个过程。</p>
+<p>vLLM 0.29.0 的 <code>CUDAGraphMode</code>（<code>vllm/config/compilation.py:53</code>）有五个取值：</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">CUDAGraphMode</span><span class="p">(</span><span class="n">enum</span><span class="o">.</span><span class="n">Enum</span><span class="p">):</span>
+    <span class="n">NONE</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">PIECEWISE</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">FULL</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="n">FULL_DECODE_ONLY</span> <span class="o">=</span> <span class="p">(</span><span class="n">FULL</span><span class="p">,</span> <span class="n">NONE</span><span class="p">)</span>
+    <span class="n">FULL_AND_PIECEWISE</span> <span class="o">=</span> <span class="p">(</span><span class="n">FULL</span><span class="p">,</span> <span class="n">PIECEWISE</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><code>PIECEWISE</code>：分段捕获，把与 CUDA Graph 不兼容的算子（部分 attention）留在捕获范围外。</li>
+<li><code>FULL</code>：后端满足要求时整图捕获。</li>
+<li>后两个是复合值：元组的两项分别用于 <strong>decode</strong> 与 <strong>mixed</strong> 两类 batch
+  （<code>decode_mode()</code> / <code>mixed_mode()</code>，同文件 65–69 行）。</li>
+</ul>
+<p><strong>v1 的默认值是 <code>FULL_AND_PIECEWISE</code></strong>（同文件 615 行的文档字符串标注 <code>(v1 default)</code>），
+不是 <code>PIECEWISE</code>。也就是说默认配置下，decode 走整图捕获，混合 batch 走分段捕获。</p>
+<p>还要注意 <code>splitting_ops</code>（517 行）是<strong>编译分图</strong>的配置，与 <code>cudagraph_mode</code>（607 行）
+的<strong>图捕获</strong>是两个独立开关，不要混为一谈。</p>
+<p>运行时还会考虑 attention backend 能力、batch 描述和已有捕获尺寸，
+必要时选择其他模式或 eager 路径。变长输入不意味着每步都必须重新捕获，
+也不意味着 attention 必须永远留在图外。
+参见 <a href="https://docs.vllm.ai/en/v0.29.0/design/cuda_graphs/">该版本的 CUDA Graph 设计</a>。</p>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 使用 <code>enforce_eager=True</code>，不能从该 trace 断言开启 graph 后的具体路径。
+而且一次 graph launch 仍可能执行多个 kernel；在支持节点级跟踪的 profiler 中，
+这些 kernel 仍然可见。图重放减少提交次数，算子融合减少 kernel 数，二者要分开看。</p>
+<h3 id="2026-09-10crater">补测：三种模式各是多少次（2026-09-10，crater）</h3>
+<p>上面那句「二者要分开看」现在有数了。同一份 decode 负载
+（Qwen3-1.7B，bs=4，每条生成 32 token，关掉 prefix caching），
+用 nsys 只统计 <code>generate</code> 那一段（<code>--capture-range=cudaProfilerApi</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>CPU 侧 launch 调用</th>
+<th>GPU 侧 kernel 数</th>
+<th>GPU 忙 (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NONE</code>（<code>enforce_eager</code>）</td>
+<td>14,003</td>
+<td>14,003</td>
+<td>137.76</td>
+</tr>
+<tr>
+<td><code>PIECEWISE</code></td>
+<td>6,071（0.434×）</td>
+<td>12,147（0.867×）</td>
+<td>132.87</td>
+</tr>
+<tr>
+<td><code>FULL_AND_PIECEWISE</code>（默认）</td>
+<td><strong>863（0.062×）</strong></td>
+<td><strong>12,147（0.867×）</strong></td>
+<td>133.37</td>
+</tr>
+</tbody>
+</table>
+<p>三件事：</p>
+<ol>
+<li><strong>CPU 侧的提交次数掉了 16.2 倍</strong>（14,003 → 863）。这是图的全部收益。</li>
+<li><strong>GPU 侧执行的 kernel 数在两种图模式下一模一样：12,147。</strong>
+   图没有让 GPU 少算任何东西。</li>
+<li><strong>GPU 忙时基本不变</strong>（137.8 / 132.9 / 133.4 ms，相差 4% 以内）。
+   在这个负载上 GPU 根本不是瓶颈——省下来的是 CPU 提交时间，
+   这正是 <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 里「decode 每步 444 次 launch 占墙钟 27%」的那一项。</li>
+</ol>
+<p><code>NONE</code> 的 14,003 比图模式的 12,147 多出 1,856 个 kernel。
+<strong>这 1,856 个不是图省掉的，是编译省掉的</strong>：<code>enforce_eager=True</code> 连
+<code>torch.compile</code> 一起关了，所以没有 Inductor 融合。这正好演示了那句
+「图重放减少提交次数，算子融合减少 kernel 数」——两个数字来自两个机制。</p>
+<p>launch 类 API 的明细能看出图的形状：</p>
+<div class="highlight"><pre><span></span><code>--- PIECEWISE ---
+  cudaLaunchKernel_v7000                           4,684
+  cudaGraphLaunch_v10000                             899
+  cuLaunchKernel                                     257
+  cuLaunchKernelEx                                   231
+
+--- FULL_AND_PIECEWISE ---
+  cudaLaunchKernel_v7000                             344
+  cuLaunchKernel                                     257
+  cuLaunchKernelEx                                   231
+  cudaGraphLaunch_v10000                              31
+</code></pre></div>
+
+<p><code>31</code> 与 <code>899</code> 不是随便的数：本次共 <strong>31 个 decode step</strong>，
+Qwen3-1.7B 有 <strong>28 层</strong>。</p>
+<ul>
+<li><code>FULL_AND_PIECEWISE</code>：31 次 graph launch = <strong>每步整模型一张图</strong>。</li>
+<li><code>PIECEWISE</code>：899 = <strong>29 × 31</strong>，即每步 29 段（28 层各一段，加上收尾一段）。</li>
+</ul>
+<p>分段模式把图切在 attention 处，所以每层都要单独提交一次。
+两种模式跑的是同一批 kernel，区别只在<strong>提交的粒度</strong>。</p>
+<div class="admonition warning">
+<p class="admonition-title">这个测量差点得出相反的结论</p>
+<p>nsys 的 <code>--cuda-graph-trace</code> 默认值是 <code>graph</code>，它把<strong>整张图记成一个单位</strong>，
+于是 <code>CUPTI_ACTIVITY_KIND_KERNEL</code> 表里只剩非图的 kernel。
+第一版就是这么跑的，得到的三行是 14,003 / 5,172 / 832——
+GPU kernel 数恰好等于 CPU launch 数，看起来像「图让 GPU 少跑了 17 倍的 kernel」。
+那是假象。加上 <code>--cuda-graph-trace=node</code> 之后才是上表。</p>
+<p>识别信号很直接：<strong>三种模式下 GPU kernel 数都精确等于 CPU launch 数</strong>。
+一个恒等式在三个不同配置下都成立，通常说明你在用两种方式数同一个东西。</p>
+</div>
+<hr />
+<h2 id="_4">工程实现 · 自己写一遍</h2>
+<p>关键是<strong>怎么把图拿出来</strong>。三种方式，各有用途。</p>
+<p><strong>(1) 自定义 backend：拿到 Dynamo 的原始 FX 图</strong></p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">capture_fx</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">):</span>
+    <span class="n">graphs</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">backend</span><span class="p">(</span><span class="n">gm</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">fx</span><span class="o">.</span><span class="n">GraphModule</span><span class="p">,</span> <span class="n">example_inputs</span><span class="p">):</span>
+        <span class="n">graphs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">gm</span><span class="o">.</span><span class="n">forward</span>           <span class="c1"># 原样返回，不做任何编译</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">)(</span><span class="o">*</span><span class="n">args</span><span class="p">)</span>
+    <span class="k">return</span> <span class="s2">"</span><span class="se">\n\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">g</span><span class="o">.</span><span class="n">print_readable</span><span class="p">(</span><span class="n">print_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="k">for</span> <span class="n">g</span> <span class="ow">in</span> <span class="n">graphs</span><span class="p">),</span> <span class="n">graphs</span>
+</code></pre></div>
+
+<p><code>print_readable()</code> 输出的就是上面那段带 shape 标注的 Python 代码。</p>
+<p><strong>(2) <code>aot_module_simplified</code>：拿到前向/反向图</strong></p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">functorch.compile</span><span class="w"> </span><span class="kn">import</span> <span class="n">aot_module_simplified</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">backend</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">inputs</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">fw</span><span class="p">(</span><span class="n">g</span><span class="p">,</span> <span class="n">i</span><span class="p">):</span> <span class="n">joint</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"forward"</span><span class="p">,</span> <span class="n">g</span><span class="p">));</span>  <span class="k">return</span> <span class="n">g</span><span class="o">.</span><span class="n">forward</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bw</span><span class="p">(</span><span class="n">g</span><span class="p">,</span> <span class="n">i</span><span class="p">):</span> <span class="n">joint</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"backward"</span><span class="p">,</span> <span class="n">g</span><span class="p">));</span> <span class="k">return</span> <span class="n">g</span><span class="o">.</span><span class="n">forward</span>
+    <span class="k">return</span> <span class="n">aot_module_simplified</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">fw_compiler</span><span class="o">=</span><span class="n">fw</span><span class="p">,</span> <span class="n">bw_compiler</span><span class="o">=</span><span class="n">bw</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>(3) 环境变量：让 Inductor 把生成的代码落盘</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nv">TORCHINDUCTOR_CACHE_DIR</span><span class="o">=</span>./cache<span class="w"> </span>python<span class="w"> </span>your_script.py
+<span class="c1"># 或者更直接：</span>
+<span class="nv">TORCH_LOGS</span><span class="o">=</span><span class="s2">"output_code"</span><span class="w"> </span>python<span class="w"> </span>your_script.py<span class="w">       </span><span class="c1"># 直接打印 Inductor 输出</span>
+<span class="nv">TORCH_LOGS</span><span class="o">=</span><span class="s2">"graph_code"</span><span class="w"> </span>python<span class="w"> </span>your_script.py<span class="w">        </span><span class="c1"># 打印 Dynamo 图</span>
+<span class="nv">TORCH_LOGS</span><span class="o">=</span><span class="s2">"+dynamo"</span><span class="w"> </span>python<span class="w"> </span>your_script.py<span class="w">           </span><span class="c1"># 详细的捕获过程</span>
+</code></pre></div>
+
+<p><strong><code>TORCH_LOGS</code> 是最省事的入口</strong>，值得记住这三个：
+<code>graph_code</code>（Dynamo 图）、<code>aot_graphs</code>（前向反向图）、<code>output_code</code>（Inductor 输出）。</p>
+<p><strong>(4) 查图断裂</strong></p>
+<div class="highlight"><pre><span></span><code><span class="n">expl</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">explain</span><span class="p">(</span><span class="n">fn</span><span class="p">)(</span><span class="o">*</span><span class="n">args</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">expl</span><span class="o">.</span><span class="n">graph_count</span><span class="p">,</span> <span class="n">expl</span><span class="o">.</span><span class="n">graph_break_count</span><span class="p">,</span> <span class="n">expl</span><span class="o">.</span><span class="n">break_reasons</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这应该是你优化 torch.compile 时的第一步</strong>：如果 <code>graph_count</code> 很大，
+说明图被切碎了，融合机会全没了。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L2/graph_anatomy.py<span class="w"> </span>--out-dir<span class="w"> </span>results/graphs/
+
+<span class="c1"># 更省事的方式</span>
+<span class="nv">TORCH_LOGS</span><span class="o">=</span><span class="s2">"graph_code,aot_graphs,output_code"</span><span class="w"> </span>python<span class="w"> </span>your_model.py<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>less
+</code></pre></div>
+
+<h3 id="_5">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>把 <code>rmsnorm_like</code> 里的 <code>.float()</code> 去掉（全程 bf16）</td>
+<td>Inductor 生成的累加器仍应是 fp32——<strong>它知道归约必须提精度</strong></td>
+</tr>
+<tr>
+<td>在中间插一句 <code>print(v.shape)</code></td>
+<td>触发图断裂。<code>explain</code> 会报出来</td>
+</tr>
+<tr>
+<td>把输入形状改成动态（<code>dynamic=True</code>）</td>
+<td>图里会出现符号形状 <code>s0</code>、<code>s1</code>，生成的 kernel 多一层边界判断</td>
+</tr>
+<tr>
+<td>用 <code>torch.compile(mode="reduce-overhead")</code></td>
+<td>检查该函数是否满足 CUDA Graph 条件；分别统计 graph launch 与图内 kernel，不能把两种计数混为一谈</td>
+</tr>
+<tr>
+<td>对一个真实的 <code>nn.TransformerEncoderLayer</code> 跑 explain</td>
+<td>看真实模型有几张图、几处断裂</td>
+</tr>
+<tr>
+<td>改成需要梯度，打印反向图</td>
+<td>数一数保存了哪些中间值——那就是训练的 activation 显存（<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span>）</td>
+</tr>
+</tbody>
+</table>
+<p>倒数第二行是最实用的：<strong>在优化任何真实模型之前，先看它被切成了几张图。</strong></p>
+<hr />
+<h2 id="_6">原始现场</h2>
+<details>
+<summary>① Dynamo FX 图全文</summary>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">GraphModule</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">L_x_</span><span class="p">:</span> <span class="s2">"bf16[4096, 2048]"</span><span class="p">,</span> <span class="n">L_w_</span><span class="p">:</span> <span class="s2">"bf16[2048]"</span><span class="p">):</span>
+        <span class="n">l_x_</span> <span class="o">=</span> <span class="n">L_x_</span>
+        <span class="n">l_w_</span> <span class="o">=</span> <span class="n">L_w_</span>
+
+        <span class="c1"># File: graph_anatomy.py:63 in rmsnorm_like, code: v = x.float()</span>
+        <span class="n">v</span><span class="p">:</span> <span class="s2">"f32[4096, 2048]"</span> <span class="o">=</span> <span class="n">l_x_</span><span class="o">.</span><span class="n">float</span><span class="p">();</span>  <span class="n">l_x_</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="c1"># File: graph_anatomy.py:64 in rmsnorm_like, code: s = v.pow(2).mean(-1, keepdim=True)</span>
+        <span class="n">pow_1</span><span class="p">:</span> <span class="s2">"f32[4096, 2048]"</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+        <span class="n">s</span><span class="p">:</span> <span class="s2">"f32[4096, 1]"</span> <span class="o">=</span> <span class="n">pow_1</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span> <span class="o">=</span> <span class="kc">True</span><span class="p">);</span>  <span class="n">pow_1</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="c1"># File: graph_anatomy.py:65 in rmsnorm_like, code: return (v * torch.rsqrt(s + 1e-6)).to(x.dtype) * w</span>
+        <span class="n">add</span><span class="p">:</span> <span class="s2">"f32[4096, 1]"</span> <span class="o">=</span> <span class="n">s</span> <span class="o">+</span> <span class="mf">1e-06</span><span class="p">;</span>  <span class="n">s</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">rsqrt</span><span class="p">:</span> <span class="s2">"f32[4096, 1]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">add</span><span class="p">);</span>  <span class="n">add</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">mul</span><span class="p">:</span> <span class="s2">"f32[4096, 2048]"</span> <span class="o">=</span> <span class="n">v</span> <span class="o">*</span> <span class="n">rsqrt</span><span class="p">;</span>  <span class="n">v</span> <span class="o">=</span> <span class="n">rsqrt</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">to</span><span class="p">:</span> <span class="s2">"bf16[4096, 2048]"</span> <span class="o">=</span> <span class="n">mul</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">);</span>  <span class="n">mul</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">mul_1</span><span class="p">:</span> <span class="s2">"bf16[4096, 2048]"</span> <span class="o">=</span> <span class="n">to</span> <span class="o">*</span> <span class="n">l_w_</span><span class="p">;</span>  <span class="n">to</span> <span class="o">=</span> <span class="n">l_w_</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">mul_1</span><span class="p">,)</span>
+</code></pre></div>
+
+<p>节点表：</p>
+<div class="highlight"><pre><span></span><code>placeholder      L_x_
+placeholder      L_w_
+call_method      float                                             args=(l_x_,)
+call_method      pow                                               args=(v, 2)
+call_method      mean                                              args=(pow_1, -1)
+call_function    &lt;built-in function add&gt;                           args=(s, 1e-06)
+call_function    &lt;built-in method rsqrt of type object at 0x...&gt;   args=(add,)
+call_function    &lt;built-in function mul&gt;                           args=(v, rsqrt)
+call_method      to                                                args=(mul, torch.bfloat16)
+call_function    &lt;built-in function mul&gt;                           args=(to, l_w_)
+output           output                                            args=((mul_1,),)
+</code></pre></div>
+
+<p>原始文件：<code>results/crater/graphs/10_dynamo_fx_graph.txt</code>、<code>11_fx_nodes.txt</code></p>
+</details>
+<details>
+<summary>② Inductor 生成的 Triton kernel 全文（核心段）</summary>
+<div class="highlight"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0</span><span class="p">(</span>
+        <span class="n">in_ptr0</span><span class="p">,</span> <span class="n">in_ptr1</span><span class="p">,</span> <span class="n">out_ptr1</span><span class="p">,</span> <span class="n">xnumel</span><span class="p">,</span> <span class="n">r0_numel</span><span class="p">,</span>
+        <span class="n">XBLOCK</span> <span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">,</span> <span class="n">R0_BLOCK</span> <span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">):</span>
+    <span class="n">xnumel</span> <span class="o">=</span> <span class="mi">4096</span>
+    <span class="n">r0_numel</span> <span class="o">=</span> <span class="mi">2048</span>
+    <span class="n">RBLOCK</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span> <span class="o">=</span> <span class="n">R0_BLOCK</span>
+    <span class="n">xoffset</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="n">XBLOCK</span>
+    <span class="n">xindex</span> <span class="o">=</span> <span class="n">xoffset</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">XBLOCK</span><span class="p">)[:,</span> <span class="kc">None</span><span class="p">]</span>
+    <span class="n">xmask</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">full</span><span class="p">([</span><span class="n">XBLOCK</span><span class="p">],</span> <span class="kc">True</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">int1</span><span class="p">)[:,</span> <span class="kc">None</span><span class="p">]</span>
+    <span class="n">r0_base</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">)[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+    <span class="n">x0</span> <span class="o">=</span> <span class="n">xindex</span>
+
+    <span class="c1"># ---- 第一遍：平方和 ----</span>
+    <span class="n">_tmp4</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">full</span><span class="p">([</span><span class="n">XBLOCK</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">],</span> <span class="mi">0</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">r0_offset</span> <span class="ow">in</span> <span class="n">tl</span><span class="o">.</span><span class="n">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">r0_numel</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">):</span>
+        <span class="n">r0_index</span> <span class="o">=</span> <span class="n">r0_offset</span> <span class="o">+</span> <span class="n">r0_base</span>
+        <span class="n">r0_mask</span> <span class="o">=</span> <span class="n">r0_index</span> <span class="o">&lt;</span> <span class="n">r0_numel</span>
+        <span class="n">r0_1</span> <span class="o">=</span> <span class="n">r0_index</span>
+        <span class="n">tmp0</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">in_ptr0</span> <span class="o">+</span> <span class="p">(</span><span class="n">r0_1</span> <span class="o">+</span> <span class="mi">2048</span><span class="o">*</span><span class="n">x0</span><span class="p">),</span> <span class="n">r0_mask</span><span class="p">,</span>
+                       <span class="n">eviction_policy</span><span class="o">=</span><span class="s1">'evict_last'</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp1</span> <span class="o">=</span> <span class="n">tmp0</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp2</span> <span class="o">=</span> <span class="n">tmp1</span> <span class="o">*</span> <span class="n">tmp1</span>
+        <span class="n">tmp3</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">broadcast_to</span><span class="p">(</span><span class="n">tmp2</span><span class="p">,</span> <span class="p">[</span><span class="n">XBLOCK</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">])</span>
+        <span class="n">tmp5</span> <span class="o">=</span> <span class="n">_tmp4</span> <span class="o">+</span> <span class="n">tmp3</span>
+        <span class="n">_tmp4</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">r0_mask</span><span class="p">,</span> <span class="n">tmp5</span><span class="p">,</span> <span class="n">_tmp4</span><span class="p">)</span>
+    <span class="n">tmp4</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">_tmp4</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[:,</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="c1"># ---- 第二遍：归一化并写回 ----</span>
+    <span class="k">for</span> <span class="n">r0_offset</span> <span class="ow">in</span> <span class="n">tl</span><span class="o">.</span><span class="n">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">r0_numel</span><span class="p">,</span> <span class="n">R0_BLOCK</span><span class="p">):</span>
+        <span class="n">r0_index</span> <span class="o">=</span> <span class="n">r0_offset</span> <span class="o">+</span> <span class="n">r0_base</span>
+        <span class="n">r0_mask</span> <span class="o">=</span> <span class="n">r0_index</span> <span class="o">&lt;</span> <span class="n">r0_numel</span>
+        <span class="n">r0_1</span> <span class="o">=</span> <span class="n">r0_index</span>
+        <span class="n">tmp6</span>  <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">in_ptr0</span> <span class="o">+</span> <span class="p">(</span><span class="n">r0_1</span> <span class="o">+</span> <span class="mi">2048</span><span class="o">*</span><span class="n">x0</span><span class="p">),</span> <span class="n">r0_mask</span><span class="p">,</span>
+                        <span class="n">eviction_policy</span><span class="o">=</span><span class="s1">'evict_first'</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp15</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">in_ptr1</span> <span class="o">+</span> <span class="p">(</span><span class="n">r0_1</span><span class="p">),</span> <span class="n">r0_mask</span><span class="p">,</span>
+                        <span class="n">eviction_policy</span><span class="o">=</span><span class="s1">'evict_last'</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp7</span>  <span class="o">=</span> <span class="n">tmp6</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp8</span>  <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">full</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="mf">2048.0</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp9</span>  <span class="o">=</span> <span class="p">(</span><span class="n">tmp4</span> <span class="o">/</span> <span class="n">tmp8</span><span class="p">)</span>
+        <span class="n">tmp10</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">full</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="mf">1e-06</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp11</span> <span class="o">=</span> <span class="n">tmp9</span> <span class="o">+</span> <span class="n">tmp10</span>
+        <span class="n">tmp12</span> <span class="o">=</span> <span class="n">libdevice</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">tmp11</span><span class="p">)</span>
+        <span class="n">tmp13</span> <span class="o">=</span> <span class="n">tmp7</span> <span class="o">*</span> <span class="n">tmp12</span>
+        <span class="n">tmp14</span> <span class="o">=</span> <span class="n">tmp13</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="n">tmp16</span> <span class="o">=</span> <span class="n">tmp14</span> <span class="o">*</span> <span class="n">tmp15</span>
+        <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">out_ptr1</span> <span class="o">+</span> <span class="p">(</span><span class="n">r0_1</span> <span class="o">+</span> <span class="mi">2048</span><span class="o">*</span><span class="n">x0</span><span class="p">),</span> <span class="n">tmp16</span><span class="p">,</span> <span class="n">r0_mask</span><span class="p">)</span>
+</code></pre></div>
+
+<p>生成的整个文件 176 行（含 import、封装函数、调用桩）。</p>
+<p>原始文件：<code>results/crater/graphs/20_inductor_output.py</code></p>
+</details>
+<details>
+<summary>③ AOTAutograd 前向 + 反向图全文（含 <code>= None</code> 生命周期标记）</summary>
+<div class="highlight"><pre><span></span><code><span class="c1">########## forward 图</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">GraphModule</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">primals_1</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">:</span> <span class="s2">"f32[512]"</span><span class="p">):</span>
+        <span class="c1"># File: graph_anatomy.py:167 in fwd_bwd, code: s = v.pow(2).mean(-1, keepdim=True)</span>
+        <span class="n">pow_1</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">pow</span><span class="o">.</span><span class="n">Tensor_Scalar</span><span class="p">(</span><span class="n">primals_1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+        <span class="n">mean</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">mean</span><span class="o">.</span><span class="n">dim</span><span class="p">(</span><span class="n">pow_1</span><span class="p">,</span> <span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="kc">True</span><span class="p">);</span>  <span class="n">pow_1</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="c1"># File: graph_anatomy.py:168 in fwd_bwd, code: return ((v * torch.rsqrt(s + 1e-6)) * w_).sum()</span>
+        <span class="n">add</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">add</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mean</span><span class="p">,</span> <span class="mf">1e-06</span><span class="p">);</span>  <span class="n">mean</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">rsqrt</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">rsqrt</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">add</span><span class="p">);</span>  <span class="n">add</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">detach</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">detach</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">rsqrt</span><span class="p">)</span>
+        <span class="n">mul</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">primals_1</span><span class="p">,</span> <span class="n">rsqrt</span><span class="p">)</span>
+        <span class="n">mul_1</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">)</span>
+        <span class="n">sum_1</span><span class="p">:</span> <span class="s2">"f32[]"</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">sum</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">mul_1</span><span class="p">);</span>  <span class="n">mul_1</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">sum_1</span><span class="p">,</span> <span class="n">primals_1</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">,</span> <span class="n">rsqrt</span><span class="p">,</span> <span class="n">detach</span><span class="p">,</span> <span class="n">mul</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">########## backward 图</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">GraphModule</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">primals_1</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">:</span> <span class="s2">"f32[512]"</span><span class="p">,</span>
+                <span class="n">rsqrt</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span><span class="p">,</span> <span class="n">detach</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span><span class="p">,</span>
+                <span class="n">mul</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span><span class="p">,</span> <span class="n">tangents_1</span><span class="p">:</span> <span class="s2">"f32[]"</span><span class="p">):</span>
+        <span class="n">expand</span><span class="p">:</span>   <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">expand</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">tangents_1</span><span class="p">,</span> <span class="p">[</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">512</span><span class="p">])</span>
+        <span class="n">mul_2</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">expand</span><span class="p">,</span> <span class="n">mul</span><span class="p">)</span>
+        <span class="n">mul_3</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">expand</span><span class="p">,</span> <span class="n">primals_2</span><span class="p">)</span>
+        <span class="n">sum_2</span><span class="p">:</span>    <span class="s2">"f32[1, 512]"</span>    <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">sum</span><span class="o">.</span><span class="n">dim_IntList</span><span class="p">(</span><span class="n">mul_2</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="n">view</span><span class="p">:</span>     <span class="s2">"f32[512]"</span>       <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">view</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">sum_2</span><span class="p">,</span> <span class="p">[</span><span class="mi">512</span><span class="p">])</span>
+        <span class="n">mul_4</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul_3</span><span class="p">,</span> <span class="n">primals_1</span><span class="p">)</span>
+        <span class="n">mul_5</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul_3</span><span class="p">,</span> <span class="n">rsqrt</span><span class="p">)</span>
+        <span class="n">sum_3</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">sum</span><span class="o">.</span><span class="n">dim_IntList</span><span class="p">(</span><span class="n">mul_4</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="n">detach_1</span><span class="p">:</span> <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">detach</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">detach</span><span class="p">)</span>
+        <span class="n">pow_2</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">pow</span><span class="o">.</span><span class="n">Tensor_Scalar</span><span class="p">(</span><span class="n">detach_1</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span>
+        <span class="n">mul_6</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Scalar</span><span class="p">(</span><span class="n">sum_3</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.5</span><span class="p">)</span>
+        <span class="n">mul_7</span><span class="p">:</span>    <span class="s2">"f32[1024, 1]"</span>   <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul_6</span><span class="p">,</span> <span class="n">pow_2</span><span class="p">)</span>
+        <span class="n">expand_1</span><span class="p">:</span> <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">expand</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">mul_7</span><span class="p">,</span> <span class="p">[</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">512</span><span class="p">])</span>
+        <span class="n">div</span><span class="p">:</span>      <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">div</span><span class="o">.</span><span class="n">Scalar</span><span class="p">(</span><span class="n">expand_1</span><span class="p">,</span> <span class="mi">512</span><span class="p">)</span>
+        <span class="n">pow_3</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">pow</span><span class="o">.</span><span class="n">Tensor_Scalar</span><span class="p">(</span><span class="n">primals_1</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
+        <span class="n">mul_8</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Scalar</span><span class="p">(</span><span class="n">pow_3</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">)</span>
+        <span class="n">mul_9</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">mul</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">div</span><span class="p">,</span> <span class="n">mul_8</span><span class="p">)</span>
+        <span class="n">add_1</span><span class="p">:</span>    <span class="s2">"f32[1024, 512]"</span> <span class="o">=</span> <span class="n">aten</span><span class="o">.</span><span class="n">add</span><span class="o">.</span><span class="n">Tensor</span><span class="p">(</span><span class="n">mul_5</span><span class="p">,</span> <span class="n">mul_9</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">add_1</span><span class="p">,</span> <span class="n">view</span><span class="p">)</span>
+</code></pre></div>
+
+<p>注意函数签名里除了 <code>primals_*</code>（输入）和 <code>tangents_1</code>（上游梯度），
+还有 <strong><code>rsqrt</code>、<code>detach</code>、<code>mul</code></strong> —— 这三个是前向<strong>保存下来</strong>的中间值。</p>
+<p><strong>它们必须在整个前向-反向期间占着显存。</strong> 这就是训练的 activation memory，
+也是 activation checkpointing 要用重算换掉的东西（<span class="xref pending" title="梯度是怎么传的：autograd 图、反向算子与内存曲线（尚未写）">L7.0</span>、<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span>）。</p>
+<p>节点数：前向 11，反向 25。</p>
+<p>原始文件：<code>results/crater/graphs/30_aot_fwd_bwd_graphs.txt</code></p>
+</details>
+<details>
+<summary>④ 图断裂的完整报告</summary>
+<div class="highlight"><pre><span></span><code>图数量        2
+断裂次数      1
+断裂原因      ["GraphCompileReason(reason='Unsupported Tensor.item() call with capture...'"]
+</code></pre></div>
+
+<p><code>torch._dynamo.explain()</code> 返回的对象里还有更多字段
+（<code>graphs</code>、<code>ops_per_graph</code>、<code>out_guards</code> 等），全文见原始文件。</p>
+<p><strong><code>out_guards</code> 特别值得看</strong>：那是 Dynamo 为这张图安装的<strong>守卫条件</strong>——
+下次调用时如果任何一条守卫不成立（形状变了、dtype 变了、某个 Python 对象的
+<code>id</code> 变了），就要<strong>重新编译</strong>。<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a> 会展开讲守卫与重编译。</p>
+<p>原始文件：<code>results/crater/graphs/40_graph_break.txt</code></p>
+</details>
+<hr />
+<h2 id="_7">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>regional compilation</strong></td>
+<td>不编整个模型，只编重复出现的层（如一个 Transformer block），编一次复用 N 层。大幅降低编译时间</td>
+</tr>
+<tr>
+<td><strong><code>torch.compile</code> 与 CUDA Graph 的组合</strong></td>
+<td><code>mode="reduce-overhead"</code> 自动套 graph。vLLM 的 piecewise graph 是更细粒度的手工版（<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a>）</td>
+</tr>
+<tr>
+<td><strong>动态形状</strong></td>
+<td>LLM 推理的形状每步都变。Dynamo 的符号形状（<code>s0</code>、<code>s1</code>）让一张图覆盖多个形状，代价是生成的 kernel 多一层判断</td>
+</tr>
+<tr>
+<td><strong>自定义算子与图</strong></td>
+<td><code>torch.library</code> 让你把手写 CUDA kernel 注册成 aten 算子，从而能出现在图里并参与融合边界的决策</td>
+</tr>
+<tr>
+<td><strong>Inductor 的融合规则</strong></td>
+<td>目前主要融合逐元素与归约。GEMM 通常不融合（除了 epilogue）。融合决策的启发式是 <a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a> 的主题</td>
+</tr>
+<tr>
+<td><strong>图级别的量化与重写</strong></td>
+<td>把 fp32 图重写成 fp8/int8 图，插入量化/反量化节点。<code>torch.ao</code> 与 llm-compressor 走的都是这条路（<a class="xref" href="../L4/4.3-quantization.html" title="量化工程">L4.3</a>）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_8">陷阱</h2>
+<p><strong>1. 以为"图"是个抽象概念。</strong> 它是一个能打印、能读、带完整 shape 标注的 Python 类。
+<strong>永远先打印再讨论。</strong></p>
+<p><strong>2. 在热路径里写 <code>.item()</code> / <code>print(tensor)</code> / <code>if tensor &gt; 0</code>。</strong>
+会断图，融合机会全没，还有 4.76 µs 的同步（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 实测）。</p>
+<p><strong>3. 不看 <code>graph_count</code> 就调优。</strong> 图被切成十几段时，
+任何融合优化都是白费——先消除断裂。</p>
+<p><strong>4. 以为反向图和前向图一样大。</strong> 实测 2.3 倍。
+而且它需要保存前向的中间值，那是训练显存的大头。</p>
+<p><strong>5. 忘了融合会改变数值。</strong> 融合后中间值留在寄存器（fp32），
+不融合时可能被写回 bf16 再读出——<strong>结果会有微小差异</strong>（<a class="xref" href="../L4/4.2-numerics.html" title="数值系统与确定性">L4.2</a>）。</p>
+<p><strong>6. 以为 Inductor 会融合一切。</strong> 它主要融合逐元素与归约。
+GEMM 之间不融合，跨 graph break 不融合，有副作用的算子不融合。</p>
+<hr />
+<h2 id="_9">自测题</h2>
+<details>
+<summary>1. 我的模型用了 torch.compile 但只快了 5%。第一步该查什么？</summary>
+<p><strong>查 <code>graph_count</code>。</strong></p>
+<div class="highlight"><pre><span></span><code><span class="n">expl</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">explain</span><span class="p">(</span><span class="n">model</span><span class="p">)(</span><span class="o">*</span><span class="n">example_inputs</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">expl</span><span class="o">.</span><span class="n">graph_count</span><span class="p">,</span> <span class="n">expl</span><span class="o">.</span><span class="n">graph_break_count</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">expl</span><span class="o">.</span><span class="n">break_reasons</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">r</span><span class="p">)</span>
+</code></pre></div>
+
+<p>如果 <code>graph_count</code> 是几十，说明图被切碎了，每段之间不能融合，
+而且每段之间都要回到 Python 解释器。<strong>融合收益（本章实测 3.68×）基本拿不到。</strong></p>
+<p>常见的断裂原因（按频率）：
+1. <code>.item()</code> / <code>.tolist()</code> / <code>bool(tensor)</code> —— 需要 GPU→CPU 同步
+2. <code>print(tensor)</code> / 日志里带张量
+3. 数据依赖的控制流（<code>if tensor.max() &gt; threshold</code>）
+4. 不支持的 Python 特性（某些闭包、生成器、第三方库调用）</p>
+<p><strong>修断裂比调任何编译参数都重要。</strong></p>
+</details>
+<details>
+<summary>2. 为什么 Inductor 生成的 kernel 里累加器是 fp32，而输入输出都是 bf16？</summary>
+<p>因为<strong>归约的累加必须提精度</strong>。</p>
+<p><a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 实测过：fp32 累加 6700 万个 1.0，在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>2</mn><mrow><mn>24</mn></mrow></msup></mrow></math></span> 处就完全失效（算出 2²⁴ 而非 2²⁶）。
+<strong>bf16 只有 8 位尾数，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>2</mn><mn>8</mn></msup><mo>&#x0003D;</mo><mn>256</mn></mrow></math></span> 个数就开始丢</strong>——比 fp32 早 65536 倍。</p>
+<p>本例是对 2048 个元素求平方和。用 bf16 累加的话：
+平方值量级约 1，累加到 256 之后再加 1 就基本无效，
+后面 1792 个元素的贡献会大部分丢失。</p>
+<p><strong>Inductor 自动做对了这件事</strong>（<code>tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)</code>）。</p>
+<p>这也是所有 LLM kernel 的铁律：<strong>存用低精度，算用高精度</strong>。
+attention 的 softmax 累加、GEMM 的 K 方向累加，全都是 fp32（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 实测 cuBLAS 也是）。</p>
+</details>
+<details>
+<summary>3. 反向图的签名里有 <code>rsqrt</code>、<code>detach</code>、<code>mul</code> 三个参数。它们是什么？为什么重要？</summary>
+<p>它们是<strong>前向保存给反向用的中间值</strong>（saved tensors）。</p>
+<p>反向要算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mfrac><mrow><mo>&#x02202;</mo><mi>L</mi></mrow><mrow><mo>&#x02202;</mo><mi>x</mi></mrow></mfrac></mrow></math></span>，需要用到前向的中间结果。
+比如 <code>mul_5 = mul_3 × rsqrt</code> 这一步就要用到前向算出的 <code>rsqrt</code>。</p>
+<p><strong>为什么重要</strong>：这些张量必须在<strong>整个前向-反向期间</strong>驻留显存。
+一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math></span> 层的模型，每层保存 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 个中间值，显存占用就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>&#x000D7;</mo><mi>k</mi><mo>&#x000D7;</mo></mrow></math></span> 张量大小。</p>
+<p>对 Qwen3-1.7B、batch=8、seq=2048：
+每层保存的激活约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>8</mn><mo>&#x000D7;</mo><mn>2048</mn><mo>&#x000D7;</mo><mn>2048</mn><mo>&#x000D7;</mo><mn>2</mn><mtext>&#x000A0;</mtext><mtext>B</mtext><mo>&#x02248;</mo><mn>67</mn></mrow></math></span> MB，
+28 层就是 <strong>1.9 GB</strong>——而权重才 3.44 GB（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 实测）。</p>
+<p><strong>这就是 activation checkpointing 的动机</strong>：不保存中间值，
+反向时<strong>重新前向算一遍</strong>。用大约 33% 的额外计算换取大幅的显存节省（<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span> 会实测）。</p>
+<p><strong>从图上看</strong>，checkpointing 就是把前向图的一段标记为"不保存输出、反向时重跑"。</p>
+</details>
+<details>
+<summary>4. 融合后带宽达到 1440 GB/s（上限的 86%）。还能更快吗？</summary>
+<p><strong>理论上还有空间，但不多，而且要改算法。</strong></p>
+<p>当前的访存量是：<strong>读 x 两遍 + 读 w 一遍 + 写 out 一遍</strong>。
+两遍读 x 是因为"两遍归约"：必须先扫一遍算出均值，才能第二遍归一化。</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>访存</mtext><mo>&#x0003D;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>32</mn><mtext>&#x000A0;</mtext><mtext>MB</mtext><mo stretchy="false">&#x00028;</mo><mtext>读</mtext><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mn>32</mn><mtext>&#x000A0;</mtext><mtext>MB</mtext><mo stretchy="false">&#x00028;</mo><mtext>写</mtext><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mn>96</mn><mtext>&#x000A0;</mtext><mtext>MB</mtext></mrow></math></div></p>
+<p>（bf16 输入 16 MB，但转 fp32 后中间量是 32 MB；实际以 bf16 读写。）</p>
+<p><strong>改进方向：单遍（online）归约。</strong> 用 Welford 算法或类似的在线更新，
+一遍扫完同时得到均值和归一化结果——但 RMSNorm 需要<strong>先有完整的均值</strong>
+才能归一化，所以单遍做不到，除非：</p>
+<ul>
+<li><strong>把 x 缓存在共享内存/寄存器里</strong>：2048 个 bf16 = 4 KB，
+  一个 block 完全装得下！这样第二遍从 smem 读（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测 6.5 周期）而不是显存。
+  <strong>这正是 vLLM 手写 <code>rms_norm_kernel</code> 做的事</strong>，也是它能比 Inductor 快的原因。</li>
+</ul>
+<p><strong>所以 86% 已经很好，但手写仍有约 1.3 倍的空间</strong>——
+代价是失去通用性（要求 hidden 维能装进 smem）。</p>
+<p>这呼应 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的结论：<strong>专用打得过通用</strong>。</p>
+</details>
+<details>
+<summary>5. 我想知道我的 vLLM 部署里 torch.compile 到底编了什么。怎么查？</summary>
+<p>三步：</p>
+<p><strong>(1) 打开日志</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nv">TORCH_LOGS</span><span class="o">=</span><span class="s2">"graph_code,output_code"</span><span class="w"> </span>vllm<span class="w"> </span>serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tee<span class="w"> </span>compile.log
+</code></pre></div>
+
+<p>或者更省事的 <code>TORCH_LOGS="+dynamo,+inductor"</code>（很啰嗦）。</p>
+<p><strong>(2) 看 Inductor 缓存目录</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">TORCHINDUCTOR_CACHE_DIR</span><span class="o">=</span>/tmp/ind_cache
+<span class="c1"># 跑一次后</span>
+find<span class="w"> </span>/tmp/ind_cache<span class="w"> </span>-name<span class="w"> </span><span class="s2">"*.py"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head
+grep<span class="w"> </span>-l<span class="w"> </span><span class="s2">"@triton.jit"</span><span class="w"> </span>/tmp/ind_cache/**/*.py
+</code></pre></div>
+
+<p>生成的 kernel 函数名就是融合清单（本章实测的
+<code>triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0</code> 那种）。</p>
+<p><strong>(3) 看 vLLM 自己的编译配置</strong></p>
+<p>vLLM 有 <code>--compilation-config</code> 参数控制编译级别与 piecewise 切分点。
+它的 <code>vllm/compilation/</code> 目录下有自定义的 Inductor pass
+（比如把某些模式重写成手写 kernel）。</p>
+<p><strong>判断编译有没有生效的最快方法</strong>：对比 <code>enforce_eager=True</code> 与默认的 kernel 数量
+（用 <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 <code>kernel_trace.py</code>）。eager 是 444 个/步，编译后应该显著减少。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.6-profiling.html">&#8592; 2.6 Profiling 工程学</a><a class="nav-next" href="../L2/2.7-compiler-stack.html">2.7 编译器栈：torch.compile 到 MLIR &#8594;</a></nav>
+</main>
+</body>
+</html>

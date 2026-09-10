@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.1 从 attention 数学到内存墙</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">3.1</div>
+  <div class="sidebar-title">从 attention 数学到内存墙</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#ss">一 · 那个 S×S 有多大</a></li>
+<li><a href="#_2">二 · 内存墙：为什么这不是"多用点显存"而已</a><ul>
+<li><a href="#flop">FLOP</a></li>
+<li><a href="#dram">DRAM 流量</a></li>
+<li><a href="#_3">算术强度</a></li>
+<li><a href="#_4">实测</a></li>
+</ul>
+</li>
+<li><a href="#softmax">三 · softmax 怎么可能分块</a><ul>
+<li><a href="#31">3.1 先解决一个更基础的问题：为什么要减最大值</a></li>
+<li><a href="#32-online-softmax">3.2 online softmax：一遍就够</a></li>
+<li><a href="#33">3.3 按块做</a></li>
+</ul>
+</li>
+<li><a href="#v">四 · 把 V 的加权和也放进同一遍</a></li>
+<li><a href="#sdpa">五 · 自己写一遍，与 SDPA 对拍</a></li>
+<li><a href="#sdpa_1">六 · SDPA 背后有几个后端</a></li>
+<li><a href="#_5">七 · 设计取舍</a><ul>
+<li><a href="#71">7.1 为什么是"重排求值顺序"，而不是"近似"</a></li>
+<li><a href="#72-online-softmax">7.2 online softmax 的代价在哪</a></li>
+<li><a href="#73-sdpa">7.3 SDPA 为什么是一个调度器</a></li>
+</ul>
+</li>
+<li><a href="#lab">八 · 动手 lab</a></li>
+<li><a href="#_6">九 · 陷阱</a></li>
+<li><a href="#_7">十 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L3 · Attention 与序列核心</div>
+  <div class="mod-id">3.1</div>
+  <h1>从 attention 数学到内存墙</h1>
+  <p class="lede">朴素实现要把 S×S 写进显存再读回来：S=8192 时峰值差 128 倍，S=16384 直接 OOM。算术强度的推导（朴素 D/3 与 S 无关，分块 S/2 随 S 增长）与实测吻合。online softmax 从「为什么减最大值」推到分块 attention，自写版本与 SDPA 对拍到 1e-7。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · CUDA 13.0</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 0.0（attention 的最小实现）· 0.2（roofline 与机器平衡点）· 2.3（访存阶梯）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>0.0 里我们手写过一次 attention：算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></math></span>、加因果 mask、softmax、乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi></mrow></math></span>。
+那份代码是对的，而且所有真实实现都必须给出和它一样的结果。
+但没有人在生产里那样写。原因不是它慢在算术上，而是它<strong>必须把一个
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 的矩阵写进显存再读回来</strong>。</p>
+<ol>
+<li>那个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 到底多大？它让朴素实现在什么规模上失效？</li>
+<li>softmax 必须先看完整行才能归一化——怎么可能分块？</li>
+<li>分块之后结果还一样吗？是精确相等还是近似？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的立场</p>
+<p>分块 attention（FlashAttention 的核心）<strong>不是一个近似算法</strong>。
+它是同一个数学表达式的另一种求值顺序，结果在浮点误差内相同。
+本章会把这一点从代数推到实测：自己写一个分块版本，
+和 PyTorch 的 SDPA 逐元素对拍。</p>
+</div>
+<hr />
+<h2 id="ss">一 · 那个 S×S 有多大</h2>
+<p>一层、<code>B=1, H=32, D=128</code>、bf16（约等于 7B 模型的一层）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">Q/K/V 合计</th>
+<th style="text-align: right;">S×S 一份</th>
+<th style="text-align: right;">朴素峰值</th>
+<th style="text-align: right;">SDPA 峰值</th>
+<th style="text-align: right;">倍数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">12.0 MB</td>
+<td style="text-align: right;">16.0 MB</td>
+<td style="text-align: right;">68.2 MB</td>
+<td style="text-align: right;">4.1 MB</td>
+<td style="text-align: right;">16.8×</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">24.0 MB</td>
+<td style="text-align: right;">64.0 MB</td>
+<td style="text-align: right;">137.0 MB</td>
+<td style="text-align: right;">8.1 MB</td>
+<td style="text-align: right;">16.9×</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">48.0 MB</td>
+<td style="text-align: right;">256.0 MB</td>
+<td style="text-align: right;">532.0 MB</td>
+<td style="text-align: right;">16.3 MB</td>
+<td style="text-align: right;">32.7×</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">96.0 MB</td>
+<td style="text-align: right;">1024.0 MB</td>
+<td style="text-align: right;">2096.0 MB</td>
+<td style="text-align: right;">32.5 MB</td>
+<td style="text-align: right;">64.5×</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">192.0 MB</td>
+<td style="text-align: right;">4096.0 MB</td>
+<td style="text-align: right;">8320.0 MB</td>
+<td style="text-align: right;">65.0 MB</td>
+<td style="text-align: right;"><strong>128.0×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">16384</td>
+<td style="text-align: right;">384.0 MB</td>
+<td style="text-align: right;">16384.0 MB</td>
+<td style="text-align: right;"><strong>OOM</strong></td>
+<td style="text-align: right;">130.0 MB</td>
+<td style="text-align: right;">—</td>
+</tr>
+</tbody>
+</table>
+<p>两条曲线的形状完全不同：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>Q/K/V</mtext><mo>&#x0003D;</mo><mn>3</mn><mi>B</mi><mi>H</mi><mi>S</mi><mi>D</mi><mo>&#x000B7;</mo><mn>2</mn><mtext>&#x000A0;</mtext><mtext>字节</mtext><mspace width="1em" /><mo stretchy="false">&#x00028;</mo><mo>&#x0221D;</mo><mi>S</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="2em" /><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi><mo>&#x0003D;</mo><mi>B</mi><mi>H</mi><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn><mtext>&#x000A0;</mtext><mtext>字节</mtext><mspace width="1em" /><mo stretchy="false">&#x00028;</mo><mo>&#x0221D;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>512</mn></mrow></math></span> 时 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 只比 Q/K/V 大一点；<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>8192</mn></mrow></math></span> 时它是 Q/K/V 的 21 倍。
+到 16384，光是一层的一份打分矩阵就要 16 GB，而这张卡总共 32 GB——
+<strong>朴素实现在这里直接 OOM，而 SDPA 只用了 130 MB。</strong></p>
+<p>注意"朴素峰值"比"S×S 一份"还大一倍多：因为 softmax 的输入 <code>s</code> 和输出 <code>p</code>
+同时活着，是两份 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span>。</p>
+<hr />
+<h2 id="_2">二 · 内存墙：为什么这不是"多用点显存"而已</h2>
+<p>显存不够只是表面。真正的问题是<strong>算术强度</strong>（每搬一字节能做多少次浮点运算），
+这是 0.2 里那条 roofline 的横轴。</p>
+<h3 id="flop">FLOP</h3>
+<p>两次矩阵乘，每头：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup><mi>:</mi><mtext>&#x000A0;</mtext><mn>2</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi><mspace width="2em" /><mi>P</mi><mi>V</mi><mi>:</mi><mtext>&#x000A0;</mtext><mn>2</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi><mspace width="2em" /><mtext>合计</mtext><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow></math></div></p>
+<p>（因果 mask 只需算下三角，实际约一半。）</p>
+<h3 id="dram">DRAM 流量</h3>
+<p><strong>朴素实现</strong>（保守估计，只数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 那几趟）：</p>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>字节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>写 <code>s</code></td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn></mrow></math></span></td>
+</tr>
+<tr>
+<td>读 <code>s</code>（softmax 求 max 与求和）</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>2</mn></mrow></math></span> 趟</td>
+</tr>
+<tr>
+<td>写 <code>p</code></td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn></mrow></math></span></td>
+</tr>
+<tr>
+<td>读 <code>p</code>（做 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mi>V</mi></mrow></math></span>）</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn></mrow></math></span></td>
+</tr>
+</tbody>
+</table>
+<p>合计约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>12</mn><msup><mi>S</mi><mn>2</mn></msup></mrow></math></span> 字节，再加 Q/K/V 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>6</mn><mi>S</mi><mi>D</mi></mrow></math></span>。</p>
+<p><strong>分块实现</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 从不落 DRAM，只有 Q/K/V/O 各过一遍，约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>8</mn><mi>S</mi><mi>D</mi></mrow></math></span> 字节。</p>
+<h3 id="_3">算术强度</h3>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>I</mi><mrow><mtext>朴素</mtext></mrow></msub><mo>&#x0003D;</mo><mfrac><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow><mrow><mn>12</mn><msup><mi>S</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>6</mn><mi>S</mi><mi>D</mi></mrow></mfrac><mover><mstyle scriptlevel="0"><mo>&#x2192;</mo></mstyle><mpadded width="+0.833em" lspace="0.556em" voffset="-.2em" height="-.2em"><mrow><mi>S</mi><mtext>&#x000A0;大</mtext></mrow><mspace depth=".25em" /></mpadded></mover><mfrac><mrow><mi>D</mi></mrow><mrow><mn>3</mn></mrow></mfrac><mspace width="2em" /><msub><mi>I</mi><mrow><mtext>分块</mtext></mrow></msub><mo>&#x0003D;</mo><mfrac><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow><mrow><mn>8</mn><mi>S</mi><mi>D</mi></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><mi>S</mi></mrow><mrow><mn>2</mn></mrow></mfrac></mrow></math></div></p>
+<p><strong>这就是内存墙的全部内容。</strong> 朴素实现的算术强度被钉死在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0002F;</mo><mn>3</mn></mrow></math></span> 附近——
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span> 时约 43 FLOP/byte——<strong>与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 无关</strong>。而 crater 的机器平衡点是
+152.7 FLOP/byte（0.2 实测）。43 远小于 152.7，所以它落在 roofline 的带宽一侧，
+<strong>而且序列再长也走不出去</strong>。</p>
+<p>分块实现的强度是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0002F;</mo><mn>2</mn></mrow></math></span>，随 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 线性增长：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>512</mn></mrow></math></span> 时 256，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>8192</mn></mrow></math></span> 时 4096。
+它很快就越过平衡点，进入算力一侧。</p>
+<h3 id="_4">实测</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">朴素 ms</th>
+<th style="text-align: right;">SDPA ms</th>
+<th style="text-align: right;">加速</th>
+<th style="text-align: right;">SDPA TFLOP/s</th>
+<th style="text-align: right;">朴素强度</th>
+<th style="text-align: right;">分块强度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">0.101</td>
+<td style="text-align: right;">0.031</td>
+<td style="text-align: right;">3.2×</td>
+<td style="text-align: right;">68.5</td>
+<td style="text-align: right;">37.9</td>
+<td style="text-align: right;">256</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">0.393</td>
+<td style="text-align: right;">0.085</td>
+<td style="text-align: right;">4.6×</td>
+<td style="text-align: right;">101.5</td>
+<td style="text-align: right;">40.2</td>
+<td style="text-align: right;">512</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2.112</td>
+<td style="text-align: right;">0.238</td>
+<td style="text-align: right;">8.9×</td>
+<td style="text-align: right;">144.3</td>
+<td style="text-align: right;">41.4</td>
+<td style="text-align: right;">1024</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">8.513</td>
+<td style="text-align: right;">0.792</td>
+<td style="text-align: right;">10.7×</td>
+<td style="text-align: right;">173.5</td>
+<td style="text-align: right;">42.0</td>
+<td style="text-align: right;">2048</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">34.250</td>
+<td style="text-align: right;">2.793</td>
+<td style="text-align: right;"><strong>12.3×</strong></td>
+<td style="text-align: right;"><strong>196.8</strong></td>
+<td style="text-align: right;">42.3</td>
+<td style="text-align: right;">4096</td>
+</tr>
+</tbody>
+</table>
+<p>「朴素强度」那一列从 37.9 爬到 42.3 就不动了，正是推导预测的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0002F;</mo><mn>3</mn><mo>&#x02248;</mo><mn>42.7</mn></mrow></math></span>。
+「分块强度」翻倍再翻倍。加速比从 3.2× 长到 12.3×，<strong>并且还在长</strong>。</p>
+<p>SDPA 在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>8192</mn></mrow></math></span> 上跑到 196.8 TFLOP/s，是 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测 bf16 上限 232 的 <strong>85%</strong>——
+它已经变成一个算力受限的算子了。这正是分块要达到的效果。</p>
+<hr />
+<h2 id="softmax">三 · softmax 怎么可能分块</h2>
+<p>这是本章的技术核心。先把问题说清楚：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mrow><mi mathvariant="normal">s</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">f</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">m</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">x</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>x</mi><msub><mo stretchy="false">&#x00029;</mo><mi>i</mi></msub><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>j</mi></msub></mrow></msup></mrow></mfrac></mrow></math></div></p>
+<p>分母要对<strong>整行</strong>求和。看起来必须先看完所有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mi>j</mi></msub></mrow></math></span> 才能算出任何一个输出。</p>
+<h3 id="31">3.1 先解决一个更基础的问题：为什么要减最大值</h3>
+<p>数学上，给所有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi></mrow></math></span> 减去同一个常数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>c</mi></mrow></math></span>，结果不变：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub><mo>&#x02212;</mo><mi>c</mi></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>j</mi></msub><mo>&#x02212;</mo><mi>c</mi></mrow></msup></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub></mrow></msup><mo>&#x0002F;</mo><msup><mi>e</mi><mrow><mi>c</mi></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>j</mi></msub></mrow></msup><mo>&#x0002F;</mo><msup><mi>e</mi><mrow><mi>c</mi></mrow></msup></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>j</mi></msub></mrow></msup></mrow></mfrac></mrow></math></div></p>
+<p>分子分母的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mi>c</mi></msup></mrow></math></span> 约掉了。所以减常数是<strong>恒等变换，不是近似</strong>。</p>
+<p>但在浮点里，不减就会炸。实测：</p>
+<div class="highlight"><pre><span></span><code>x 最大    10.0   exp(x) = [22026.46484375, 8103.083984375, 2980.9580078125]
+                    朴素 softmax = [0.6652409434318542, 0.2447284758090973, 0.09003057330846786]
+                    减最大值后   = [0.665241, 0.244728, 0.090031]
+x 最大    88.0   exp(x) = [1.6516362661361307e+38, 6.076030347399616e+37, 2.2352465286715966e+37]
+                    朴素 softmax = [0.6652409434318542, 0.2447284609079361, 0.09003056585788727]
+                    减最大值后   = [0.665241, 0.244728, 0.090031]
+x 最大   100.0   exp(x) = [inf, inf, inf]
+                    朴素 softmax = [nan, nan, nan]
+                    减最大值后   = [0.665241, 0.244728, 0.090031]
+x 最大  1000.0   exp(x) = [inf, inf, inf]
+                    朴素 softmax = [nan, nan, nan]
+                    减最大值后   = [0.665241, 0.244728, 0.090031]
+</code></pre></div>
+
+<p>float32 能表示的最大值约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>3.4</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mn>38</mn></mrow></msup></mrow></math></span>。看 88.0 那一行：
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mn>88</mn></mrow></msup><mo>&#x0003D;</mo><mn>1.65</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mn>38</mn></mrow></msup></mrow></math></span> 已经贴着上限，再大一点就溢出——
+100.0 那行三项<strong>全部</strong>变成 <code>inf</code>，<code>inf/inf</code> 得到 <code>nan</code>，整行结果全毁。</p>
+<p>注意 88.0 那行朴素写法<strong>还是对的</strong>（0.66524…），和减最大值的结果一致。
+这正是危险之处：它在临界点之前完全正常，越过之后一次性全毁，中间没有过渡。</p>
+<p>反方向也一样。<code>x = [-800, -801, -802]</code>：</p>
+<div class="highlight"><pre><span></span><code>exp(x) = [0.0, 0.0, 0.0]  -&gt; 全部下溢成 0
+朴素 softmax = [nan, nan, nan]   (0/0)
+减最大值后   = [0.665241, 0.244728, 0.090031]
+</code></pre></div>
+
+<p>减最大值之后，最大那一项恰好是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mn>0</mn></msup><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span>，其余都在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mn>0</mn><mo>&#x0002C;</mo><mn>1</mn><mo stretchy="false">]</mo></mrow></math></span>——
+既不上溢也不会全部下溢。这个写法叫 <strong>safe softmax</strong>，
+是所有实际实现的起点。</p>
+<p>代价是它需要<strong>先扫一遍求最大值</strong>。于是教科书写法是三遍：</p>
+<div class="highlight"><pre><span></span><code>第1遍 m = max(x)
+第2遍 p = exp(x - m)
+第3遍 l = Σp
+      y = p / l
+</code></pre></div>
+
+<h3 id="32-online-softmax">3.2 online softmax：一遍就够</h3>
+<p>关键在于<strong>最大值可以边走边更新，已经累加的部分和可以事后修正</strong>。</p>
+<p>设已经处理完前 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 个元素，手上有</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x0003D;</mo><mo>max</mo><mo stretchy="false">&#x00028;</mo><msub><mi>x</mi><mn>1</mn></msub><mo>&#x0002E;</mo><mo>&#x0002E;</mo><msub><mi>x</mi><mi>k</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>l</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mrow><mi>i</mi><mo>&#x02264;</mo><mi>k</mi></mrow></munder><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub></mrow></msup></mrow></math></div></p>
+<p>来了新元素 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mrow><mtext>new</mtext></mrow></msub></mrow></math></span>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x0003D;</mo><mo>max</mo><mo stretchy="false">&#x00028;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x0002C;</mo><msub><mi>x</mi><mrow><mtext>new</mtext></mrow></msub><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>l</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x0003D;</mo><msub><mi>l</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x000B7;</mo><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup><mo>&#x0002B;</mo><msup><mi>e</mi><mrow><msub><mi>x</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup></mrow></math></div></p>
+<p><strong>为什么那个修正因子是对的</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>l</mi><mrow><mtext>old</mtext></mrow></msub></mrow></math></span> 里每一项的基准是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub></mrow></math></span>，
+现在基准要换成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></math></span>，每一项都要乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub></mrow></msup><mo>&#x0002F;</mo><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup><mo>&#x0003D;</mo><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup></mrow></math></span>。
+求和是线性的，所以这个因子可以提到外面，<strong>整个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>l</mi><mrow><mtext>old</mtext></mrow></msub></mrow></math></span> 乘一次就行</strong>。</p>
+<p>而且 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x02265;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub></mrow></math></span>，所以这个因子 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02264;</mo><mn>1</mn></mrow></math></span>——它永远不会放大，
+数值上是安全的。</p>
+<p>逐元素跑一遍（<code>x</code> 是 8 个随机数）：</p>
+<div class="highlight"><pre><span></span><code>   步     x_new      m_old      m_new       修正因子        l_new
+    0    -0.9247       -inf    -0.9247   0.000000     1.000000
+    1     1.4142    -0.9247     1.4142   0.097496     1.097496
+    2    -0.1425     1.4142     1.4142   1.000000     1.303931
+    ...
+    7     2.5141     4.6230     4.6230   1.000000     1.212988
+
+一遍之后 m=4.622988  l=1.212988
+三遍写法   m=4.622988  l=1.212988
+m 相同: True   l 相同: True
+最终结果与三遍写法的 max|err| = 0.000e+00
+</code></pre></div>
+
+<p>看第 1 行：新元素 1.4142 比旧的最大值 −0.9247 大，
+所以基准要抬高，修正因子 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mo>&#x02212;</mo><mn>0.9247</mn><mo>&#x02212;</mo><mn>1.4142</mn></mrow></msup><mo>&#x0003D;</mo><mn>0.0975</mn></mrow></math></span>，
+把之前累积的 1.0 缩成 0.0975 再加上新项。
+第 2 行新元素没超过当前最大值，修正因子是 1.0，什么都不用改。</p>
+<p><strong>误差精确为 0</strong>（和三遍写法比）。这不是"误差小到可以接受"，
+是同样的浮点运算换了个顺序。</p>
+<h3 id="33">3.3 按块做</h3>
+<p>逐元素只是块大小为 1 的特例。块大小 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 时：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>m</mi><mrow><mtext>blk</mtext></mrow></msub><mo>&#x0003D;</mo><mo>max</mo><mo stretchy="false">&#x00028;</mo><mtext>块内</mtext><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="1em" /><msub><mi>l</mi><mrow><mtext>blk</mtext></mrow></msub><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mrow><mtext>块内</mtext></mrow></munder><msup><mi>e</mi><mrow><mi>x</mi><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>blk</mtext></mrow></msub></mrow></msup></mrow></math></div></p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x0003D;</mo><mo>max</mo><mo stretchy="false">&#x00028;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x0002C;</mo><msub><mi>m</mi><mrow><mtext>blk</mtext></mrow></msub><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="1em" /><msub><mi>l</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x0003D;</mo><msub><mi>l</mi><mrow><mtext>old</mtext></mrow></msub><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup><mo>&#x0002B;</mo><msub><mi>l</mi><mrow><mtext>blk</mtext></mrow></msub><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>blk</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup></mrow></math></div></p>
+<div class="highlight"><pre><span></span><code>块大小 2:  m=4.622988  l=1.212988   与三遍写法一致: True
+块大小 4:  m=4.622988  l=1.212987   与三遍写法一致: True
+块大小 8:  m=4.622988  l=1.212988   与三遍写法一致: True
+</code></pre></div>
+
+<p>块大小 4 那行末位差了 1（1.212987 vs 1.212988）——这是浮点加法不满足结合律
+的正常表现（2.4 里讨论过），不是算法错误。</p>
+<hr />
+<h2 id="v">四 · 把 V 的加权和也放进同一遍</h2>
+<p>softmax 只是中间步骤，真正要的是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo>&#x0003D;</mo><mrow><mi mathvariant="normal">s</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">f</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">m</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">x</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>s</mi><mo stretchy="false">&#x00029;</mo><mspace width="0.167em" /><mi>V</mi></mrow></math></span>。
+再加一个累加器就行：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>O</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x0003D;</mo><msub><mi>O</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x000B7;</mo><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup><mo>&#x0002B;</mo><msup><mi>e</mi><mrow><msub><mi>s</mi><mrow><mtext>blk</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup><msub><mi>V</mi><mrow><mtext>blk</mtext></mrow></msub></mrow></math></div></p>
+<p><strong>关键：中间只累加未归一化的和，除法留到最后一次做。</strong>
+因为除以 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span> 是逐元素的线性操作，可以推迟；而如果每块都除一次，
+就要在基准改变时把除过的结果再乘回去，麻烦且损精度。</p>
+<p>一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>12</mn></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>4</mn></mrow></math></span>、块大小 4 的完整过程：</p>
+<div class="highlight"><pre><span></span><code>  块     m_old     m_new        修正      l_run  o_run（未归一化）
+   0      -inf   -0.0989  0.000000    2.88054  [-0.6853, 0.9778, 0.1907, 2.0945]
+   1   -0.0989    0.8751  0.377547    3.32266  [-0.4288, -1.0139, 1.0599, 1.8531]
+   2    0.8751    0.8751  1.000000    5.36555  [0.1595, -1.0876, 0.5023, 1.0567]
+
+归一化后 o = [0.02972, -0.2027, 0.09362, 0.19694]
+参照     o = [0.02972, -0.2027, 0.09362, 0.19694]
+max|err| = 1.490e-08
+</code></pre></div>
+
+<p>第 1 块把 <code>o_run</code> 整个乘了 0.3775——因为第 1 块里出现了更大的打分，
+基准抬高了，之前累积的贡献要按同样的比例缩小。
+第 2 块的最大值没超过，修正因子 1.0，<code>o_run</code> 只是累加。</p>
+<p><strong>峰值额外存储：一块的打分 + <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span> 各一个标量 + <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span> 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 个数。
+与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 无关。</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 变成 100 万也是这么多。</p>
+<hr />
+<h2 id="sdpa">五 · 自己写一遍，与 SDPA 对拍</h2>
+<p>把上面的东西写成多头版本（<code>labs/L3/online_softmax.py</code> 的 <code>flash_like</code>），
+只用基本张量运算，不调任何 attention 库：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">190</span>    <span class="k">def</span><span class="w"> </span><span class="nf">flash_like</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">block</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+<span class="linenos">191</span><span class="w">        </span><span class="sd">"""分块 attention。Q/K/V: [B, H, S, D]。只用基本张量运算。"""</span>
+<span class="linenos">192</span>        <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="n">Q</span><span class="o">.</span><span class="n">shape</span>
+<span class="linenos">193</span>        <span class="n">scale</span> <span class="o">=</span> <span class="n">D</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
+<span class="linenos">194</span>        <span class="n">O</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">Q</span><span class="p">)</span>
+<span class="linenos">195</span>        <span class="c1"># 外层遍历 Q 的块（FA2 的顺序），内层遍历 K/V 的块</span>
+<span class="linenos">196</span>        <span class="k">for</span> <span class="n">q0</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">block</span><span class="p">):</span>
+<span class="linenos">197</span>            <span class="n">q1</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">q0</span> <span class="o">+</span> <span class="n">block</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+<span class="linenos">198</span>            <span class="n">Qb</span> <span class="o">=</span> <span class="n">Q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">q0</span><span class="p">:</span><span class="n">q1</span><span class="p">]</span>                          <span class="c1"># [B,H,bq,D]</span>
+<span class="linenos">199</span>            <span class="n">m</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">q1</span> <span class="o">-</span> <span class="n">q0</span><span class="p">),</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+<span class="linenos">200</span>                           <span class="n">dtype</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+<span class="linenos">201</span>            <span class="n">l</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">q1</span> <span class="o">-</span> <span class="n">q0</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+<span class="linenos">202</span>            <span class="n">acc</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">Qb</span><span class="p">)</span>
+<span class="linenos">203</span>            <span class="k">for</span> <span class="n">k0</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">block</span><span class="p">):</span>
+<span class="linenos">204</span>                <span class="n">k1</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">k0</span> <span class="o">+</span> <span class="n">block</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+<span class="linenos">205</span>                <span class="k">if</span> <span class="n">causal</span> <span class="ow">and</span> <span class="n">k0</span> <span class="o">&gt;</span> <span class="n">q1</span> <span class="o">-</span> <span class="mi">1</span><span class="p">:</span>               <span class="c1"># 整块都在未来，跳过</span>
+<span class="linenos">206</span>                    <span class="k">continue</span>
+<span class="linenos">207</span>                <span class="n">Kb</span><span class="p">,</span> <span class="n">Vb</span> <span class="o">=</span> <span class="n">K</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">k0</span><span class="p">:</span><span class="n">k1</span><span class="p">],</span> <span class="n">V</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">k0</span><span class="p">:</span><span class="n">k1</span><span class="p">]</span>
+<span class="linenos">208</span>                <span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="n">Qb</span> <span class="o">@</span> <span class="n">Kb</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">))</span> <span class="o">*</span> <span class="n">scale</span>  <span class="c1"># [B,H,bq,bk]</span>
+<span class="linenos">209</span>                <span class="k">if</span> <span class="n">causal</span><span class="p">:</span>
+<span class="linenos">210</span>                    <span class="n">qi</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">q0</span><span class="p">,</span> <span class="n">q1</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="linenos">211</span>                    <span class="n">ki</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">k0</span><span class="p">,</span> <span class="n">k1</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">212</span>                    <span class="n">s</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">ki</span> <span class="o">&gt;</span> <span class="n">qi</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos">213</span>                <span class="n">m_blk</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">amax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>                   <span class="c1"># [B,H,bq]</span>
+<span class="linenos">214</span>                <span class="n">m_new</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">m_blk</span><span class="p">)</span>
+<span class="linenos">215</span>                <span class="n">corr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">m</span> <span class="o">-</span> <span class="n">m_new</span><span class="p">)</span>
+<span class="linenos">216</span>                <span class="n">corr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nan_to_num</span><span class="p">(</span><span class="n">corr</span><span class="p">,</span> <span class="n">nan</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>   <span class="c1"># 首块 m=-inf</span>
+<span class="linenos">217</span>                <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">s</span> <span class="o">-</span> <span class="n">m_new</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+<span class="linenos">218</span>                <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nan_to_num</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">nan</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>         <span class="c1"># 整行被 mask 掉时</span>
+<span class="linenos">219</span>                <span class="n">l</span> <span class="o">=</span> <span class="n">l</span> <span class="o">*</span> <span class="n">corr</span> <span class="o">+</span> <span class="n">p</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">220</span>                <span class="n">acc</span> <span class="o">=</span> <span class="n">acc</span> <span class="o">*</span> <span class="n">corr</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="n">p</span> <span class="o">@</span> <span class="n">Vb</span>
+<span class="linenos">221</span>                <span class="n">m</span> <span class="o">=</span> <span class="n">m_new</span>
+</pre></div>
+<div class="srcref"><code>labs/L3/online_softmax.py 第 190–221 行</code><a href="../code/labs/L3/online_softmax.py.html#labs-L3-online_softmax-py-L-190">在完整文件中打开 &rarr;</a></div></div>
+<p>和 PyTorch 的 SDPA 逐元素比：</p>
+<div class="highlight"><pre><span></span><code>B=1 H=2 S=128 D=32 causal=False max|err| = 2.384e-07   一致
+B=1 H=2 S=128 D=32 causal=True  max|err| = 2.384e-07   一致
+B=2 H=4 S=256 D=64 causal=False max|err| = 4.768e-07   一致
+B=2 H=4 S=256 D=64 causal=True  max|err| = 4.172e-07   一致
+</code></pre></div>
+
+<p>块大小不影响结果：</p>
+<div class="highlight"><pre><span></span><code>block=  16   max|err| vs SDPA = 4.172e-07
+block=  32   max|err| vs SDPA = 3.576e-07
+block=  64   max|err| vs SDPA = 3.576e-07
+block= 128   max|err| vs SDPA = 3.576e-07
+block= 256   max|err| vs SDPA = 3.576e-07
+</code></pre></div>
+
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span> 是 fp32 的舍入量级（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>2</mn><mrow><mo>&#x02212;</mo><mn>23</mn></mrow></msup><mo>&#x02248;</mo><mn>1.2</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span>）。
+<strong>分块是精确的重排，块大小只改变访存与并行度，不改变结果。</strong></p>
+<div class="admonition note">
+<p class="admonition-title">因果 mask 在分块下的两个细节</p>
+<p><code>flash_like</code> 里有两处容易写错：</p>
+<ol>
+<li><strong>整块都在未来时直接跳过</strong>（<code>if causal and k0 &gt; q1 - 1: continue</code>）。
+   这不只是优化——如果不跳过，整块被 mask 成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span>，
+   <code>exp(-inf - (-inf))</code> 会得到 <code>nan</code>。</li>
+<li><strong>首块的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x0003D;</mo><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span></strong>，修正因子 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo><mo>&#x02212;</mo><mi>m</mi></mrow></msup><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span> 是对的，
+   但 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo><mo>&#x02212;</mo><mo stretchy="false">&#x00028;</mo><mo>&#x02212;</mo><mo>&#x0221E;</mo><mo stretchy="false">&#x00029;</mo></mrow></math></span> 是 <code>nan</code>。代码里用 <code>nan_to_num</code> 处理，
+   真实 kernel 里通常把首块单独展开成一个不带修正的分支。</li>
+</ol>
+<p>这两处都是"数学上没有、浮点上必须处理"的地方。</p>
+</div>
+<hr />
+<h2 id="sdpa_1">六 · SDPA 背后有几个后端</h2>
+<p><code>F.scaled_dot_product_attention</code> 是一个调度器，不是一个实现。
+<code>B=1, H=32, S=4096, D=128</code>, bf16, causal：</p>
+<table>
+<thead>
+<tr>
+<th>后端</th>
+<th style="text-align: right;">ms</th>
+<th style="text-align: right;">峰值 MB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FLASH_ATTENTION</td>
+<td style="text-align: right;">0.793</td>
+<td style="text-align: right;">32.5</td>
+</tr>
+<tr>
+<td>EFFICIENT_ATTENTION</td>
+<td style="text-align: right;">1.677</td>
+<td style="text-align: right;">32.0</td>
+</tr>
+<tr>
+<td><strong>MATH（就是朴素实现）</strong></td>
+<td style="text-align: right;"><strong>21.770</strong></td>
+<td style="text-align: right;"><strong>4928.1</strong></td>
+</tr>
+<tr>
+<td>CUDNN_ATTENTION</td>
+<td style="text-align: right;">0.739</td>
+<td style="text-align: right;">32.0</td>
+</tr>
+<tr>
+<td><em>不指定（默认）</em></td>
+<td style="text-align: right;">0.789</td>
+<td style="text-align: right;">—</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>MATH 后端就是本章的 <code>naive_attention</code></strong>：慢 27.5×，多用 152× 显存。
+  它存在的意义是<strong>参照实现</strong>——在任何硬件、任何 dtype、任何 mask 下都能跑，
+  也用来给别的后端对答案。2.0 里那张分发表上的 <code>CompositeExplicitAutograd</code>
+  就是这种角色。</li>
+<li>默认选了 0.789 ms，和 FLASH（0.793）最接近。</li>
+<li>CUDNN 这次略快（0.739），但差距在 7% 以内，
+  单次测量不足以断言谁更好（<span class="xref pending" title="可信性能测量（尚未写）">M2</span> 会讲怎么测才算数）。</li>
+</ul>
+<div class="admonition warning">
+<p class="admonition-title">MATH 的 21.77 ms 比第二节的朴素实现（8.51 ms）还慢 2.6 倍</p>
+<p>两者都是"朴素"，为什么差这么多？我没有查证，所以这里只记录现象。
+可能的方向：MATH 后端要处理更一般的 mask 与 dtype 提升路径，
+可能多了一次 fp32 上转或额外的 mask 张量。
+<strong>这是一个待查项，不要用它来说明任何结论。</strong>
+判据：用 nsys 抓两条路径的 kernel 序列对比（2.6 的方法）。</p>
+</div>
+<hr />
+<h2 id="_5">七 · 设计取舍</h2>
+<h3 id="71">7.1 为什么是"重排求值顺序"，而不是"近似"</h3>
+<p>面对 attention 的二次复杂度，设计空间里至少有三类做法：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>做法</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A. 近似</td>
+<td>稀疏化、低秩、线性 attention</td>
+<td>改变结果；要重新训练或接受质量下降</td>
+</tr>
+<tr>
+<td>B. 换硬件</td>
+<td>更大的片上存储</td>
+<td>不在你手里</td>
+</tr>
+<tr>
+<td>C. 重排求值顺序</td>
+<td>分块 + online softmax</td>
+<td><strong>结果不变</strong>；实现复杂度上升</td>
+</tr>
+</tbody>
+</table>
+<p>FlashAttention 选 C。这个选择最关键的性质是<strong>结果不变</strong>——
+它可以直接替换掉现有实现，不需要重新训练，不需要评估质量，
+不需要任何人同意。一个"精确"的优化在工程上的传播速度，
+和一个"通常够好"的近似完全不是一个量级。</p>
+<p>这也解释了为什么 3.4 要讲的那些稀疏/线性方法（方案 A）至今没有取代 attention：
+它们必须证明质量，而 C 类只需要证明数值一致。</p>
+<p><strong>可带走的判据：</strong> 当你要优化一个被广泛依赖的东西时，
+"能不能保证行为完全不变"这一条，往往比性能数字更能决定它会不会被采用。</p>
+<h3 id="72-online-softmax">7.2 online softmax 的代价在哪</h3>
+<p>天下没有免费的重排。分块版本付出的是：</p>
+<ul>
+<li><strong>重复计算</strong>：修正因子 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup></mrow></math></span> 每块都要算一次乘一遍，
+  <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span> 累加器要被反复缩放。这些在朴素实现里不存在。</li>
+<li><strong>实现复杂度</strong>：上面那两个 <code>nan</code> 陷阱只是开始；
+  真实 kernel 还要处理 SRAM 容量、warp 分工、bank conflict（2.6）。</li>
+<li><strong>反向更麻烦</strong>：反向要重算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>s</mi></mrow></math></span>（因为没存），这是用算力换显存的又一次交易——
+  和 7.0 要讲的 activation checkpointing 是同一个思路。</li>
+</ul>
+<p>这些代价能被接受，是因为被换掉的东西（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 的 DRAM 往返）
+在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 大时是压倒性的。<strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 小的时候这笔交易并不划算</strong>——
+本章实测 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>512</mn></mrow></math></span> 时只有 3.2×，而 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>8192</mn></mrow></math></span> 时是 12.3×。</p>
+<h3 id="73-sdpa">7.3 SDPA 为什么是一个调度器</h3>
+<p>PyTorch 没有把 FlashAttention 直接做成 <code>attention</code> 的唯一实现，
+而是留了一个多后端的选择层。理由能从上表读出来：
+每个后端都有它跑不了的情况（head_dim 限制、dtype 限制、mask 形状限制、
+硬件架构限制），而 MATH 是那个<strong>永远能跑</strong>的兜底。</p>
+<p>代价是"我不知道它选了哪个"，所以才需要 <code>sdpa_kernel</code> 这样的显式上下文
+来做 A/B——这正是本章第六节做的事。0.3 里那条"同一个 Python 调用
+不保证两张卡跑同样的机器码"，在这里是同一个道理。</p>
+<hr />
+<h2 id="lab">八 · 动手 lab</h2>
+<p><strong>推导与自实现（CPU 就能跑）</strong></p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L3/online_softmax.py
+</code></pre></div>
+
+<p><strong>内存墙实测（需要单卡）</strong></p>
+<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L3 &amp;&amp; /scratch/learn/envs/serve/bin/python attention_memory.py'</span>
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/attn/31_online_softmax.txt</code>（127 行）、
+<code>results/crater/attn/31_attention_memory.txt</code>（73 行）。</p>
+<details class="fold srcfold"><summary>labs/L3/online_softmax.py 全文（255 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L3.1 —— online softmax 与分块 attention，从零写一遍。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">纯 torch（CPU 就能跑），不用任何 attention 库。目的是把</span>
+<span class="linenos">  5</span><span class="sd">「为什么可以不materialize 那个 S×S 矩阵」这件事推到能自己写出来。</span>
+<span class="linenos">  6</span>
+<span class="linenos">  7</span><span class="sd">四步：</span>
+<span class="linenos">  8</span><span class="sd">  [A] softmax 为什么要减最大值 —— 不减会溢出</span>
+<span class="linenos">  9</span><span class="sd">  [B] 三遍扫描 -&gt; 两遍 -&gt; 一遍（online），每一步的代数与实测等价</span>
+<span class="linenos"> 10</span><span class="sd">  [C] 把 V 的加权和也放进同一遍 -&gt; 分块 attention</span>
+<span class="linenos"> 11</span><span class="sd">  [D] 和 PyTorch 的 SDPA 对拍</span>
+<span class="linenos"> 12</span>
+<span class="linenos"> 13</span><span class="sd">用法：</span>
+<span class="linenos"> 14</span><span class="sd">    python online_softmax.py</span>
+<span class="linenos"> 15</span><span class="sd">    python online_softmax.py B C</span>
+<span class="linenos"> 16</span><span class="sd">"""</span>
+<span class="linenos"> 17</span>
+<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 19</span>
+<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 21</span>
+<span class="linenos"> 22</span><span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos"> 23</span>
+<span class="linenos"> 24</span>
+<span class="linenos"> 25</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 26</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos"> 27</span>
+<span class="linenos"> 28</span>
+<span class="linenos"> 29</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 30</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos"> 31</span>
+<span class="linenos"> 32</span>
+<span class="linenos"> 33</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos"> 34</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos"> 35</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] softmax 为什么必须减去最大值"</span><span class="p">)</span>
+<span class="linenos"> 36</span>
+<span class="linenos"> 37</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  softmax(x)_i = exp(x_i) / Σ_j exp(x_j)"</span><span class="p">)</span>
+<span class="linenos"> 38</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  数学上，给每个 x 减去同一个常数 c，结果不变："</span><span class="p">)</span>
+<span class="linenos"> 39</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    exp(x_i - c) / Σ exp(x_j - c) = [exp(x_i)/exp(c)] / [Σ exp(x_j)/exp(c)]"</span><span class="p">)</span>
+<span class="linenos"> 40</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  分子分母的 exp(c) 约掉了。所以减常数是**恒等变换**，不是近似。"</span><span class="p">)</span>
+<span class="linenos"> 41</span>
+<span class="linenos"> 42</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"但在浮点里不减就会炸"</span><span class="p">)</span>
+<span class="linenos"> 43</span>    <span class="k">for</span> <span class="n">val</span> <span class="ow">in</span> <span class="p">[</span><span class="mf">10.0</span><span class="p">,</span> <span class="mf">88.0</span><span class="p">,</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mf">1000.0</span><span class="p">]:</span>
+<span class="linenos"> 44</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">val</span><span class="p">,</span> <span class="n">val</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">val</span> <span class="o">-</span> <span class="mi">2</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="linenos"> 45</span>        <span class="n">naive_num</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos"> 46</span>        <span class="n">naive</span> <span class="o">=</span> <span class="n">naive_num</span> <span class="o">/</span> <span class="n">naive_num</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos"> 47</span>        <span class="n">safe</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos"> 48</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  x 最大 </span><span class="si">{</span><span class="n">val</span><span class="si">:</span><span class="s2">&gt;7.1f</span><span class="si">}</span><span class="s2">   exp(x) = </span><span class="si">{</span><span class="n">naive_num</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 49</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">''</span><span class="si">:</span><span class="s2">17</span><span class="si">}</span><span class="s2">   朴素 softmax = </span><span class="si">{</span><span class="n">naive</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 50</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">''</span><span class="si">:</span><span class="s2">17</span><span class="si">}</span><span class="s2">   减最大值后   = </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">6</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">safe</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 51</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  float32 能表示的最大值约 3.4e38，exp(88.7) 就到顶了。"</span><span class="p">)</span>
+<span class="linenos"> 52</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  一旦 exp 溢出成 inf，inf/inf = nan，整行结果全毁。"</span><span class="p">)</span>
+<span class="linenos"> 53</span>
+<span class="linenos"> 54</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"反方向：全是很小的负数"</span><span class="p">)</span>
+<span class="linenos"> 55</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="o">-</span><span class="mf">800.0</span><span class="p">,</span> <span class="o">-</span><span class="mf">801.0</span><span class="p">,</span> <span class="o">-</span><span class="mf">802.0</span><span class="p">])</span>
+<span class="linenos"> 56</span>    <span class="n">num</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos"> 57</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  exp(x) = </span><span class="si">{</span><span class="n">num</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span><span class="si">}</span><span class="s2">  -&gt; 全部下溢成 0"</span><span class="p">)</span>
+<span class="linenos"> 58</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  朴素 softmax = </span><span class="si">{</span><span class="p">(</span><span class="n">num</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">num</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span><span class="si">}</span><span class="s2">   (0/0)"</span><span class="p">)</span>
+<span class="linenos"> 59</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  减最大值后   = </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">6</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">torch</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 60</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  减最大值之后，最大那一项恰好是 exp(0)=1，其余都在 (0,1]，"</span><span class="p">)</span>
+<span class="linenos"> 61</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  既不会上溢也不会全部下溢。这就是所谓 safe softmax。"</span><span class="p">)</span>
+<span class="linenos"> 62</span>
+<span class="linenos"> 63</span>
+<span class="linenos"> 64</span><span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos"> 65</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos"> 66</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 三遍 -&gt; 两遍 -&gt; 一遍"</span><span class="p">)</span>
+<span class="linenos"> 67</span>
+<span class="linenos"> 68</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">)</span> <span class="o">*</span> <span class="mi">3</span>
+<span class="linenos"> 69</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  x = </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">x</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 70</span>
+<span class="linenos"> 71</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"写法一：三遍扫描（教科书写法）"</span><span class="p">)</span>
+<span class="linenos"> 72</span>    <span class="n">m</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">max</span><span class="p">()</span>                       <span class="c1"># 第 1 遍：求最大值</span>
+<span class="linenos"> 73</span>    <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">x</span> <span class="o">-</span> <span class="n">m</span><span class="p">)</span>              <span class="c1"># 第 2 遍：求指数</span>
+<span class="linenos"> 74</span>    <span class="n">l</span> <span class="o">=</span> <span class="n">p</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>                       <span class="c1"># 第 3 遍：求和</span>
+<span class="linenos"> 75</span>    <span class="n">y3</span> <span class="o">=</span> <span class="n">p</span> <span class="o">/</span> <span class="n">l</span>
+<span class="linenos"> 76</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  第1遍 m = max(x)      = </span><span class="si">{</span><span class="n">m</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 77</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  第2遍 p = exp(x - m)  = </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">p</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 78</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  第3遍 l = Σp          = </span><span class="si">{</span><span class="n">l</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 79</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  y = p / l             = </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">y3</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 80</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  代价：x 要从内存读 2 次（求 m 一次，求 p 一次）。"</span><span class="p">)</span>
+<span class="linenos"> 81</span>
+<span class="linenos"> 82</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"写法二：一遍就把 m 和 l 都算出来（online）"</span><span class="p">)</span>
+<span class="linenos"> 83</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  关键恒等式：已经处理完前 k 个元素，手上有"</span><span class="p">)</span>
+<span class="linenos"> 84</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      m_old = max(x_1..x_k)"</span><span class="p">)</span>
+<span class="linenos"> 85</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      l_old = Σ_{i&lt;=k} exp(x_i - m_old)"</span><span class="p">)</span>
+<span class="linenos"> 86</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  来了第 k+1 个元素 x_new："</span><span class="p">)</span>
+<span class="linenos"> 87</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      m_new = max(m_old, x_new)"</span><span class="p">)</span>
+<span class="linenos"> 88</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      l_new = l_old * exp(m_old - m_new) + exp(x_new - m_new)"</span><span class="p">)</span>
+<span class="linenos"> 89</span>    <span class="nb">print</span><span class="p">()</span>
+<span class="linenos"> 90</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  为什么那个 exp(m_old - m_new) 是对的：l_old 里每一项的基准是 m_old，"</span><span class="p">)</span>
+<span class="linenos"> 91</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  现在基准要换成 m_new，每一项都要乘 exp(m_old)/exp(m_new)"</span><span class="p">)</span>
+<span class="linenos"> 92</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  = exp(m_old - m_new)。整个和是线性的，所以提到外面乘一次就行。"</span><span class="p">)</span>
+<span class="linenos"> 93</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  m_new &gt;= m_old，所以这个因子 &lt;= 1，永远不会放大 —— 数值上是安全的。"</span><span class="p">)</span>
+<span class="linenos"> 94</span>
+<span class="linenos"> 95</span>    <span class="n">m_run</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos"> 96</span>    <span class="n">l_run</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos"> 97</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'步'</span><span class="si">:</span><span class="s2">&gt;3</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'x_new'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'m_old'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'m_new'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos"> 98</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'修正因子'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'l_new'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 99</span>    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">xv</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+<span class="linenos">100</span>        <span class="n">m_old</span><span class="p">,</span> <span class="n">l_old</span> <span class="o">=</span> <span class="n">m_run</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="n">l_run</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos">101</span>        <span class="n">m_run</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">m_old</span><span class="p">,</span> <span class="n">xv</span><span class="p">)</span>
+<span class="linenos">102</span>        <span class="n">corr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">m_old</span> <span class="o">-</span> <span class="n">m_run</span><span class="p">)</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">m_old</span><span class="p">)</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos">103</span>        <span class="n">l_run</span> <span class="o">=</span> <span class="n">l_old</span> <span class="o">*</span> <span class="n">corr</span> <span class="o">+</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">xv</span> <span class="o">-</span> <span class="n">m_run</span><span class="p">)</span>
+<span class="linenos">104</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">i</span><span class="si">:</span><span class="s2">&gt;3</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">xv</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">m_old</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">105</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">m_run</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">corr</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;10.6f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">l_run</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;12.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">106</span>
+<span class="linenos">107</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  一遍之后 m=</span><span class="si">{</span><span class="n">m_run</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">  l=</span><span class="si">{</span><span class="n">l_run</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">108</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  三遍写法   m=</span><span class="si">{</span><span class="n">m</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">  l=</span><span class="si">{</span><span class="n">l</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">109</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  m 相同: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">m_run</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span><span class="si">}</span><span class="s2">   l 相同: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">l_run</span><span class="p">,</span><span class="w"> </span><span class="n">l</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">110</span>
+<span class="linenos">111</span>    <span class="n">y1</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">x</span> <span class="o">-</span> <span class="n">m_run</span><span class="p">)</span> <span class="o">/</span> <span class="n">l_run</span>
+<span class="linenos">112</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  最终结果与三遍写法的 max|err| = </span><span class="si">{</span><span class="p">(</span><span class="n">y1</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">y3</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">113</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  与 torch.softmax 的 max|err|   = "</span>
+<span class="linenos">114</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">(</span><span class="n">y1</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">torch</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">))</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">115</span>
+<span class="linenos">116</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"按块做也一样（这才是 kernel 里的写法）"</span><span class="p">)</span>
+<span class="linenos">117</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  逐元素只是块大小为 1 的特例。块大小 B 时："</span><span class="p">)</span>
+<span class="linenos">118</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      m_blk = max(块内)          l_blk = Σ exp(块内 - m_blk)"</span><span class="p">)</span>
+<span class="linenos">119</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      m_new = max(m_old, m_blk)"</span><span class="p">)</span>
+<span class="linenos">120</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      l_new = l_old*exp(m_old-m_new) + l_blk*exp(m_blk-m_new)"</span><span class="p">)</span>
+<span class="linenos">121</span>    <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">]:</span>
+<span class="linenos">122</span>        <span class="n">m_run</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">));</span> <span class="n">l_run</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos">123</span>        <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">numel</span><span class="p">(),</span> <span class="n">B</span><span class="p">):</span>
+<span class="linenos">124</span>            <span class="n">blk</span> <span class="o">=</span> <span class="n">x</span><span class="p">[</span><span class="n">s</span><span class="p">:</span><span class="n">s</span> <span class="o">+</span> <span class="n">B</span><span class="p">]</span>
+<span class="linenos">125</span>            <span class="n">m_blk</span> <span class="o">=</span> <span class="n">blk</span><span class="o">.</span><span class="n">max</span><span class="p">()</span>
+<span class="linenos">126</span>            <span class="n">l_blk</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">blk</span> <span class="o">-</span> <span class="n">m_blk</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos">127</span>            <span class="n">m_new</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">m_run</span><span class="p">,</span> <span class="n">m_blk</span><span class="p">)</span>
+<span class="linenos">128</span>            <span class="n">corr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">m_run</span> <span class="o">-</span> <span class="n">m_new</span><span class="p">)</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">m_run</span><span class="p">)</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos">129</span>            <span class="n">l_run</span> <span class="o">=</span> <span class="n">l_run</span> <span class="o">*</span> <span class="n">corr</span> <span class="o">+</span> <span class="n">l_blk</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">m_blk</span> <span class="o">-</span> <span class="n">m_new</span><span class="p">)</span>
+<span class="linenos">130</span>            <span class="n">m_run</span> <span class="o">=</span> <span class="n">m_new</span>
+<span class="linenos">131</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  块大小 </span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2">:  m=</span><span class="si">{</span><span class="n">m_run</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">  l=</span><span class="si">{</span><span class="n">l_run</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">   "</span>
+<span class="linenos">132</span>              <span class="sa">f</span><span class="s2">"与三遍写法一致: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">l_run</span><span class="p">,</span><span class="w"> </span><span class="n">l</span><span class="p">,</span><span class="w"> </span><span class="n">atol</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">133</span>
+<span class="linenos">134</span>
+<span class="linenos">135</span><span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos">136</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos">137</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 把 V 的加权和也放进同一遍：分块 attention"</span><span class="p">)</span>
+<span class="linenos">138</span>
+<span class="linenos">139</span>    <span class="n">S</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">12</span><span class="p">,</span> <span class="mi">4</span>
+<span class="linenos">140</span>    <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">D</span><span class="p">)</span>
+<span class="linenos">141</span>    <span class="n">K</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span>
+<span class="linenos">142</span>    <span class="n">V</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span>
+<span class="linenos">143</span>    <span class="n">scale</span> <span class="o">=</span> <span class="n">D</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
+<span class="linenos">144</span>
+<span class="linenos">145</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"参照：先算完整的 S 维打分，再 softmax，再乘 V"</span><span class="p">)</span>
+<span class="linenos">146</span>    <span class="n">s_full</span> <span class="o">=</span> <span class="p">(</span><span class="n">K</span> <span class="o">@</span> <span class="n">q</span><span class="p">)</span> <span class="o">*</span> <span class="n">scale</span>
+<span class="linenos">147</span>    <span class="n">p_full</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">s_full</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+<span class="linenos">148</span>    <span class="n">o_full</span> <span class="o">=</span> <span class="n">p_full</span> <span class="o">@</span> <span class="n">V</span>
+<span class="linenos">149</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  打分 s（长度 </span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2">）= </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">s_full</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">150</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  o = </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">o_full</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">151</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  这条路要把长度 </span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> 的 s 完整存下来。真实场景里它是 S×S 的矩阵。"</span><span class="p">)</span>
+<span class="linenos">152</span>
+<span class="linenos">153</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"分块：每块只看 K/V 的一段，从不存完整的 s"</span><span class="p">)</span>
+<span class="linenos">154</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  额外的量：输出累加器 O。基准换了之后 O 也要跟着修正。"</span><span class="p">)</span>
+<span class="linenos">155</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      O_new = O_old * exp(m_old - m_new) + exp(s_blk - m_new) @ V_blk"</span><span class="p">)</span>
+<span class="linenos">156</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  最后统一除以 l。**除法留到最后一次做**，中间只累加未归一化的和。"</span><span class="p">)</span>
+<span class="linenos">157</span>
+<span class="linenos">158</span>    <span class="n">B</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="linenos">159</span>    <span class="n">m_run</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos">160</span>    <span class="n">l_run</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos">161</span>    <span class="n">o_run</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">D</span><span class="p">)</span>
+<span class="linenos">162</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'块'</span><span class="si">:</span><span class="s2">&gt;3</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'m_old'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'m_new'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'修正'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'l_run'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">  o_run（未归一化）"</span><span class="p">)</span>
+<span class="linenos">163</span>    <span class="k">for</span> <span class="n">bi</span><span class="p">,</span> <span class="n">s0</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">B</span><span class="p">)):</span>
+<span class="linenos">164</span>        <span class="n">Kb</span><span class="p">,</span> <span class="n">Vb</span> <span class="o">=</span> <span class="n">K</span><span class="p">[</span><span class="n">s0</span><span class="p">:</span><span class="n">s0</span> <span class="o">+</span> <span class="n">B</span><span class="p">],</span> <span class="n">V</span><span class="p">[</span><span class="n">s0</span><span class="p">:</span><span class="n">s0</span> <span class="o">+</span> <span class="n">B</span><span class="p">]</span>
+<span class="linenos">165</span>        <span class="n">s_blk</span> <span class="o">=</span> <span class="p">(</span><span class="n">Kb</span> <span class="o">@</span> <span class="n">q</span><span class="p">)</span> <span class="o">*</span> <span class="n">scale</span>
+<span class="linenos">166</span>        <span class="n">m_blk</span> <span class="o">=</span> <span class="n">s_blk</span><span class="o">.</span><span class="n">max</span><span class="p">()</span>
+<span class="linenos">167</span>        <span class="n">m_old</span> <span class="o">=</span> <span class="n">m_run</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos">168</span>        <span class="n">m_new</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">m_old</span><span class="p">,</span> <span class="n">m_blk</span><span class="p">)</span>
+<span class="linenos">169</span>        <span class="n">corr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">m_old</span> <span class="o">-</span> <span class="n">m_new</span><span class="p">)</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">m_old</span><span class="p">)</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos">170</span>        <span class="n">p_blk</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">s_blk</span> <span class="o">-</span> <span class="n">m_new</span><span class="p">)</span>
+<span class="linenos">171</span>        <span class="n">l_run</span> <span class="o">=</span> <span class="n">l_run</span> <span class="o">*</span> <span class="n">corr</span> <span class="o">+</span> <span class="n">p_blk</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos">172</span>        <span class="n">o_run</span> <span class="o">=</span> <span class="n">o_run</span> <span class="o">*</span> <span class="n">corr</span> <span class="o">+</span> <span class="n">p_blk</span> <span class="o">@</span> <span class="n">Vb</span>
+<span class="linenos">173</span>        <span class="n">m_run</span> <span class="o">=</span> <span class="n">m_new</span>
+<span class="linenos">174</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">bi</span><span class="si">:</span><span class="s2">&gt;3</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">m_old</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">m_new</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">175</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">corr</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;9.6f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">l_run</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;10.5f</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos">176</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">o_run</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">177</span>
+<span class="linenos">178</span>    <span class="n">o_online</span> <span class="o">=</span> <span class="n">o_run</span> <span class="o">/</span> <span class="n">l_run</span>
+<span class="linenos">179</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  归一化后 o = </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">o_online</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">180</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  参照     o = </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">o_full</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">181</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  max|err| = </span><span class="si">{</span><span class="p">(</span><span class="n">o_online</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">o_full</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">182</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  峰值额外存储：一块的打分 </span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> 个数 + m,l 各 1 个 + O 的 </span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> 个。"</span><span class="p">)</span>
+<span class="linenos">183</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  与 S=</span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> 无关。S 变成 100 万也是这么多。"</span><span class="p">)</span>
+<span class="linenos">184</span>
+<span class="linenos">185</span>
+<span class="linenos">186</span><span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos">187</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos">188</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 写成真正的多头版本，与 PyTorch SDPA 对拍"</span><span class="p">)</span>
+<span class="linenos">189</span>
+<span class="linenos">190</span>    <span class="k">def</span><span class="w"> </span><span class="nf">flash_like</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">block</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+<span class="linenos">191</span><span class="w">        </span><span class="sd">"""分块 attention。Q/K/V: [B, H, S, D]。只用基本张量运算。"""</span>
+<span class="linenos">192</span>        <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="n">Q</span><span class="o">.</span><span class="n">shape</span>
+<span class="linenos">193</span>        <span class="n">scale</span> <span class="o">=</span> <span class="n">D</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
+<span class="linenos">194</span>        <span class="n">O</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">Q</span><span class="p">)</span>
+<span class="linenos">195</span>        <span class="c1"># 外层遍历 Q 的块（FA2 的顺序），内层遍历 K/V 的块</span>
+<span class="linenos">196</span>        <span class="k">for</span> <span class="n">q0</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">block</span><span class="p">):</span>
+<span class="linenos">197</span>            <span class="n">q1</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">q0</span> <span class="o">+</span> <span class="n">block</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+<span class="linenos">198</span>            <span class="n">Qb</span> <span class="o">=</span> <span class="n">Q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">q0</span><span class="p">:</span><span class="n">q1</span><span class="p">]</span>                          <span class="c1"># [B,H,bq,D]</span>
+<span class="linenos">199</span>            <span class="n">m</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">q1</span> <span class="o">-</span> <span class="n">q0</span><span class="p">),</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+<span class="linenos">200</span>                           <span class="n">dtype</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+<span class="linenos">201</span>            <span class="n">l</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">q1</span> <span class="o">-</span> <span class="n">q0</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+<span class="linenos">202</span>            <span class="n">acc</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">Qb</span><span class="p">)</span>
+<span class="linenos">203</span>            <span class="k">for</span> <span class="n">k0</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">block</span><span class="p">):</span>
+<span class="linenos">204</span>                <span class="n">k1</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">k0</span> <span class="o">+</span> <span class="n">block</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+<span class="linenos">205</span>                <span class="k">if</span> <span class="n">causal</span> <span class="ow">and</span> <span class="n">k0</span> <span class="o">&gt;</span> <span class="n">q1</span> <span class="o">-</span> <span class="mi">1</span><span class="p">:</span>               <span class="c1"># 整块都在未来，跳过</span>
+<span class="linenos">206</span>                    <span class="k">continue</span>
+<span class="linenos">207</span>                <span class="n">Kb</span><span class="p">,</span> <span class="n">Vb</span> <span class="o">=</span> <span class="n">K</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">k0</span><span class="p">:</span><span class="n">k1</span><span class="p">],</span> <span class="n">V</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">k0</span><span class="p">:</span><span class="n">k1</span><span class="p">]</span>
+<span class="linenos">208</span>                <span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="n">Qb</span> <span class="o">@</span> <span class="n">Kb</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">))</span> <span class="o">*</span> <span class="n">scale</span>  <span class="c1"># [B,H,bq,bk]</span>
+<span class="linenos">209</span>                <span class="k">if</span> <span class="n">causal</span><span class="p">:</span>
+<span class="linenos">210</span>                    <span class="n">qi</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">q0</span><span class="p">,</span> <span class="n">q1</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="linenos">211</span>                    <span class="n">ki</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">k0</span><span class="p">,</span> <span class="n">k1</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">Q</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">212</span>                    <span class="n">s</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">ki</span> <span class="o">&gt;</span> <span class="n">qi</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos">213</span>                <span class="n">m_blk</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">amax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>                   <span class="c1"># [B,H,bq]</span>
+<span class="linenos">214</span>                <span class="n">m_new</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">m_blk</span><span class="p">)</span>
+<span class="linenos">215</span>                <span class="n">corr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">m</span> <span class="o">-</span> <span class="n">m_new</span><span class="p">)</span>
+<span class="linenos">216</span>                <span class="n">corr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nan_to_num</span><span class="p">(</span><span class="n">corr</span><span class="p">,</span> <span class="n">nan</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>   <span class="c1"># 首块 m=-inf</span>
+<span class="linenos">217</span>                <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">s</span> <span class="o">-</span> <span class="n">m_new</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+<span class="linenos">218</span>                <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nan_to_num</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">nan</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>         <span class="c1"># 整行被 mask 掉时</span>
+<span class="linenos">219</span>                <span class="n">l</span> <span class="o">=</span> <span class="n">l</span> <span class="o">*</span> <span class="n">corr</span> <span class="o">+</span> <span class="n">p</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">220</span>                <span class="n">acc</span> <span class="o">=</span> <span class="n">acc</span> <span class="o">*</span> <span class="n">corr</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="n">p</span> <span class="o">@</span> <span class="n">Vb</span>
+<span class="linenos">221</span>                <span class="n">m</span> <span class="o">=</span> <span class="n">m_new</span>
+<span class="linenos">222</span>            <span class="n">O</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">q0</span><span class="p">:</span><span class="n">q1</span><span class="p">]</span> <span class="o">=</span> <span class="n">acc</span> <span class="o">/</span> <span class="n">l</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="nb">min</span><span class="o">=</span><span class="mf">1e-20</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">223</span>        <span class="k">return</span> <span class="n">O</span>
+<span class="linenos">224</span>
+<span class="linenos">225</span>    <span class="n">dev</span> <span class="o">=</span> <span class="s2">"cuda"</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="k">else</span> <span class="s2">"cpu"</span>
+<span class="linenos">226</span>    <span class="k">for</span> <span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span> <span class="ow">in</span> <span class="p">[(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">32</span><span class="p">),</span> <span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">64</span><span class="p">)]:</span>
+<span class="linenos">227</span>        <span class="n">Q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="linenos">228</span>        <span class="n">K</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="linenos">229</span>        <span class="n">V</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="linenos">230</span>        <span class="k">for</span> <span class="n">causal</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">):</span>
+<span class="linenos">231</span>            <span class="n">mine</span> <span class="o">=</span> <span class="n">flash_like</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">block</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">)</span>
+<span class="linenos">232</span>            <span class="n">ref</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span>
+<span class="linenos">233</span>                <span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">is_causal</span><span class="o">=</span><span class="n">causal</span><span class="p">)</span>
+<span class="linenos">234</span>            <span class="n">err</span> <span class="o">=</span> <span class="p">(</span><span class="n">mine</span> <span class="o">-</span> <span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">235</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2"> S=</span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> causal=</span><span class="si">{</span><span class="n">causal</span><span class="si">!s:</span><span class="s2">&lt;5</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">236</span>                  <span class="sa">f</span><span class="s2">"max|err| = </span><span class="si">{</span><span class="n">err</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">   </span><span class="si">{</span><span class="s1">'一致'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">err</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">1e-4</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'不一致'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">237</span>
+<span class="linenos">238</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"块大小不影响结果（只影响速度与显存）"</span><span class="p">)</span>
+<span class="linenos">239</span>    <span class="n">Q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">240</span>    <span class="n">K</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">241</span>    <span class="n">V</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">242</span>    <span class="n">ref</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">is_causal</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">243</span>    <span class="k">for</span> <span class="n">blk</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">]:</span>
+<span class="linenos">244</span>        <span class="n">err</span> <span class="o">=</span> <span class="p">(</span><span class="n">flash_like</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">block</span><span class="o">=</span><span class="n">blk</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">-</span> <span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">245</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  block=</span><span class="si">{</span><span class="n">blk</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2">   max|err| vs SDPA = </span><span class="si">{</span><span class="n">err</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">246</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  分块是**精确**的重排，不是近似。块大小只改变访存与并行度。"</span><span class="p">)</span>
+<span class="linenos">247</span>
+<span class="linenos">248</span>
+<span class="linenos">249</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span> <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">}</span>
+<span class="linenos">250</span>
+<span class="linenos">251</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">252</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos">253</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">254</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos">255</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+</pre></div>
+<div class="srcref"><code>labs/L3/online_softmax.py 全文（255 行）</code><a href="../code/labs/L3/online_softmax.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p><strong>建议的消融</strong></p>
+<ol>
+<li>把 <code>flash_like</code> 的两处 <code>nan_to_num</code> 去掉，看在哪个配置下先出 <code>nan</code>。
+   先预测再跑——预测错了说明第五节那个 note 你没真的读懂。</li>
+<li>把 [A] 的 <code>H</code> 从 32 改成 8，重算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 的大小并预测 OOM 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span>，
+   再跑一遍对答案。</li>
+<li>在 [B] 里把 <code>D</code> 从 128 换成 64 和 256，检查「朴素强度」是不是分别收敛到
+   <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0002F;</mo><mn>3</mn><mo>&#x02248;</mo><mn>21.3</mn></mrow></math></span> 和 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>85.3</mn></mrow></math></span>。这是对第二节那个推导的直接检验。</li>
+<li>把 <code>flash_like</code> 的内外循环换个方向（外层遍历 K/V 块、内层遍历 Q 块），
+   这是 FA1 与 FA2 的关键差别之一。结果应当不变，但你要说得出
+   哪些量需要在外层维护、哪些在内层——3.2 会讲为什么 FA2 换了方向。</li>
+</ol>
+<hr />
+<h2 id="_6">九 · 陷阱</h2>
+<ol>
+<li><strong>不减最大值的 softmax 会在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x0003E;</mo><mn>88</mn></mrow></math></span>（fp32）时溢出成 <code>nan</code></strong>，
+   而且是整行全毁。bf16 的指数范围和 fp32 一样，但尾数更短，问题一样在。</li>
+<li><strong>分块时首块的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi><mo>&#x0003D;</mo><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span> 会产生 <code>nan</code></strong>（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo><mo>&#x02212;</mo><mo stretchy="false">&#x00028;</mo><mo>&#x02212;</mo><mo>&#x0221E;</mo><mo stretchy="false">&#x00029;</mo></mrow></math></span>）。</li>
+<li><strong>因果 mask 下整块都在未来时必须跳过</strong>，否则整块 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span> 同样产生 <code>nan</code>。</li>
+<li><strong>中间不要做除法</strong>。归一化留到最后，否则基准改变时还要把除过的乘回来。</li>
+<li><strong>不要把分块当近似。</strong> 它是精确重排，误差只有浮点舍入量级（本章 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span>，fp32）。
+   如果你测出来误差远大于这个，是实现错了，不是"分块的固有误差"。</li>
+<li><strong>算加速比要说明 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span>。</strong> 本章从 3.2×（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mrow><mo>&#x0003D;</mo></mrow><mn>512</mn></mrow></math></span>）到 12.3×（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mrow><mo>&#x0003D;</mo></mrow><mn>8192</mn></mrow></math></span>），
+   引用单个数字没有意义。</li>
+<li><strong>因果 attention 的 FLOP 是满 attention 的一半。</strong> 我第一版忘了除 2，
+   算出 393 TFLOP/s——超过这张卡实测的 232 上限。
+   <strong>凡是算出来超过 roofline 的数字，先查自己的公式。</strong></li>
+<li><strong><code>torch.cuda.max_memory_allocated()</code> 测的是 PyTorch 的 allocated，
+   不是 reserved</strong>（2.0 §4.3）。测峰值前要 <code>reset_peak_memory_stats()</code>。</li>
+</ol>
+<hr />
+<h2 id="_7">十 · 自测题</h2>
+<details>
+<summary>1. 为什么朴素 attention 的算术强度与 S 无关，而分块的随 S 增长？</summary>
+<p>朴素实现的流量主项是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 矩阵的几次往返，约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>12</mn><msup><mi>S</mi><mn>2</mn></msup></mrow></math></span> 字节；
+FLOP 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow></math></span>。两者<strong>都是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup></mrow></math></span></strong>，比值里 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup></mrow></math></span> 约掉，剩下 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0002F;</mo><mn>3</mn></mrow></math></span>。</p>
+<p>分块实现的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 从不落 DRAM，流量只有 Q/K/V/O 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>8</mn><mi>S</mi><mi>D</mi></mrow></math></span> 字节（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0221D;</mo><mi>S</mi></mrow></math></span>），
+而 FLOP 仍是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow></math></span>（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0221D;</mo><msup><mi>S</mi><mn>2</mn></msup></mrow></math></span>）。比值 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mi>S</mi><mo>&#x0002F;</mo><mn>2</mn></mrow></math></span>，随 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 线性增长。</p>
+<p>本章实测：朴素那一列从 37.9 到 42.3（几乎不动，收敛到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0002F;</mo><mn>3</mn><mo>&#x02248;</mo><mn>42.7</mn></mrow></math></span>），
+分块那一列 256 → 4096。</p>
+</details>
+<details>
+<summary>2. 修正因子 <code>exp(m_old - m_new)</code> 为什么可以提到求和外面？为什么它永远不会放大？</summary>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>l</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x0003D;</mo><msub><mo>&#x02211;</mo><mi>i</mi></msub><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub></mrow></msup></mrow></math></span>。要把基准换成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></math></span>，
+每一项都要变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup><mo>&#x0003D;</mo><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub></mrow></msup><mo>&#x000B7;</mo><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub></mrow></msup></mrow></math></span>。
+每项乘的是<strong>同一个</strong>常数，而求和是线性的，所以可以提到外面乘一次。</p>
+<p>不会放大是因为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x0003D;</mo><mo>max</mo><mo stretchy="false">&#x00028;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x0002C;</mo><msub><mi>m</mi><mrow><mtext>blk</mtext></mrow></msub><mo stretchy="false">&#x00029;</mo><mo>&#x02265;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub></mrow></math></span>，
+所以指数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x02264;</mo><mn>0</mn></mrow></math></span>，因子 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02264;</mo><mn>1</mn></mrow></math></span>。</p>
+<p>这一条很重要：它保证了 online 版本的数值稳定性不比三遍写法差。
+如果基准可能下降，累积值就会被放大，多轮之后可能溢出。</p>
+</details>
+<details>
+<summary>3. 有人说"FlashAttention 用精度换了速度"。这个说法错在哪？</summary>
+<p>错在把"重排求值顺序"当成"近似"。分块 attention 计算的是同一个数学表达式，
+只是改变了求值顺序与中间结果的存放位置。</p>
+<p>本章实测：自己写的分块版本与 SDPA 的 <code>max|err|</code> 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span> 量级，
+正是 fp32 的机器精度（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>2</mn><mrow><mo>&#x02212;</mo><mn>23</mn></mrow></msup><mo>&#x02248;</mo><mn>1.2</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span>）；
+块大小从 16 变到 256，误差不变。</p>
+<p>浮点加法不满足结合律，所以换顺序确实会改变末位（本章块大小 4 那行
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span> 的末位差了 1）。但这与"用精度换速度"是两回事——
+朴素实现换个累加顺序也会有同样量级的差异（2.4 讨论过）。</p>
+<p>真正用精度换速度的是量化（4.3）和低精度累加（4.2），不是分块。</p>
+</details>
+<details>
+<summary>4. 你实现了一个分块 attention，S=1024 时和 SDPA 差 1e-2。可能是哪里错了？</summary>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>2</mn></mrow></msup></mrow></math></span> 远大于 fp32 的舍入量级 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span>，所以是<strong>实现错误</strong>，不是数值噪声。
+按可能性排：</p>
+<ul>
+<li><strong>忘了修正 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span> 累加器</strong>：只修正了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span> 没修正 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span>，或者反过来。
+  两者必须用同一个修正因子。</li>
+<li><strong>中途做了归一化</strong>：每块都除以当时的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span>，基准改变后没乘回来。</li>
+<li><strong>因果 mask 的边界</strong>：块内的 mask 用了全局索引还是块内索引，差一位。</li>
+<li><strong>修正因子用了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><msub><mi>m</mi><mrow><mtext>new</mtext></mrow></msub><mo>&#x02212;</mo><msub><mi>m</mi><mrow><mtext>old</mtext></mrow></msub></mrow></msup></mrow></math></span>（符号反了）</strong>：
+  这会放大而不是缩小，误差通常更大且随 S 增长。</li>
+</ul>
+<p>诊断办法：把 S 调到很小（比如 8，一块就装下），如果这时是精确的，
+说明单块路径没问题，错在跨块的修正上；再用两块（S=16）逐步打印
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span>，和三遍写法逐块对。</p>
+</details>
+<details>
+<summary>5. 什么时候分块 attention 反而不划算？</summary>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 很小的时候。分块要付出重复计算（每块一次修正因子、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span> 反复缩放）
+和更复杂的访存模式，而省下的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 往返在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 小时本来就不大。</p>
+<p>本章实测：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>512</mn></mrow></math></span> 只有 3.2×，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>8192</mn></mrow></math></span> 是 12.3×。再往小走，
+加上 kernel launch 开销（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 实测 2.68 µs），收益会进一步被摊薄。</p>
+<p>decode 阶段是个特例：那时 Q 只有 1 个 token，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 退化成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span>，
+根本没有二次项。所以 decode 需要的是完全不同的优化——
+split-K、GQA、paged 布局，这是 3.3 的内容。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.8-custom-op-integration.html">&#8592; 2.8 把一个算子接进 PyTorch：注册、分发、backward 与 compile</a><a class="nav-next" href="../L3/3.2-flashattention-lineage.html">3.2 FlashAttention 1 → 2 → 3 → 4 &#8594;</a></nav>
+</main>
+</body>
+</html>

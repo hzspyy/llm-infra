@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.3 异构对照：同一模型在两种 GPU 上</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">0.3</div>
+  <div class="sidebar-title">异构对照：同一模型在两种 GPU 上</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#gpu">比较 GPU 之前，先固定要做的工作</a></li>
+<li><a href="#_1">先看两台机器有什么差别</a></li>
+<li><a href="#_2">这份脚本到底怎样计时</a></li>
+<li><a href="#prompt">结果一：处理 prompt 的调用耗时</a></li>
+<li><a href="#_3">结果二：后续生成步骤的平均耗时估计</a></li>
+<li><a href="#_4">带宽能解释到哪一步</a></li>
+<li><a href="#_5">如何读代码里的硬件适配</a><ul>
+<li><a href="#_6">已经观察到的两处差别</a></li>
+</ul>
+</li>
+<li><a href="#_7">读这组结果时容易出错的地方</a></li>
+<li><a href="#_8">原始文件与复现入口</a></li>
+<li><a href="#_9">如何把结果用于选择配置</a></li>
+<li><a href="#_10">自测与练习</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L0 · 坐标系</div>
+  <div class="mod-id">0.3</div>
+  <h1>异构对照：同一模型在两种 GPU 上</h1>
+  <p class="lede">当前比较 5090 与 L40S 上的同一 vLLM 模型配置，区分 prefill、decode 与硬件能力；其他硬件和引擎的对照尚待补充。</p>
+  <div class="chips"><span class="chip">实测机器 历史记录：crater RTX 5090 D 与 worldvln L40S · vLLM 0.29.0</span><span class="chip">数据日期 2026-09-09；本次重写使用已有记录，没有新测量</span><span class="chip">前置 L0.1（请求流程）· L0.2（资源计算与 roofline）</span></div>
+</header><article class="prose"><h2 id="gpu">比较 GPU 之前，先固定要做的工作</h2>
+<p>“哪张 GPU 跑模型更快”缺少几个条件：什么模型，输入多长，一次处理多少请求，
+比较首个输出还是后续生成。不同条件下，模型需要的计算量与数据量不同，
+两张卡的差距也可能改变。</p>
+<p>本章使用已有的 Qwen3-1.7B 记录，比较 RTX 5090 D 与 L40S。
+模型快照相同，使用 vLLM 的 eager 路径，关闭前缀缓存。
+因此这里没有比较 CUDA Graph、其他模型，也没有比较两种引擎。</p>
+<p>我们的目标是学习怎样读这种比较。先检查设置是否一致，再读结果，
+最后讨论哪些解释与结果相容。不要一看到相近的两个比值，
+就把其中一个认定为另一个的全部原因。</p>
+<h2 id="_1">先看两台机器有什么差别</h2>
+<p>下面只列与本次分析直接相关的项目。容量来自设备记录，
+带宽与 GEMM 吞吐来自已有微基准，不是模型请求的有效吞吐。</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th style="text-align: right;">crater：RTX 5090 D</th>
+<th style="text-align: right;">worldvln：L40S</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>架构标识</td>
+<td style="text-align: right;">sm_120</td>
+<td style="text-align: right;">sm_89</td>
+</tr>
+<tr>
+<td>显存容量标称</td>
+<td style="text-align: right;">32 GB</td>
+<td style="text-align: right;">48 GB</td>
+</tr>
+<tr>
+<td>copy 带宽记录</td>
+<td style="text-align: right;">1519.3 GB/s</td>
+<td style="text-align: right;">649.7 GB/s</td>
+</tr>
+<tr>
+<td>bf16 GEMM 吞吐记录</td>
+<td style="text-align: right;">232.0 TFLOP/s</td>
+<td style="text-align: right;">256.0 TFLOP/s</td>
+</tr>
+<tr>
+<td>eager 微基准均摊提交/执行时间</td>
+<td style="text-align: right;">2.68 µs</td>
+<td style="text-align: right;">5.03 µs</td>
+</tr>
+</tbody>
+</table>
+<p>这张表有一个值得保留的区别：两台机器的 bf16 GEMM 参照值接近，
+而显存带宽参照值相差较大。按 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的模型，如果某段工作主要受计算量限制，
+它们可能较接近；如果主要受数据搬运限制，差距可能更大。</p>
+<p>这里说的是待检查的预测，而不是先验结论。实际 kernel 选择、CPU、
+频率、缓存和调度仍可能影响结果。两台不同主机的比较，
+也不能自动视作“只改变了 GPU 一个变量”。</p>
+<p>完整硬件记录保留了更细的测试项。读某个峰值时，也要看测试形状与采集时间：</p>
+<details class="fold srcfold"><summary>results/crater/hw_crater_5090.json 全文（55 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="p">{</span>
+<span class="linenos"> 2</span><span class="w">  </span><span class="nt">"measured_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-09T16:11:51+00:00"</span><span class="p">,</span>
+<span class="linenos"> 3</span><span class="w">  </span><span class="nt">"device"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 4</span><span class="w">    </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA GeForce RTX 5090 D"</span><span class="p">,</span>
+<span class="linenos"> 5</span><span class="w">    </span><span class="nt">"compute_capability"</span><span class="p">:</span><span class="w"> </span><span class="s2">"12.0"</span><span class="p">,</span>
+<span class="linenos"> 6</span><span class="w">    </span><span class="nt">"sm_count"</span><span class="p">:</span><span class="w"> </span><span class="mi">170</span><span class="p">,</span>
+<span class="linenos"> 7</span><span class="w">    </span><span class="nt">"total_mem_gb"</span><span class="p">:</span><span class="w"> </span><span class="mf">33.7</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="w">    </span><span class="nt">"l2_cache_mb"</span><span class="p">:</span><span class="w"> </span><span class="mf">100.7</span><span class="p">,</span>
+<span class="linenos"> 9</span><span class="w">    </span><span class="nt">"nvidia_smi"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA GeForce RTX 5090 D, 32607 MiB, 580.95.05, 3090 MHz, 14001 MHz, 575.00 W"</span><span class="p">,</span>
+<span class="linenos">10</span><span class="w">    </span><span class="nt">"torch"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2.13.0+cu130"</span><span class="p">,</span>
+<span class="linenos">11</span><span class="w">    </span><span class="nt">"cuda"</span><span class="p">:</span><span class="w"> </span><span class="s2">"13.0"</span><span class="p">,</span>
+<span class="linenos">12</span><span class="w">    </span><span class="nt">"host"</span><span class="p">:</span><span class="w"> </span><span class="s2">"sg-admin-260624-2348f-default0-0"</span>
+<span class="linenos">13</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">14</span><span class="w">  </span><span class="nt">"memory_bandwidth"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">15</span><span class="w">    </span><span class="nt">"copy_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">1519.3</span><span class="p">,</span>
+<span class="linenos">16</span><span class="w">    </span><span class="nt">"readonly_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">1608.6</span><span class="p">,</span>
+<span class="linenos">17</span><span class="w">    </span><span class="nt">"buffer_mb"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos">18</span><span class="w">    </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"copy_ 计入读+写两份流量；readonly 用 reduction 近似纯读"</span>
+<span class="linenos">19</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">20</span><span class="w">  </span><span class="nt">"gemm"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">21</span><span class="w">    </span><span class="nt">"bf16"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">22</span><span class="w">      </span><span class="nt">"peak_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">232.0</span><span class="p">,</span>
+<span class="linenos">23</span><span class="w">      </span><span class="nt">"by_size"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">24</span><span class="w">        </span><span class="nt">"4096"</span><span class="p">:</span><span class="w"> </span><span class="mf">218.1</span><span class="p">,</span>
+<span class="linenos">25</span><span class="w">        </span><span class="nt">"8192"</span><span class="p">:</span><span class="w"> </span><span class="mf">232.0</span>
+<span class="linenos">26</span><span class="w">      </span><span class="p">}</span>
+<span class="linenos">27</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">28</span><span class="w">    </span><span class="nt">"fp16"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">29</span><span class="w">      </span><span class="nt">"peak_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">225.5</span><span class="p">,</span>
+<span class="linenos">30</span><span class="w">      </span><span class="nt">"by_size"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">31</span><span class="w">        </span><span class="nt">"4096"</span><span class="p">:</span><span class="w"> </span><span class="mf">216.7</span><span class="p">,</span>
+<span class="linenos">32</span><span class="w">        </span><span class="nt">"8192"</span><span class="p">:</span><span class="w"> </span><span class="mf">225.5</span>
+<span class="linenos">33</span><span class="w">      </span><span class="p">}</span>
+<span class="linenos">34</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">35</span><span class="w">    </span><span class="nt">"fp8_e4m3"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">36</span><span class="w">      </span><span class="nt">"peak_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">560.4</span><span class="p">,</span>
+<span class="linenos">37</span><span class="w">      </span><span class="nt">"by_size"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">38</span><span class="w">        </span><span class="nt">"8192"</span><span class="p">:</span><span class="w"> </span><span class="mf">560.4</span>
+<span class="linenos">39</span><span class="w">      </span><span class="p">}</span>
+<span class="linenos">40</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos">41</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">42</span><span class="w">  </span><span class="nt">"launch_overhead"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">43</span><span class="w">    </span><span class="nt">"n_kernels"</span><span class="p">:</span><span class="w"> </span><span class="mi">500</span><span class="p">,</span>
+<span class="linenos">44</span><span class="w">    </span><span class="nt">"eager_us_per_kernel"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.68</span><span class="p">,</span>
+<span class="linenos">45</span><span class="w">    </span><span class="nt">"graph_us_per_kernel"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.79</span><span class="p">,</span>
+<span class="linenos">46</span><span class="w">    </span><span class="nt">"graph_speedup"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.4</span>
+<span class="linenos">47</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">48</span><span class="w">  </span><span class="nt">"pcie"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">49</span><span class="w">    </span><span class="nt">"h2d_pinned_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">47.5</span><span class="p">,</span>
+<span class="linenos">50</span><span class="w">    </span><span class="nt">"d2h_pinned_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">42.7</span><span class="p">,</span>
+<span class="linenos">51</span><span class="w">    </span><span class="nt">"h2d_pageable_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">23.3</span><span class="p">,</span>
+<span class="linenos">52</span><span class="w">    </span><span class="nt">"buffer_mb"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos">53</span><span class="w">    </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pageable 需要 driver 先拷到临时 pinned 缓冲，所以更慢——这是 pin_memory 的意义"</span>
+<span class="linenos">54</span><span class="w">  </span><span class="p">}</span>
+<span class="linenos">55</span><span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/hw_crater_5090.json 全文（55 行）</code><a href="../code/results/crater/hw_crater_5090.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/worldvln/hw_worldvln_l40s.json 全文（55 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="p">{</span>
+<span class="linenos"> 2</span><span class="w">  </span><span class="nt">"measured_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-09T17:12:03+00:00"</span><span class="p">,</span>
+<span class="linenos"> 3</span><span class="w">  </span><span class="nt">"device"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 4</span><span class="w">    </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA L40S"</span><span class="p">,</span>
+<span class="linenos"> 5</span><span class="w">    </span><span class="nt">"compute_capability"</span><span class="p">:</span><span class="w"> </span><span class="s2">"8.9"</span><span class="p">,</span>
+<span class="linenos"> 6</span><span class="w">    </span><span class="nt">"sm_count"</span><span class="p">:</span><span class="w"> </span><span class="mi">142</span><span class="p">,</span>
+<span class="linenos"> 7</span><span class="w">    </span><span class="nt">"total_mem_gb"</span><span class="p">:</span><span class="w"> </span><span class="mf">47.7</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="w">    </span><span class="nt">"l2_cache_mb"</span><span class="p">:</span><span class="w"> </span><span class="mf">100.7</span><span class="p">,</span>
+<span class="linenos"> 9</span><span class="w">    </span><span class="nt">"nvidia_smi"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA L40S, 46068 MiB, 580.173.02, 2520 MHz, 9001 MHz, 350.00 W\nNVIDIA L40S, 46068 MiB, 580.173.02, 2520 MHz, 9001 MHz, 350.00 W\nNVIDIA L40S, 46068 MiB, 580.173.02, 2520 MHz, 9001 MHz, 350.00 W\nNVIDIA L40S, 46068 MiB, 580.173.02, 2520 MHz, 9001 MHz, 350.00 W\nNVIDIA L40S, 46068 MiB, 580.173.02, 2520 MHz, 9001 MHz, 350.00 W"</span><span class="p">,</span>
+<span class="linenos">10</span><span class="w">    </span><span class="nt">"torch"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2.13.0+cu130"</span><span class="p">,</span>
+<span class="linenos">11</span><span class="w">    </span><span class="nt">"cuda"</span><span class="p">:</span><span class="w"> </span><span class="s2">"13.0"</span><span class="p">,</span>
+<span class="linenos">12</span><span class="w">    </span><span class="nt">"host"</span><span class="p">:</span><span class="w"> </span><span class="s2">"worldvln"</span>
+<span class="linenos">13</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">14</span><span class="w">  </span><span class="nt">"memory_bandwidth"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">15</span><span class="w">    </span><span class="nt">"copy_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">649.7</span><span class="p">,</span>
+<span class="linenos">16</span><span class="w">    </span><span class="nt">"readonly_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">734.4</span><span class="p">,</span>
+<span class="linenos">17</span><span class="w">    </span><span class="nt">"buffer_mb"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos">18</span><span class="w">    </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"copy_ 计入读+写两份流量；readonly 用 reduction 近似纯读"</span>
+<span class="linenos">19</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">20</span><span class="w">  </span><span class="nt">"gemm"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">21</span><span class="w">    </span><span class="nt">"bf16"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">22</span><span class="w">      </span><span class="nt">"peak_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">256.0</span><span class="p">,</span>
+<span class="linenos">23</span><span class="w">      </span><span class="nt">"by_size"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">24</span><span class="w">        </span><span class="nt">"4096"</span><span class="p">:</span><span class="w"> </span><span class="mf">256.0</span><span class="p">,</span>
+<span class="linenos">25</span><span class="w">        </span><span class="nt">"8192"</span><span class="p">:</span><span class="w"> </span><span class="mf">199.9</span>
+<span class="linenos">26</span><span class="w">      </span><span class="p">}</span>
+<span class="linenos">27</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">28</span><span class="w">    </span><span class="nt">"fp16"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">29</span><span class="w">      </span><span class="nt">"peak_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">249.2</span><span class="p">,</span>
+<span class="linenos">30</span><span class="w">      </span><span class="nt">"by_size"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">31</span><span class="w">        </span><span class="nt">"4096"</span><span class="p">:</span><span class="w"> </span><span class="mf">249.2</span><span class="p">,</span>
+<span class="linenos">32</span><span class="w">        </span><span class="nt">"8192"</span><span class="p">:</span><span class="w"> </span><span class="mf">177.2</span>
+<span class="linenos">33</span><span class="w">      </span><span class="p">}</span>
+<span class="linenos">34</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">35</span><span class="w">    </span><span class="nt">"fp8_e4m3"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">36</span><span class="w">      </span><span class="nt">"peak_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">417.3</span><span class="p">,</span>
+<span class="linenos">37</span><span class="w">      </span><span class="nt">"by_size"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">38</span><span class="w">        </span><span class="nt">"8192"</span><span class="p">:</span><span class="w"> </span><span class="mf">417.3</span>
+<span class="linenos">39</span><span class="w">      </span><span class="p">}</span>
+<span class="linenos">40</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos">41</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">42</span><span class="w">  </span><span class="nt">"launch_overhead"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">43</span><span class="w">    </span><span class="nt">"n_kernels"</span><span class="p">:</span><span class="w"> </span><span class="mi">500</span><span class="p">,</span>
+<span class="linenos">44</span><span class="w">    </span><span class="nt">"eager_us_per_kernel"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.03</span><span class="p">,</span>
+<span class="linenos">45</span><span class="w">    </span><span class="nt">"graph_us_per_kernel"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.9</span><span class="p">,</span>
+<span class="linenos">46</span><span class="w">    </span><span class="nt">"graph_speedup"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.6</span>
+<span class="linenos">47</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">48</span><span class="w">  </span><span class="nt">"pcie"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">49</span><span class="w">    </span><span class="nt">"h2d_pinned_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">25.0</span><span class="p">,</span>
+<span class="linenos">50</span><span class="w">    </span><span class="nt">"d2h_pinned_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">27.0</span><span class="p">,</span>
+<span class="linenos">51</span><span class="w">    </span><span class="nt">"h2d_pageable_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">20.5</span><span class="p">,</span>
+<span class="linenos">52</span><span class="w">    </span><span class="nt">"buffer_mb"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos">53</span><span class="w">    </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"pageable 需要 driver 先拷到临时 pinned 缓冲，所以更慢——这是 pin_memory 的意义"</span>
+<span class="linenos">54</span><span class="w">  </span><span class="p">}</span>
+<span class="linenos">55</span><span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/worldvln/hw_worldvln_l40s.json 全文（55 行）</code><a href="../code/results/worldvln/hw_worldvln_l40s.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h2 id="_2">这份脚本到底怎样计时</h2>
+<p>prefill 部分调用离线 <code>LLM.generate()</code>，要求只生成一个输出 token，
+再记录整个调用耗时。它包含 prompt 前向、采样和请求处理，
+不是只对 attention 或某个 GPU kernel 计时，也不是从 HTTP 客户端测到的 TTFT。</p>
+<p>decode 部分使用差分。对于同一 batch 大小和初始上下文长度，
+分别测“生成一个 token”和“生成 33 个 token”的调用耗时，
+用差值除以 32，估算额外生成步骤的平均耗时：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>T</mi><mrow><mi>s</mi><mi>t</mi><mi>e</mi><mi>p</mi><mo>&#x0002C;</mo><mi>e</mi><mi>s</mi><mi>t</mi><mi>i</mi><mi>m</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>&#x0003D;</mo><mfrac><mrow><msub><mi>T</mi><mrow><mn>33</mn><mtext>&#x000A0;</mtext><mi>o</mi><mi>u</mi><mi>t</mi><mi>p</mi><mi>u</mi><mi>t</mi><mi>s</mi></mrow></msub><mo>&#x02212;</mo><msub><mi>T</mi><mrow><mn>1</mn><mtext>&#x000A0;</mtext><mi>o</mi><mi>u</mi><mi>t</mi><mi>p</mi><mi>u</mi><mi>t</mi></mrow></msub></mrow><mrow><mn>32</mn></mrow></mfrac></mrow></math></div></p>
+<p>两个调用使用独立生成的随机 prompt。关闭前缀缓存是为了避免后一调用
+因命中前缀而少算一部分输入，但这并不消除所有运行差异。
+另外，生成过程中上下文逐步变长，所以这个差分是多步的平均估计，
+不是固定上下文长度处某一步的直接时间戳。</p>
+<p>已有脚本对每个点预热并重复，最后只保存中位数。
+这种汇总便于读表，但无法让我们在事后重建完整分布或置信区间。
+本章保留这个限制，不把中位数相近写成“严格等价”。</p>
+<details class="fold srcfold"><summary>labs/L0/bench_phases.py 全文（148 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L0 lab · 分相位基准：把 prefill 和 decode 分开测，再跟 roofline 下界比。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">大部分 benchmark 只报一个「吞吐」数字，那没法回答任何问题。</span>
+<span class="linenos">  5</span><span class="sd">本脚本分别测：</span>
+<span class="linenos">  6</span><span class="sd">  A. prefill 时间 vs prompt 长度   → TTFT 的来源，受**算力**限制</span>
+<span class="linenos">  7</span><span class="sd">  B. decode 每步时间 vs batch      → TPOT 的来源，受**带宽**限制</span>
+<span class="linenos">  8</span><span class="sd">  C. 各自达到 roofline 下界的比例  → 差距该去哪一层找</span>
+<span class="linenos">  9</span>
+<span class="linenos"> 10</span><span class="sd">方法学（L0 就要立规矩，M2 会展开）：</span>
+<span class="linenos"> 11</span><span class="sd">  - 预热两次，丢掉（首次含 JIT、显存分配、时钟爬升）</span>
+<span class="linenos"> 12</span><span class="sd">  - 每个点重复 N 次取中位数，不取平均（避免个别抖动主导）</span>
+<span class="linenos"> 13</span><span class="sd">  - 关掉 prefix caching，每次换随机 prompt（否则 prefill 会被缓存命中）</span>
+<span class="linenos"> 14</span><span class="sd">  - 关掉 CUDA Graph（enforce_eager）以隔离变量；graph 的收益单独在 L5.4 测</span>
+<span class="linenos"> 15</span><span class="sd">  - 用差分把 prefill 从 decode 里减掉</span>
+<span class="linenos"> 16</span>
+<span class="linenos"> 17</span><span class="sd">用法：</span>
+<span class="linenos"> 18</span><span class="sd">    python bench_phases.py --model /path --hw results/hw_x.json --out results/bench_x.json</span>
+<span class="linenos"> 19</span><span class="sd">"""</span>
+<span class="linenos"> 20</span>
+<span class="linenos"> 21</span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos"> 22</span>
+<span class="linenos"> 23</span><span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="linenos"> 24</span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos"> 25</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 26</span><span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos"> 27</span><span class="kn">import</span><span class="w"> </span><span class="nn">statistics</span>
+<span class="linenos"> 28</span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos"> 29</span><span class="kn">from</span><span class="w"> </span><span class="nn">datetime</span><span class="w"> </span><span class="kn">import</span> <span class="n">datetime</span><span class="p">,</span> <span class="n">timezone</span>
+<span class="linenos"> 30</span><span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="linenos"> 31</span>
+<span class="linenos"> 32</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_LOGGING_LEVEL"</span><span class="p">,</span> <span class="s2">"ERROR"</span><span class="p">)</span>
+<span class="linenos"> 33</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_ENABLE_V1_MULTIPROCESSING"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
+<span class="linenos"> 34</span>
+<span class="linenos"> 35</span>
+<span class="linenos"> 36</span><span class="k">def</span><span class="w"> </span><span class="nf">load_arch</span><span class="p">(</span><span class="n">model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="linenos"> 37</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 38</span>    <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">parent</span><span class="p">))</span>
+<span class="linenos"> 39</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">ledger</span><span class="w"> </span><span class="kn">import</span> <span class="n">Arch</span><span class="p">,</span> <span class="n">decode_step</span><span class="p">,</span> <span class="n">prefill_flops</span><span class="p">,</span> <span class="n">roofline_tpot_ms</span>  <span class="c1"># noqa: E402</span>
+<span class="linenos"> 40</span>    <span class="n">cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">((</span><span class="n">Path</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"config.json"</span><span class="p">)</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+<span class="linenos"> 41</span>    <span class="k">if</span> <span class="s2">"text_config"</span> <span class="ow">in</span> <span class="n">cfg</span> <span class="ow">and</span> <span class="s2">"hidden_size"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">cfg</span><span class="p">:</span>
+<span class="linenos"> 42</span>        <span class="n">cfg</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"text_config"</span><span class="p">]</span>
+<span class="linenos"> 43</span>    <span class="k">return</span> <span class="n">Arch</span><span class="o">.</span><span class="n">from_hf</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">Path</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span><span class="o">.</span><span class="n">name</span><span class="p">),</span> <span class="n">decode_step</span><span class="p">,</span> <span class="n">prefill_flops</span><span class="p">,</span> <span class="n">roofline_tpot_ms</span>
+<span class="linenos"> 44</span>
+<span class="linenos"> 45</span>
+<span class="linenos"> 46</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos"> 47</span>    <span class="n">ap</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+<span class="linenos"> 48</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--model"</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 49</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--hw"</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s2">"probe_hw.py 的输出，用来算 roofline 下界"</span><span class="p">)</span>
+<span class="linenos"> 50</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--out"</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 51</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--prompt-lens"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"512,1024,2048,4096"</span><span class="p">)</span>
+<span class="linenos"> 52</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--batches"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"1,4,16,32"</span><span class="p">)</span>
+<span class="linenos"> 53</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--decode-steps"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">32</span><span class="p">)</span>
+<span class="linenos"> 54</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--repeats"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+<span class="linenos"> 55</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--ctx-for-decode"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">1024</span><span class="p">)</span>
+<span class="linenos"> 56</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--gpu-frac"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">float</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mf">0.85</span><span class="p">)</span>
+<span class="linenos"> 57</span>    <span class="n">args</span> <span class="o">=</span> <span class="n">ap</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos"> 58</span>
+<span class="linenos"> 59</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 60</span>
+<span class="linenos"> 61</span>    <span class="n">arch</span><span class="p">,</span> <span class="n">decode_step</span><span class="p">,</span> <span class="n">prefill_flops</span><span class="p">,</span> <span class="n">roofline</span> <span class="o">=</span> <span class="n">load_arch</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+<span class="linenos"> 62</span>    <span class="n">hw</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">hw</span><span class="p">)</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+<span class="linenos"> 63</span>    <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">1234</span><span class="p">)</span>
+<span class="linenos"> 64</span>
+<span class="linenos"> 65</span>    <span class="n">prompt_lens</span> <span class="o">=</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">args</span><span class="o">.</span><span class="n">prompt_lens</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">","</span><span class="p">)]</span>
+<span class="linenos"> 66</span>    <span class="n">batches</span> <span class="o">=</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">args</span><span class="o">.</span><span class="n">batches</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">","</span><span class="p">)]</span>
+<span class="linenos"> 67</span>    <span class="n">max_len</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">prompt_lens</span><span class="p">),</span> <span class="n">args</span><span class="o">.</span><span class="n">ctx_for_decode</span><span class="p">)</span> <span class="o">+</span> <span class="n">args</span><span class="o">.</span><span class="n">decode_steps</span> <span class="o">+</span> <span class="mi">16</span>
+<span class="linenos"> 68</span>
+<span class="linenos"> 69</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos"> 70</span>              <span class="n">gpu_memory_utilization</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">gpu_frac</span><span class="p">,</span> <span class="n">max_model_len</span><span class="o">=</span><span class="n">max_len</span><span class="p">,</span>
+<span class="linenos"> 71</span>              <span class="n">disable_log_stats</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">enable_prefix_caching</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos"> 72</span>    <span class="n">tok</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">get_tokenizer</span><span class="p">()</span>
+<span class="linenos"> 73</span>    <span class="n">lo</span><span class="p">,</span> <span class="n">hi</span> <span class="o">=</span> <span class="mi">1000</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="mi">100000</span><span class="p">,</span> <span class="n">tok</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+<span class="linenos"> 74</span>
+<span class="linenos"> 75</span>    <span class="k">def</span><span class="w"> </span><span class="nf">prompts</span><span class="p">(</span><span class="n">n</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">length</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+<span class="linenos"> 76</span><span class="w">        </span><span class="sd">"""每次都是新的随机 token 串——双保险地避开任何前缀复用。"""</span>
+<span class="linenos"> 77</span>        <span class="k">return</span> <span class="p">[{</span><span class="s2">"prompt_token_ids"</span><span class="p">:</span> <span class="p">[</span><span class="n">rng</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="n">lo</span><span class="p">,</span> <span class="n">hi</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">length</span><span class="p">)]}</span>
+<span class="linenos"> 78</span>                <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)]</span>
+<span class="linenos"> 79</span>
+<span class="linenos"> 80</span>    <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">max_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="linenos"> 81</span>        <span class="n">sp</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">max_tokens</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 82</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos"> 83</span>        <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos"> 84</span>        <span class="k">return</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e3</span>
+<span class="linenos"> 85</span>
+<span class="linenos"> 86</span>    <span class="k">def</span><span class="w"> </span><span class="nf">median_of</span><span class="p">(</span><span class="n">fn</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="linenos"> 87</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">):</span>                       <span class="c1"># 预热并丢弃</span>
+<span class="linenos"> 88</span>            <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 89</span>        <span class="k">return</span> <span class="n">statistics</span><span class="o">.</span><span class="n">median</span><span class="p">(</span><span class="n">fn</span><span class="p">()</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">repeats</span><span class="p">))</span>
+<span class="linenos"> 90</span>
+<span class="linenos"> 91</span>    <span class="n">result</span> <span class="o">=</span> <span class="p">{</span>
+<span class="linenos"> 92</span>        <span class="s2">"measured_at"</span><span class="p">:</span> <span class="n">datetime</span><span class="o">.</span><span class="n">now</span><span class="p">(</span><span class="n">timezone</span><span class="o">.</span><span class="n">utc</span><span class="p">)</span><span class="o">.</span><span class="n">astimezone</span><span class="p">()</span><span class="o">.</span><span class="n">isoformat</span><span class="p">(</span><span class="n">timespec</span><span class="o">=</span><span class="s2">"seconds"</span><span class="p">),</span>
+<span class="linenos"> 93</span>        <span class="s2">"host"</span><span class="p">:</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"device"</span><span class="p">][</span><span class="s2">"host"</span><span class="p">],</span> <span class="s2">"gpu"</span><span class="p">:</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"device"</span><span class="p">][</span><span class="s2">"name"</span><span class="p">],</span>
+<span class="linenos"> 94</span>        <span class="s2">"model"</span><span class="p">:</span> <span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="n">name</span><span class="p">,</span>
+<span class="linenos"> 95</span>        <span class="s2">"hw_roofline"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"bw_gbps"</span><span class="p">:</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"memory_bandwidth"</span><span class="p">][</span><span class="s2">"copy_gbps"</span><span class="p">],</span>
+<span class="linenos"> 96</span>                        <span class="s2">"bf16_tflops"</span><span class="p">:</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"gemm"</span><span class="p">][</span><span class="s2">"bf16"</span><span class="p">][</span><span class="s2">"peak_tflops"</span><span class="p">],</span>
+<span class="linenos"> 97</span>                        <span class="s2">"launch_us"</span><span class="p">:</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"launch_overhead"</span><span class="p">][</span><span class="s2">"eager_us_per_kernel"</span><span class="p">]},</span>
+<span class="linenos"> 98</span>        <span class="s2">"config"</span><span class="p">:</span> <span class="nb">vars</span><span class="p">(</span><span class="n">args</span><span class="p">),</span>
+<span class="linenos"> 99</span>    <span class="p">}</span>
+<span class="linenos">100</span>
+<span class="linenos">101</span>    <span class="c1"># ---- A. prefill vs prompt 长度 ----</span>
+<span class="linenos">102</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="s1">'prompt'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'实测ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'下界ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'达标率'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'有效TFLOPS'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">103</span>    <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">104</span>    <span class="k">for</span> <span class="n">L</span> <span class="ow">in</span> <span class="n">prompt_lens</span><span class="p">:</span>
+<span class="linenos">105</span>        <span class="n">ms</span> <span class="o">=</span> <span class="n">median_of</span><span class="p">(</span><span class="k">lambda</span> <span class="n">L</span><span class="o">=</span><span class="n">L</span><span class="p">:</span> <span class="n">run</span><span class="p">(</span><span class="n">prompts</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">L</span><span class="p">),</span> <span class="mi">1</span><span class="p">))</span>
+<span class="linenos">106</span>        <span class="n">pf</span> <span class="o">=</span> <span class="n">prefill_flops</span><span class="p">(</span><span class="n">arch</span><span class="p">,</span> <span class="n">L</span><span class="p">)</span>
+<span class="linenos">107</span>        <span class="n">lb</span> <span class="o">=</span> <span class="n">pf</span><span class="p">[</span><span class="s2">"total"</span><span class="p">]</span> <span class="o">/</span> <span class="p">(</span><span class="n">hw</span><span class="p">[</span><span class="s2">"gemm"</span><span class="p">][</span><span class="s2">"bf16"</span><span class="p">][</span><span class="s2">"peak_tflops"</span><span class="p">]</span> <span class="o">*</span> <span class="mf">1e12</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e3</span>
+<span class="linenos">108</span>        <span class="n">eff</span> <span class="o">=</span> <span class="n">pf</span><span class="p">[</span><span class="s2">"total"</span><span class="p">]</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e12</span>
+<span class="linenos">109</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">L</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ms</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">lb</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">lb</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">ms</span><span class="si">:</span><span class="s2">&gt;6.0%</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">eff</span><span class="si">:</span><span class="s2">&gt;11.1f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">110</span>        <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"prompt_len"</span><span class="p">:</span> <span class="n">L</span><span class="p">,</span> <span class="s2">"ms"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">ms</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="s2">"lower_bound_ms"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">lb</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos">111</span>                     <span class="s2">"frac_of_roofline"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">lb</span> <span class="o">/</span> <span class="n">ms</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span>
+<span class="linenos">112</span>                     <span class="s2">"effective_tflops"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">eff</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos">113</span>                     <span class="s2">"tflop"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">pf</span><span class="p">[</span><span class="s2">"total"</span><span class="p">]</span> <span class="o">/</span> <span class="mf">1e12</span><span class="p">,</span> <span class="mi">3</span><span class="p">)})</span>
+<span class="linenos">114</span>    <span class="n">result</span><span class="p">[</span><span class="s2">"prefill"</span><span class="p">]</span> <span class="o">=</span> <span class="n">rows</span>
+<span class="linenos">115</span>
+<span class="linenos">116</span>    <span class="c1"># ---- B. decode vs batch ----</span>
+<span class="linenos">117</span>    <span class="n">C</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">ctx_for_decode</span>
+<span class="linenos">118</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">上下文 </span><span class="si">{</span><span class="n">C</span><span class="si">}</span><span class="s2">，每条序列生成 </span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">decode_steps</span><span class="si">}</span><span class="s2"> token"</span><span class="p">)</span>
+<span class="linenos">119</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'每步ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'下界ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'达标率'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'tok/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'有效GB/s'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">120</span>    <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">121</span>    <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="n">batches</span><span class="p">:</span>
+<span class="linenos">122</span>        <span class="k">def</span><span class="w"> </span><span class="nf">one</span><span class="p">(</span><span class="n">B</span><span class="o">=</span><span class="n">B</span><span class="p">):</span>
+<span class="linenos">123</span>            <span class="n">ps</span> <span class="o">=</span> <span class="n">prompts</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">C</span><span class="p">)</span>
+<span class="linenos">124</span>            <span class="n">t_pf</span> <span class="o">=</span> <span class="n">run</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="linenos">125</span>            <span class="n">ps2</span> <span class="o">=</span> <span class="n">prompts</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">C</span><span class="p">)</span>
+<span class="linenos">126</span>            <span class="n">t_all</span> <span class="o">=</span> <span class="n">run</span><span class="p">(</span><span class="n">ps2</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">decode_steps</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+<span class="linenos">127</span>            <span class="k">return</span> <span class="p">(</span><span class="n">t_all</span> <span class="o">-</span> <span class="n">t_pf</span><span class="p">)</span> <span class="o">/</span> <span class="n">args</span><span class="o">.</span><span class="n">decode_steps</span>
+<span class="linenos">128</span>        <span class="n">ms</span> <span class="o">=</span> <span class="n">median_of</span><span class="p">(</span><span class="n">one</span><span class="p">)</span>
+<span class="linenos">129</span>        <span class="n">st</span> <span class="o">=</span> <span class="n">decode_step</span><span class="p">(</span><span class="n">arch</span><span class="p">,</span> <span class="n">C</span><span class="p">,</span> <span class="n">B</span><span class="p">)</span>
+<span class="linenos">130</span>        <span class="n">rf</span> <span class="o">=</span> <span class="n">roofline</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">hw</span><span class="p">)</span>
+<span class="linenos">131</span>        <span class="n">tps</span> <span class="o">=</span> <span class="n">B</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span>
+<span class="linenos">132</span>        <span class="n">eff_bw</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"bytes_total"</span><span class="p">]</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
+<span class="linenos">133</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ms</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">rf</span><span class="p">[</span><span class="s1">'t_lower_bound_ms'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">134</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">rf</span><span class="p">[</span><span class="s1">'t_lower_bound_ms'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">ms</span><span class="si">:</span><span class="s2">&gt;6.0%</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tps</span><span class="si">:</span><span class="s2">&gt;9.0f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">eff_bw</span><span class="si">:</span><span class="s2">&gt;10.0f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">135</span>        <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"batch"</span><span class="p">:</span> <span class="n">B</span><span class="p">,</span> <span class="s2">"ms_per_step"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">ms</span><span class="p">,</span> <span class="mi">3</span><span class="p">),</span>
+<span class="linenos">136</span>                     <span class="s2">"lower_bound_ms"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">rf</span><span class="p">[</span><span class="s2">"t_lower_bound_ms"</span><span class="p">],</span> <span class="mi">3</span><span class="p">),</span>
+<span class="linenos">137</span>                     <span class="s2">"frac_of_roofline"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">rf</span><span class="p">[</span><span class="s2">"t_lower_bound_ms"</span><span class="p">]</span> <span class="o">/</span> <span class="n">ms</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span>
+<span class="linenos">138</span>                     <span class="s2">"tokens_per_s"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">tps</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos">139</span>                     <span class="s2">"effective_bw_gbps"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">eff_bw</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos">140</span>                     <span class="s2">"arithmetic_intensity"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s2">"arithmetic_intensity"</span><span class="p">],</span> <span class="mi">2</span><span class="p">)})</span>
+<span class="linenos">141</span>    <span class="n">result</span><span class="p">[</span><span class="s2">"decode"</span><span class="p">]</span> <span class="o">=</span> <span class="n">rows</span>
+<span class="linenos">142</span>
+<span class="linenos">143</span>    <span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">out</span><span class="p">)</span><span class="o">.</span><span class="n">write_text</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span> <span class="n">encoding</span><span class="o">=</span><span class="s2">"utf-8"</span><span class="p">)</span>
+<span class="linenos">144</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">写出 </span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">out</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">145</span>
+<span class="linenos">146</span>
+<span class="linenos">147</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">148</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/bench_phases.py 全文（148 行）</code><a href="../code/labs/L0/bench_phases.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h2 id="prompt">结果一：处理 prompt 的调用耗时</h2>
+<p>下表来自两份历史 JSON。单位为毫秒，每次只有一条请求：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">prompt 长度</th>
+<th style="text-align: right;">RTX 5090 D</th>
+<th style="text-align: right;">L40S</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">512 token</td>
+<td style="text-align: right;">10.85</td>
+<td style="text-align: right;">12.80</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024 token</td>
+<td style="text-align: right;">19.83</td>
+<td style="text-align: right;">19.75</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048 token</td>
+<td style="text-align: right;">36.64</td>
+<td style="text-align: right;">38.85</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096 token</td>
+<td style="text-align: right;">76.91</td>
+<td style="text-align: right;">79.54</td>
+</tr>
+</tbody>
+</table>
+<p>在这些点上，两台机器的耗时较接近。4096-token 点约相差 3.4%。
+这与前面“bf16 GEMM 参照值接近”的观察相容，但还不能证明整段 prefill
+只受 GEMM 算力限制。归一化、attention、KV 写入和 CPU 处理也在该调用中。</p>
+<p>prompt 从 512 增加到 4096 时，耗时并没有简单按八倍增长。
+一个原因是固定开销不会随长度等比例增长；另一方面，
+attention 计算量、矩阵形状和后端选择也可能变化。
+要进一步解释，需要结合 <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 trace，而不是只看这一张总时间表。</p>
+<h2 id="_3">结果二：后续生成步骤的平均耗时估计</h2>
+<p>这一组的初始上下文长度为 1024 token，每条请求额外生成 32 个 token。
+这里的 batch 表示一起处理的请求数量。</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">batch</th>
+<th style="text-align: right;">RTX 5090 D，ms/步</th>
+<th style="text-align: right;">L40S，ms/步</th>
+<th style="text-align: right;">L40S 时间 / 5090 D 时间</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4.483</td>
+<td style="text-align: right;">11.127</td>
+<td style="text-align: right;">约 2.48</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">4.680</td>
+<td style="text-align: right;">11.411</td>
+<td style="text-align: right;">约 2.44</td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">5.850</td>
+<td style="text-align: right;">11.949</td>
+<td style="text-align: right;">约 2.04</td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">6.798</td>
+<td style="text-align: right;">12.624</td>
+<td style="text-align: right;">约 1.86</td>
+</tr>
+</tbody>
+</table>
+<p>先看 batch=1：这一配置下，L40S 每步平均估计耗时约为 5090 D 的 2.48 倍。
+再看 batch=32：两台机器的每步时间都增加了，但每轮同时为更多请求生成 token，
+所以总吞吐也提高了。</p>
+<p>例如，5090 D 在 batch=32 时，一轮约 6.798 ms，为 32 条请求各生成一个 token。
+总吞吐约为 4707 token/s。这个数字不是单条请求的生成速度，
+也不能用它倒数来表示该请求等待一个 token 的时间。</p>
+<p>batch 增大后，时间比从 2.48 缩小到 1.86。
+这说明不能把 batch=1 的比值直接用于所有并发规模。
+<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的权重与 KV 公式可以帮助解释这种变化，
+但具体比例仍要依赖实际执行数据。</p>
+<h2 id="_4">带宽能解释到哪一步</h2>
+<p>两台机器的 copy 带宽之比约为：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>1519.3</mn><mo>&#x0002F;</mo><mn>649.7</mn><mo>&#x02248;</mo><mn>2.34</mn></mrow></math></div></p>
+<p>它与小 batch decode 的时间比 2.48 接近。因此，
+“数据搬运是这个配置下的重要限制”是值得继续检验的解释。</p>
+<p>但不能再往前跳一步，写成“94% 的差异由显存带宽造成，剩余 6% 来自 launch”。
+这两个比值之间的接近程度不是原因的占比。
+完整调用包含多种工作，CPU 提交与 GPU 执行还可能重叠，
+不满足把总时间按带宽缩放、再把余量分配给另一个因素的简单假设。</p>
+<p>更有帮助的下一步，是把候选解释与检查方法对应起来：</p>
+<table>
+<thead>
+<tr>
+<th>候选解释</th>
+<th>需要检查什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主要差异来自权重或 KV 读取</td>
+<td>实际流量、缓存命中，以及改变上下文后的变化</td>
+</tr>
+<tr>
+<td>CPU 提交限制了执行</td>
+<td>同一运行的 CPU/GPU 时间线与等待区间</td>
+</tr>
+<tr>
+<td>两台机器用了不同实现</td>
+<td>attention backend、GEMM kernel 与编译目标</td>
+</tr>
+<tr>
+<td>频率或功耗状态不同</td>
+<td>覆盖被测区间的设备状态记录</td>
+</tr>
+</tbody>
+</table>
+<p>这些检查尚未在本轮重新进行。表的作用是把后续问题说清楚，
+不是把一个尚未证明的解释换成另一套断言。</p>
+<h2 id="_5">如何读代码里的硬件适配</h2>
+<p>相同的 Python 调用不保证两张卡运行完全相同的机器码。
+库可能依据 GPU 架构、dtype、head_dim、可用后端及编译配置选择实现。
+因此需要区分三层身份：上层算子名称、实际 kernel 符号、最终编译目标。</p>
+<p>先在配置与启动日志中找后端选择，再在 trace 中找 kernel 名，
+最后在编译产物中确认目标。kernel 名和缓存目录名能提供线索，
+但不能仅凭一个名字就断言指令、调度和全部执行路径都相同。</p>
+<p>这一阅读方法也适用于环境错误。例如 PTX ISA 版本不被 ptxas 接受时，
+要比较前端生成了哪个版本、后端支持哪个版本，
+而不是笼统地说“CUDA 版本不对”。</p>
+<p>本章原有工具链记录可以作为样本，但修复命令必须按当前独立学习环境重新确认。
+不要修改共享系统的驱动或工具链，也不要为了复现一个数字清理他人的缓存。</p>
+<h3 id="_6">已经观察到的两处差别</h3>
+<p>把上面的方法用在这两台机器上，得到两个具体结果。</p>
+<p><strong>attention 后端：同一个符号，两套机器码。</strong>
+vLLM 的 <code>v1/attention/selector.py</code> 按 compute capability、head_dim、dtype
+以及 FlashInfer 是否可用来选后端。两台机器上都看到了
+<code>flash::flash_fwd_splitkv_kernel</code>，符号名相同；但编译目标不同，
+FlashInfer 的 JIT 缓存目录名把这一点显示了出来：</p>
+<div class="highlight"><pre><span></span><code>crater:    /scratch/learn/.cache/flashinfer/0.6.18/120f/cached_ops/sampling
+worldvln:  /root/.cache/flashinfer/0.6.18/89/cached_ops/sampling
+                                          ^^^^   ^^
+</code></pre></div>
+
+<p><code>120f</code> 指 <code>sm_120f</code>（family-specific），<code>89</code> 指 <code>sm_89</code>。
+这正是前面说的"kernel 名相同不等于执行路径相同"的一个实例。</p>
+<p><strong>GEMM kernel：5090 上跑的是 sm_80 世代的 kernel。</strong>
+<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 trace 在 5090 上看到的是 <code>cutlass_80_tensorop_bf16_s16816gemm_*</code>。
+消费级 Blackwell（sm_120）没有 <code>tcgen05</code> 与 Tensor Memory，
+它的 tensor core 编程模型仍是 Ampere 血统的 <code>mma.sync</code>；
+L40S（sm_89，Ada）同样走 <code>mma.sync</code>。</p>
+<p>这与本章开头的结果相容：<strong>两张卡在 GEMM 上走的是同一条代码路径</strong>，
+所以 bf16 GEMM 参照值接近，prefill 也接近。
+需要注意这是一个相容的解释，不是已证明的唯一原因——
+要确认，还需要按上表的方式逐项检查 kernel 与编译目标。</p>
+<p>sm_120 缺少 <code>tcgen05</code> 这一条本身是可验证的：<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 用一个只含该指令的探针，
+在 <code>sm_100a</code> 上编译通过、在 <code>sm_120a</code> 上被 ptxas 拒绝。
+真正需要 tcgen05、TMEM 与 FP4 的路径，见 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 与 <a class="xref" href="../L4/4.3-quantization.html" title="量化工程">L4.3</a>。</p>
+<h2 id="_7">读这组结果时容易出错的地方</h2>
+<p><strong>1. 只报一个"吞吐"数字。</strong> 吞吐是 prefill 与 decode 的混合结果，
+两者在这两台机器上的表现方向不同。不说明输入长度、batch 与阶段构成的吞吐，
+无法比较。</p>
+<p><strong>2. 用厂商标称参数做归因。</strong> L40S 标称带宽 864 GB/s，本章实测 649.7 GB/s，
+约为标称的 75%。用标称值做分母，会把归因算错。</p>
+<p><strong>3. 把"达标率高"当成"性能好"。</strong> 在 batch=32 上，L40S 达到约 88% 的 roofline 参照，
+5090 D 约 70%，但 5090 D 的每步时间仍然更短。
+达标率衡量的是"离自己的上限有多远"，不是"比别人快多少"。</p>
+<p><strong>4. 忽略持续负载下的降频。</strong> L40S 在 8192 的 GEMM 上比 4096 慢约 22%。
+如果基准只跑一个尺寸、且跑得很短，可能测不到这一项。</p>
+<p><strong>5. 忘了两台机器的软件栈可能不同。</strong> 本章两台都是 vLLM 0.29.0 + torch 2.13.0+cu130，
+这是刻意对齐的结果，不是默认状态。跨机比较前应先记录并核对版本。</p>
+<p><strong>6. 在共享机器上不查占用就开跑。</strong> 显存被别人占用时，引擎可能直接启动失败，
+也可能以更小的 KV 池启动而不报错——后一种情况会安静地改变你的测量条件。</p>
+<h2 id="_8">原始文件与复现入口</h2>
+<p>以下两份文件保存模型快照、参数、prefill 和 decode 汇总。
+先对照其中的 <code>config</code>，再看结果。
+<code>model</code> 字段在这里是快照标识，不要把它误读成模型名称。</p>
+<details class="fold srcfold"><summary>results/crater/bench_crater_5090_qwen3_1.7b.json 全文（94 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="p">{</span>
+<span class="linenos"> 2</span><span class="w">  </span><span class="nt">"measured_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-09T17:13:52+00:00"</span><span class="p">,</span>
+<span class="linenos"> 3</span><span class="w">  </span><span class="nt">"host"</span><span class="p">:</span><span class="w"> </span><span class="s2">"sg-admin-260624-2348f-default0-0"</span><span class="p">,</span>
+<span class="linenos"> 4</span><span class="w">  </span><span class="nt">"gpu"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA GeForce RTX 5090 D"</span><span class="p">,</span>
+<span class="linenos"> 5</span><span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"</span><span class="p">,</span>
+<span class="linenos"> 6</span><span class="w">  </span><span class="nt">"hw_roofline"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 7</span><span class="w">    </span><span class="nt">"bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">1519.3</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="w">    </span><span class="nt">"bf16_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">232.0</span><span class="p">,</span>
+<span class="linenos"> 9</span><span class="w">    </span><span class="nt">"launch_us"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.68</span>
+<span class="linenos">10</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">11</span><span class="w">  </span><span class="nt">"config"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">12</span><span class="w">    </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/scratch/learn/models/hf/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"</span><span class="p">,</span>
+<span class="linenos">13</span><span class="w">    </span><span class="nt">"hw"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/scratch/learn/results/hw_crater_5090.json"</span><span class="p">,</span>
+<span class="linenos">14</span><span class="w">    </span><span class="nt">"out"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/scratch/learn/results/bench_crater_5090_qwen3_1.7b.json"</span><span class="p">,</span>
+<span class="linenos">15</span><span class="w">    </span><span class="nt">"prompt_lens"</span><span class="p">:</span><span class="w"> </span><span class="s2">"512,1024,2048,4096"</span><span class="p">,</span>
+<span class="linenos">16</span><span class="w">    </span><span class="nt">"batches"</span><span class="p">:</span><span class="w"> </span><span class="s2">"1,4,16,32"</span><span class="p">,</span>
+<span class="linenos">17</span><span class="w">    </span><span class="nt">"decode_steps"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="linenos">18</span><span class="w">    </span><span class="nt">"repeats"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="linenos">19</span><span class="w">    </span><span class="nt">"ctx_for_decode"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos">20</span><span class="w">    </span><span class="nt">"gpu_frac"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.85</span>
+<span class="linenos">21</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">22</span><span class="w">  </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos">23</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">24</span><span class="w">      </span><span class="nt">"prompt_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos">25</span><span class="w">      </span><span class="nt">"ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">10.85</span><span class="p">,</span>
+<span class="linenos">26</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.35</span><span class="p">,</span>
+<span class="linenos">27</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5856</span><span class="p">,</span>
+<span class="linenos">28</span><span class="w">      </span><span class="nt">"effective_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">135.9</span><span class="p">,</span>
+<span class="linenos">29</span><span class="w">      </span><span class="nt">"tflop"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.474</span>
+<span class="linenos">30</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">31</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">32</span><span class="w">      </span><span class="nt">"prompt_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos">33</span><span class="w">      </span><span class="nt">"ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">19.83</span><span class="p">,</span>
+<span class="linenos">34</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">12.96</span><span class="p">,</span>
+<span class="linenos">35</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.6535</span><span class="p">,</span>
+<span class="linenos">36</span><span class="w">      </span><span class="nt">"effective_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">151.6</span><span class="p">,</span>
+<span class="linenos">37</span><span class="w">      </span><span class="nt">"tflop"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.007</span>
+<span class="linenos">38</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">39</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">40</span><span class="w">      </span><span class="nt">"prompt_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="linenos">41</span><span class="w">      </span><span class="nt">"ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">36.64</span><span class="p">,</span>
+<span class="linenos">42</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">26.96</span><span class="p">,</span>
+<span class="linenos">43</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.7358</span><span class="p">,</span>
+<span class="linenos">44</span><span class="w">      </span><span class="nt">"effective_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">170.7</span><span class="p">,</span>
+<span class="linenos">45</span><span class="w">      </span><span class="nt">"tflop"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.254</span>
+<span class="linenos">46</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">47</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">48</span><span class="w">      </span><span class="nt">"prompt_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos">49</span><span class="w">      </span><span class="nt">"ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">76.91</span><span class="p">,</span>
+<span class="linenos">50</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">58.06</span><span class="p">,</span>
+<span class="linenos">51</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.7549</span><span class="p">,</span>
+<span class="linenos">52</span><span class="w">      </span><span class="nt">"effective_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">175.1</span><span class="p">,</span>
+<span class="linenos">53</span><span class="w">      </span><span class="nt">"tflop"</span><span class="p">:</span><span class="w"> </span><span class="mf">13.47</span>
+<span class="linenos">54</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos">55</span><span class="w">  </span><span class="p">],</span>
+<span class="linenos">56</span><span class="w">  </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos">57</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">58</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos">59</span><span class="w">      </span><span class="nt">"ms_per_step"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.483</span><span class="p">,</span>
+<span class="linenos">60</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.342</span><span class="p">,</span>
+<span class="linenos">61</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5225</span><span class="p">,</span>
+<span class="linenos">62</span><span class="w">      </span><span class="nt">"tokens_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">223.1</span><span class="p">,</span>
+<span class="linenos">63</span><span class="w">      </span><span class="nt">"effective_bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">793.8</span><span class="p">,</span>
+<span class="linenos">64</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.03</span>
+<span class="linenos">65</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">66</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">67</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos">68</span><span class="w">      </span><span class="nt">"ms_per_step"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.68</span><span class="p">,</span>
+<span class="linenos">69</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.574</span><span class="p">,</span>
+<span class="linenos">70</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5501</span><span class="p">,</span>
+<span class="linenos">71</span><span class="w">      </span><span class="nt">"tokens_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">854.8</span><span class="p">,</span>
+<span class="linenos">72</span><span class="w">      </span><span class="nt">"effective_bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">835.7</span><span class="p">,</span>
+<span class="linenos">73</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.76</span>
+<span class="linenos">74</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">75</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">76</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="linenos">77</span><span class="w">      </span><span class="nt">"ms_per_step"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.85</span><span class="p">,</span>
+<span class="linenos">78</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.502</span><span class="p">,</span>
+<span class="linenos">79</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5986</span><span class="p">,</span>
+<span class="linenos">80</span><span class="w">      </span><span class="nt">"tokens_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">2735.3</span><span class="p">,</span>
+<span class="linenos">81</span><span class="w">      </span><span class="nt">"effective_bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">909.5</span><span class="p">,</span>
+<span class="linenos">82</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.06</span>
+<span class="linenos">83</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">84</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">85</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="linenos">86</span><span class="w">      </span><span class="nt">"ms_per_step"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.798</span><span class="p">,</span>
+<span class="linenos">87</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.738</span><span class="p">,</span>
+<span class="linenos">88</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.697</span><span class="p">,</span>
+<span class="linenos">89</span><span class="w">      </span><span class="nt">"tokens_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">4707.1</span><span class="p">,</span>
+<span class="linenos">90</span><span class="w">      </span><span class="nt">"effective_bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">1059.0</span><span class="p">,</span>
+<span class="linenos">91</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">16.34</span>
+<span class="linenos">92</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos">93</span><span class="w">  </span><span class="p">]</span>
+<span class="linenos">94</span><span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/bench_crater_5090_qwen3_1.7b.json 全文（94 行）</code><a href="../code/results/crater/bench_crater_5090_qwen3_1.7b.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/worldvln/bench_worldvln_l40s_qwen3_1.7b.json 全文（94 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="p">{</span>
+<span class="linenos"> 2</span><span class="w">  </span><span class="nt">"measured_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-09T17:22:29+00:00"</span><span class="p">,</span>
+<span class="linenos"> 3</span><span class="w">  </span><span class="nt">"host"</span><span class="p">:</span><span class="w"> </span><span class="s2">"worldvln"</span><span class="p">,</span>
+<span class="linenos"> 4</span><span class="w">  </span><span class="nt">"gpu"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA L40S"</span><span class="p">,</span>
+<span class="linenos"> 5</span><span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"</span><span class="p">,</span>
+<span class="linenos"> 6</span><span class="w">  </span><span class="nt">"hw_roofline"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 7</span><span class="w">    </span><span class="nt">"bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">649.7</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="w">    </span><span class="nt">"bf16_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">256.0</span><span class="p">,</span>
+<span class="linenos"> 9</span><span class="w">    </span><span class="nt">"launch_us"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.03</span>
+<span class="linenos">10</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">11</span><span class="w">  </span><span class="nt">"config"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">12</span><span class="w">    </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/root/learn/models/hf/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"</span><span class="p">,</span>
+<span class="linenos">13</span><span class="w">    </span><span class="nt">"hw"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/root/learn/results/hw_worldvln_l40s.json"</span><span class="p">,</span>
+<span class="linenos">14</span><span class="w">    </span><span class="nt">"out"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/root/learn/results/bench_worldvln_l40s_qwen3_1.7b.json"</span><span class="p">,</span>
+<span class="linenos">15</span><span class="w">    </span><span class="nt">"prompt_lens"</span><span class="p">:</span><span class="w"> </span><span class="s2">"512,1024,2048,4096"</span><span class="p">,</span>
+<span class="linenos">16</span><span class="w">    </span><span class="nt">"batches"</span><span class="p">:</span><span class="w"> </span><span class="s2">"1,4,16,32"</span><span class="p">,</span>
+<span class="linenos">17</span><span class="w">    </span><span class="nt">"decode_steps"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="linenos">18</span><span class="w">    </span><span class="nt">"repeats"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="linenos">19</span><span class="w">    </span><span class="nt">"ctx_for_decode"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos">20</span><span class="w">    </span><span class="nt">"gpu_frac"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.85</span>
+<span class="linenos">21</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos">22</span><span class="w">  </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos">23</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">24</span><span class="w">      </span><span class="nt">"prompt_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos">25</span><span class="w">      </span><span class="nt">"ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">12.8</span><span class="p">,</span>
+<span class="linenos">26</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.76</span><span class="p">,</span>
+<span class="linenos">27</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.4498</span><span class="p">,</span>
+<span class="linenos">28</span><span class="w">      </span><span class="nt">"effective_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">115.1</span><span class="p">,</span>
+<span class="linenos">29</span><span class="w">      </span><span class="nt">"tflop"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.474</span>
+<span class="linenos">30</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">31</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">32</span><span class="w">      </span><span class="nt">"prompt_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos">33</span><span class="w">      </span><span class="nt">"ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">19.75</span><span class="p">,</span>
+<span class="linenos">34</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.75</span><span class="p">,</span>
+<span class="linenos">35</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5947</span><span class="p">,</span>
+<span class="linenos">36</span><span class="w">      </span><span class="nt">"effective_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">152.2</span><span class="p">,</span>
+<span class="linenos">37</span><span class="w">      </span><span class="nt">"tflop"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.007</span>
+<span class="linenos">38</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">39</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">40</span><span class="w">      </span><span class="nt">"prompt_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="linenos">41</span><span class="w">      </span><span class="nt">"ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">38.85</span><span class="p">,</span>
+<span class="linenos">42</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">24.43</span><span class="p">,</span>
+<span class="linenos">43</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.6289</span><span class="p">,</span>
+<span class="linenos">44</span><span class="w">      </span><span class="nt">"effective_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">161.0</span><span class="p">,</span>
+<span class="linenos">45</span><span class="w">      </span><span class="nt">"tflop"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.254</span>
+<span class="linenos">46</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">47</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">48</span><span class="w">      </span><span class="nt">"prompt_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos">49</span><span class="w">      </span><span class="nt">"ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">79.54</span><span class="p">,</span>
+<span class="linenos">50</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">52.62</span><span class="p">,</span>
+<span class="linenos">51</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.6615</span><span class="p">,</span>
+<span class="linenos">52</span><span class="w">      </span><span class="nt">"effective_tflops"</span><span class="p">:</span><span class="w"> </span><span class="mf">169.3</span><span class="p">,</span>
+<span class="linenos">53</span><span class="w">      </span><span class="nt">"tflop"</span><span class="p">:</span><span class="w"> </span><span class="mf">13.47</span>
+<span class="linenos">54</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos">55</span><span class="w">  </span><span class="p">],</span>
+<span class="linenos">56</span><span class="w">  </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos">57</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">58</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos">59</span><span class="w">      </span><span class="nt">"ms_per_step"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.127</span><span class="p">,</span>
+<span class="linenos">60</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.477</span><span class="p">,</span>
+<span class="linenos">61</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.4922</span><span class="p">,</span>
+<span class="linenos">62</span><span class="w">      </span><span class="nt">"tokens_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">89.9</span><span class="p">,</span>
+<span class="linenos">63</span><span class="w">      </span><span class="nt">"effective_bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">319.8</span><span class="p">,</span>
+<span class="linenos">64</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.03</span>
+<span class="linenos">65</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">66</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">67</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos">68</span><span class="w">      </span><span class="nt">"ms_per_step"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.411</span><span class="p">,</span>
+<span class="linenos">69</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.019</span><span class="p">,</span>
+<span class="linenos">70</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5275</span><span class="p">,</span>
+<span class="linenos">71</span><span class="w">      </span><span class="nt">"tokens_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">350.5</span><span class="p">,</span>
+<span class="linenos">72</span><span class="w">      </span><span class="nt">"effective_bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">342.7</span><span class="p">,</span>
+<span class="linenos">73</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.76</span>
+<span class="linenos">74</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">75</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">76</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="linenos">77</span><span class="w">      </span><span class="nt">"ms_per_step"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.949</span><span class="p">,</span>
+<span class="linenos">78</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">8.188</span><span class="p">,</span>
+<span class="linenos">79</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.6853</span><span class="p">,</span>
+<span class="linenos">80</span><span class="w">      </span><span class="nt">"tokens_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">1339.1</span><span class="p">,</span>
+<span class="linenos">81</span><span class="w">      </span><span class="nt">"effective_bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">445.2</span><span class="p">,</span>
+<span class="linenos">82</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.06</span>
+<span class="linenos">83</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos">84</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos">85</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="linenos">86</span><span class="w">      </span><span class="nt">"ms_per_step"</span><span class="p">:</span><span class="w"> </span><span class="mf">12.624</span><span class="p">,</span>
+<span class="linenos">87</span><span class="w">      </span><span class="nt">"lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.08</span><span class="p">,</span>
+<span class="linenos">88</span><span class="w">      </span><span class="nt">"frac_of_roofline"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.8777</span><span class="p">,</span>
+<span class="linenos">89</span><span class="w">      </span><span class="nt">"tokens_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">2534.8</span><span class="p">,</span>
+<span class="linenos">90</span><span class="w">      </span><span class="nt">"effective_bw_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">570.3</span><span class="p">,</span>
+<span class="linenos">91</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">16.34</span>
+<span class="linenos">92</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos">93</span><span class="w">  </span><span class="p">]</span>
+<span class="linenos">94</span><span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/worldvln/bench_worldvln_l40s_qwen3_1.7b.json 全文（94 行）</code><a href="../code/results/worldvln/bench_worldvln_l40s_qwen3_1.7b.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p>复现前还应确认：模型和 tokenizer 快照、引擎版本、eager/graph 配置、
+prefix cache 开关、GPU 占用、实际输入输出长度，以及日志是否保留。</p>
+<p>如果重新设计实验，建议保存每次调用的耗时和运行顺序，
+而不只保留中位数。按合适的粒度交错配置，可以减少温度、
+频率或背景负载随时间变化带来的偏差。失败调用也需要保留，
+不能只统计成功且较快的调用。</p>
+<p>本轮未运行新实验。已有命令参数可以通过脚本的 <code>--help</code> 查看；
+只有在学习环境与机器授权确认后，才应启动 GPU 工作。</p>
+<h2 id="_9">如何把结果用于选择配置</h2>
+<p>这组数据支持比较“当前小模型、当前长度与 batch 下”的表现，
+不支持直接给 GPU 做采购排名。
+更多显存可能允许更大模型或更多缓存，但并不自动意味着更低的请求延迟；
+某个小 batch 更快，也不自动意味着特定 SLO 下的服务成本更低。</p>
+<p>如果考虑 PD 分离，把 prefill 和 decode 放到不同节点，
+还要加入 KV 传输、排队和路由成本。单机两个阶段各自较快，
+不能保证拆开之后端到端更快。<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span> 应把这些成本一起测量。</p>
+<h2 id="_10">自测与练习</h2>
+<details>
+<summary>两张卡在 4096-token prefill 上相差 3.4%，能否宣布性能相同？</summary>
+<p>不能。这里报告的是已有中位数，缺少完整样本和预先确定的等价范围。
+可以说“这组记录中的耗时接近”，但不能由此证明等价。</p>
+</details>
+<details>
+<summary>batch=32 的总吞吐很高，为什么单条请求仍可能更慢？</summary>
+<p>一轮同时产出的 token 更多，但该轮本身也可能更长。
+总吞吐除以请求数之后才与单请求平均生成速率有关；
+实际服务中还要考虑排队及请求长度不一致。</p>
+</details>
+<details>
+<summary>改变 prefix cache 开关后速度提高，是否说明 kernel 更快？</summary>
+<p>不一定。缓存命中可能使模型少处理一些输入 token，
+这是工作量减少，不是同样工作量下 kernel 变快。
+必须同时记录命中量和实际处理的 token 数。</p>
+</details>
+<p>只用已有 JSON 也能做一个练习：逐行算出两台机器的时间比，
+再算 batch 增大时各自的吞吐变化。为每个结论写出适用的模型、长度和执行配置。
+这个练习的目标不是多算几个小数位，而是避免把一个局部结果扩大成通用结论。</p></article><nav class="pagenav"><a class="nav-prev" href="../L0/0.2-resource-ledger.html">&#8592; 0.2 资源账本：字节、FLOP 与 roofline</a><a class="nav-next" href="../L0/0.4-text-to-tensor.html">0.4 文本闭环（上）：从 Unicode 字节到模型输入张量 &#8594;</a></nav>
+</main>
+</body>
+</html>

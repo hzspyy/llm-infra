@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.0 最小完整模型（上）：张量、矩阵乘与一次生成</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">0.0</div>
+  <div class="sidebar-title">最小完整模型（上）：张量、矩阵乘与一次生成</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一次前向的形状变化</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#_4">一、「模型」是一张参数表加一段代码</a></li>
+<li><a href="#embedding">二、从字符到向量：embedding 是一次查表</a></li>
+<li><a href="#_5">三、注意力：三步，每一步都能打印</a></li>
+<li><a href="#zzmath20zz">四、为什么要除以 </a></li>
+<li><a href="#logits-token">五、从 logits 到概率，再到一个 token</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 源码走读：同样五行在真实模型里</a></li>
+<li><a href="#_7">工程实现 · 自己写一遍</a><ul>
+<li><a href="#_8">完整源码</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_9">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L0 · 坐标系</div>
+  <div class="mod-id">0.0</div>
+  <h1>最小完整模型（上）：张量、矩阵乘与一次生成</h1>
+  <p class="lede">一个 2 层、词表 64 的玩具语言模型，参数全部手写并打印。讲清 tensor / 矩阵乘 / softmax 与概率 / 采样，走完一次 forward 到下一个 token。后面每一层都回到这个模型。</p>
+  <div class="chips"><span class="chip">实测机器 本机 CPU（macOS, torch 2.14.0）· 源码核对：crater 上的 vLLM 0.29.0 / transformers</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 无。这是全书第一章。</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>一个「模型」在内存里到底是什么？</li>
+<li>从一串字符到下一个字符的概率，中间经过哪些张量？每一步的形状怎么变？</li>
+<li>softmax 出来的那串数，在什么意义上是概率？</li>
+</ol>
+<p>后面每一层——L2 的 kernel、L4 的模型解剖、L7 的训练——都会回到本章这个模型。
+它只有 26,560 个参数，跑在 CPU 上，几分钟能读完，但结构和 Qwen3、Llama 属于同一族。</p>
+<p>先约定三个词，本书全程这么用：</p>
+<ul>
+<li><strong>张量（tensor）</strong>：一个多维数组，加上它的形状（shape）与元素类型（dtype）。
+  一维是向量，二维是矩阵，更高维就直接叫张量。</li>
+<li><strong>token</strong>：模型处理的最小单位。本章用「一个字符 = 一个 token」，
+  真实模型用 BPE 切分（<a class="xref" href="../L0/0.4-text-to-tensor.html" title="文本闭环（上）：从 Unicode 字节到模型输入张量">L0.4</a> 展开）。</li>
+<li><strong>logits</strong>：模型最后输出的一串实数，每个词表项一个。它还不是概率，
+  要经过 softmax 才是。</li>
+</ul>
+<hr />
+<h2 id="_2">心智模型：一次前向的形状变化</h2>
+<figure>
+<svg viewBox="0 0 740 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="最小模型的一次前向">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">输入「风吹过山谷」，走完一次前向（本机实测的真实形状）</text>
+
+    <g font-size="10.5">
+      <text x="12" y="44" font-weight="600">阶段</text>
+      <text x="180" y="44" font-weight="600">张量形状</text>
+      <text x="330" y="44" font-weight="600">这一步做了什么</text>
+      <line x1="12" y1="52" x2="728" y2="52" stroke="currentColor" stroke-width="1" opacity="0.35"/>
+
+      <text x="12" y="72">字符串</text>
+      <text x="180" y="72" font-family="ui-monospace,monospace">'风吹过山谷'</text>
+      <text x="330" y="72">5 个字符</text>
+
+      <text x="12" y="94">token id</text>
+      <text x="180" y="94" font-family="ui-monospace,monospace">[1, 5]  int64</text>
+      <text x="330" y="94">查词表：'风'→16，'吹'→6 …</text>
+
+      <text x="12" y="116">embedding</text>
+      <text x="180" y="116" font-family="ui-monospace,monospace">[1, 5, 32]  fp32</text>
+      <text x="330" y="116">每个 id 查出一个 32 维向量，再加位置向量</text>
+
+      <text x="12" y="138">Q / K / V</text>
+      <text x="180" y="138" font-family="ui-monospace,monospace">[1, 4, 5, 8]  ×3</text>
+      <text x="330" y="138">一次线性层出 96 维，切三份，再拆成 4 个头 × 8 维</text>
+
+      <text x="12" y="160">注意力矩阵</text>
+      <text x="180" y="160" font-family="ui-monospace,monospace">[1, 4, 5, 5]</text>
+      <text x="330" y="160">每对位置一个权重；掩码后每行只有前 t+1 项非零</text>
+
+      <text x="12" y="182">注意力输出</text>
+      <text x="180" y="182" font-family="ui-monospace,monospace">[1, 5, 32]</text>
+      <text x="330" y="182">按权重取 V 的加权和，合头，再过一个线性层</text>
+
+      <text x="12" y="204">MLP 中间</text>
+      <text x="180" y="204" font-family="ui-monospace,monospace">[1, 5, 128]</text>
+      <text x="330" y="204">升到 4 倍宽，过激活函数，再降回来</text>
+
+      <text x="12" y="226">logits</text>
+      <text x="180" y="226" font-family="ui-monospace,monospace">[1, 5, 18]</text>
+      <text x="330" y="226">最后一维 = 词表大小，每个词表项一个分数</text>
+
+      <text x="12" y="248">概率</text>
+      <text x="180" y="248" font-family="ui-monospace,monospace">[18]</text>
+      <text x="330" y="248">只取最后一个位置，softmax 成一个分布</text>
+      <line x1="12" y1="258" x2="728" y2="258" stroke="currentColor" stroke-width="1" opacity="0.35"/>
+    </g>
+
+    <text x="12" y="282" font-size="12" font-weight="600">两件贯穿全书的事</text>
+    <g font-size="10.5">
+      <text x="24" y="304">1. 第一维 <tspan font-family="ui-monospace,monospace">B</tspan> 是 batch，第二维 <tspan font-family="ui-monospace,monospace">T</tspan> 是序列长度，最后一维是特征维。</text>
+      <text x="40" y="322">中间各层只在最后一维上变换，<tspan font-family="ui-monospace,monospace">B</tspan> 和 <tspan font-family="ui-monospace,monospace">T</tspan> 一路不变——直到 lm_head 把特征维换成词表维。</text>
+      <text x="24" y="348">2. 一次前向对 <tspan font-family="ui-monospace,monospace">T</tspan> 个位置同时算出了预测，但生成时只用最后一个。</text>
+      <text x="40" y="366">前 <tspan font-family="ui-monospace,monospace">T-1</tspan> 个位置的结果在生成时被丢掉，在训练时全部用上（L0.0b）。</text>
+    </g>
+
+    <line x1="12" y1="382" x2="728" y2="382" stroke="currentColor" stroke-width="1" opacity="0.35"/>
+    <text x="12" y="404" font-size="10.5">参数总量 26,560 个 fp32 = 103.8 KiB。真实模型是同样的结构乘以更大的 d_model 与更多的层。</text>
+  </g>
+</svg>
+<figcaption>一次前向的形状变化。所有形状取自本机实测输出，见「原始现场」。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="_4">一、「模型」是一张参数表加一段代码</h3>
+<p>先回答第一个问题。把模型的所有参数列出来，它就是这个样子：</p>
+<div class="highlight"><pre><span></span><code>参数名                          形状                      元素数
+tok_emb.weight               (18, 32)                576
+pos_emb.weight               (16, 32)                512
+blocks.0.ln1.weight          (32,)                    32
+blocks.0.ln1.bias            (32,)                    32
+blocks.0.attn.qkv.weight     (96, 32)              3,072
+blocks.0.attn.proj.weight    (32, 32)              1,024
+blocks.0.ln2.weight          (32,)                    32
+blocks.0.ln2.bias            (32,)                    32
+blocks.0.mlp.fc1.weight      (128, 32)             4,096
+blocks.0.mlp.fc2.weight      (32, 128)             4,096
+blocks.1.…                   （与 blocks.0 完全相同的一组）
+ln_f.weight                  (32,)                    32
+ln_f.bias                    (32,)                    32
+lm_head.weight               (18, 32)                576
+合计                                                26,560  (103.8 KiB @ fp32)
+</code></pre></div>
+
+<p><strong>模型 = 这张表里的所有数字，加上一段决定它们怎么相乘的代码。</strong> 没有别的东西。</p>
+<p>几个可以立刻验证的观察：</p>
+<ul>
+<li><code>blocks.0</code> 和 <code>blocks.1</code> 的参数名、形状<strong>完全一样</strong>。Transformer 是同一种层堆叠 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math></span> 次，
+  每层参数独立。所以参数量大致随层数线性增长。</li>
+<li>一层里参数最多的是 MLP：<code>fc1</code> + <code>fc2</code> = 8,192，是注意力部分（3,072 + 1,024 = 4,096）的两倍。
+  这个 2:1 的比例在真实模型里也大致成立，因为 MLP 的中间维取 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4</mn><mi>d</mi></mrow></math></span>。</li>
+<li><code>tok_emb.weight</code> 和 <code>lm_head.weight</code> 形状相同，都是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>V</mi><mo>&#x0002C;</mo><mi>d</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>。
+  很多模型让它们<strong>共享同一块内存</strong>（weight tying），本章没有共享，
+  <a class="xref" href="../L4/4.0-checkpoint-format.html" title="模型文件到底是什么：safetensors 字节布局与加载路径">L4.0</a> 会在真实 checkpoint 里看到这两种情况。</li>
+</ul>
+<p>参数量的粗略公式（忽略 LayerNorm 和 bias 这些小项）：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>N</mi><mo>&#x02248;</mo><munder><munder><mrow><mn>2</mn><mi>V</mi><mi>d</mi></mrow><mo>&#x23DF;</mo></munder><mrow><mtext>两个&#x000A0;embedding</mtext></mrow></munder><mo>&#x0002B;</mo><mi>L</mi><mo>&#x000B7;</mo><munder><munder><mrow><mo stretchy="false">&#x00028;</mo><mn>4</mn><msup><mi>d</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>8</mn><msup><mi>d</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow><mo>&#x23DF;</mo></munder><mrow><mtext>每层注意力&#x000A0;+&#x000A0;MLP</mtext></mrow></munder></mrow></math></div></p>
+<p>代入本章的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi><mo>&#x0003D;</mo><mn>18</mn><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mi>d</mi><mo>&#x0003D;</mo><mn>32</mn><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mi>L</mi><mo>&#x0003D;</mo><mn>2</mn></mrow></math></span>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>18</mn><mo>&#x000D7;</mo><mn>32</mn><mo>&#x0002B;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>12</mn><mo>&#x000D7;</mo><msup><mn>32</mn><mn>2</mn></msup><mo>&#x0003D;</mo><mn>1152</mn><mo>&#x0002B;</mo><mn>24576</mn><mo>&#x0003D;</mo><mn>25728</mn></mrow></math></span>，
+与实测 26,560 相差的 832 就是 LayerNorm 的权重与偏置、以及 <code>pos_emb</code> 与 <code>tok_emb</code> 的行数差异。
+<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 会用同一个公式算 Qwen3-1.7B 的账。</p>
+<h3 id="embedding">二、从字符到向量：embedding 是一次查表</h3>
+<div class="highlight"><pre><span></span><code><span class="n">tok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tok_emb</span><span class="p">(</span><span class="n">idx</span><span class="p">)</span>          <span class="c1"># idx: [B, T] int64  -&gt;  tok: [B, T, C] fp32</span>
+</code></pre></div>
+
+<p><code>nn.Embedding</code> 听起来像一个操作，实际上就是<strong>按行取矩阵</strong>。实测验证：</p>
+<div class="highlight"><pre><span></span><code>文本   '风吹过山谷'
+id     [16, 6, 14, 8, 12]
+验证 tok_emb[0,0] == tok_emb.weight[16] : True
+</code></pre></div>
+
+<p>第 0 个位置的向量，就是权重矩阵的第 16 行。没有乘法。</p>
+<p>这有两个工程后果，后面会反复遇到：</p>
+<ul>
+<li>embedding 是<strong>访存密集</strong>的，不是计算密集的。它在 roofline 图上落在带宽那一侧（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a>）。</li>
+<li>词表越大，这张表越大。<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi><mo>&#x0003D;</mo><mn>150</mn><mrow><mo>&#x0002C;</mo></mrow><mn>000</mn><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mi>d</mi><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span> 的模型，
+  光 embedding 就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>150000</mn><mo>&#x000D7;</mo><mn>4096</mn><mo>&#x000D7;</mo><mn>2</mn><mtext>&#x000A0;</mtext><mtext>B</mtext><mo>&#x02248;</mo><mn>1.2</mn></mrow></math></span> GB（bf16）。</li>
+</ul>
+<p>位置信息是另一张表，按位置下标查：</p>
+<div class="highlight"><pre><span></span><code><span class="n">pos</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pos_emb</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">T</span><span class="p">))</span>   <span class="c1"># [T, C]</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">tok</span> <span class="o">+</span> <span class="n">pos</span>                          <span class="c1"># 广播相加 -&gt; [B, T, C]</span>
+</code></pre></div>
+
+<p><strong>为什么需要它</strong>：注意力算的是「查询与每个键的相似度」，
+这个运算对输入的顺序是不敏感的。不加位置信息，模型分不清「风吹」和「吹风」。
+本章第 [B] 组消融实验直接验证了这一点，见下文。</p>
+<h3 id="_5">三、注意力：三步，每一步都能打印</h3>
+<p>注意力回答的问题是：<strong>为了预测位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 的下一个 token，前面各个位置各应该占多大权重？</strong></p>
+<p>第一步，从同一个输入算出三样东西：</p>
+<div class="highlight"><pre><span></span><code><span class="n">qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>                <span class="c1"># [B, T, 3C]，一次线性层</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">qkv</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">C</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>    <span class="c1"># 各 [B, T, C]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Q（query，查询）</strong>：当前位置「想找什么」</li>
+<li><strong>K（key，键）</strong>：每个位置「能提供什么」</li>
+<li><strong>V（value，值）</strong>：每个位置「实际给出什么内容」</li>
+</ul>
+<p>第二步，拆头。把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi></mrow></math></span> 维拆成 <code>n_head</code> 组，每组 <code>d_head</code> 维，各算各的：</p>
+<div class="highlight"><pre><span></span><code><span class="n">q</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>   <span class="c1"># [B, nh, T, hd]</span>
+</code></pre></div>
+
+<p>实测形状：<code>[1, 4, 5, 8]</code>，即 batch 1、4 个头、5 个位置、每头 8 维。
+多头的作用是让不同的头关注不同的模式，代价只是把一个大矩阵乘拆成几个小的。</p>
+<div class="admonition note">
+<p class="admonition-title">transpose 之后张量不再连续</p>
+<p>实测输出里，<code>q</code> 这一行写着 <code>contig=否</code>。<code>transpose(1, 2)</code> 没有搬动任何字节，
+它只是改了描述这块内存怎么读的元信息（stride）。</p>
+<p>这件事在 <a class="xref" href="../L2/2.0-tensor-and-framework.html" title="框架内部：storage、stride、view 与 dispatcher">L2.0</a> 展开——它是理解 PyTorch 内存布局的入口，
+也解释了为什么代码里接着有一句 <code>.contiguous()</code>。</p>
+</div>
+<p>第三步，算权重并加权求和：</p>
+<div class="highlight"><pre><span></span><code><span class="n">att</span> <span class="o">=</span> <span class="n">q</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>                    <span class="c1"># [B, nh, T, T]</span>
+<span class="n">att</span> <span class="o">=</span> <span class="n">att</span> <span class="o">/</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span>               <span class="c1"># 缩放</span>
+<span class="n">att</span> <span class="o">=</span> <span class="n">att</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">mask</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:</span><span class="n">T</span><span class="p">,</span> <span class="p">:</span><span class="n">T</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>   <span class="c1"># 因果掩码</span>
+<span class="n">att</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">att</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>                     <span class="c1"># 每行归一化成概率</span>
+<span class="n">out</span> <span class="o">=</span> <span class="n">att</span> <span class="o">@</span> <span class="n">v</span>                                    <span class="c1"># [B, nh, T, hd]</span>
+</code></pre></div>
+
+<p>打印出来的注意力矩阵（第 0 个头，未训练模型）：</p>
+<div class="highlight"><pre><span></span><code>             风       吹       过       山       谷
+   风     1.000   0.000   0.000   0.000   0.000   行和=1.0000
+   吹     0.262   0.738   0.000   0.000   0.000   行和=1.0000
+   过     0.324   0.321   0.354   0.000   0.000   行和=1.0000
+   山     0.259   0.281   0.189   0.270   0.000   行和=1.0000
+   谷     0.313   0.122   0.130   0.264   0.171   行和=1.0000
+</code></pre></div>
+
+<p>三件事可以直接读出来：</p>
+<ol>
+<li><strong>上三角全是 0。</strong> 这是因果掩码（causal mask）的作用：位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 只能看到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02264;</mo><mi>t</mi></mrow></math></span>。
+   实现方式是在 softmax <strong>之前</strong>把这些位置填成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span>，
+   <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></msup><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span>，softmax 之后自然是 0。</li>
+<li><strong>每行和为 1。</strong> softmax 保证了这一点，所以 <code>att @ v</code> 是一次凸组合（加权平均）。</li>
+<li>第一行只有一个 1.000：位置 0 只能看自己，softmax 一个元素必然得到 1。</li>
+</ol>
+<h3 id="zzmath20zz">四、为什么要除以 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></msqrt></mrow></math></span></h3>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>q</mi><mo>&#x000B7;</mo><mi>k</mi></mrow></math></span> 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></math></span> 个乘积之和。若 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>q</mi><mo>&#x0002C;</mo><mi>k</mi></mrow></math></span> 各分量独立、均值 0 方差 1，
+这个和的方差就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></math></span>，标准差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></msqrt></mrow></math></span>。
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></math></span> 越大，分数的绝对值越大。</p>
+<p>softmax 对输入尺度敏感：分数拉得越开，输出越接近 one-hot。
+下面固定 64 个 key，每格 200 次随机试验取平均（本机实测）：</p>
+<table>
+<thead>
+<tr>
+<th><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></math></span></th>
+<th>缩放</th>
+<th>分数标准差</th>
+<th>平均最大概率</th>
+<th>平均熵</th>
+<th><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mo>&#x02211;</mo><mi>i</mi></msub><msub><mi>p</mi><mi>i</mi></msub><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><msub><mi>p</mi><mi>i</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></math></span></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8</td>
+<td>是</td>
+<td>0.957</td>
+<td>0.098</td>
+<td>3.717</td>
+<td>0.963</td>
+</tr>
+<tr>
+<td>8</td>
+<td>否</td>
+<td>2.769</td>
+<td>0.422</td>
+<td>2.050</td>
+<td>0.716</td>
+</tr>
+<tr>
+<td>64</td>
+<td>是</td>
+<td>0.981</td>
+<td>0.110</td>
+<td>3.686</td>
+<td>0.960</td>
+</tr>
+<tr>
+<td>64</td>
+<td>否</td>
+<td>8.032</td>
+<td>0.790</td>
+<td>0.587</td>
+<td>0.292</td>
+</tr>
+<tr>
+<td>256</td>
+<td>是</td>
+<td>0.997</td>
+<td>0.109</td>
+<td>3.680</td>
+<td>0.961</td>
+</tr>
+<tr>
+<td>256</td>
+<td>否</td>
+<td><strong>15.811</strong></td>
+<td><strong>0.902</strong></td>
+<td><strong>0.253</strong></td>
+<td><strong>0.140</strong></td>
+</tr>
+</tbody>
+</table>
+<p>对照：64 个 key 的均匀分布，熵 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mi>ln</mi><mn>64</mn><mo>&#x0003D;</mo><mn>4.159</mn></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02211;</mo><mi>p</mi><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><mi>p</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mn>0.984</mn></mrow></math></span>。</p>
+<p>不缩放时，分数标准差按 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></msqrt></mrow></math></span> 增长（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><mn>256</mn></mrow></msqrt><mo>&#x0003D;</mo><mn>16</mn></mrow></math></span>，实测 15.8），
+最大概率涨到 0.90，熵掉到 0.25——分布塌成了 one-hot。</p>
+<p><strong>最后一列是关键。</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mo>&#x02211;</mo><mi>i</mi></msub><msub><mi>p</mi><mi>i</mi></msub><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><msub><mi>p</mi><mi>i</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></math></span> 是 softmax 雅可比矩阵对角元之和，
+它决定梯度还剩多少。<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 接近 0 或 1 时这一项趋于 0，也就是梯度消失。
+从 0.963 掉到 0.140，意味着不缩放的模型学不动。</p>
+<p>所以 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><msqrt><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></msqrt></mrow></math></span> 不是为了「数值好看」，是为了保住梯度。
+这一点在 <a class="xref" href="../L0/0.0b-minimal-model-backward.html" title="最小完整模型（下）：链式法则与一次参数更新">L0.0b</a> 讲完反向之后会更清楚。</p>
+<h3 id="logits-token">五、从 logits 到概率，再到一个 token</h3>
+<p><code>lm_head</code> 是一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>d</mi><mo>&#x0002C;</mo><mi>V</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 的线性层，把每个位置的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi></mrow></math></span> 维向量变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi></mrow></math></span> 个分数：</p>
+<div class="highlight"><pre><span></span><code>logits           (1, 5, 18)
+</code></pre></div>
+
+<p>最后一维正好是词表大小。softmax 把分数变成概率：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>p</mi><mi>i</mi></msub><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>i</mi></msub></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>j</mi></msub></mrow></msup></mrow></mfrac></mrow></math></div></p>
+<p>分子把任意实数变成正数，分母做归一化。所以 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>p</mi><mi>i</mi></msub><mo>&#x02265;</mo><mn>0</mn></mrow></math></span> 且 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mo>&#x02211;</mo><mi>i</mi></msub><msub><mi>p</mi><mi>i</mi></msub><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span>——
+这就是「在什么意义上是概率」的答案：它是词表上的一个离散分布。</p>
+<p>未训练模型的实测：</p>
+<div class="highlight"><pre><span></span><code>位置 4（'谷'）之后最可能的 5 个字符：
+  '动'  logit=+0.9692  p=0.1162
+  '面'  logit=+0.7022  p=0.0889
+  '风'  logit=+0.6949  p=0.0883
+  '，'  logit=+0.5169  p=0.0739
+  '不'  logit=+0.5005  p=0.0727
+均匀分布应为 1/18 = 0.0556
+</code></pre></div>
+
+<p>最高概率 0.116 只比均匀分布的 0.056 高一倍——模型确实还没学到东西。</p>
+<p>生成一个 token 就是从这个分布里采样，然后把采到的 token 接到序列尾部，再算一次：</p>
+<div class="highlight"><pre><span></span><code>起点 '风吹过山谷'
+第 1 步：喂进去 5 个 token，只取最后一个位置的 logits，采到 '落' (p=0.0457) -&gt; '风吹过山谷落'
+第 2 步：喂进去 6 个 token，只取最后一个位置的 logits，采到 '在' (p=0.0522) -&gt; '风吹过山谷落在'
+第 3 步：喂进去 7 个 token，只取最后一个位置的 logits，采到 '风' (p=0.0933) -&gt; '风吹过山谷落在风'
+</code></pre></div>
+
+<p>注意每一步都把<strong>整个前缀重新算了一遍</strong>。第 2 步重算了第 1 步已经算过的 5 个位置。
+这个浪费正是 KV cache 要解决的问题（<a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a>）。</p>
+<p>（采样策略——temperature、top-k、top-p、停止条件——是 <a class="xref" href="../L0/0.5-tensor-to-text.html" title="文本闭环（下）：从 logits 到你看到的那段文字">L0.5</a> 的内容。
+本章一律用最朴素的按概率采样。）</p>
+<hr />
+<h2 id="_6">工程实现 · 源码走读：同样五行在真实模型里</h2>
+<p>本章的注意力和 Qwen3 的注意力是同一件事，差别在工程细节。
+以下行号来自 crater 上安装的 vLLM 0.29.0 与 transformers。</p>
+<p><strong>缩放系数</strong>（<code>vllm/model_executor/models/qwen3.py:102</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">scaling</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="o">**-</span><span class="mf">0.5</span>
+</code></pre></div>
+
+<p>就是本章的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><msqrt><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></msqrt></mrow></math></span>。</p>
+<p><strong>QKV 的两种写法。</strong> 这是入门阶段就能看到的一个真实工程分歧：</p>
+<p><code>transformers/models/qwen3/modeling_qwen3.py:225-234</code> 用三个独立的线性层：</p>
+<div class="highlight"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><code>vllm/model_executor/models/qwen3.py:105</code> 用一个融合的：</p>
+<div class="highlight"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">qkv_proj</span> <span class="o">=</span> <span class="n">QKVParallelLinear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="o">...</span>
+<span class="n">qkv</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>      <span class="c1"># 第 158 行</span>
+</code></pre></div>
+
+<p><strong>数学上完全一样</strong>，工程上不一样：一次大矩阵乘比三次小矩阵乘更能喂饱 GPU
+（原因见 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）。代价是加载 checkpoint 时要把三份权重拼成一份——
+<a class="xref" href="../L4/4.0-checkpoint-format.html" title="模型文件到底是什么：safetensors 字节布局与加载路径">L4.0</a> 会看到这个拼接过程。本章的 <code>TinyAttention</code> 用的是融合写法。</p>
+<p><strong>本章模型没有、真实模型有的东西</strong>，列在这里，各自有对应章节：</p>
+<table>
+<thead>
+<tr>
+<th>真实模型里的</th>
+<th>本章的简化</th>
+<th>展开位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RoPE（旋转位置编码）</td>
+<td>可学习的 <code>pos_emb</code> 查表</td>
+<td><a class="xref" href="../L3/3.1-attention-memory-wall.html" title="从 attention 数学到内存墙">L3.1</a></td>
+</tr>
+<tr>
+<td>RMSNorm</td>
+<td><code>nn.LayerNorm</code></td>
+<td><a class="xref" href="../L4/4.1-transformer-anatomy.html" title="Transformer 层解剖与从零实现">L4.1</a></td>
+</tr>
+<tr>
+<td>GQA（K/V 头数少于 Q）</td>
+<td>每个头都有自己的 K/V</td>
+<td><a class="xref" href="../L3/3.3-decode-attention.html" title="Decode 侧 attention">L3.3</a></td>
+</tr>
+<tr>
+<td>SwiGLU（门控 MLP）</td>
+<td>单路 GELU</td>
+<td><a class="xref" href="../L4/4.1-transformer-anatomy.html" title="Transformer 层解剖与从零实现">L4.1</a></td>
+</tr>
+<tr>
+<td>QK-Norm（Qwen3 有，<code>qwen3.py:150-151</code>）</td>
+<td>无</td>
+<td><a class="xref" href="../L4/4.1-transformer-anatomy.html" title="Transformer 层解剖与从零实现">L4.1</a></td>
+</tr>
+<tr>
+<td>KV cache</td>
+<td>每步重算全部前缀</td>
+<td><a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a></td>
+</tr>
+</tbody>
+</table>
+<p>这些替换都不改变本章讲的形状变化骨架。</p>
+<hr />
+<h2 id="_7">工程实现 · 自己写一遍</h2>
+<p>整个模型 180 行。下面的代码块都是<strong>从文件里直接抽出来的</strong>，
+不是誊抄，所以不会和源码漂移；每块底下的链接会跳到完整文件的对应行。</p>
+<p>顶层的 <code>forward</code>，把前面讲的每一步串起来：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">136</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">idx</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">trace</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">137</span><span class="w">        </span><span class="sd">"""idx: [B, T] 的 token id -&gt; logits: [B, T, vocab]。"""</span>
+<span class="linenos">138</span>        <span class="n">B</span><span class="p">,</span> <span class="n">T</span> <span class="o">=</span> <span class="n">idx</span><span class="o">.</span><span class="n">shape</span>
+<span class="linenos">139</span>        <span class="k">assert</span> <span class="n">T</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"序列长 </span><span class="si">{</span><span class="n">T</span><span class="si">}</span><span class="s2"> 超过 block_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">140</span>        <span class="n">tok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tok_emb</span><span class="p">(</span><span class="n">idx</span><span class="p">)</span>                               <span class="c1"># [B, T, C]</span>
+<span class="linenos">141</span>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_pos</span><span class="p">:</span>
+<span class="linenos">142</span>            <span class="n">pos</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pos_emb</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">T</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">idx</span><span class="o">.</span><span class="n">device</span><span class="p">))</span>   <span class="c1"># [T, C]</span>
+<span class="linenos">143</span>            <span class="n">x</span> <span class="o">=</span> <span class="n">tok</span> <span class="o">+</span> <span class="n">pos</span>                                     <span class="c1"># 广播到 [B, T, C]</span>
+<span class="linenos">144</span>        <span class="k">else</span><span class="p">:</span>
+<span class="linenos">145</span>            <span class="n">x</span> <span class="o">=</span> <span class="n">tok</span>                                           <span class="c1"># 消融 [B]：不加位置</span>
+<span class="linenos">146</span>        <span class="k">if</span> <span class="n">trace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">147</span>            <span class="n">trace</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">tok_emb</span><span class="o">=</span><span class="n">tok</span><span class="p">,</span> <span class="n">x_in</span><span class="o">=</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">148</span>        <span class="k">for</span> <span class="n">blk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span>
+<span class="linenos">149</span>            <span class="n">x</span> <span class="o">=</span> <span class="n">blk</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">trace</span><span class="p">)</span>
+<span class="linenos">150</span>        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">151</span>        <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>                              <span class="c1"># [B, T, vocab]</span>
+<span class="linenos">152</span>        <span class="k">if</span> <span class="n">trace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">153</span>            <span class="n">trace</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">x_final</span><span class="o">=</span><span class="n">x</span><span class="p">,</span> <span class="n">logits</span><span class="o">=</span><span class="n">logits</span><span class="p">)</span>
+<span class="linenos">154</span>        <span class="k">return</span> <span class="n">logits</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/tiny_lm.py 第 136–155 行</code><a href="../code/labs/L0/tiny_lm.py.html#labs-L0-tiny_lm-py-L-136">在完整文件中打开 &rarr;</a></div></div>
+<p>一层的结构：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">116</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">trace</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">117</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ln1</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">trace</span><span class="p">)</span>
+<span class="linenos">118</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ln2</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">trace</span><span class="p">)</span>
+<span class="linenos">119</span>        <span class="k">return</span> <span class="n">x</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/tiny_lm.py 第 116–120 行</code><a href="../code/labs/L0/tiny_lm.py.html#labs-L0-tiny_lm-py-L-116">在完整文件中打开 &rarr;</a></div></div>
+<p><code>x = x + f(...)</code> 叫<strong>残差连接（residual connection）</strong>：子层算出的是「修正量」，
+加回原值而不是替换它。这样即使某一层什么都没学到，信息也能原样传下去。
+它对反向传播的意义在 <a class="xref" href="../L0/0.0b-minimal-model-backward.html" title="最小完整模型（下）：链式法则与一次参数更新">L0.0b</a> 讲。</p>
+<p>先归一化再进子层叫 <strong>pre-norm</strong>，是目前的主流；原始 Transformer 论文是先子层再归一化
+（post-norm）。差别与训练稳定性有关，<a class="xref" href="../L4/4.1-transformer-anatomy.html" title="Transformer 层解剖与从零实现">L4.1</a> 展开。</p>
+<p>注意力那三步，完整实现在这里（含拆头、缩放、掩码、合头）：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">60</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">trace</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">61</span>        <span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">C</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span>                       <span class="c1"># batch, 序列长度, d_model</span>
+<span class="linenos">62</span>        <span class="n">qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>                       <span class="c1"># [B, T, 3C]</span>
+<span class="linenos">63</span>        <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">qkv</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">C</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>           <span class="c1"># 各 [B, T, C]</span>
+<span class="linenos">64</span>        <span class="c1"># 拆头：把 C 拆成 (n_head, d_head)，再把 head 维换到前面，</span>
+<span class="linenos">65</span>        <span class="c1"># 这样后面的矩阵乘就是每个头各算各的。</span>
+<span class="linenos">66</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>   <span class="c1"># [B, nh, T, hd]</span>
+<span class="linenos">67</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos">68</span>        <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos">69</span>
+<span class="linenos">70</span>        <span class="n">att</span> <span class="o">=</span> <span class="n">q</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>           <span class="c1"># [B, nh, T, T] 每对位置的相似度</span>
+<span class="linenos">71</span>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">scale</span><span class="p">:</span>
+<span class="linenos">72</span>            <span class="n">att</span> <span class="o">=</span> <span class="n">att</span> <span class="o">/</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span>  <span class="c1"># 缩放：见 walk_generate.py 的消融 [A]</span>
+<span class="linenos">73</span>        <span class="n">att</span> <span class="o">=</span> <span class="n">att</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mask</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:</span><span class="n">T</span><span class="p">,</span> <span class="p">:</span><span class="n">T</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos">74</span>        <span class="n">att</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">att</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>            <span class="c1"># 每一行是一个概率分布</span>
+<span class="linenos">75</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">att</span> <span class="o">@</span> <span class="n">v</span>                           <span class="c1"># [B, nh, T, hd] 按权重取 V 的加权和</span>
+<span class="linenos">76</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">out</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">C</span><span class="p">)</span>   <span class="c1"># 合头</span>
+<span class="linenos">77</span>        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">out</span><span class="p">)</span>
+<span class="linenos">78</span>
+<span class="linenos">79</span>        <span class="k">if</span> <span class="n">trace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">80</span>            <span class="n">trace</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">qkv</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span> <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">att_logits</span><span class="o">=</span><span class="n">q</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">),</span>
+<span class="linenos">81</span>                         <span class="n">att</span><span class="o">=</span><span class="n">att</span><span class="p">,</span> <span class="n">attn_out</span><span class="o">=</span><span class="n">out</span><span class="p">)</span>
+<span class="linenos">82</span>        <span class="k">return</span> <span class="n">out</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/tiny_lm.py 第 60–83 行</code><a href="../code/labs/L0/tiny_lm.py.html#labs-L0-tiny_lm-py-L-60">在完整文件中打开 &rarr;</a></div></div>
+<p>写这个模型时<strong>刻意没用</strong>的三样东西，以及原因：</p>
+<ul>
+<li><code>F.scaled_dot_product_attention</code>：它把注意力的三步合成一个调用，中间张量看不见。
+  真实推理引擎当然要用它（或 FlashAttention），那是 <a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a> 的内容。</li>
+<li><code>nn.TransformerEncoderLayer</code>：封装太多，而且默认设置与 decoder-only 模型不同。</li>
+<li>任何「一行搞定」的高层 API：本章的目的就是让每一步都能打印。</li>
+</ul>
+<h3 id="_8">完整源码</h3>
+<p>这个文件值得从头读一遍——它是后面十几章反复引用的那个模型。</p>
+<details class="fold srcfold"><summary>labs/L0/tiny_lm.py 全文（180 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L0.0 / L0.0b · 一个能完整读完的语言模型。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">这个模型只有几万个参数，跑在 CPU 上，但结构和 Qwen3、Llama 是同一族：</span>
+<span class="linenos">  5</span><span class="sd">token embedding、若干层「attention + MLP」、最后一个线性层输出词表上的分数。</span>
+<span class="linenos">  6</span><span class="sd">后面每一层（L2 的 kernel、L4 的模型解剖、L7 的训练）都会回到这个模型。</span>
+<span class="linenos">  7</span>
+<span class="linenos">  8</span><span class="sd">刻意不用的东西，以及原因：</span>
+<span class="linenos">  9</span><span class="sd">    F.scaled_dot_product_attention  —— 它把注意力的三步并成一个调用，看不见中间张量</span>
+<span class="linenos"> 10</span><span class="sd">    nn.TransformerEncoderLayer      —— 同上，而且它的默认设置与 decoder-only 不同</span>
+<span class="linenos"> 11</span><span class="sd">    nn.LayerNorm 之外的任何封装     —— 归一化本身在 L4.1 展开</span>
+<span class="linenos"> 12</span>
+<span class="linenos"> 13</span><span class="sd">被 walk_generate.py（L0.0）和 walk_train.py（L0.0b）共用。</span>
+<span class="linenos"> 14</span><span class="sd">"""</span>
+<span class="linenos"> 15</span>
+<span class="linenos"> 16</span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos"> 17</span>
+<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos"> 19</span>
+<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 21</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+<span class="linenos"> 23</span>
+<span class="linenos"> 24</span><span class="c1"># 一小段中文，用作字符级语料。字符表就是词表。</span>
+<span class="linenos"> 25</span><span class="n">CORPUS</span> <span class="o">=</span> <span class="s2">"风吹过山谷，云落在水面。山不动，水在动，风来了又走。"</span>
+<span class="linenos"> 26</span>
+<span class="linenos"> 27</span>
+<span class="linenos"> 28</span><span class="k">class</span><span class="w"> </span><span class="nc">CharVocab</span><span class="p">:</span>
+<span class="linenos"> 29</span><span class="w">    </span><span class="sd">"""字符级词表：一个字符一个 token。真实模型用 BPE（见 L0.4）。"""</span>
+<span class="linenos"> 30</span>
+<span class="linenos"> 31</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos"> 32</span>        <span class="bp">self</span><span class="o">.</span><span class="n">itos</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">text</span><span class="p">))</span>          <span class="c1"># id -&gt; 字符</span>
+<span class="linenos"> 33</span>        <span class="bp">self</span><span class="o">.</span><span class="n">stoi</span> <span class="o">=</span> <span class="p">{</span><span class="n">c</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">itos</span><span class="p">)}</span>
+<span class="linenos"> 34</span>        <span class="bp">self</span><span class="o">.</span><span class="n">size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">itos</span><span class="p">)</span>
+<span class="linenos"> 35</span>
+<span class="linenos"> 36</span>    <span class="k">def</span><span class="w"> </span><span class="nf">encode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">s</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="linenos"> 37</span>        <span class="k">return</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">stoi</span><span class="p">[</span><span class="n">c</span><span class="p">]</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">s</span><span class="p">]</span>
+<span class="linenos"> 38</span>
+<span class="linenos"> 39</span>    <span class="k">def</span><span class="w"> </span><span class="nf">decode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="linenos"> 40</span>        <span class="k">return</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">itos</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">ids</span><span class="p">)</span>
+<span class="linenos"> 41</span>
+<span class="linenos"> 42</span>
+<span class="linenos"> 43</span><span class="k">class</span><span class="w"> </span><span class="nc">TinyAttention</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="linenos"> 44</span><span class="w">    </span><span class="sd">"""单层因果自注意力，多头。每一步的张量都留在局部变量里，便于打印。"""</span>
+<span class="linenos"> 45</span>
+<span class="linenos"> 46</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">d_model</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">n_head</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">block_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">scale</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+<span class="linenos"> 47</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos"> 48</span>        <span class="k">assert</span> <span class="n">d_model</span> <span class="o">%</span> <span class="n">n_head</span> <span class="o">==</span> <span class="mi">0</span>
+<span class="linenos"> 49</span>        <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span> <span class="o">=</span> <span class="n">n_head</span>
+<span class="linenos"> 50</span>        <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span> <span class="o">=</span> <span class="n">d_model</span> <span class="o">//</span> <span class="n">n_head</span>
+<span class="linenos"> 51</span>        <span class="bp">self</span><span class="o">.</span><span class="n">scale</span> <span class="o">=</span> <span class="n">scale</span>
+<span class="linenos"> 52</span>        <span class="c1"># 一个线性层同时产生 Q、K、V：输出维度是 3*d_model，之后再切三份。</span>
+<span class="linenos"> 53</span>        <span class="c1"># 真实模型（含 vLLM 的 QKVParallelLinear）也这样做，因为一次 GEMM 比三次快。</span>
+<span class="linenos"> 54</span>        <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">d_model</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos"> 55</span>        <span class="bp">self</span><span class="o">.</span><span class="n">proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="n">d_model</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos"> 56</span>        <span class="c1"># 因果掩码：位置 i 只能看到 &lt;= i。register_buffer 表示它是状态但不是参数。</span>
+<span class="linenos"> 57</span>        <span class="n">mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tril</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">block_size</span><span class="p">,</span> <span class="n">block_size</span><span class="p">))</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">block_size</span><span class="p">,</span> <span class="n">block_size</span><span class="p">)</span>
+<span class="linenos"> 58</span>        <span class="bp">self</span><span class="o">.</span><span class="n">register_buffer</span><span class="p">(</span><span class="s2">"mask"</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos"> 59</span>
+<span class="linenos"> 60</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">trace</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos"> 61</span>        <span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">C</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span>                       <span class="c1"># batch, 序列长度, d_model</span>
+<span class="linenos"> 62</span>        <span class="n">qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>                       <span class="c1"># [B, T, 3C]</span>
+<span class="linenos"> 63</span>        <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">qkv</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">C</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>           <span class="c1"># 各 [B, T, C]</span>
+<span class="linenos"> 64</span>        <span class="c1"># 拆头：把 C 拆成 (n_head, d_head)，再把 head 维换到前面，</span>
+<span class="linenos"> 65</span>        <span class="c1"># 这样后面的矩阵乘就是每个头各算各的。</span>
+<span class="linenos"> 66</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>   <span class="c1"># [B, nh, T, hd]</span>
+<span class="linenos"> 67</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos"> 68</span>        <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos"> 69</span>
+<span class="linenos"> 70</span>        <span class="n">att</span> <span class="o">=</span> <span class="n">q</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>           <span class="c1"># [B, nh, T, T] 每对位置的相似度</span>
+<span class="linenos"> 71</span>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">scale</span><span class="p">:</span>
+<span class="linenos"> 72</span>            <span class="n">att</span> <span class="o">=</span> <span class="n">att</span> <span class="o">/</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span>  <span class="c1"># 缩放：见 walk_generate.py 的消融 [A]</span>
+<span class="linenos"> 73</span>        <span class="n">att</span> <span class="o">=</span> <span class="n">att</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mask</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:</span><span class="n">T</span><span class="p">,</span> <span class="p">:</span><span class="n">T</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos"> 74</span>        <span class="n">att</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">att</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>            <span class="c1"># 每一行是一个概率分布</span>
+<span class="linenos"> 75</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">att</span> <span class="o">@</span> <span class="n">v</span>                           <span class="c1"># [B, nh, T, hd] 按权重取 V 的加权和</span>
+<span class="linenos"> 76</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">out</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">C</span><span class="p">)</span>   <span class="c1"># 合头</span>
+<span class="linenos"> 77</span>        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">out</span><span class="p">)</span>
+<span class="linenos"> 78</span>
+<span class="linenos"> 79</span>        <span class="k">if</span> <span class="n">trace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos"> 80</span>            <span class="n">trace</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">qkv</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span> <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">att_logits</span><span class="o">=</span><span class="n">q</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">),</span>
+<span class="linenos"> 81</span>                         <span class="n">att</span><span class="o">=</span><span class="n">att</span><span class="p">,</span> <span class="n">attn_out</span><span class="o">=</span><span class="n">out</span><span class="p">)</span>
+<span class="linenos"> 82</span>        <span class="k">return</span> <span class="n">out</span>
+<span class="linenos"> 83</span>
+<span class="linenos"> 84</span>
+<span class="linenos"> 85</span><span class="k">class</span><span class="w"> </span><span class="nc">TinyMLP</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="linenos"> 86</span><span class="w">    </span><span class="sd">"""两层前馈网络。中间维度取 4*d_model 是 Transformer 论文以来的惯例。"""</span>
+<span class="linenos"> 87</span>
+<span class="linenos"> 88</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">d_model</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+<span class="linenos"> 89</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos"> 90</span>        <span class="bp">self</span><span class="o">.</span><span class="n">fc1</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">d_model</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos"> 91</span>        <span class="bp">self</span><span class="o">.</span><span class="n">fc2</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">4</span> <span class="o">*</span> <span class="n">d_model</span><span class="p">,</span> <span class="n">d_model</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos"> 92</span>
+<span class="linenos"> 93</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">trace</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos"> 94</span>        <span class="n">h</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc1</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos"> 95</span>        <span class="n">a</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">gelu</span><span class="p">(</span><span class="n">h</span><span class="p">)</span>
+<span class="linenos"> 96</span>        <span class="n">y</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc2</span><span class="p">(</span><span class="n">a</span><span class="p">)</span>
+<span class="linenos"> 97</span>        <span class="k">if</span> <span class="n">trace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos"> 98</span>            <span class="n">trace</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">mlp_hidden</span><span class="o">=</span><span class="n">h</span><span class="p">,</span> <span class="n">mlp_act</span><span class="o">=</span><span class="n">a</span><span class="p">,</span> <span class="n">mlp_out</span><span class="o">=</span><span class="n">y</span><span class="p">)</span>
+<span class="linenos"> 99</span>        <span class="k">return</span> <span class="n">y</span>
+<span class="linenos">100</span>
+<span class="linenos">101</span>
+<span class="linenos">102</span><span class="k">class</span><span class="w"> </span><span class="nc">TinyBlock</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="linenos">103</span><span class="w">    </span><span class="sd">"""一层：norm -&gt; attention -&gt; 残差；norm -&gt; MLP -&gt; 残差。</span>
+<span class="linenos">104</span>
+<span class="linenos">105</span><span class="sd">    先 norm 后子层（pre-norm）是现在的主流写法；原始 Transformer 是 post-norm。</span>
+<span class="linenos">106</span><span class="sd">    差别与训练稳定性有关，L4.1 展开。</span>
+<span class="linenos">107</span><span class="sd">    """</span>
+<span class="linenos">108</span>
+<span class="linenos">109</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">d_model</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">n_head</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">block_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">scale</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+<span class="linenos">110</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos">111</span>        <span class="bp">self</span><span class="o">.</span><span class="n">ln1</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">d_model</span><span class="p">)</span>
+<span class="linenos">112</span>        <span class="bp">self</span><span class="o">.</span><span class="n">attn</span> <span class="o">=</span> <span class="n">TinyAttention</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="n">n_head</span><span class="p">,</span> <span class="n">block_size</span><span class="p">,</span> <span class="n">scale</span><span class="p">)</span>
+<span class="linenos">113</span>        <span class="bp">self</span><span class="o">.</span><span class="n">ln2</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">d_model</span><span class="p">)</span>
+<span class="linenos">114</span>        <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">TinyMLP</span><span class="p">(</span><span class="n">d_model</span><span class="p">)</span>
+<span class="linenos">115</span>
+<span class="linenos">116</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">trace</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">117</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ln1</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">trace</span><span class="p">)</span>
+<span class="linenos">118</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ln2</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">trace</span><span class="p">)</span>
+<span class="linenos">119</span>        <span class="k">return</span> <span class="n">x</span>
+<span class="linenos">120</span>
+<span class="linenos">121</span>
+<span class="linenos">122</span><span class="k">class</span><span class="w"> </span><span class="nc">TinyLM</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="linenos">123</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">d_model</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32</span><span class="p">,</span> <span class="n">n_head</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span>
+<span class="linenos">124</span>                 <span class="n">n_layer</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span> <span class="n">block_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span><span class="p">,</span>
+<span class="linenos">125</span>                 <span class="n">scale</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="n">use_pos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+<span class="linenos">126</span>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos">127</span>        <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="n">block_size</span>
+<span class="linenos">128</span>        <span class="bp">self</span><span class="o">.</span><span class="n">use_pos</span> <span class="o">=</span> <span class="n">use_pos</span>
+<span class="linenos">129</span>        <span class="bp">self</span><span class="o">.</span><span class="n">tok_emb</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Embedding</span><span class="p">(</span><span class="n">vocab_size</span><span class="p">,</span> <span class="n">d_model</span><span class="p">)</span>      <span class="c1"># 查表：id -&gt; 向量</span>
+<span class="linenos">130</span>        <span class="bp">self</span><span class="o">.</span><span class="n">pos_emb</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Embedding</span><span class="p">(</span><span class="n">block_size</span><span class="p">,</span> <span class="n">d_model</span><span class="p">)</span>      <span class="c1"># 位置也查表</span>
+<span class="linenos">131</span>        <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">ModuleList</span><span class="p">(</span>
+<span class="linenos">132</span>            <span class="p">[</span><span class="n">TinyBlock</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="n">n_head</span><span class="p">,</span> <span class="n">block_size</span><span class="p">,</span> <span class="n">scale</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_layer</span><span class="p">)])</span>
+<span class="linenos">133</span>        <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">d_model</span><span class="p">)</span>
+<span class="linenos">134</span>        <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">d_model</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">135</span>
+<span class="linenos">136</span>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">idx</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">trace</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">137</span><span class="w">        </span><span class="sd">"""idx: [B, T] 的 token id -&gt; logits: [B, T, vocab]。"""</span>
+<span class="linenos">138</span>        <span class="n">B</span><span class="p">,</span> <span class="n">T</span> <span class="o">=</span> <span class="n">idx</span><span class="o">.</span><span class="n">shape</span>
+<span class="linenos">139</span>        <span class="k">assert</span> <span class="n">T</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"序列长 </span><span class="si">{</span><span class="n">T</span><span class="si">}</span><span class="s2"> 超过 block_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">140</span>        <span class="n">tok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tok_emb</span><span class="p">(</span><span class="n">idx</span><span class="p">)</span>                               <span class="c1"># [B, T, C]</span>
+<span class="linenos">141</span>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_pos</span><span class="p">:</span>
+<span class="linenos">142</span>            <span class="n">pos</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pos_emb</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">T</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">idx</span><span class="o">.</span><span class="n">device</span><span class="p">))</span>   <span class="c1"># [T, C]</span>
+<span class="linenos">143</span>            <span class="n">x</span> <span class="o">=</span> <span class="n">tok</span> <span class="o">+</span> <span class="n">pos</span>                                     <span class="c1"># 广播到 [B, T, C]</span>
+<span class="linenos">144</span>        <span class="k">else</span><span class="p">:</span>
+<span class="linenos">145</span>            <span class="n">x</span> <span class="o">=</span> <span class="n">tok</span>                                           <span class="c1"># 消融 [B]：不加位置</span>
+<span class="linenos">146</span>        <span class="k">if</span> <span class="n">trace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">147</span>            <span class="n">trace</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">tok_emb</span><span class="o">=</span><span class="n">tok</span><span class="p">,</span> <span class="n">x_in</span><span class="o">=</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">148</span>        <span class="k">for</span> <span class="n">blk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span>
+<span class="linenos">149</span>            <span class="n">x</span> <span class="o">=</span> <span class="n">blk</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">trace</span><span class="p">)</span>
+<span class="linenos">150</span>        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">151</span>        <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>                              <span class="c1"># [B, T, vocab]</span>
+<span class="linenos">152</span>        <span class="k">if</span> <span class="n">trace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">153</span>            <span class="n">trace</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">x_final</span><span class="o">=</span><span class="n">x</span><span class="p">,</span> <span class="n">logits</span><span class="o">=</span><span class="n">logits</span><span class="p">)</span>
+<span class="linenos">154</span>        <span class="k">return</span> <span class="n">logits</span>
+<span class="linenos">155</span>
+<span class="linenos">156</span>    <span class="nd">@torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">()</span>
+<span class="linenos">157</span>    <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">idx</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">n_new</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
+<span class="linenos">158</span>                 <span class="n">generator</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos">159</span><span class="w">        </span><span class="sd">"""自回归生成：每次只用最后一个位置的 logits 采一个 token，再拼回去。"""</span>
+<span class="linenos">160</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_new</span><span class="p">):</span>
+<span class="linenos">161</span>            <span class="n">ctx</span> <span class="o">=</span> <span class="n">idx</span><span class="p">[:,</span> <span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">:]</span>         <span class="c1"># 超长就截断（真实系统见 L5.3）</span>
+<span class="linenos">162</span>            <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="p">(</span><span class="n">ctx</span><span class="p">)[:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="p">:]</span>            <span class="c1"># 只要最后一个位置</span>
+<span class="linenos">163</span>            <span class="n">probs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits</span> <span class="o">/</span> <span class="n">temperature</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">164</span>            <span class="n">nxt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">multinomial</span><span class="p">(</span><span class="n">probs</span><span class="p">,</span> <span class="n">num_samples</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">generator</span><span class="p">)</span>
+<span class="linenos">165</span>            <span class="n">idx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">idx</span><span class="p">,</span> <span class="n">nxt</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">166</span>        <span class="k">return</span> <span class="n">idx</span>
+<span class="linenos">167</span>
+<span class="linenos">168</span>
+<span class="linenos">169</span><span class="k">def</span><span class="w"> </span><span class="nf">param_table</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">,</span> <span class="nb">int</span><span class="p">]],</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="linenos">170</span><span class="w">    </span><span class="sd">"""列出每个参数张量的名字、形状与元素个数。"""</span>
+<span class="linenos">171</span>    <span class="n">rows</span> <span class="o">=</span> <span class="p">[(</span><span class="n">n</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span> <span class="n">p</span><span class="o">.</span><span class="n">numel</span><span class="p">())</span> <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">()]</span>
+<span class="linenos">172</span>    <span class="k">return</span> <span class="n">rows</span><span class="p">,</span> <span class="nb">sum</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">)</span>
+<span class="linenos">173</span>
+<span class="linenos">174</span>
+<span class="linenos">175</span><span class="k">def</span><span class="w"> </span><span class="nf">show</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">t</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="linenos">176</span><span class="w">    </span><span class="sd">"""统一的张量摘要：形状、dtype、是否连续、前 k 个数。"""</span>
+<span class="linenos">177</span>    <span class="n">flat</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[:</span><span class="n">k</span><span class="p">]</span>
+<span class="linenos">178</span>    <span class="n">nums</span> <span class="o">=</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">v</span><span class="si">:</span><span class="s2">+.4f</span><span class="si">}</span><span class="s2">"</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">flat</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
+<span class="linenos">179</span>    <span class="k">return</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;16s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">))</span><span class="si">:</span><span class="s2">&lt;18s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'torch.'</span><span class="p">,</span><span class="s1">''</span><span class="p">)</span><span class="si">:</span><span class="s2">&lt;8s</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">180</span>            <span class="sa">f</span><span class="s2">"contig=</span><span class="si">{</span><span class="s1">'是'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">t</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'否'</span><span class="si">:</span><span class="s2">&lt;2s</span><span class="si">}</span><span class="s2"> 前</span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2">个: [</span><span class="si">{</span><span class="n">nums</span><span class="si">}</span><span class="s2">]"</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/tiny_lm.py 全文（180 行）</code><a href="../code/labs/L0/tiny_lm.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L0/walk_generate.py
+</code></pre></div>
+
+<p>不需要 GPU，几秒钟跑完，输出 143 行。它按顺序打印本章讲的每一步。</p>
+<h3 id="_9">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>先预测，再验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>d_model</code> 32 → 64</td>
+<td>哪些张量的形状变了？参数量变成多少？（提示：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>d</mi><mn>2</mn></msup></mrow></math></span> 项）</td>
+</tr>
+<tr>
+<td><code>n_head</code> 4 → 8</td>
+<td><code>q</code> 的形状怎么变？参数量变不变？</td>
+</tr>
+<tr>
+<td>输入换成一个字符</td>
+<td>注意力矩阵变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><mn>1</mn></mrow></math></span>，值必然是 1.000。为什么？</td>
+</tr>
+<tr>
+<td>删掉 <code>masked_fill</code> 那一行</td>
+<td>注意力矩阵的上三角不再是 0。这个模型还能用来生成吗？</td>
+</tr>
+<tr>
+<td><code>TinyAttention</code> 里 <code>scale=False</code></td>
+<td>用 <code>d_head=64</code> 跑，看注意力矩阵是不是塌成 one-hot</td>
+</tr>
+<tr>
+<td>把 <code>x = x + self.attn(...)</code> 改成 <code>x = self.attn(...)</code></td>
+<td>去掉残差。生成结果会怎样？（<a class="xref" href="../L0/0.0b-minimal-model-backward.html" title="最小完整模型（下）：链式法则与一次参数更新">L0.0b</a> 训练之后差别更明显）</td>
+</tr>
+<tr>
+<td>打印 <code>pos_emb.weight</code> 的前两行</td>
+<td>它们是随机初始化的，训练后才会有结构</td>
+</tr>
+</tbody>
+</table>
+<p>第四行最值得做：删掉因果掩码之后，位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 就能看到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 之后的内容。
+训练时这叫「信息泄漏」，模型会学会抄答案，<a class="xref" href="../L0/0.0b-minimal-model-backward.html" title="最小完整模型（下）：链式法则与一次参数更新">L0.0b</a> 的失败案例 [A] 是同一类问题。</p>
+<hr />
+<h2 id="_10">原始现场</h2>
+<details>
+<summary>① 完整参数表与词表</summary>
+<div class="highlight"><pre><span></span><code>[0] 词表与参数清单
+    语料 26 个字符，去重后 18 个 -&gt; 词表大小 18
+    itos = ['。', '不', '了', '云', '动', '又', '吹', '在', '山', '来', '水', '落', '谷', '走', '过', '面', '风', '，']
+    '风' -&gt; id 16,  id 0 -&gt; '。'
+
+    模型：d_model=32, n_head=4(每头 8 维), n_layer=2, block_size=16
+    参数名                          形状                      元素数
+    tok_emb.weight               (18, 32)                576
+    pos_emb.weight               (16, 32)                512
+    blocks.0.ln1.weight          (32,)                    32
+    blocks.0.ln1.bias            (32,)                    32
+    blocks.0.attn.qkv.weight     (96, 32)              3,072
+    blocks.0.attn.proj.weight    (32, 32)              1,024
+    blocks.0.ln2.weight          (32,)                    32
+    blocks.0.ln2.bias            (32,)                    32
+    blocks.0.mlp.fc1.weight      (128, 32)             4,096
+    blocks.0.mlp.fc2.weight      (32, 128)             4,096
+    blocks.1.ln1.weight          (32,)                    32
+    blocks.1.ln1.bias            (32,)                    32
+    blocks.1.attn.qkv.weight     (96, 32)              3,072
+    blocks.1.attn.proj.weight    (32, 32)              1,024
+    blocks.1.ln2.weight          (32,)                    32
+    blocks.1.ln2.bias            (32,)                    32
+    blocks.1.mlp.fc1.weight      (128, 32)             4,096
+    blocks.1.mlp.fc2.weight      (32, 128)             4,096
+    ln_f.weight                  (32,)                    32
+    ln_f.bias                    (32,)                    32
+    lm_head.weight               (18, 32)                576
+    合计                                                26,560  (103.8 KiB @ fp32)
+</code></pre></div>
+
+<p><strong>怎么读</strong>：<code>itos</code> 是 id 到字符的映射，排序后 <code>'。'</code> 排第一所以是 id 0。
+参数名的层级对应模块嵌套：<code>blocks.0.attn.qkv.weight</code> 就是第 0 层里
+注意力模块里那个 qkv 线性层的权重。真实模型的 checkpoint 用的是同一套命名规则，
+<a class="xref" href="../L4/4.0-checkpoint-format.html" title="模型文件到底是什么：safetensors 字节布局与加载路径">L4.0</a> 会看到 Qwen3 的完整参数清单。</p>
+<p><strong>下一步观察</strong>：把 <code>d_model</code> 改成 64 重跑，对照哪些行的形状变了。</p>
+<p>采集命令：<code>python labs/L0/walk_generate.py</code>
+完整输出：<code>results/local/00_walk_generate.txt</code></p>
+</details>
+<details>
+<summary>② 每一步张量的形状、dtype 与前 4 个数</summary>
+<div class="highlight"><pre><span></span><code>[1] 输入：字符 -&gt; id -&gt; 向量
+    文本   '风吹过山谷'
+    id     [16, 6, 14, 8, 12]
+    张量   idx              (1, 5)             int64    contig=是  前4个: [+16.0000, +6.0000, +14.0000, +8.0000]
+
+    tok_emb          (1, 5, 32)         float32  contig=是  前4个: [-0.5461, -0.6302, -0.6347, +0.9747]
+    x_in             (1, 5, 32)         float32  contig=是  前4个: [-1.4194, -0.6259, -1.8925, -0.1098]   ← tok_emb + pos_emb
+    验证 tok_emb[0,0] == tok_emb.weight[16] : True
+
+[2] 注意力内部
+    qkv              (1, 5, 96)         float32  contig=是  前4个: [-0.1675, -1.4062, -0.7367, -0.3779]
+    q                (1, 4, 5, 8)       float32  contig=否  前4个: [-0.1675, -1.4062, -0.7367, -0.3779]
+    k                (1, 4, 5, 8)       float32  contig=否  前4个: [+0.0807, +0.2170, -0.3819, +0.4538]
+    v                (1, 4, 5, 8)       float32  contig=否  前4个: [+0.2209, -0.3519, +0.4768, +0.1721]
+    att_logits       (1, 4, 5, 5)       float32  contig=是  前4个: [+0.1264, +0.1396, -0.1195, -0.3105]
+    att              (1, 4, 5, 5)       float32  contig=是  前4个: [+1.0000, +0.0000, +0.0000, +0.0000]
+    attn_out         (1, 5, 32)         float32  contig=是  前4个: [-0.4922, -0.3665, -0.4287, +0.3496]
+
+[3] MLP 与残差
+    mlp_hidden       (1, 5, 128)        float32  contig=是  前4个: [+0.4115, +0.1725, -0.0527, -0.1618]
+    mlp_act          (1, 5, 128)        float32  contig=是  前4个: [+0.2715, +0.0980, -0.0252, -0.0705]
+    mlp_out          (1, 5, 32)         float32  contig=是  前4个: [+0.1930, -0.0044, +0.2190, -0.1392]
+    x_final          (1, 5, 32)         float32  contig=是  前4个: [-0.7934, -0.5272, -1.4286, -0.2936]
+
+[4] logits -&gt; 概率
+    logits           (1, 5, 18)         float32  contig=是  前4个: [+0.1560, +0.4895, -0.2074, +0.0675]
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：</p>
+<ul>
+<li><code>q</code> 的 <code>contig=否</code> 是 <code>transpose</code> 留下的痕迹，见 <a class="xref" href="../L2/2.0-tensor-and-framework.html" title="框架内部：storage、stride、view 与 dispatcher">L2.0</a>。</li>
+<li><code>q</code> 的前 4 个数与 <code>qkv</code> 的前 4 个数<strong>完全相同</strong>，因为 Q 就是 <code>qkv</code> 的前 32 列，
+  而 <code>view</code> + <code>transpose</code> 都不搬字节。</li>
+<li><code>att</code> 的前 4 个是 <code>[1.0, 0, 0, 0]</code>：那是注意力矩阵的第一行，位置 0 只能看自己。</li>
+<li>所有中间张量都是 <code>float32</code>。真实推理用 bf16 或 fp16，
+  但归约的累加器仍是 fp32（<a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a>）。</li>
+</ul>
+<p><strong>下一步观察</strong>：把输入换成 6 个字符，看哪些形状里的 <code>5</code> 变成了 <code>6</code>，哪些没变。</p>
+</details>
+<details>
+<summary>③ 位置编码消融：一个需要小心设计的实验</summary>
+<p>第一版实验是错的，值得记录为什么。</p>
+<p><strong>错误做法</strong>：造两个模型，一个 <code>use_pos=True</code> 一个 <code>use_pos=False</code>，比较它们的输出差。
+问题在于这两个模型的权重是<strong>独立随机初始化</strong>的，比出来的差值混杂了权重差异，
+说明不了位置编码的作用。</p>
+<p><strong>正确做法</strong>需要两个条件：</p>
+<ol>
+<li>同一组权重，只切换 <code>use_pos</code>；</li>
+<li>用<strong>单层</strong>模型。</li>
+</ol>
+<p>第二条的理由：不加位置编码时，注意力对输入是置换等变的——
+交换前两个 token（保持最后一个不变），最后一个位置看到的键值<strong>集合</strong>没变，
+所以输出应当相同。但这只在单层成立。两层时，第 1 层在位置 0 和 1 上
+分别看到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x0007B;</mo><mi>风</mi><mo stretchy="false">&#x0007D;</mo></mrow></math></span> 和 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x0007B;</mo><mi>风</mi><mo>&#x0002C;</mo><mi>吹</mi><mo stretchy="false">&#x0007D;</mo></mrow></math></span>，交换输入后变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x0007B;</mo><mi>吹</mi><mo stretchy="false">&#x0007D;</mo></mrow></math></span> 和 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x0007B;</mo><mi>吹</mi><mo>&#x0002C;</mo><mi>风</mi><mo stretchy="false">&#x0007D;</mo></mrow></math></span>——
+这两个集合不同，所以第 2 层看到的输入已经变了。</p>
+<p>实测（<code>A='风吹过'</code>，<code>B='吹风过'</code>，只交换前两个字符）：</p>
+<div class="highlight"><pre><span></span><code>  层数     位置编码        末位 logits 最大差
+   1        无            1.043e-07
+   1        有            5.605e-02
+   2        无            4.412e-02
+   2        有            6.380e-02
+</code></pre></div>
+
+<p>单层无位置编码那一行是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span>，即浮点误差量级——
+两次前向在数学上是同一个和，只是浮点加法顺序不同（对照 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 关于累加顺序的讨论）。
+加上位置编码后差值涨了约 5 个数量级。</p>
+<p>两层无位置编码那一行是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4.4</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>2</mn></mrow></msup></mrow></math></span>，与「有位置编码」的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>6.4</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>2</mn></mrow></msup></mrow></math></span> 同量级——
+<strong>如果只做两层这一组，会得出「位置编码没什么用」的错误结论。</strong></p>
+<p>采集命令：<code>python labs/L0/walk_generate.py</code>（第 [B] 节）</p>
+</details>
+<hr />
+<h2 id="_11">前沿</h2>
+<p>本章是入门章，这里只标出「后面会被替换掉的部分」以及它们各自的动机。</p>
+<table>
+<thead>
+<tr>
+<th>本章的做法</th>
+<th>现在的做法</th>
+<th>解决了什么</th>
+<th>代价</th>
+<th>章节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>可学习的位置查表</td>
+<td>RoPE：把位置编码成旋转</td>
+<td>可外推到训练时没见过的长度</td>
+<td>实现更复杂</td>
+<td><a class="xref" href="../L3/3.1-attention-memory-wall.html" title="从 attention 数学到内存墙">L3.1</a></td>
+</tr>
+<tr>
+<td>显式算出 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x000D7;</mo><mi>T</mi></mrow></math></span> 注意力矩阵</td>
+<td>FlashAttention：分块、不落显存</td>
+<td>显存从 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>T</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 降到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>T</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span></td>
+<td>kernel 复杂度高</td>
+<td><a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a></td>
+</tr>
+<tr>
+<td>每个头独立的 K/V</td>
+<td>GQA / MLA：多个 Q 头共享 K/V</td>
+<td>KV cache 显存大幅下降</td>
+<td>表达能力略降</td>
+<td><a class="xref" href="../L3/3.3-decode-attention.html" title="Decode 侧 attention">L3.3</a></td>
+</tr>
+<tr>
+<td>单路 GELU</td>
+<td>SwiGLU：门控</td>
+<td>同参数量下效果更好</td>
+<td>多一个矩阵</td>
+<td><a class="xref" href="../L4/4.1-transformer-anatomy.html" title="Transformer 层解剖与从零实现">L4.1</a></td>
+</tr>
+<tr>
+<td>每步重算全部前缀</td>
+<td>KV cache + 分页</td>
+<td>生成从 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>T</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 降到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>T</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span></td>
+<td>显存管理复杂</td>
+<td><a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a></td>
+</tr>
+<tr>
+<td>稠密 MLP</td>
+<td>MoE：每个 token 只激活少数专家</td>
+<td>参数量与计算量解耦</td>
+<td>通信与负载均衡</td>
+<td><a class="xref" href="../L4/4.4-moe.html" title="MoE：稀疏激活的系统代价">L4.4</a></td>
+</tr>
+</tbody>
+</table>
+<p>这张表也是本书 L3–L5 的路线图：<strong>每一项都是为了解决本章模型的一个具体缺陷。</strong></p>
+<hr />
+<h2 id="_12">陷阱</h2>
+<p><strong>1. 把 embedding 当成矩阵乘。</strong> 它是按行取，不是乘法。
+性质完全不同：访存密集、不吃 tensor core、词表大时占显存。</p>
+<p><strong>2. 忘记 batch 维。</strong> 本章所有张量第一维都是 <code>B</code>。
+真实代码里 <code>[T, C]</code> 和 <code>[B, T, C]</code> 混用是常见 bug，而广播机制常常让它<strong>不报错</strong>。</p>
+<p><strong>3. 以为一次前向只算了一个预测。</strong> 它对 <code>T</code> 个位置都算了。
+生成时丢掉前 <code>T-1</code> 个，训练时全部用上——这是 <a class="xref" href="../L0/0.0b-minimal-model-backward.html" title="最小完整模型（下）：链式法则与一次参数更新">L0.0b</a> 的起点。</p>
+<p><strong>4. 忽略缩放系数。</strong> 去掉 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><msqrt><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub></mrow></msqrt></mrow></math></span> 在小模型上可能看不出问题，
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>d</mi><mrow><mtext>head</mtext></mrow></msub><mo>&#x0003D;</mo><mn>256</mn></mrow></math></span> 时 softmax 就塌了，梯度尺度掉到 1/7。</p>
+<p><strong>5. 用不受控的对照做消融。</strong> 两个随机初始化的模型之间的差，
+不能归因到你改的那个变量。见「原始现场 ③」。</p>
+<p><strong>6. 把注意力矩阵的每一行理解成「谁重要」。</strong> 它是一个归一化的权重，
+行和恒为 1。某一列权重高只说明相对于同行其他列高，
+不能跨行比较，也不能直接解释成语义上的「关注」。</p>
+<hr />
+<h2 id="_13">自测题</h2>
+<details>
+<summary>1. 把 <code>d_model</code> 从 32 改成 64（<code>n_head</code> 保持 4），参数量变成多少？哪些张量的形状会变？</summary>
+<p><strong>先按参数量的构成分类。</strong> 参数分三种，对 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi></mrow></math></span> 的依赖不同：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>例子</th>
+<th>对 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi></mrow></math></span> 的依赖</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>embedding</td>
+<td><code>tok_emb (V,d)</code>、<code>pos_emb (BS,d)</code>、<code>lm_head (V,d)</code></td>
+<td>线性</td>
+</tr>
+<tr>
+<td>方阵类</td>
+<td><code>attn.qkv (3d,d)</code>、<code>attn.proj (d,d)</code>、<code>mlp.fc1 (4d,d)</code>、<code>mlp.fc2 (d,4d)</code></td>
+<td>平方</td>
+</tr>
+<tr>
+<td>归一化</td>
+<td><code>ln.weight (d,)</code>、<code>ln.bias (d,)</code></td>
+<td>线性</td>
+</tr>
+</tbody>
+</table>
+<p><strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x0003D;</mo><mn>32</mn></mrow></math></span> 时</strong>：
+- embedding 类：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>18</mn><mo>&#x000D7;</mo><mn>32</mn><mo>&#x0002B;</mo><mn>16</mn><mo>&#x000D7;</mo><mn>32</mn><mo>&#x0002B;</mo><mn>18</mn><mo>&#x000D7;</mo><mn>32</mn><mo>&#x0003D;</mo><mn>576</mn><mo>&#x0002B;</mo><mn>512</mn><mo>&#x0002B;</mo><mn>576</mn><mo>&#x0003D;</mo><mn>1664</mn></mrow></math></span>
+- 方阵类，每层 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>3</mn><msup><mi>d</mi><mn>2</mn></msup><mo>&#x0002B;</mo><msup><mi>d</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>4</mn><msup><mi>d</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>4</mn><msup><mi>d</mi><mn>2</mn></msup><mo>&#x0003D;</mo><mn>12</mn><msup><mi>d</mi><mn>2</mn></msup><mo>&#x0003D;</mo><mn>12288</mn></mrow></math></span>，两层 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mn>24576</mn></mrow></math></span>
+- 归一化：每层 2 个 LayerNorm × 2（weight+bias）× 32 = 128，两层 256，加 <code>ln_f</code> 的 64 = 320</p>
+<p>合计 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1664</mn><mo>&#x0002B;</mo><mn>24576</mn><mo>&#x0002B;</mo><mn>320</mn><mo>&#x0003D;</mo><mn>26560</mn></mrow></math></span>，与实测一致。</p>
+<p><strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x0003D;</mo><mn>64</mn></mrow></math></span> 时</strong>：
+- embedding 类：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>18</mn><mo>&#x000D7;</mo><mn>64</mn><mo>&#x0002B;</mo><mn>16</mn><mo>&#x000D7;</mo><mn>64</mn><mo>&#x0002B;</mo><mn>18</mn><mo>&#x000D7;</mo><mn>64</mn><mo>&#x0003D;</mo><mn>3328</mn></mrow></math></span>（翻倍）
+- 方阵类：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>12</mn><mo>&#x000D7;</mo><msup><mn>64</mn><mn>2</mn></msup><mo>&#x000D7;</mo><mn>2</mn><mo>&#x0003D;</mo><mn>98304</mn></mrow></math></span>（四倍）
+- 归一化：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>640</mn></mrow></math></span></p>
+<p>合计 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mn mathvariant="bold">102</mn><mrow><mo mathvariant="bold">&#x0002C;</mo></mrow><mn mathvariant="bold">272</mn></mrow></mrow></math></span>，约为原来的 3.85 倍。</p>
+<p><strong>形状变化</strong>：所有含 32 的维度变成 64，含 128 的变成 256（因为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4</mn><mi>d</mi></mrow></math></span>），
+含 96 的变成 192（因为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>3</mn><mi>d</mi></mrow></math></span>）。<code>d_head</code> 从 8 变成 16（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>64</mn><mo>&#x0002F;</mo><mn>4</mn></mrow></math></span>）。
+<strong>词表维 18 不变</strong>，序列维 5 也不变。</p>
+<p><strong>推广</strong>：大模型里方阵类占绝对多数，所以参数量近似 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>12</mn><mi>L</mi><msup><mi>d</mi><mn>2</mn></msup></mrow></math></span>。
+Qwen3-1.7B：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x0003D;</mo><mn>2048</mn><mo>&#x0002C;</mo><mi>L</mi><mo>&#x0003D;</mo><mn>28</mn></mrow></math></span> → <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>12</mn><mo>&#x000D7;</mo><mn>28</mn><mo>&#x000D7;</mo><msup><mn>2048</mn><mn>2</mn></msup><mo>&#x02248;</mo><mn>1.41</mn></mrow></math></span>B，
+加上 embedding 就接近标称的 1.7B（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 会算完整的账）。</p>
+</details>
+<details>
+<summary>2. 注意力矩阵的第一行必然是 <code>[1.000, 0, 0, ...]</code>。为什么这与模型参数完全无关？</summary>
+<p><strong>逐步推。</strong> 第一行对应位置 0 这个查询。</p>
+<p>第一步，因果掩码把位置 0 这一行除第 0 列之外全部填成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>att</mtext><mo stretchy="false">[</mo><mn>0</mn><mo stretchy="false">]</mo><mo>&#x0003D;</mo><mo stretchy="false">[</mo><msub><mi>z</mi><mn>0</mn></msub><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mo>&#x02212;</mo><mo>&#x0221E;</mo><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mo>&#x02212;</mo><mo>&#x0221E;</mo><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mo>&#x02026;</mo><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mo>&#x02212;</mo><mo>&#x0221E;</mo><mo stretchy="false">]</mo></mrow></math></div></p>
+<p>其中 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>z</mi><mn>0</mn></msub><mo>&#x0003D;</mo><msub><mi>q</mi><mn>0</mn></msub><mo>&#x000B7;</mo><msub><mi>k</mi><mn>0</mn></msub><mo>&#x0002F;</mo><msqrt><mrow><mi>d</mi></mrow></msqrt></mrow></math></span>，这个值确实依赖参数。</p>
+<p>第二步，softmax：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>p</mi><mi>j</mi></msub><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>j</mi></msub></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>i</mi></msub><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>i</mi></msub></mrow></msup></mrow></mfrac></mrow></math></div></p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></msup><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span>，所以分母 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><msup><mi>e</mi><mrow><msub><mi>z</mi><mn>0</mn></msub></mrow></msup><mo>&#x0002B;</mo><mn>0</mn><mo>&#x0002B;</mo><mo>&#x02026;</mo><mo>&#x0002B;</mo><mn>0</mn><mo>&#x0003D;</mo><msup><mi>e</mi><mrow><msub><mi>z</mi><mn>0</mn></msub></mrow></msup></mrow></math></span>，
+分子对 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>j</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span> 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><msub><mi>z</mi><mn>0</mn></msub></mrow></msup></mrow></math></span>，其余是 0。于是</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>p</mi><mn>0</mn></msub><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>z</mi><mn>0</mn></msub></mrow></msup></mrow><mrow><msup><mi>e</mi><mrow><msub><mi>z</mi><mn>0</mn></msub></mrow></msup></mrow></mfrac><mo>&#x0003D;</mo><mn>1</mn><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>p</mi><mrow><mi>j</mi><mo>&#x0003E;</mo><mn>0</mn></mrow></msub><mo>&#x0003D;</mo><mn>0</mn></mrow></math></div></p>
+<p><strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>z</mi><mn>0</mn></msub></mrow></math></span> 被约掉了。</strong> 无论参数是什么，结果都是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">[</mo><mn>1</mn><mo>&#x0002C;</mo><mn>0</mn><mo>&#x0002C;</mo><mo>&#x02026;</mo><mo>&#x0002C;</mo><mn>0</mn><mo stretchy="false">]</mo></mrow></math></span>。</p>
+<p><strong>推论</strong>：单个 token 的注意力输出就是它自己的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>v</mi><mn>0</mn></msub></mrow></math></span>，与 Q、K 无关。
+所以生成第一个 token 时，注意力层退化成一个逐位置的线性变换。</p>
+<p><strong>工程上的用处</strong>：这是一个很好的单元测试。任何注意力实现——
+包括 FlashAttention 这类高度优化的 kernel——第一行都必须是精确的 1.0。
+不是 0.9999，是 1.0（在 softmax 用了最大值稳定化的实现里）。</p>
+</details>
+<details>
+<summary>3. 生成 10 个 token，模型一共做了多少次前向？每次的序列长度是多少？总共浪费了多少计算？</summary>
+<p><strong>逐步数。</strong> 设初始提示长度为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi></mrow></math></span>。</p>
+<table>
+<thead>
+<tr>
+<th>第几次前向</th>
+<th>输入长度</th>
+<th>用到的输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi></mrow></math></span></td>
+<td>只用位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span></td>
+</tr>
+<tr>
+<td>2</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span></td>
+<td>只用位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi></mrow></math></span></td>
+</tr>
+<tr>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+</tr>
+<tr>
+<td>10</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mo>&#x0002B;</mo><mn>9</mn></mrow></math></span></td>
+<td>只用位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mo>&#x0002B;</mo><mn>8</mn></mrow></math></span></td>
+</tr>
+</tbody>
+</table>
+<p><strong>10 次前向</strong>，输入长度从 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi></mrow></math></span> 递增到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mo>&#x0002B;</mo><mn>9</mn></mrow></math></span>。</p>
+<p><strong>浪费量。</strong> 第 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi></mrow></math></span> 次前向算了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mo>&#x0002B;</mo><mi>i</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 个位置，只用了 1 个，
+浪费 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mo>&#x0002B;</mo><mi>i</mi><mo>&#x02212;</mo><mn>2</mn></mrow></math></span> 个位置的计算。总位置数：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><munderover><mo>&#x02211;</mo><mrow><mi>i</mi><mo>&#x0003D;</mo><mn>1</mn></mrow><mrow><mn>10</mn></mrow></munderover><mo stretchy="false">&#x00028;</mo><mi>P</mi><mo>&#x0002B;</mo><mi>i</mi><mo>&#x02212;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mn>10</mn><mi>P</mi><mo>&#x0002B;</mo><mn>45</mn></mrow></math></div></p>
+<p>其中只有 10 个位置的结果被用到。取 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mo>&#x0003D;</mo><mn>5</mn></mrow></math></span>（本章的例子）：
+总共算了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>50</mn><mo>&#x0002B;</mo><mn>45</mn><mo>&#x0003D;</mo><mn>95</mn></mrow></math></span> 个位置，用了 10 个，<strong>浪费 89%</strong>。</p>
+<p><strong>而且浪费的比例随生成长度增长。</strong> 生成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 个 token 时，
+总位置数是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>N</mi><mn>2</mn></msup><mo>&#x0002F;</mo><mn>2</mn><mo stretchy="false">&#x00029;</mo></mrow></math></span>，有用的是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>N</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>。</p>
+<p><strong>KV cache 的思路</strong>：前面位置的 K 和 V 只依赖于该位置之前的输入，
+生成新 token 不会改变它们。把它们存下来，每步只算新 token 那一个位置，
+总计算就从 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>N</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 降到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>N</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>。</p>
+<p>代价是要存 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mi>L</mi><mo>&#x000D7;</mo><mi>T</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> 个数（每层的 K 和 V）。
+这块显存怎么管，就是 <a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a> 整章的内容。</p>
+</details>
+<details>
+<summary>4. 我把 <code>masked_fill</code> 那一行删了，生成的文本看起来还挺正常。这说明掩码没用吗？</summary>
+<p><strong>不能这么推。要分清生成和训练两种场景。</strong></p>
+<p><strong>生成时</strong>，你只用最后一个位置的输出。位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 本来就能看到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>0</mn><mo>&#x0002E;</mo><mo>&#x0002E;</mo><mi>T</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 全部内容，
+掩码对它<strong>没有任何影响</strong>。所以删掉掩码后生成结果看起来正常，是预期之内的。</p>
+<p>准确地说：删掉掩码后，位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>0</mn><mo>&#x0002E;</mo><mo>&#x0002E;</mo><mi>T</mi><mo>&#x02212;</mo><mn>2</mn></mrow></math></span> 的输出会变（它们看到了本不该看到的内容），
+但这些输出在生成时被丢掉了。</p>
+<p><strong>训练时</strong>完全不同。训练要用<strong>所有</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math></span> 个位置的输出算 loss（<a class="xref" href="../L0/0.0b-minimal-model-backward.html" title="最小完整模型（下）：链式法则与一次参数更新">L0.0b</a>）。
+没有掩码，位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 就能看到位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span>——而位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 的标签正是位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span> 的 token。
+模型只要学会「把下一个位置的 embedding 抄过来」就能把 loss 压到 0。
+训练 loss 会漂亮地下降，生成时却完全不可用。</p>
+<p>这与 <a class="xref" href="../L0/0.0b-minimal-model-backward.html" title="最小完整模型（下）：链式法则与一次参数更新">L0.0b</a> 的失败案例 [A]（标签没有移位）是同一类问题：
+<strong>信息泄漏，loss 曲线看不出来。</strong></p>
+<p><strong>怎么真正验证掩码有没有生效</strong>：不要看生成结果，而是
+比较位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 的 logits 在「输入长度为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span>」和「输入长度为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math></span>」两种情况下是否相同。
+掩码正确时它们必须完全一致——这也是 KV cache 正确性的基础前提（<a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a>）。</p>
+</details>
+<details>
+<summary>5. vLLM 用一个融合的 QKV 线性层，transformers 用三个独立的。为什么数学上等价？加载 checkpoint 时要做什么？</summary>
+<p><strong>等价性。</strong> 设输入 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x02208;</mo><msup><mi>&#x0211D;</mi><mrow><mi>d</mi></mrow></msup></mrow></math></span>，三个权重矩阵
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>W</mi><mi>q</mi></msub><mo>&#x0002C;</mo><msub><mi>W</mi><mi>k</mi></msub><mo>&#x0002C;</mo><msub><mi>W</mi><mi>v</mi></msub><mo>&#x02208;</mo><msup><mi>&#x0211D;</mi><mrow><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></msup></mrow></math></span>。</p>
+<p>分开算：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>q</mi><mo>&#x0003D;</mo><msub><mi>W</mi><mi>q</mi></msub><mi>x</mi><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mi>k</mi><mo>&#x0003D;</mo><msub><mi>W</mi><mi>k</mi></msub><mi>x</mi><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mi>v</mi><mo>&#x0003D;</mo><msub><mi>W</mi><mi>v</mi></msub><mi>x</mi></mrow></math></span>。</p>
+<p>融合算：把三个矩阵按行拼成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>W</mi><mrow><mi>q</mi><mi>k</mi><mi>v</mi></mrow></msub><mo>&#x02208;</mo><msup><mi>&#x0211D;</mi><mrow><mn>3</mn><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></msup></mrow></math></span>，</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>W</mi><mrow><mi>q</mi><mi>k</mi><mi>v</mi></mrow></msub><mo>&#x0003D;</mo><mo>&#x0005B;</mo><mtable><mtr><mtd><msub><mi>W</mi><mi>q</mi></msub></mtd></mtr><mtr><mtd><msub><mi>W</mi><mi>k</mi></msub></mtd></mtr><mtr><mtd><msub><mi>W</mi><mi>v</mi></msub></mtd></mtr></mtable><mo>&#x0005D;</mo><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>W</mi><mrow><mi>q</mi><mi>k</mi><mi>v</mi></mrow></msub><mspace width="0.167em" /><mi>x</mi><mo>&#x0003D;</mo><mo>&#x0005B;</mo><mtable><mtr><mtd><msub><mi>W</mi><mi>q</mi></msub><mi>x</mi></mtd></mtr><mtr><mtd><msub><mi>W</mi><mi>k</mi></msub><mi>x</mi></mtd></mtr><mtr><mtd><msub><mi>W</mi><mi>v</mi></msub><mi>x</mi></mtd></mtr></mtable><mo>&#x0005D;</mo><mo>&#x0003D;</mo><mo>&#x0005B;</mo><mtable><mtr><mtd><mi>q</mi></mtd></mtr><mtr><mtd><mi>k</mi></mtd></mtr><mtr><mtd><mi>v</mi></mtd></mtr></mtable><mo>&#x0005D;</mo></mrow></math></div></p>
+<p>矩阵乘按行分块，每一块的结果就是对应子矩阵乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi></mrow></math></span>。所以只要把输出按 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi></mrow></math></span> 切三段，
+得到的就是原来的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>q</mi><mo>&#x0002C;</mo><mi>k</mi><mo>&#x0002C;</mo><mi>v</mi></mrow></math></span>——<strong>逐位相同</strong>（同样的乘加，同样的顺序）。</p>
+<p><strong>为什么要融合。</strong> 一次 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>3</mn><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> 的矩阵乘比三次 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> 更能喂饱 GPU：
+kernel launch 少两次、权重的读取更连续、矩阵更大更接近 GEMM 的高效区间。
+具体收益见 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>。</p>
+<p><strong>加载 checkpoint 时要做的事。</strong> checkpoint 里存的通常是
+<code>q_proj.weight</code>、<code>k_proj.weight</code>、<code>v_proj.weight</code> 三个张量，
+而 vLLM 的模块只有一个 <code>qkv_proj.weight</code>。加载器必须把三份按行拼起来。</p>
+<p>拼接时有两个容易出错的地方：</p>
+<ol>
+<li><strong>顺序</strong>：必须是 q, k, v，反了就会静默地算错（不报错，输出是乱的）。</li>
+<li><strong>GQA 时的形状</strong>：K/V 的头数少于 Q，三块的行数不相等，
+   拼出来是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><msub><mi>n</mi><mi>q</mi></msub><msub><mi>h</mi><mi>d</mi></msub><mo>&#x0002B;</mo><mn>2</mn><msub><mi>n</mi><mrow><mi>k</mi><mi>v</mi></mrow></msub><msub><mi>h</mi><mi>d</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> 而不是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>3</mn><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span>。</li>
+</ol>
+<p><a class="xref" href="../L4/4.0-checkpoint-format.html" title="模型文件到底是什么：safetensors 字节布局与加载路径">L4.0</a> 会在真实 checkpoint 上看这个拼接，<a class="xref" href="../L3/3.3-decode-attention.html" title="Decode 侧 attention">L3.3</a> 讲 GQA 的形状。</p>
+</details></article><nav class="pagenav"><span></span><a class="nav-next" href="../L0/0.0b-minimal-model-backward.html">0.0b 最小完整模型（下）：链式法则与一次参数更新 &#8594;</a></nav>
+</main>
+</body>
+</html>

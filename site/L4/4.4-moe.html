@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.4 MoE：稀疏激活的系统代价</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">4.4</div>
+  <div class="sidebar-title">MoE：稀疏激活的系统代价</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">一 · 稀疏的是算力，不是显存</a></li>
+<li><a href="#_3">二 · 路由有多不均衡</a></li>
+<li><a href="#_4">三 · 分组本身的代价</a></li>
+<li><a href="#batch">四 · 稀疏性在大 batch 下消失</a></li>
+<li><a href="#_5">五 · 设计取舍</a><ul>
+<li><a href="#51-moe-75">5.1 MoE 稀疏化的是那 75%</a></li>
+<li><a href="#52">5.2 负载均衡是训练与推理的目标错配</a></li>
+<li><a href="#53-7b-1b">5.3 "7B 的模型，1B 的计算量"这句话的正确读法</a></li>
+</ul>
+</li>
+<li><a href="#lab">六 · 动手 lab</a></li>
+<li><a href="#_6">七 · 陷阱</a></li>
+<li><a href="#_7">八 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L4 · 模型架构与数值</div>
+  <div class="mod-id">4.4</div>
+  <h1>MoE：稀疏激活的系统代价</h1>
+  <p class="lede">用真实 MoE（OLMoE 64 专家/top-8）量三件事：稀疏的只有算力（5.8×），显存要按总参数量买（12.70 GiB 全驻留），带宽的稀疏性在 batch≥64 时完全消失。路由**跨层聚合会抹掉不均衡**（总体 CV 0.295 vs 逐层 1.0–1.2，每层都有专家拿 0.00%），逐层最热专家占 11.8% → 并行效率上界 13%。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · OLMoE-1B-7B-0924-Instruct（64 专家 / top-8）</span><span class="chip">数据日期 2026-09-11</span><span class="chip">前置 4.1（参数量的账）· 3.3（decode 的带宽账）· 2.7（瘦长 GEMM 的效率）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>MoE 的宣传语是"7B 的模型，1B 的计算量"。这一章把这句话拆开：
+<strong>稀疏的到底是哪一项？不稀疏的那一项要付什么代价？</strong></p>
+<ol>
+<li>参数量与激活量差多少？显存按哪个买？</li>
+<li>路由是均衡的吗？不均衡对系统意味着什么？</li>
+<li>把 token 按专家分组做 GEMM，分组本身要多少钱？</li>
+</ol>
+<p>用的是 <code>allenai/OLMoE-1B-7B-0924-Instruct</code>：16 层、64 个专家、top-8、
+hidden 2048、专家 intermediate 1024。</p>
+<hr />
+<h2 id="_2">一 · 稀疏的是算力，不是显存</h2>
+<div class="highlight"><pre><span></span><code>一个专家 = 3×2048×1024 = 6,291,456 参数
+一层有 64 个专家 + 1 个 router(2048×64)
+
+                          总参数       每 token 激活       比值
+MoE 部分/层           402,784,256       50,462,720     8.0×
+attention/层           16,777,216       16,777,216     1.0×
+每层合计               419,561,472       67,239,936     6.2×
+16 层 + embedding    6,816,006,144    1,178,861,568     5.8×
+</code></pre></div>
+
+<p><strong>6.82B 总参数，每 token 只激活 1.18B（5.8×）。</strong></p>
+<p>MoE 那一层的比值恰好是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>64</mn><mo>&#x0002F;</mo><mn>8</mn><mo>&#x0003D;</mo><mn>8.0</mn><mo>&#x000D7;</mo></mrow></math></span>——因为每 token 只走 8 个专家。
+attention 是 1.0×（每 token 都要走全部 attention 权重），
+所以整层被摊薄到 6.2×，全模型 5.8×。</p>
+<p>但：</p>
+<div class="highlight"><pre><span></span><code>bf16 权重显存：全部 12.70 GiB，而每 token 只用到 2.20 GiB 的量
+**但那 12.70 GiB 必须全部驻留显存** —— 你不知道下一个 token 会路由到谁。
+</code></pre></div>
+
+<p><strong>这就是 MoE 的核心系统代价：按总参数量买显存，按激活量拿算力。</strong></p>
+<p>一个 6.8B 的 MoE 和一个 6.8B 的稠密模型<strong>占一样多的显存</strong>，
+只是算得快一些。所以 MoE 不是"省显存的技术"，恰恰相反——
+它是"在显存够的前提下，用显存换质量"的技术。</p>
+<hr />
+<h2 id="_3">二 · 路由有多不均衡</h2>
+<p>在 16 层的 router 上挂钩子，985 个 token 的真实文本：</p>
+<div class="highlight"><pre><span></span><code>总选择次数 126,080，理想每专家 1,970
+实际 min=945  max=3511  中位数=1906
+最热/最冷 = 3.7×
+最热的专家拿了 2.78%（均匀应为 1.56%）
+变异系数 CV = 0.295
+</code></pre></div>
+
+<p>看起来还行——最热的只比均匀多 78%。</p>
+<p><strong>但这是错的看法。</strong> 逐层看：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">层</th>
+<th style="text-align: right;">最热占比</th>
+<th style="text-align: right;">最冷占比</th>
+<th style="text-align: right;">最热/最冷</th>
+<th style="text-align: right;">CV</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">9.51%</td>
+<td style="text-align: right;"><strong>0.00%</strong></td>
+<td style="text-align: right;">749.0×</td>
+<td style="text-align: right;">1.032</td>
+</tr>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">10.66%</td>
+<td style="text-align: right;">0.20%</td>
+<td style="text-align: right;">52.5×</td>
+<td style="text-align: right;">1.145</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">11.37%</td>
+<td style="text-align: right;"><strong>0.01%</strong></td>
+<td style="text-align: right;"><strong>896.0×</strong></td>
+<td style="text-align: right;">1.232</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">7.97%</td>
+<td style="text-align: right;">0.00%</td>
+<td style="text-align: right;">628.0×</td>
+<td style="text-align: right;">0.996</td>
+</tr>
+<tr>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">8.17%</td>
+<td style="text-align: right;">0.00%</td>
+<td style="text-align: right;">644.0×</td>
+<td style="text-align: right;">1.106</td>
+</tr>
+<tr>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">9.16%</td>
+<td style="text-align: right;">0.00%</td>
+<td style="text-align: right;">722.0×</td>
+<td style="text-align: right;">1.206</td>
+</tr>
+</tbody>
+</table>
+<p><strong>每一层都有专家拿到 0.00%，最热/最冷动辄几百倍，CV 在 1.0 以上。</strong></p>
+<div class="admonition warning">
+<p class="admonition-title">跨层求和会把不均衡抹掉</p>
+<p>总体 CV 0.295 vs 逐层 CV 1.0–1.2，差了 3–4 倍。</p>
+<p>原因：<strong>不同层的热专家不是同一批</strong>，加起来互相填平了。</p>
+<p>而系统关心的是<strong>每一层</strong>——每层各做一次 grouped GEMM，
+每层的最热专家各自决定那一层的关键路径。
+<strong>看总体就是看错了对象。</strong></p>
+<p>这是一个很容易犯的统计错误：把需要分组看的量聚合起来看。
+本书里 0.3 §陷阱 1（只报一个"吞吐"）、5.1 §三（只报吞吐掩盖 TTFT/TPOT）
+都是同一个形态。</p>
+</div>
+<p>用逐层的数算系统含义：</p>
+<div class="highlight"><pre><span></span><code>每层 985 个 token × top-8 = 7880 次选择，均匀应为每专家 123 个
+实测最热的专家拿到该层的 11.8%，即 933 个 token —— 是均匀值的 7.6 倍
+grouped GEMM 若各段并行执行，总时间由最大的那一段决定，
+所以并行效率的上界就是 1/7.6 = 13%。
+</code></pre></div>
+
+<p><strong>13% 是上界。</strong> 在专家并行（EP，<span class="xref pending" title="MoE 分布式与 all-to-all（尚未写）">L6.3</span>）里，这直接变成
+<strong>某张卡在算、其它卡在等</strong>。这就是 MoE 服务最难的一件事。</p>
+<p>（注意 <code>router_aux_loss_coef = 0.01</code>——训练时<strong>有</strong>负载均衡的辅助损失。
+即使如此，推理时在具体文本上仍然这么不均。
+辅助损失优化的是训练分布上的期望，不保证任意输入上的均衡。）</p>
+<hr />
+<h2 id="_4">三 · 分组本身的代价</h2>
+<p>一步 4096 个 token、top-8，即 32768 次专家调用：</p>
+<table>
+<thead>
+<tr>
+<th>做法</th>
+<th style="text-align: right;">ms</th>
+<th style="text-align: right;">TFLOP/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>grouped GEMM（含排序）</td>
+<td style="text-align: right;">1.379</td>
+<td style="text-align: right;">99.7</td>
+</tr>
+<tr>
+<td>　其中只排序</td>
+<td style="text-align: right;">0.255</td>
+<td style="text-align: right;">— （占 18.5%）</td>
+</tr>
+<tr>
+<td>同样 FLOP 的单个大 GEMM</td>
+<td style="text-align: right;"><strong>0.627</strong></td>
+<td style="text-align: right;"><strong>219.3</strong> ← 上界</td>
+</tr>
+</tbody>
+</table>
+<p><strong>分成 64 个小 GEMM 比一个大 GEMM 慢 2.2×。</strong></p>
+<p>原因是每个小 GEMM 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>M</mi></mrow></math></span> 只有约 512，远小于 tensor core 喜欢的形状——
+2.7 §六 量过瘦长 GEMM 的效率远低于方阵（那次是 cuBLAS 在 decode 形状上
+只有 1465 GB/s 而方阵能到 213 TFLOP/s）。</p>
+<p>而且<strong>排序就占了 18.5%</strong>——把 token 按专家重排是纯开销，不产生任何 FLOP。</p>
+<div class="admonition note">
+<p class="admonition-title">这个 2.2× 是上界，不是真实实现的代价</p>
+<p>我这里用 python 循环逐个专家做 GEMM，每个专家一次 kernel launch。
+真实实现用<strong>专门的 grouped GEMM kernel</strong>：一次 launch 处理所有分段，
+每个 block 根据自己的 block id 查表决定处理哪一段。</p>
+<p>那样能省掉 64 次 launch（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a>：每次 2.68 µs）和大部分调度开销。
+<strong>本节量的是"用最朴素的方式实现会有多贵"</strong>，
+它的用处是说明为什么必须写专门的 kernel。
+（同 3.3 §四 分页那次的定位。）</p>
+</div>
+<p>不均衡会让情况更糟：</p>
+<div class="highlight"><pre><span></span><code>均匀              max=  575 min= 462 max/mean= 1.12×
+倾斜（一个专家占 20%） max= 7061 min= 357 max/mean=13.79×
+</code></pre></div>
+
+<p>分段 GEMM 若并行执行，总时间由最大的那一段决定，
+<strong><code>max/mean</code> 就是并行效率的直接上界</strong>——和第二节算出的 7.6× / 13% 是同一件事。</p>
+<hr />
+<h2 id="batch">四 · 稀疏性在大 batch 下消失</h2>
+<p>decode 时 batch=1 只碰 8 个专家。但 batch 一大，
+不同 token 路由到不同专家，读取量迅速逼近全部。</p>
+<p>期望被碰到的专家数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mi>E</mi><mrow><mo stretchy="true" fence="true" form="prefix">[</mo><mn>1</mn><mo>&#x02212;</mo><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><mi>K</mi><mo>&#x0002F;</mo><mi>E</mi><msup><mo stretchy="false">&#x00029;</mo><mi>B</mi></msup><mo stretchy="true" fence="true" form="postfix">]</mo></mrow></mrow></math></span>：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">batch</th>
+<th style="text-align: right;">期望被碰到的专家数/层</th>
+<th style="text-align: right;">读取量 MB</th>
+<th style="text-align: right;">占全部</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">1536.0</td>
+<td style="text-align: right;">12.5%</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">26.5</td>
+<td style="text-align: right;">5085.0</td>
+<td style="text-align: right;">41.4%</td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">56.4</td>
+<td style="text-align: right;">10837.2</td>
+<td style="text-align: right;"><strong>88.2%</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">64.0</td>
+<td style="text-align: right;">12285.6</td>
+<td style="text-align: right;"><strong>100.0%</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">64.0</td>
+<td style="text-align: right;">12288.0</td>
+<td style="text-align: right;">100.0%</td>
+</tr>
+</tbody>
+</table>
+<p><strong>batch≥64 时每层所有 64 个专家都要读一遍。</strong></p>
+<p>所以：<strong>MoE 的稀疏性在大 batch 下从带宽角度基本消失</strong>，
+只在算力上仍然稀疏（每 token 仍只算 8 个专家）。</p>
+<p>结合 5.1 的账：
+- <strong>小 batch decode</strong>（带宽受限）：MoE 读 12.5% 的权重，看似大赚——
+  但小 batch 本来就没吃满带宽，收益打折
+- <strong>大 batch decode</strong>（越过平衡点后转算力受限）：权重全读，
+  带宽上没有优势；但算力上仍稀疏 8 倍——<strong>这才是 MoE 的主场</strong>
+- <strong>prefill</strong>（算力受限）：同上，算力稀疏是真收益</p>
+<p><strong>MoE 适合算力受限的场景，在小 batch decode 上优势有限。</strong>
+这和"MoE 让小模型跑得像大模型"的直觉相反。</p>
+<hr />
+<h2 id="_5">五 · 设计取舍</h2>
+<h3 id="51-moe-75">5.1 MoE 稀疏化的是那 75%</h3>
+<p>4.1 实测：稠密 Transformer 每层 <strong>MLP 占 75%、attention 占 25%</strong> 的参数。
+MoE 只把 MLP 换成专家，attention 一个字节都不动。</p>
+<p>这个选择很精准：
+- MLP 是参数大头，稀疏化它收益最大
+- attention 有 KV cache 的账（3.3），稀疏化它会破坏 KV 的规整性
+- MLP 是逐 token 独立的，天然可以按 token 路由；attention 跨 token，不好切</p>
+<p>本章实测的 8.0×（MoE 层）→ 6.2×（含 attention）→ 5.8×（含 embedding）
+这条衰减链，就是"只稀疏化了一部分"的直接体现。</p>
+<p><strong>判据：稀疏化要挑那个「占比大 + 结构上可分」的部分。</strong> 两个条件缺一不可。</p>
+<h3 id="52">5.2 负载均衡是训练与推理的目标错配</h3>
+<p>训练时用 aux loss 惩罚不均衡（本模型 <code>router_aux_loss_coef = 0.01</code>），
+优化的是<strong>训练分布上的期望均衡</strong>。</p>
+<p>但推理时面对的是<strong>某一个具体的 batch</strong>，而且 batch 越小方差越大。
+本章实测：即使有 aux loss，单层最热专家仍拿到 11.8%（均匀 1.56%）。</p>
+<p>这是一个结构性的错配：<strong>训练优化期望，推理承受方差。</strong></p>
+<p>工程上的应对都是在推理侧打补丁：
+- capacity factor（超出容量的 token 直接丢弃或走 residual）——牺牲质量
+- 把热专家复制到多张卡——牺牲显存
+- 动态重排专家到卡的映射——牺牲复杂度</p>
+<p><strong>没有一个是免费的</strong>，因为问题的根源在目标函数里。</p>
+<h3 id="53-7b-1b">5.3 "7B 的模型，1B 的计算量"这句话的正确读法</h3>
+<p>拆成三句：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>是不是稀疏的</th>
+<th>本章实测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>算力</strong></td>
+<td>是</td>
+<td>5.8×（每 token 只算 1.18B）</td>
+</tr>
+<tr>
+<td><strong>显存</strong></td>
+<td><strong>否</strong></td>
+<td>12.70 GiB 全部要驻留</td>
+</tr>
+<tr>
+<td><strong>带宽</strong></td>
+<td><strong>取决于 batch</strong></td>
+<td>batch=1 读 12.5%，batch≥64 读 100%</td>
+</tr>
+</tbody>
+</table>
+<p>宣传语只说了第一行。第二行决定了你能不能部署，
+第三行决定了它在你的负载上到底快不快。</p>
+<p><strong>可带走的判断：任何"稀疏"的说法，都要问清楚稀疏的是哪一种资源。</strong>
+算力、显存、带宽三者可以完全解耦——本章就是一个三者各不相同的例子。</p>
+<hr />
+<h2 id="lab">六 · 动手 lab</h2>
+<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L4 &amp;&amp; /scratch/learn/envs/serve/bin/python moe.py'</span>
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/ckpt/44_moe.txt</code>。</p>
+<details class="fold srcfold"><summary>labs/L4/moe.py 全文（335 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L4.4 —— MoE：稀疏激活的系统代价。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">用一个真实的 MoE 模型（OLMoE-1B-7B：64 个专家、top-8、1B 激活 / 7B 总量）：</span>
+<span class="linenos">  5</span>
+<span class="linenos">  6</span><span class="sd">  [A] 参数量 vs 激活量：稀疏到底稀疏了什么</span>
+<span class="linenos">  7</span><span class="sd">  [B] 路由：真实文本上每个专家被选了多少次（负载均衡）</span>
+<span class="linenos">  8</span><span class="sd">  [C] grouped GEMM：把 token 按专家分组的代价</span>
+<span class="linenos">  9</span><span class="sd">  [D] 显存与带宽的账：MoE 为什么难服务</span>
+<span class="linenos"> 10</span>
+<span class="linenos"> 11</span><span class="sd">用法：</span>
+<span class="linenos"> 12</span><span class="sd">    python moe.py</span>
+<span class="linenos"> 13</span><span class="sd">    python moe.py B</span>
+<span class="linenos"> 14</span><span class="sd">"""</span>
+<span class="linenos"> 15</span>
+<span class="linenos"> 16</span><span class="kn">import</span><span class="w"> </span><span class="nn">glob</span>
+<span class="linenos"> 17</span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 20</span><span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">Counter</span>
+<span class="linenos"> 21</span>
+<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 23</span>
+<span class="linenos"> 24</span><span class="c1"># 模型都已在本地缓存；强制离线，避免 vLLM/transformers 每次去连 Hub</span>
+<span class="linenos"> 25</span><span class="c1"># （连不上时会直接抛 httpx.ConnectError，即使文件就在本地）</span>
+<span class="linenos"> 26</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"HF_HUB_OFFLINE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
+<span class="linenos"> 27</span>
+<span class="linenos"> 28</span><span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos"> 29</span><span class="n">HUB</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"HF_HOME"</span><span class="p">,</span> <span class="s2">"/scratch/learn/models/hf"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/hub"</span>
+<span class="linenos"> 30</span><span class="n">REPO</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"L44_MODEL"</span><span class="p">,</span> <span class="s2">"allenai/OLMoE-1B-7B-0924-Instruct"</span><span class="p">)</span>
+<span class="linenos"> 31</span>
+<span class="linenos"> 32</span>
+<span class="linenos"> 33</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 34</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos"> 35</span>
+<span class="linenos"> 36</span>
+<span class="linenos"> 37</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 38</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos"> 39</span>
+<span class="linenos"> 40</span>
+<span class="linenos"> 41</span><span class="k">def</span><span class="w"> </span><span class="nf">snap</span><span class="p">(</span><span class="n">repo</span><span class="p">):</span>
+<span class="linenos"> 42</span>    <span class="n">d</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">HUB</span><span class="si">}</span><span class="s2">/models--</span><span class="si">{</span><span class="n">repo</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'/'</span><span class="p">,</span><span class="w"> </span><span class="s1">'--'</span><span class="p">)</span><span class="si">}</span><span class="s2">/snapshots"</span>
+<span class="linenos"> 43</span>    <span class="n">g</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/*"</span><span class="p">))</span>
+<span class="linenos"> 44</span>    <span class="k">return</span> <span class="n">g</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">g</span> <span class="k">else</span> <span class="kc">None</span>
+<span class="linenos"> 45</span>
+<span class="linenos"> 46</span>
+<span class="linenos"> 47</span><span class="k">def</span><span class="w"> </span><span class="nf">timeit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">5</span><span class="p">):</span>
+<span class="linenos"> 48</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">warmup</span><span class="p">):</span>
+<span class="linenos"> 49</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 50</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 51</span>    <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 52</span>    <span class="n">a</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 53</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos"> 54</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 55</span>    <span class="n">b</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 56</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 57</span>    <span class="k">return</span> <span class="n">a</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
+<span class="linenos"> 58</span>
+<span class="linenos"> 59</span>
+<span class="linenos"> 60</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos"> 61</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos"> 62</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 参数量 vs 激活量"</span><span class="p">)</span>
+<span class="linenos"> 63</span>
+<span class="linenos"> 64</span>    <span class="n">d</span> <span class="o">=</span> <span class="n">snap</span><span class="p">(</span><span class="n">REPO</span><span class="p">)</span>
+<span class="linenos"> 65</span>    <span class="k">if</span> <span class="ow">not</span> <span class="n">d</span><span class="p">:</span>
+<span class="linenos"> 66</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">REPO</span><span class="si">}</span><span class="s2"> 未下载"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos"> 67</span>    <span class="n">c</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/config.json"</span><span class="p">))</span>
+<span class="linenos"> 68</span>    <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">,</span> <span class="s2">"intermediate_size"</span><span class="p">,</span> <span class="s2">"num_hidden_layers"</span><span class="p">,</span>
+<span class="linenos"> 69</span>              <span class="s2">"num_attention_heads"</span><span class="p">,</span> <span class="s2">"num_key_value_heads"</span><span class="p">,</span>
+<span class="linenos"> 70</span>              <span class="s2">"num_experts"</span><span class="p">,</span> <span class="s2">"num_experts_per_tok"</span><span class="p">,</span> <span class="s2">"vocab_size"</span><span class="p">,</span>
+<span class="linenos"> 71</span>              <span class="s2">"norm_topk_prob"</span><span class="p">,</span> <span class="s2">"router_aux_loss_coef"</span><span class="p">]:</span>
+<span class="linenos"> 72</span>        <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">c</span><span class="p">:</span>
+<span class="linenos"> 73</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">k</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">c</span><span class="p">[</span><span class="n">k</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 74</span>
+<span class="linenos"> 75</span>    <span class="n">H</span><span class="p">,</span> <span class="n">I</span><span class="p">,</span> <span class="n">L</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span>
+<span class="linenos"> 76</span>    <span class="n">E</span><span class="p">,</span> <span class="n">K</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_experts"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_experts_per_tok"</span><span class="p">]</span>
+<span class="linenos"> 77</span>    <span class="n">V</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"vocab_size"</span><span class="p">]</span>
+<span class="linenos"> 78</span>
+<span class="linenos"> 79</span>    <span class="n">p_expert</span> <span class="o">=</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">I</span>                  <span class="c1"># SwiGLU 三个矩阵</span>
+<span class="linenos"> 80</span>    <span class="n">p_router</span> <span class="o">=</span> <span class="n">H</span> <span class="o">*</span> <span class="n">E</span>
+<span class="linenos"> 81</span>    <span class="n">p_moe_layer</span> <span class="o">=</span> <span class="n">E</span> <span class="o">*</span> <span class="n">p_expert</span> <span class="o">+</span> <span class="n">p_router</span>
+<span class="linenos"> 82</span>    <span class="n">nq</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">]</span>
+<span class="linenos"> 83</span>    <span class="n">nkv</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"num_key_value_heads"</span><span class="p">,</span> <span class="n">nq</span><span class="p">)</span>
+<span class="linenos"> 84</span>    <span class="n">hd</span> <span class="o">=</span> <span class="n">H</span> <span class="o">//</span> <span class="n">nq</span>
+<span class="linenos"> 85</span>    <span class="n">p_attn</span> <span class="o">=</span> <span class="n">H</span> <span class="o">*</span> <span class="n">nq</span> <span class="o">*</span> <span class="n">hd</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">nkv</span> <span class="o">*</span> <span class="n">hd</span> <span class="o">+</span> <span class="n">nq</span> <span class="o">*</span> <span class="n">hd</span> <span class="o">*</span> <span class="n">H</span>
+<span class="linenos"> 86</span>    <span class="n">p_layer</span> <span class="o">=</span> <span class="n">p_moe_layer</span> <span class="o">+</span> <span class="n">p_attn</span>
+<span class="linenos"> 87</span>    <span class="n">total</span> <span class="o">=</span> <span class="n">L</span> <span class="o">*</span> <span class="n">p_layer</span> <span class="o">+</span> <span class="n">V</span> <span class="o">*</span> <span class="n">H</span>
+<span class="linenos"> 88</span>
+<span class="linenos"> 89</span>    <span class="n">act_moe</span> <span class="o">=</span> <span class="n">K</span> <span class="o">*</span> <span class="n">p_expert</span> <span class="o">+</span> <span class="n">p_router</span>     <span class="c1"># 每 token 只走 K 个专家</span>
+<span class="linenos"> 90</span>    <span class="n">act_layer</span> <span class="o">=</span> <span class="n">act_moe</span> <span class="o">+</span> <span class="n">p_attn</span>
+<span class="linenos"> 91</span>    <span class="n">act_total</span> <span class="o">=</span> <span class="n">L</span> <span class="o">*</span> <span class="n">act_layer</span> <span class="o">+</span> <span class="n">V</span> <span class="o">*</span> <span class="n">H</span>
+<span class="linenos"> 92</span>
+<span class="linenos"> 93</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  一个专家 = 3×</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">I</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">p_expert</span><span class="si">:</span><span class="s2">,</span><span class="si">}</span><span class="s2"> 参数"</span><span class="p">)</span>
+<span class="linenos"> 94</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  一层有 </span><span class="si">{</span><span class="n">E</span><span class="si">}</span><span class="s2"> 个专家 + 1 个 router(</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">E</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos"> 95</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">''</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'总参数'</span><span class="si">:</span><span class="s2">&gt;16</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'每 token 激活'</span><span class="si">:</span><span class="s2">&gt;16</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'比值'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 96</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'MoE 部分/层'</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p_moe_layer</span><span class="si">:</span><span class="s2">&gt;16,</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">act_moe</span><span class="si">:</span><span class="s2">&gt;16,</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos"> 97</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">p_moe_layer</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">act_moe</span><span class="si">:</span><span class="s2">&gt;7.1f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos"> 98</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'attention/层'</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p_attn</span><span class="si">:</span><span class="s2">&gt;16,</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p_attn</span><span class="si">:</span><span class="s2">&gt;16,</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="mf">1.0</span><span class="si">:</span><span class="s2">&gt;7.1f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos"> 99</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'每层合计'</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p_layer</span><span class="si">:</span><span class="s2">&gt;16,</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">act_layer</span><span class="si">:</span><span class="s2">&gt;16,</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">100</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">p_layer</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">act_layer</span><span class="si">:</span><span class="s2">&gt;7.1f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">101</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="sa">f</span><span class="s1">'</span><span class="si">{</span><span class="n">L</span><span class="si">}</span><span class="s1"> 层 + embedding'</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">total</span><span class="si">:</span><span class="s2">&gt;16,</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">act_total</span><span class="si">:</span><span class="s2">&gt;16,</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">102</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">act_total</span><span class="si">:</span><span class="s2">&gt;7.1f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">103</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  bf16 权重显存：全部 </span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1024</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB，"</span>
+<span class="linenos">104</span>          <span class="sa">f</span><span class="s2">"而每 token 只用到 </span><span class="si">{</span><span class="n">act_total</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1024</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB 的量"</span><span class="p">)</span>
+<span class="linenos">105</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  **但那 </span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1024</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB 必须全部驻留显存** —— "</span>
+<span class="linenos">106</span>          <span class="sa">f</span><span class="s2">"你不知道下一个 token 会路由到谁。"</span><span class="p">)</span>
+<span class="linenos">107</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这就是 MoE 的核心系统代价：**按总参数量买显存，按激活量拿算力。**"</span><span class="p">)</span>
+<span class="linenos">108</span>
+<span class="linenos">109</span>
+<span class="linenos">110</span><span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos">111</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos">112</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 路由：真实文本上专家被选了多少次"</span><span class="p">)</span>
+<span class="linenos">113</span>
+<span class="linenos">114</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoTokenizer</span>
+<span class="linenos">115</span>    <span class="n">tok</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">REPO</span><span class="p">)</span>
+<span class="linenos">116</span>    <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+<span class="linenos">117</span>        <span class="n">REPO</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<span class="linenos">118</span>    <span class="n">cfg</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span>
+<span class="linenos">119</span>    <span class="n">E</span><span class="p">,</span> <span class="n">K</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_experts</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_experts_per_tok</span>
+<span class="linenos">120</span>
+<span class="linenos">121</span>    <span class="n">text</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"The transformer architecture uses self-attention to model "</span>
+<span class="linenos">122</span>            <span class="s2">"dependencies between tokens. In a mixture-of-experts layer, a router "</span>
+<span class="linenos">123</span>            <span class="s2">"assigns each token to a small subset of expert networks. This makes "</span>
+<span class="linenos">124</span>            <span class="s2">"the total parameter count much larger than the number of parameters "</span>
+<span class="linenos">125</span>            <span class="s2">"actually used for any single token. 混合专家模型的路由决定了每个 token "</span>
+<span class="linenos">126</span>            <span class="s2">"走哪几个专家。def forward(self, x): return self.mlp(self.norm(x)) "</span>
+<span class="linenos">127</span>            <span class="s2">"1 + 1 = 2. The quick brown fox jumps over the lazy dog. "</span><span class="p">)</span> <span class="o">*</span> <span class="mi">8</span>
+<span class="linenos">128</span>    <span class="n">ids</span> <span class="o">=</span> <span class="n">tok</span><span class="p">(</span><span class="n">text</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">)</span><span class="o">.</span><span class="n">input_ids</span><span class="o">.</span><span class="n">cuda</span><span class="p">()[:,</span> <span class="p">:</span><span class="mi">1024</span><span class="p">]</span>
+<span class="linenos">129</span>    <span class="n">S</span> <span class="o">=</span> <span class="n">ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos">130</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">REPO</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">131</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">E</span><span class="si">}</span><span class="s2"> 个专家，每 token 选 top-</span><span class="si">{</span><span class="n">K</span><span class="si">}</span><span class="s2">，输入 </span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> 个 token"</span><span class="p">)</span>
+<span class="linenos">132</span>
+<span class="linenos">133</span>    <span class="c1"># 挂钩子抓每一层 router 的选择</span>
+<span class="linenos">134</span>    <span class="n">picks</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">135</span>
+<span class="linenos">136</span>    <span class="k">def</span><span class="w"> </span><span class="nf">mk_hook</span><span class="p">(</span><span class="n">li</span><span class="p">):</span>
+<span class="linenos">137</span>        <span class="k">def</span><span class="w"> </span><span class="nf">hook</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">inp</span><span class="p">,</span> <span class="n">out</span><span class="p">):</span>
+<span class="linenos">138</span>            <span class="n">logits</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">)</span> <span class="k">else</span> <span class="n">out</span>
+<span class="linenos">139</span>            <span class="k">if</span> <span class="n">logits</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">3</span><span class="p">:</span>
+<span class="linenos">140</span>                <span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+<span class="linenos">141</span>            <span class="n">top</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">K</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">indices</span>        <span class="c1"># [tokens, K]</span>
+<span class="linenos">142</span>            <span class="n">picks</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">li</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">top</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">())</span>
+<span class="linenos">143</span>        <span class="k">return</span> <span class="n">hook</span>
+<span class="linenos">144</span>
+<span class="linenos">145</span>    <span class="n">handles</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">146</span>    <span class="k">for</span> <span class="n">li</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
+<span class="linenos">147</span>        <span class="n">gate</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">mlp</span><span class="p">,</span> <span class="s2">"gate"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+<span class="linenos">148</span>        <span class="k">if</span> <span class="n">gate</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">149</span>            <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gate</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">mk_hook</span><span class="p">(</span><span class="n">li</span><span class="p">)))</span>
+<span class="linenos">150</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  在 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">handles</span><span class="p">)</span><span class="si">}</span><span class="s2"> 层的 router 上挂了钩子"</span><span class="p">)</span>
+<span class="linenos">151</span>
+<span class="linenos">152</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">153</span>        <span class="n">model</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span>
+<span class="linenos">154</span>    <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">handles</span><span class="p">:</span>
+<span class="linenos">155</span>        <span class="n">h</span><span class="o">.</span><span class="n">remove</span><span class="p">()</span>
+<span class="linenos">156</span>
+<span class="linenos">157</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"总体：所有层所有 token 加起来"</span><span class="p">)</span>
+<span class="linenos">158</span>    <span class="n">allpick</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">picks</span><span class="o">.</span><span class="n">values</span><span class="p">()])</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+<span class="linenos">159</span>    <span class="n">cnt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bincount</span><span class="p">(</span><span class="n">allpick</span><span class="p">,</span> <span class="n">minlength</span><span class="o">=</span><span class="n">E</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">160</span>    <span class="n">ideal</span> <span class="o">=</span> <span class="n">cnt</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">/</span> <span class="n">E</span>
+<span class="linenos">161</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  总选择次数 </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">cnt</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">())</span><span class="si">:</span><span class="s2">,</span><span class="si">}</span><span class="s2">，理想每专家 </span><span class="si">{</span><span class="n">ideal</span><span class="si">:</span><span class="s2">,.0f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">162</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  实际 min=</span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">cnt</span><span class="o">.</span><span class="n">min</span><span class="p">())</span><span class="si">}</span><span class="s2">  max=</span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">cnt</span><span class="o">.</span><span class="n">max</span><span class="p">())</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos">163</span>          <span class="sa">f</span><span class="s2">"中位数=</span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">cnt</span><span class="o">.</span><span class="n">median</span><span class="p">())</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">164</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  **最热/最冷 = </span><span class="si">{</span><span class="n">cnt</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nb">max</span><span class="p">(</span><span class="n">cnt</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">×**"</span><span class="p">)</span>
+<span class="linenos">165</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  最热的专家拿了 </span><span class="si">{</span><span class="n">cnt</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">cnt</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">166</span>          <span class="sa">f</span><span class="s2">"（均匀应为 </span><span class="si">{</span><span class="mi">1</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">E</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos">167</span>    <span class="c1"># 变异系数</span>
+<span class="linenos">168</span>    <span class="n">cv</span> <span class="o">=</span> <span class="p">(</span><span class="n">cnt</span><span class="o">.</span><span class="n">std</span><span class="p">()</span> <span class="o">/</span> <span class="n">cnt</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">169</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  变异系数 CV = </span><span class="si">{</span><span class="n">cv</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">   （0 = 完全均衡）"</span><span class="p">)</span>
+<span class="linenos">170</span>
+<span class="linenos">171</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"逐层看：不均衡程度一样吗"</span><span class="p">)</span>
+<span class="linenos">172</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'层'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'最热占比'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'最冷占比'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'最热/最冷'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'CV'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">173</span>    <span class="k">for</span> <span class="n">li</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">picks</span><span class="p">)[:</span><span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">picks</span><span class="p">)[</span><span class="o">-</span><span class="mi">3</span><span class="p">:]:</span>
+<span class="linenos">174</span>        <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">picks</span><span class="p">[</span><span class="n">li</span><span class="p">])</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+<span class="linenos">175</span>        <span class="n">c</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bincount</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">minlength</span><span class="o">=</span><span class="n">E</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">176</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">li</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">c</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">c</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;9.2%</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">177</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">c</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">c</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;9.2%</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">178</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">c</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nb">max</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2">× "</span>
+<span class="linenos">179</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">std</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">c</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;8.3f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">180</span>
+<span class="linenos">181</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"⚠ 跨层求和会把不均衡抹掉"</span><span class="p">)</span>
+<span class="linenos">182</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  总体那张表看着还行（最热/最冷 </span><span class="si">{</span><span class="n">cnt</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nb">max</span><span class="p">(</span><span class="n">cnt</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">×，"</span>
+<span class="linenos">183</span>          <span class="sa">f</span><span class="s2">"CV </span><span class="si">{</span><span class="n">cv</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">），"</span><span class="p">)</span>
+<span class="linenos">184</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  但逐层表里最热/最冷动辄几百倍、CV 在 1.0 以上，而且**每层都有专家拿到 0.00%**。"</span><span class="p">)</span>
+<span class="linenos">185</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  原因：不同层的热专家不是同一批，加起来互相填平了。"</span><span class="p">)</span>
+<span class="linenos">186</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  **而系统关心的是每一层**——每一层都要做一次 grouped GEMM，"</span><span class="p">)</span>
+<span class="linenos">187</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  每一层的最热专家各自决定那一层的关键路径。所以看总体是看错了对象。"</span><span class="p">)</span>
+<span class="linenos">188</span>
+<span class="linenos">189</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"对系统的直接含义（用逐层的数）"</span><span class="p">)</span>
+<span class="linenos">190</span>    <span class="n">per_layer_tokens</span> <span class="o">=</span> <span class="n">S</span> <span class="o">*</span> <span class="n">K</span>                     <span class="c1"># 每层每 token 选 K 个</span>
+<span class="linenos">191</span>    <span class="n">ideal_layer</span> <span class="o">=</span> <span class="n">per_layer_tokens</span> <span class="o">/</span> <span class="n">E</span>
+<span class="linenos">192</span>    <span class="n">hot_frac</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span>
+<span class="linenos">193</span>        <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bincount</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">picks</span><span class="p">[</span><span class="n">li</span><span class="p">])</span><span class="o">.</span><span class="n">flatten</span><span class="p">(),</span> <span class="n">minlength</span><span class="o">=</span><span class="n">E</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span>
+<span class="linenos">194</span>         <span class="o">/</span> <span class="n">per_layer_tokens</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="k">for</span> <span class="n">li</span> <span class="ow">in</span> <span class="n">picks</span><span class="p">)</span>
+<span class="linenos">195</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  每层 </span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> 个 token × top-</span><span class="si">{</span><span class="n">K</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">per_layer_tokens</span><span class="si">}</span><span class="s2"> 次选择，"</span>
+<span class="linenos">196</span>          <span class="sa">f</span><span class="s2">"均匀应为每专家 </span><span class="si">{</span><span class="n">ideal_layer</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> 个"</span><span class="p">)</span>
+<span class="linenos">197</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  实测最热的专家拿到该层的 </span><span class="si">{</span><span class="n">hot_frac</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos">198</span>          <span class="sa">f</span><span class="s2">"即 </span><span class="si">{</span><span class="n">hot_frac</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">per_layer_tokens</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> 个 token —— "</span>
+<span class="linenos">199</span>          <span class="sa">f</span><span class="s2">"是均匀值的 </span><span class="si">{</span><span class="n">hot_frac</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">E</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> 倍"</span><span class="p">)</span>
+<span class="linenos">200</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  grouped GEMM 若各段并行执行，总时间由最大的那一段决定，"</span><span class="p">)</span>
+<span class="linenos">201</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  所以并行效率的上界就是 1/</span><span class="si">{</span><span class="n">hot_frac</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">E</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="mi">1</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">hot_frac</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">E</span><span class="p">)</span><span class="si">:</span><span class="s2">.0%</span><span class="si">}</span><span class="s2">。"</span><span class="p">)</span>
+<span class="linenos">202</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  在专家并行（EP）里，这直接变成**某张卡在算、其它卡在等**（L6.3）。"</span><span class="p">)</span>
+<span class="linenos">203</span>    <span class="k">del</span> <span class="n">model</span>
+<span class="linenos">204</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">205</span>
+<span class="linenos">206</span>
+<span class="linenos">207</span><span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos">208</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos">209</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] grouped GEMM：分组本身要多少代价"</span><span class="p">)</span>
+<span class="linenos">210</span>
+<span class="linenos">211</span>    <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+<span class="linenos">212</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  需要 CUDA"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos">213</span>    <span class="n">d</span> <span class="o">=</span> <span class="n">snap</span><span class="p">(</span><span class="n">REPO</span><span class="p">)</span>
+<span class="linenos">214</span>    <span class="n">c</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/config.json"</span><span class="p">))</span> <span class="k">if</span> <span class="n">d</span> <span class="k">else</span> <span class="p">{</span>
+<span class="linenos">215</span>        <span class="s2">"hidden_size"</span><span class="p">:</span> <span class="mi">2048</span><span class="p">,</span> <span class="s2">"intermediate_size"</span><span class="p">:</span> <span class="mi">1024</span><span class="p">,</span>
+<span class="linenos">216</span>        <span class="s2">"num_experts"</span><span class="p">:</span> <span class="mi">64</span><span class="p">,</span> <span class="s2">"num_experts_per_tok"</span><span class="p">:</span> <span class="mi">8</span><span class="p">}</span>
+<span class="linenos">217</span>    <span class="n">H</span><span class="p">,</span> <span class="n">I</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">]</span>
+<span class="linenos">218</span>    <span class="n">E</span><span class="p">,</span> <span class="n">K</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_experts"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_experts_per_tok"</span><span class="p">]</span>
+<span class="linenos">219</span>    <span class="n">T</span> <span class="o">=</span> <span class="mi">4096</span>                                  <span class="c1"># 一个 step 的 token 数</span>
+<span class="linenos">220</span>
+<span class="linenos">221</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2"> I=</span><span class="si">{</span><span class="n">I</span><span class="si">}</span><span class="s2"> 专家数=</span><span class="si">{</span><span class="n">E</span><span class="si">}</span><span class="s2"> top-</span><span class="si">{</span><span class="n">K</span><span class="si">}</span><span class="s2">  一步 </span><span class="si">{</span><span class="n">T</span><span class="si">}</span><span class="s2"> 个 token"</span><span class="p">)</span>
+<span class="linenos">222</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">E</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">I</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">223</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">T</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">224</span>
+<span class="linenos">225</span>    <span class="c1"># 均匀路由</span>
+<span class="linenos">226</span>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">227</span>    <span class="n">assign</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">E</span><span class="p">,</span> <span class="p">(</span><span class="n">T</span> <span class="o">*</span> <span class="n">K</span><span class="p">,),</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">228</span>    <span class="n">xs</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">repeat_interleave</span><span class="p">(</span><span class="n">K</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">229</span>
+<span class="linenos">230</span>    <span class="k">def</span><span class="w"> </span><span class="nf">dense_all</span><span class="p">():</span>
+<span class="linenos">231</span><span class="w">        </span><span class="sd">"""朴素：每个 token 都过所有专家（正确但浪费 E/K 倍）"""</span>
+<span class="linenos">232</span>        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">"th,ehi-&gt;tei"</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos">233</span>
+<span class="linenos">234</span>    <span class="k">def</span><span class="w"> </span><span class="nf">grouped</span><span class="p">():</span>
+<span class="linenos">235</span><span class="w">        </span><span class="sd">"""按专家排序后分段做 GEMM —— 这是真实实现的形态"""</span>
+<span class="linenos">236</span>        <span class="n">order</span> <span class="o">=</span> <span class="n">assign</span><span class="o">.</span><span class="n">argsort</span><span class="p">()</span>
+<span class="linenos">237</span>        <span class="n">xs_sorted</span> <span class="o">=</span> <span class="n">xs</span><span class="p">[</span><span class="n">order</span><span class="p">]</span>
+<span class="linenos">238</span>        <span class="n">counts</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bincount</span><span class="p">(</span><span class="n">assign</span><span class="p">,</span> <span class="n">minlength</span><span class="o">=</span><span class="n">E</span><span class="p">)</span>
+<span class="linenos">239</span>        <span class="n">outs</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">240</span>        <span class="n">off</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos">241</span>        <span class="n">cpu_counts</span> <span class="o">=</span> <span class="n">counts</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+<span class="linenos">242</span>        <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">E</span><span class="p">):</span>
+<span class="linenos">243</span>            <span class="n">n</span> <span class="o">=</span> <span class="n">cpu_counts</span><span class="p">[</span><span class="n">e</span><span class="p">]</span>
+<span class="linenos">244</span>            <span class="k">if</span> <span class="n">n</span><span class="p">:</span>
+<span class="linenos">245</span>                <span class="n">outs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">xs_sorted</span><span class="p">[</span><span class="n">off</span><span class="p">:</span><span class="n">off</span> <span class="o">+</span> <span class="n">n</span><span class="p">]</span> <span class="o">@</span> <span class="n">w</span><span class="p">[</span><span class="n">e</span><span class="p">])</span>
+<span class="linenos">246</span>            <span class="n">off</span> <span class="o">+=</span> <span class="n">n</span>
+<span class="linenos">247</span>        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">outs</span><span class="p">)</span> <span class="k">if</span> <span class="n">outs</span> <span class="k">else</span> <span class="kc">None</span>
+<span class="linenos">248</span>
+<span class="linenos">249</span>    <span class="k">def</span><span class="w"> </span><span class="nf">sort_only</span><span class="p">():</span>
+<span class="linenos">250</span>        <span class="n">order</span> <span class="o">=</span> <span class="n">assign</span><span class="o">.</span><span class="n">argsort</span><span class="p">()</span>
+<span class="linenos">251</span>        <span class="k">return</span> <span class="n">xs</span><span class="p">[</span><span class="n">order</span><span class="p">]</span>
+<span class="linenos">252</span>
+<span class="linenos">253</span>    <span class="n">t_grp</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="n">grouped</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">254</span>    <span class="n">t_sort</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="n">sort_only</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">255</span>    <span class="n">flops</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">T</span> <span class="o">*</span> <span class="n">K</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">I</span>
+<span class="linenos">256</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'做法'</span><span class="si">:</span><span class="s2">&lt;34</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'TFLOP/s'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">257</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'grouped GEMM（含排序）'</span><span class="si">:</span><span class="s2">&lt;30</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_grp</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">258</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">flops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_grp</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">259</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'其中只排序'</span><span class="si">:</span><span class="s2">&lt;32</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_sort</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">260</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'—'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">   占 </span><span class="si">{</span><span class="n">t_sort</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_grp</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">261</span>    <span class="n">ref</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">T</span> <span class="o">*</span> <span class="n">K</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">262</span>    <span class="n">w0</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos">263</span>    <span class="n">t_one</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">ref</span> <span class="o">@</span> <span class="n">w0</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">264</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'同样 FLOP 的单个大 GEMM'</span><span class="si">:</span><span class="s2">&lt;30</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_one</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">265</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">flops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_one</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2">   &lt;- 上界"</span><span class="p">)</span>
+<span class="linenos">266</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  分成 </span><span class="si">{</span><span class="n">E</span><span class="si">}</span><span class="s2"> 个小 GEMM 相对一个大 GEMM 慢 </span><span class="si">{</span><span class="n">t_grp</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_one</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">×。"</span><span class="p">)</span>
+<span class="linenos">267</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  原因：每个小 GEMM 的 M 只有 ~</span><span class="si">{:.0f}</span><span class="s2">，远小于 tensor core 喜欢的形状"</span>
+<span class="linenos">268</span>          <span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">T</span> <span class="o">*</span> <span class="n">K</span> <span class="o">/</span> <span class="n">E</span><span class="p">))</span>
+<span class="linenos">269</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  （2.7 §六 测过：瘦长 GEMM 的效率远低于方阵）。"</span><span class="p">)</span>
+<span class="linenos">270</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  真实实现用专门的 grouped GEMM kernel（一次 launch 处理所有分段），"</span><span class="p">)</span>
+<span class="linenos">271</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  比这里的 python 循环好得多 —— 这里量的是**上界**。"</span><span class="p">)</span>
+<span class="linenos">272</span>
+<span class="linenos">273</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"不均衡会让情况更糟"</span><span class="p">)</span>
+<span class="linenos">274</span>    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">probs</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"均匀"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="p">(</span><span class="s2">"倾斜（一个专家占 20%）"</span><span class="p">,</span> <span class="s2">"skew"</span><span class="p">)]:</span>
+<span class="linenos">275</span>        <span class="k">if</span> <span class="n">probs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">276</span>            <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">E</span><span class="p">,</span> <span class="p">(</span><span class="n">T</span> <span class="o">*</span> <span class="n">K</span><span class="p">,),</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">277</span>        <span class="k">else</span><span class="p">:</span>
+<span class="linenos">278</span>            <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">E</span><span class="p">,</span> <span class="p">(</span><span class="n">T</span> <span class="o">*</span> <span class="n">K</span><span class="p">,),</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">279</span>            <span class="n">m</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="n">T</span> <span class="o">*</span> <span class="n">K</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mf">0.2</span>
+<span class="linenos">280</span>            <span class="n">a</span><span class="p">[</span><span class="n">m</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos">281</span>        <span class="n">cnt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bincount</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">minlength</span><span class="o">=</span><span class="n">E</span><span class="p">)</span>
+<span class="linenos">282</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> max=</span><span class="si">{</span><span class="n">cnt</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">283</span>              <span class="sa">f</span><span class="s2">"min=</span><span class="si">{</span><span class="n">cnt</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;5</span><span class="si">}</span><span class="s2"> max/mean=</span><span class="si">{</span><span class="n">cnt</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">cnt</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;5.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">284</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  分段 GEMM 的总时间由最大的那一段决定（若并行执行），"</span><span class="p">)</span>
+<span class="linenos">285</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以 max/mean 就是并行效率的直接上界。"</span><span class="p">)</span>
+<span class="linenos">286</span>    <span class="k">del</span> <span class="n">w</span><span class="p">,</span> <span class="n">x</span>
+<span class="linenos">287</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">288</span>
+<span class="linenos">289</span>
+<span class="linenos">290</span><span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos">291</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos">292</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 显存与带宽的账"</span><span class="p">)</span>
+<span class="linenos">293</span>
+<span class="linenos">294</span>    <span class="n">d</span> <span class="o">=</span> <span class="n">snap</span><span class="p">(</span><span class="n">REPO</span><span class="p">)</span>
+<span class="linenos">295</span>    <span class="k">if</span> <span class="ow">not</span> <span class="n">d</span><span class="p">:</span>
+<span class="linenos">296</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  模型未下载"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos">297</span>    <span class="n">c</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/config.json"</span><span class="p">))</span>
+<span class="linenos">298</span>    <span class="n">H</span><span class="p">,</span> <span class="n">I</span><span class="p">,</span> <span class="n">L</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span>
+<span class="linenos">299</span>    <span class="n">E</span><span class="p">,</span> <span class="n">K</span> <span class="o">=</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_experts"</span><span class="p">],</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_experts_per_tok"</span><span class="p">]</span>
+<span class="linenos">300</span>
+<span class="linenos">301</span>    <span class="n">p_expert</span> <span class="o">=</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">I</span>
+<span class="linenos">302</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  一个专家 </span><span class="si">{</span><span class="n">p_expert</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> MB (bf16)"</span><span class="p">)</span>
+<span class="linenos">303</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  一层 </span><span class="si">{</span><span class="n">E</span><span class="si">}</span><span class="s2"> 个专家 = </span><span class="si">{</span><span class="n">E</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">p_expert</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> MB"</span><span class="p">)</span>
+<span class="linenos">304</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">L</span><span class="si">}</span><span class="s2"> 层 = </span><span class="si">{</span><span class="n">L</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">E</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">p_expert</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1024</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB 的专家权重"</span><span class="p">)</span>
+<span class="linenos">305</span>
+<span class="linenos">306</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"decode 时到底要读多少权重"</span><span class="p">)</span>
+<span class="linenos">307</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  batch=1 时每 token 只碰 K 个专家："</span><span class="p">)</span>
+<span class="linenos">308</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    读 </span><span class="si">{</span><span class="n">K</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">L</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">K</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">L</span><span class="si">}</span><span class="s2"> 个专家 = "</span>
+<span class="linenos">309</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">K</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">L</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">p_expert</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> MB"</span><span class="p">)</span>
+<span class="linenos">310</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  但 batch 一大，不同 token 路由到不同专家，读取量迅速逼近全部："</span><span class="p">)</span>
+<span class="linenos">311</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'期望被碰到的专家数/层'</span><span class="si">:</span><span class="s2">&gt;22</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'读取量 MB'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">312</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'占全部'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">313</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos">314</span>    <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">1024</span><span class="p">]:</span>
+<span class="linenos">315</span>        <span class="c1"># 每 token 选 K 个；B 个 token 共 B*K 次抽取，期望覆盖的专家数</span>
+<span class="linenos">316</span>        <span class="n">expected</span> <span class="o">=</span> <span class="n">E</span> <span class="o">*</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">K</span> <span class="o">/</span> <span class="n">E</span><span class="p">)</span> <span class="o">**</span> <span class="n">B</span><span class="p">)</span>
+<span class="linenos">317</span>        <span class="n">mb</span> <span class="o">=</span> <span class="n">expected</span> <span class="o">*</span> <span class="n">L</span> <span class="o">*</span> <span class="n">p_expert</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">/</span> <span class="n">MB</span>
+<span class="linenos">318</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">expected</span><span class="si">:</span><span class="s2">&gt;22.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">mb</span><span class="si">:</span><span class="s2">&gt;12.1f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">319</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">expected</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">E</span><span class="si">:</span><span class="s2">&gt;7.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">320</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  batch≥64 时基本每层的所有 </span><span class="si">{</span><span class="n">E</span><span class="si">}</span><span class="s2"> 个专家都要读一遍 ——"</span><span class="p">)</span>
+<span class="linenos">321</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  **MoE 的稀疏性在大 batch 下从带宽角度基本消失**，"</span><span class="p">)</span>
+<span class="linenos">322</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  只在算力上仍然稀疏（每 token 仍只算 K 个）。"</span><span class="p">)</span>
+<span class="linenos">323</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这就是为什么 MoE 适合「算力受限」的场景，"</span><span class="p">)</span>
+<span class="linenos">324</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  而在小 batch decode（带宽受限，3.3）上优势有限。"</span><span class="p">)</span>
+<span class="linenos">325</span>
+<span class="linenos">326</span>
+<span class="linenos">327</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span> <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">}</span>
+<span class="linenos">328</span>
+<span class="linenos">329</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">330</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos">331</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  model </span><span class="si">{</span><span class="n">REPO</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">332</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos">333</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos">334</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos">335</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L4/moe.py 全文（335 行）</code><a href="../code/labs/L4/moe.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p><strong>建议的消融</strong></p>
+<ol>
+<li><strong>换一批文本重跑 [B]</strong>（代码、中文、数学各一段），看热专家是不是同一批。
+   如果不同领域的热专家不同，说明路由确实学到了分工；
+   如果总是同一批，说明是退化的（router collapse）。</li>
+<li>[B] 把 token 数从 985 加到 8000，看逐层 CV 会不会下降——
+   这能区分"结构性不均衡"与"样本量小造成的方差"。<strong>这条最重要。</strong></li>
+<li>[C] 把 <code>T</code> 从 4096 降到 128（模拟小 batch decode），
+   看 grouped GEMM 相对大 GEMM 的比值怎么变。</li>
+<li>[D] 的公式假设路由是均匀随机的。用 [B] 实测的分布重算期望覆盖数，
+   看会不会低于均匀假设（热专家集中 → 覆盖更慢）。</li>
+</ol>
+<hr />
+<h2 id="_6">七 · 陷阱</h2>
+<ol>
+<li><strong>MoE 不省显存。</strong> 全部专家必须驻留（本章 12.70 GiB），稀疏的只有算力。</li>
+<li><strong>跨层聚合路由统计会抹掉不均衡</strong>（本章总体 CV 0.295 vs 逐层 1.0–1.2）。
+   必须逐层看。</li>
+<li><strong>训练有 aux loss 不代表推理均衡</strong>。期望均衡 ≠ 每个 batch 均衡。</li>
+<li><strong>大 batch 下 MoE 的带宽优势消失</strong>（batch≥64 读 100% 的专家）。</li>
+<li><strong>框架层的 python 循环量不出真实 grouped GEMM 的代价</strong>（本章 2.2× 是上界）。</li>
+<li><strong>排序是纯开销</strong>，本章占 grouped GEMM 的 18.5%，不产生任何 FLOP。</li>
+<li><strong><code>max/mean</code> 才是并行效率的上界</strong>，不是 <code>max/min</code>，也不是 CV。</li>
+</ol>
+<hr />
+<h2 id="_7">八 · 自测题</h2>
+<details>
+<summary>1. 一个 7B 的 MoE 和一个 7B 的稠密模型，部署时有什么区别？</summary>
+<p><strong>显存一样，算力不同。</strong></p>
+<p>MoE 的全部专家都要驻留显存（本章实测 6.82B → 12.70 GiB bf16），
+因为你不知道下一个 token 路由到谁。所以显存按<strong>总参数量</strong>买。</p>
+<p>算力上 MoE 每 token 只算 1.18B（5.8×），所以同样的算力预算能跑更大的"有效模型"。</p>
+<p>另外 MoE 多了两项稠密模型没有的开销：
+- 路由 + 按专家排序（本章占 grouped GEMM 的 18.5%）
+- 负载不均导致的并行效率损失（本章上界 13%）</p>
+<p><strong>所以 MoE 的正确定位是：显存换质量，不是省资源。</strong></p>
+</details>
+<details>
+<summary>2. 你测出 MoE 的路由「总体最热/最冷只有 3.7 倍」，能说明负载还算均衡吗？</summary>
+<p>不能——<strong>这是聚合错误</strong>。</p>
+<p>本章实测：总体 3.7×、CV 0.295，看着不错；但逐层最热/最冷高达 896×，
+CV 1.0–1.2，而且<strong>每层都有专家拿到 0.00%</strong>。</p>
+<p>原因是不同层的热专家不是同一批，求和时互相填平了。</p>
+<p>而系统关心的是每一层：每层各做一次 grouped GEMM，
+每层的最热专家各自决定那一层的关键路径。</p>
+<p>正确的看法是<strong>逐层统计</strong>，而且指标要用 <code>max/mean</code>（并行效率的上界），
+不是 <code>max/min</code>（受最冷那个的噪声影响）也不是 CV（对长尾不敏感）。</p>
+</details>
+<details>
+<summary>3. MoE 在小 batch decode 上能省多少带宽？</summary>
+<p>理论上省很多（batch=1 只碰 8/64 = 12.5% 的专家），但<strong>实际收益有限</strong>，
+因为小 batch decode 本来就没吃满带宽。</p>
+<p>而且随 batch 上升，覆盖率迅速逼近 100%：
+本章实测 batch=4 → 41.4%，batch=16 → 88.2%，batch=64 → <strong>100%</strong>。</p>
+<p>期望覆盖数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mi>E</mi><mo stretchy="false">[</mo><mn>1</mn><mo>&#x02212;</mo><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><mi>K</mi><mo>&#x0002F;</mo><mi>E</mi><msup><mo stretchy="false">&#x00029;</mo><mi>B</mi></msup><mo stretchy="false">]</mo></mrow></math></span>，这是个饱和很快的函数。</p>
+<p>所以：<strong>MoE 的带宽优势只存在于极小 batch</strong>，而那个区间恰好是
+整体利用率最低的区间。它真正的主场是<strong>算力受限</strong>的场景
+（大 batch decode、prefill），那里 5.8× 的算力稀疏是实打实的。</p>
+</details>
+<details>
+<summary>4. 为什么 MoE 只稀疏化 MLP，不稀疏化 attention？</summary>
+<p>三个理由，前两个本书都量过：</p>
+<ol>
+<li><strong>MLP 是参数大头</strong>：4.1 实测稠密层里 MLP 占 75%、attention 占 25%。
+   稀疏化 MLP 收益大得多。</li>
+<li><strong>attention 有 KV cache 的账</strong>（3.3）。稀疏化 attention 头会让
+   KV 的形状不规整，而 KV 是 decode 的唯一瓶颈，破坏它得不偿失。</li>
+<li><strong>MLP 是逐 token 独立的</strong>，天然可以按 token 路由；
+   attention 要跨 token 交互，"这个 token 走专家 A、那个走专家 B"
+   在 attention 里没有对应的语义。</li>
+</ol>
+<p>一般判据：<strong>稀疏化要挑「占比大 + 结构上可分」的部分</strong>，两个条件缺一不可。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L4/4.3-quantization.html">&#8592; 4.3 量化工程</a><a class="nav-next" href="../L5/5.1-prefill-decode.html">5.1 prefill 与 decode 的系统性质 &#8594;</a></nav>
+</main>
+</body>
+</html>

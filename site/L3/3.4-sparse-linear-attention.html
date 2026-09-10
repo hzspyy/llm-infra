@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.4 稀疏、线性与混合架构</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">3.4</div>
+  <div class="sidebar-title">稀疏、线性与混合架构</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#attention-sink">一 · attention sink：真实模型里的一个反常现象</a><ul>
+<li><a href="#_2">为什么会这样</a></li>
+<li><a href="#_3">对滑动窗口的直接后果</a></li>
+</ul>
+</li>
+<li><a href="#kv">二 · 滑动窗口：把 KV 变成常数</a></li>
+<li><a href="#attention-softmax">三 · 线性 attention：换掉 softmax</a><ul>
+<li><a href="#31">3.1 复杂度优势不会自动变成性能优势</a></li>
+<li><a href="#32">3.2 它真正换掉的东西：精确检索</a></li>
+</ul>
+</li>
+<li><a href="#rope">四 · RoPE 与长上下文外推</a><ul>
+<li><a href="#scaling">三种 scaling 改了什么</a></li>
+</ul>
+</li>
+<li><a href="#_4">五 · 设计取舍</a><ul>
+<li><a href="#51">5.1 三条路线砍的是账本里不同的项</a></li>
+<li><a href="#52">5.2 混合架构是这个取舍的显式解</a></li>
+<li><a href="#53-attention-sink">5.3 attention sink 是"实现细节"变成"架构约束"的例子</a></li>
+</ul>
+</li>
+<li><a href="#lab">六 · 动手 lab</a></li>
+<li><a href="#_5">七 · 陷阱</a></li>
+<li><a href="#_6">八 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L3 · Attention 与序列核心</div>
+  <div class="mod-id">3.4</div>
+  <h1>稀疏、线性与混合架构</h1>
+  <p class="lede">从真实模型里把 attention sink 量出来（最后一层 73% 的注意力给了第一个 token），再讲滑动窗口为什么不能简单丢弃。滑动窗口 decode 耗时随上下文完全不变；线性 attention 的精确检索能力从 1.0000 掉到 0.2393；RoPE 频率表说明外推失败的确切机制。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · Qwen3-1.7B</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 3.1（online softmax）· 3.3（decode 的账）· 0.2（资源账本）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>3.3 给出的结论是：decode 的算术强度恒为 1，唯二的出路是<strong>读得更快</strong>或<strong>读得更少</strong>。
+GQA/MLA 走的是"每个 token 少存点"。这一章看另一条路：<strong>少读一些 token</strong>，
+以及更激进的——<strong>把 softmax 换掉，让状态大小与上下文无关</strong>。</p>
+<ol>
+<li>只保留最近 W 个 token 会怎样？为什么不能简单地把旧的丢掉？</li>
+<li>线性 attention 把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>S</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>，它用什么换的？</li>
+<li>长上下文外推为什么会失败？RoPE scaling 到底改了什么？</li>
+</ol>
+<div class="admonition warning">
+<p class="admonition-title">这一层大部分还在变动</p>
+<p>NSA、MoBA 这些 2025 年的稀疏方案还没有可直接使用的实现，
+Mamba 类混合架构需要专门的权重。所以本章严格分两类：
+<strong>能在这张卡上直接测的</strong>（attention sink、滑动窗口、线性 attention 的复杂度与检索能力、
+RoPE 频率表），和<strong>只能按定义算的</strong>。凡是算出来的都明确标注。</p>
+</div>
+<hr />
+<h2 id="attention-sink">一 · attention sink：真实模型里的一个反常现象</h2>
+<p>先看一个现象，它决定了滑动窗口能不能简单地做。</p>
+<p>拿 Qwen3-1.7B 跑一段 33 token 的文本，把注意力权重取出来
+（<code>attn_implementation="eager"</code> + <code>output_attentions=True</code>），
+看<strong>最后一个 query 分给第 0 个 token 多少注意力</strong>。
+如果注意力是均匀的，应该是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><mn>33</mn><mo>&#x0003D;</mo><mn>0.0303</mn></mrow></math></span>：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">层</th>
+<th style="text-align: right;">给 token 0</th>
+<th style="text-align: right;">给最近 8 个</th>
+<th style="text-align: right;">其余</th>
+<th style="text-align: right;">token 0 是均匀的几倍</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.1045</td>
+<td style="text-align: right;">0.3332</td>
+<td style="text-align: right;">0.5623</td>
+<td style="text-align: right;">2.7×</td>
+</tr>
+<tr>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">0.4847</td>
+<td style="text-align: right;">0.1888</td>
+<td style="text-align: right;">0.3265</td>
+<td style="text-align: right;">12.6×</td>
+</tr>
+<tr>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">0.6465</td>
+<td style="text-align: right;">0.1842</td>
+<td style="text-align: right;">0.1693</td>
+<td style="text-align: right;">16.8×</td>
+</tr>
+<tr>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;"><strong>0.7279</strong></td>
+<td style="text-align: right;">0.1746</td>
+<td style="text-align: right;">0.0975</td>
+<td style="text-align: right;"><strong>18.9×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>最后一层把 73% 的注意力给了第一个 token。</strong> 那个 token 是：</p>
+<div class="highlight"><pre><span></span><code>token id 785 = 'The'
+</code></pre></div>
+
+<p>一个没有任何语义重要性的冠词。</p>
+<p>按头铺开（第 14 层，16 个头给 token 0 的份额）：</p>
+<div class="highlight"><pre><span></span><code>0.527 0.402 0.621 0.523 0.438 0.629 0.268 0.734 0.449 0.027 0.844 0.363 0.352 0.145 0.980 0.453
+最大 0.980  最小 0.027  中位数 0.449
+</code></pre></div>
+
+<p>有的头给了 <strong>98%</strong>，有的只给 2.7%。这不是所有头的统一行为，
+而是<strong>多数头都有、程度不一</strong>。</p>
+<h3 id="_2">为什么会这样</h3>
+<p>文献里的解释是：softmax 强制每行和为 1。当某个头在这一步"不想关注任何东西"时，
+它没有"全都不看"这个选项——那份概率质量必须倒在某处。
+于是它选了位置最固定、内容最无关紧要的第一个 token。</p>
+<div class="admonition note">
+<p class="admonition-title">本章只测到了现象，没有验证机制</p>
+<p>上面那段解释我没有做实验验证。要验证它，可以做的实验是：
+在 softmax 里额外加一个可学习的"垃圾桶"logit（即所谓 softmax-off-by-one / sink token），
+看 token 0 的份额会不会转移过去。<strong>在做这个实验之前，
+把它当成一个流行的解释，不是已确立的事实。</strong></p>
+</div>
+<h3 id="_3">对滑动窗口的直接后果</h3>
+<p>如果窗口把 token 0 划出去，那 73% 的质量无处可去，会被迫分给窗口内的 token——
+本来"不想关注"的头突然被迫强烈关注某些近处的内容。这就是为什么
+StreamingLLM 要<strong>单独保留最前面几个 token</strong>（sink token），
+而不是简单地丢掉窗口外的一切。</p>
+<p><strong>先有这个现象，才有那个设计。</strong> 这是本章把 sink 放在滑动窗口之前讲的原因。</p>
+<hr />
+<h2 id="kv">二 · 滑动窗口：把 KV 变成常数</h2>
+<p>full attention 的 KV 随上下文线性增长，无上界。
+滑动窗口（SWA）只保留最近 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi></mrow></math></span> 个 token 的 KV，上界就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi></mrow></math></span>。</p>
+<p>按 Qwen3-1.7B 的配置算（28 层，8 KV 头，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>，bf16，每 token 114688 B）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">上下文</th>
+<th style="text-align: right;">full KV</th>
+<th style="text-align: right;">W=4096</th>
+<th style="text-align: right;">W=1024</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">448.0 MB</td>
+<td style="text-align: right;">448.0 MB</td>
+<td style="text-align: right;">112.0 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">16384</td>
+<td style="text-align: right;">1792.0 MB</td>
+<td style="text-align: right;">448.0 MB</td>
+<td style="text-align: right;">112.0 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">65536</td>
+<td style="text-align: right;">7168.0 MB</td>
+<td style="text-align: right;">448.0 MB</td>
+<td style="text-align: right;">112.0 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">262144</td>
+<td style="text-align: right;">28672.0 MB</td>
+<td style="text-align: right;">448.0 MB</td>
+<td style="text-align: right;">112.0 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">1048576</td>
+<td style="text-align: right;"><strong>114688.0 MB</strong></td>
+<td style="text-align: right;"><strong>448.0 MB</strong></td>
+<td style="text-align: right;">112.0 MB</td>
+</tr>
+</tbody>
+</table>
+<p>上下文 1M 时 full 要 <strong>114 GB</strong>（这张卡只有 32 GB），W=4096 只要 448 MB。
+但真正的关键不是那个 256 倍，是<strong>后两列不再增长</strong>。</p>
+<p>decode 每步耗时实测（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x0003D;</mo><mn>8</mn></mrow></math></span>, <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>H</mi><mo>&#x0003D;</mo><mn>8</mn></mrow></math></span>, <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">上下文</th>
+<th style="text-align: right;">full ms</th>
+<th style="text-align: right;">W=4096 ms</th>
+<th style="text-align: right;">加速</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">0.0909</td>
+<td style="text-align: right;">0.0912</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td style="text-align: right;">16384</td>
+<td style="text-align: right;">0.6609</td>
+<td style="text-align: right;">0.0907</td>
+<td style="text-align: right;">7.29×</td>
+</tr>
+<tr>
+<td style="text-align: right;">65536</td>
+<td style="text-align: right;">2.5253</td>
+<td style="text-align: right;">0.0902</td>
+<td style="text-align: right;">27.98×</td>
+</tr>
+<tr>
+<td style="text-align: right;">131072</td>
+<td style="text-align: right;">5.5029</td>
+<td style="text-align: right;">0.0910</td>
+<td style="text-align: right;"><strong>60.49×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>W=4096 那一列是平的：0.0912 / 0.0907 / 0.0902 / 0.0910。</strong>
+上下文长了 32 倍，每步耗时纹丝不动。</p>
+<p>这直接来自 3.3 的结论：decode 时间 = KV 字节 ÷ 带宽。
+KV 字节被 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi></mrow></math></span> 钉住，时间就被钉住。<strong>从"随上下文线性增长"变成"常数"，
+这是 SWA 唯一但足够大的卖点。</strong></p>
+<p>代价当然也是明确的：窗口外的信息<strong>完全看不到</strong>。
+实际模型（Mistral、Gemma）的做法是靠层数堆感受野——
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math></span> 层滑动窗口的理论感受野是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>&#x000D7;</mo><mi>W</mi></mrow></math></span>——
+或者<strong>交替</strong>使用滑动窗口层与 full attention 层，
+让少数几层负责长程。</p>
+<hr />
+<h2 id="attention-softmax">三 · 线性 attention：换掉 softmax</h2>
+<p>标准 attention 必须先算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></math></span>，因为 softmax 不可分解。
+线性 attention 把 softmax 换成一个<strong>可分解的核</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003D5;</mi><mo stretchy="false">&#x00028;</mo><mi>q</mi><mo stretchy="false">&#x00029;</mo><mo>&#x000B7;</mo><mi>&#x003D5;</mi><mo stretchy="false">&#x00028;</mo><mi>k</mi><msup><mo stretchy="false">&#x00029;</mo><mo>&#x022A4;</mo></msup></mrow></math></span>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>O</mi><mi>i</mi></msub><mo>&#x0003D;</mo><mfrac><mrow><mi>&#x003D5;</mi><mo stretchy="false">&#x00028;</mo><msub><mi>q</mi><mi>i</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x000B7;</mo><msub><mo>&#x02211;</mo><mrow><mi>j</mi><mo>&#x02264;</mo><mi>i</mi></mrow></msub><mi>&#x003D5;</mi><mo stretchy="false">&#x00028;</mo><msub><mi>k</mi><mi>j</mi></msub><mo stretchy="false">&#x00029;</mo><msubsup><mi>v</mi><mi>j</mi><mo>&#x022A4;</mo></msubsup></mrow><mrow><mi>&#x003D5;</mi><mo stretchy="false">&#x00028;</mo><msub><mi>q</mi><mi>i</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x000B7;</mo><msub><mo>&#x02211;</mo><mrow><mi>j</mi><mo>&#x02264;</mo><mi>i</mi></mrow></msub><mi>&#x003D5;</mi><mo stretchy="false">&#x00028;</mo><msub><mi>k</mi><mi>j</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></mfrac></mrow></math></div></p>
+<p>括号里那两个和<strong>可以增量维护</strong>：一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> 矩阵和一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi></mrow></math></span> 维向量。
+于是 decode 时的状态大小 <strong>与上下文长度无关</strong>——这是它最吸引人的性质。</p>
+<h3 id="31">3.1 复杂度优势不会自动变成性能优势</h3>
+<p>用最朴素的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003D5;</mi><mo>&#x0003D;</mo><mrow><mi mathvariant="normal">e</mi><mi mathvariant="normal">l</mi><mi mathvariant="normal">u</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span> 实现（prefill，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mrow><mo>&#x0003D;</mo></mrow><mn>1</mn></mrow></math></span>, <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>H</mi><mrow><mo>&#x0003D;</mo></mrow><mn>8</mn></mrow></math></span>, <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mrow><mo>&#x0003D;</mo></mrow><mn>64</mn></mrow></math></span>）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">标准 ms</th>
+<th style="text-align: right;">线性 ms</th>
+<th style="text-align: right;">标准/线性</th>
+<th style="text-align: right;">标准峰值 MB</th>
+<th style="text-align: right;">线性峰值 MB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">0.0556</td>
+<td style="text-align: right;">0.4245</td>
+<td style="text-align: right;"><strong>0.13×</strong></td>
+<td style="text-align: right;">1.0</td>
+<td style="text-align: right;">130.0</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">0.1071</td>
+<td style="text-align: right;">0.9224</td>
+<td style="text-align: right;">0.12×</td>
+<td style="text-align: right;">2.0</td>
+<td style="text-align: right;">260.0</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">0.3458</td>
+<td style="text-align: right;">1.8435</td>
+<td style="text-align: right;">0.19×</td>
+<td style="text-align: right;">4.0</td>
+<td style="text-align: right;">520.0</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">0.8770</td>
+<td style="text-align: right;">3.7624</td>
+<td style="text-align: right;">0.23×</td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;"><strong>1040.0</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>"线性"的那个慢 4–8 倍，显存多 130 倍。</strong></p>
+<p>原因是我这个朴素写法用 <code>cumsum</code> 把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 份 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> 状态全物化了
+（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> = 4096 × 64 × 64 × 4B × 8 头 = 1040 MB）。
+真实的线性 attention 用<strong>分块递推</strong>，块内并行、块间串行传递状态，
+不物化中间状态。</p>
+<p><strong>这一格的用处正是它是负面的</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>S</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 的复杂度是渐近性质，
+在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span>、常数因子差几十倍的时候完全体现不出来。
+拿"复杂度更低"当"更快"的论据，在这个尺度上是错的。</p>
+<h3 id="32">3.2 它真正换掉的东西：精确检索</h3>
+<p>做一个最小的检索任务：序列里埋一个 key-value 对，让最后一个 query 明确指向它。</p>
+<div class="highlight"><pre><span></span><code>埋在位置 37，最后一个 query 指向它
+标准 attention 取回的向量 与目标的余弦相似度: 1.0000
+线性 attention 取回的向量 与目标的余弦相似度: 0.2393
+</code></pre></div>
+
+<p><strong>标准 attention 精确取回（1.0000），线性只有 0.2393。</strong></p>
+<p>机制是 softmax 的<strong>指数放大</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mi>s</mi></mrow></msup></mrow></math></span> 让最大的那一项压倒性地主导，
+其余项被压到接近 0，于是输出几乎就是那一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>v</mi><mi>j</mi></msub></mrow></math></span>。
+线性核没有这个放大——状态是所有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>k</mi><mo>&#x0002C;</mo><mi>v</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 的<strong>加权和</strong>，
+新信息不断叠加进同一个固定大小的状态里，旧信息被摊平。</p>
+<p>这就是纯线性/SSM 架构在"大海捞针"类任务上吃亏的直接原因。
+固定大小的状态是它的优点（与上下文无关），也是它的极限（信息容量有上界）。</p>
+<p><strong>也正是混合架构流行的原因</strong>：少数几层用 full attention 负责精确检索，
+其余层用线性/SSM 负责廉价的长程传播。
+（0.2 里 SGLang 的 <code>pool_configurator</code> 要处理 "Mamba 层不产生 KV" 这种情况，
+就是这类架构在工程侧的账。）</p>
+<hr />
+<h2 id="rope">四 · RoPE 与长上下文外推</h2>
+<p>从 Qwen3-1.7B 的 config 读到：<code>head_dim=128</code>, <code>rope_theta=1e+06</code>,
+<code>max_position_embeddings=40960</code>, <code>rope_scaling=None</code>。</p>
+<p>RoPE 把 head_dim 拆成 64 对，第 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi></mrow></math></span> 对的角频率 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mn>1</mn><mo>&#x0002F;</mo><msup><mtext>base</mtext><mrow><mn>2</mn><mi>i</mi><mo>&#x0002F;</mo><mi>d</mi></mrow></msup></mrow></math></span>：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">第几对</th>
+<th style="text-align: right;">角频率</th>
+<th style="text-align: right;">周期(token)</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">1.000e+00</td>
+<td style="text-align: right;">6.3</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">8.058e-01</td>
+<td style="text-align: right;">7.8</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1.778e-01</td>
+<td style="text-align: right;">35.3</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3.162e-02</td>
+<td style="text-align: right;">198.7</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">1.000e-03</td>
+<td style="text-align: right;">6283.2</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align: right;">62</td>
+<td style="text-align: right;">1.540e-06</td>
+<td style="text-align: right;">4080185.2</td>
+<td>周期 &gt; 训练长度 40960，从未转满一圈</td>
+</tr>
+<tr>
+<td style="text-align: right;">63</td>
+<td style="text-align: right;">1.241e-06</td>
+<td style="text-align: right;">5063256.0</td>
+<td>周期 &gt; 训练长度 40960，从未转满一圈</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键在最后两行</strong>：周期大于训练长度的那些维度，
+在训练中<strong>从未见过完整的一圈</strong>。推理时位置一旦超过 40960，
+它们进入训练中没出现过的角度区间。</p>
+<p>这就是长上下文外推失败的<strong>直接机制</strong>——不是含糊的"模型记不住"，
+而是某些输入维度取到了训练分布外的值。</p>
+<h3 id="scaling">三种 scaling 改了什么</h3>
+<p>想把 40960 撑到 163840（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>s</mi><mo>&#x0003D;</mo><mn>4</mn></mrow></math></span>）：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th style="text-align: right;">最高频周期(i=0)</th>
+<th style="text-align: right;">中间(i=32)</th>
+<th style="text-align: right;">最低频周期(i=63)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始</td>
+<td style="text-align: right;">6.28</td>
+<td style="text-align: right;">6283.2</td>
+<td style="text-align: right;">5063256.0</td>
+</tr>
+<tr>
+<td>PI（位置插值）</td>
+<td style="text-align: right;"><strong>25.13</strong></td>
+<td style="text-align: right;">25132.7</td>
+<td style="text-align: right;">20253024.0</td>
+</tr>
+<tr>
+<td>NTK（base 放大）</td>
+<td style="text-align: right;"><strong>6.28</strong></td>
+<td style="text-align: right;">12705.4</td>
+<td style="text-align: right;">20253024.0</td>
+</tr>
+</tbody>
+</table>
+<p><strong>最低频那一列 PI 与 NTK 完全一样</strong>（都 ×4）——
+NTK 的 base 放大公式本来就是这么设计的，让最低频恰好对上 PI。</p>
+<p>差别全在最高频：PI 把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi><mrow><mo>&#x0003D;</mo></mrow><mn>0</mn></mrow></math></span> 的周期从 6.28 拉到 25.13（×4），
+NTK 拉到 6.28（<strong>×1.000，几乎不变</strong>）。</p>
+<p>高频维度负责区分"相邻几个 token"。PI 把它也拉长 4 倍，
+等于让模型分不清近处的位置；NTK 保住高频，只拉低频。
+YaRN 在此基础上再按维度分段处理，并加一个注意力温度修正。</p>
+<div class="admonition warning">
+<p class="admonition-title">本节只算了频率，没有测任何模型质量</p>
+<p>哪种 scaling 更好<strong>必须跑长上下文评测</strong>（大海捞针、长文困惑度）。
+频率表只能说明它们改了什么，不能说明改得好不好。
+本轮没有做这个评测——它需要长文本数据集和相当的算力预算。</p>
+</div>
+<hr />
+<h2 id="_4">五 · 设计取舍</h2>
+<h3 id="51">5.1 三条路线砍的是账本里不同的项</h3>
+<p>回到 3.3 那个式子：decode 每步时间 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02248;</mo></mrow></math></span> KV 字节 ÷ 带宽。
+KV 字节 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mn>2</mn><mo>&#x000B7;</mo><mi>L</mi><mo>&#x000B7;</mo><msub><mi>H</mi><mrow><mi>k</mi><mi>v</mi></mrow></msub><mo>&#x000B7;</mo><mi>D</mi><mo>&#x000B7;</mo><mtext>ctx</mtext><mo>&#x000B7;</mo><mtext>dtype</mtext></mrow></math></span>。</p>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>砍哪一项</th>
+<th>保留什么</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GQA / MQA</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>H</mi><mrow><mi>k</mi><mi>v</mi></mrow></msub></mrow></math></span></td>
+<td>精确 attention、全上下文</td>
+<td>表达能力（KV 侧）</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>H</mi><mrow><mi>k</mi><mi>v</mi></mrow></msub><mo>&#x000B7;</mo><mi>D</mi></mrow></math></span>（压成低秩）</td>
+<td>精确 attention、全上下文</td>
+<td>多一次投影（算力换带宽）</td>
+</tr>
+<tr>
+<td>KV 量化（4.3）</td>
+<td>dtype</td>
+<td>精确 attention、全上下文</td>
+<td>数值精度</td>
+</tr>
+<tr>
+<td><strong>滑动窗口</strong></td>
+<td><strong>ctx</strong></td>
+<td>精确 attention（窗口内）</td>
+<td><strong>窗口外完全看不到</strong></td>
+</tr>
+<tr>
+<td><strong>线性 / SSM</strong></td>
+<td><strong>整个式子</strong>（状态恒定）</td>
+<td>常数状态</td>
+<td><strong>精确检索能力</strong>（本章 1.0 → 0.24）</td>
+</tr>
+</tbody>
+</table>
+<p>前三条<strong>不改变 attention 的语义</strong>，只改变存什么、存多精细——
+所以它们可以叠加使用，而且不需要重新论证模型能力。
+后两条<strong>改变了模型能看到什么</strong>，必须重新训练并评估质量。</p>
+<p>这与 3.1 §7.1 讲的是同一条判据：<strong>精确的优化传播得快，
+改变语义的优化要过质量这一关。</strong> GQA 用了几年就成了默认配置，
+而线性 attention 讨论了更久仍未取代 attention，差别就在这里。</p>
+<h3 id="52">5.2 混合架构是这个取舍的显式解</h3>
+<p>既然精确检索只在少数几层、少数几个头上真正需要（第一节那张表里
+各头差异从 0.027 到 0.980），那就不必让每一层都付全额代价。</p>
+<p>混合架构的逻辑是：<strong>把稀缺资源（精确的全上下文 attention）
+只花在需要它的地方</strong>。少数层用 full attention，其余层用滑动窗口或线性状态。</p>
+<p>这是一个可复用的判断：<strong>当一个能力的需求分布很不均匀时，
+统一供给是浪费。</strong> 先量出分布（像第一节那样），再决定怎么分配。</p>
+<h3 id="53-attention-sink">5.3 attention sink 是"实现细节"变成"架构约束"的例子</h3>
+<p>sink 现象不是设计出来的，是训练出来的副产品。
+但它一旦存在，就成了后续所有设计的<strong>硬约束</strong>：
+任何丢弃前几个 token 的方案都必须处理它。</p>
+<p>这类"涌现出来的约束"在系统里很常见，而且<strong>只能通过观测发现，
+无法从设计文档推出</strong>。所以第一节是先看数据、再讲机制，
+而不是先讲 StreamingLLM 的设计然后说"因为有 sink"。</p>
+<hr />
+<h2 id="lab">六 · 动手 lab</h2>
+<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L3 &amp;&amp; /scratch/learn/envs/serve/bin/python sparse_linear.py'</span>
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/attn/34_sparse_linear.txt</code>。</p>
+<details class="fold srcfold"><summary>labs/L3/sparse_linear.py 全文（287 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L3.4 —— 稀疏、线性与混合：哪些能测，哪些只能算。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">这一层的东西大多还在变动，很多没有可用实现。所以本 lab 严格分两类：</span>
+<span class="linenos">  5</span><span class="sd">**能在这张卡上直接测的**，和**只能按定义算的**。</span>
+<span class="linenos">  6</span>
+<span class="linenos">  7</span><span class="sd">  [A] attention sink：从真实模型里把注意力权重取出来看</span>
+<span class="linenos">  8</span><span class="sd">  [B] 滑动窗口：KV 有上界之后，decode 的账变成什么样</span>
+<span class="linenos">  9</span><span class="sd">  [C] 线性 attention：O(S) 的代价与它换掉的东西</span>
+<span class="linenos"> 10</span><span class="sd">  [D] RoPE 与长上下文外推：频率表长什么样，scaling 改了什么</span>
+<span class="linenos"> 11</span>
+<span class="linenos"> 12</span><span class="sd">用法：</span>
+<span class="linenos"> 13</span><span class="sd">    python sparse_linear.py</span>
+<span class="linenos"> 14</span><span class="sd">    python sparse_linear.py A D</span>
+<span class="linenos"> 15</span><span class="sd">"""</span>
+<span class="linenos"> 16</span>
+<span class="linenos"> 17</span><span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 20</span>
+<span class="linenos"> 21</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+<span class="linenos"> 23</span>
+<span class="linenos"> 24</span><span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos"> 25</span><span class="n">MODEL</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"L34_MODEL"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen3-1.7B"</span><span class="p">)</span>
+<span class="linenos"> 26</span>
+<span class="linenos"> 27</span>
+<span class="linenos"> 28</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 29</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos"> 30</span>
+<span class="linenos"> 31</span>
+<span class="linenos"> 32</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 33</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos"> 34</span>
+<span class="linenos"> 35</span>
+<span class="linenos"> 36</span><span class="k">def</span><span class="w"> </span><span class="nf">timeit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">5</span><span class="p">):</span>
+<span class="linenos"> 37</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">warmup</span><span class="p">):</span>
+<span class="linenos"> 38</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 39</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 40</span>    <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 41</span>    <span class="n">a</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 42</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos"> 43</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 44</span>    <span class="n">b</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 45</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 46</span>    <span class="k">return</span> <span class="n">a</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
+<span class="linenos"> 47</span>
+<span class="linenos"> 48</span>
+<span class="linenos"> 49</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos"> 50</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos"> 51</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] attention sink：真实模型的注意力权重长什么样"</span><span class="p">)</span>
+<span class="linenos"> 52</span>
+<span class="linenos"> 53</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoTokenizer</span>
+<span class="linenos"> 54</span>    <span class="n">tok</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">MODEL</span><span class="p">)</span>
+<span class="linenos"> 55</span>    <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+<span class="linenos"> 56</span>        <span class="n">MODEL</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">attn_implementation</span><span class="o">=</span><span class="s2">"eager"</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<span class="linenos"> 57</span>
+<span class="linenos"> 58</span>    <span class="n">text</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"The capital of France is Paris. The capital of Japan is Tokyo. "</span>
+<span class="linenos"> 59</span>            <span class="s2">"Machine learning models process sequences of tokens one at a time."</span><span class="p">)</span>
+<span class="linenos"> 60</span>    <span class="n">ids</span> <span class="o">=</span> <span class="n">tok</span><span class="p">(</span><span class="n">text</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">)</span><span class="o">.</span><span class="n">input_ids</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+<span class="linenos"> 61</span>    <span class="n">S</span> <span class="o">=</span> <span class="n">ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos"> 62</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  模型 </span><span class="si">{</span><span class="n">MODEL</span><span class="si">}</span><span class="s2">，输入 </span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> 个 token"</span><span class="p">)</span>
+<span class="linenos"> 63</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  前 8 个 token: </span><span class="si">{</span><span class="p">[</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">i</span><span class="p">])</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">ids</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="p">:</span><span class="mi">8</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 64</span>
+<span class="linenos"> 65</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos"> 66</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="n">output_attentions</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 67</span>    <span class="n">attn</span> <span class="o">=</span> <span class="n">out</span><span class="o">.</span><span class="n">attentions</span>          <span class="c1"># tuple: 每层 [B, H, S, S]</span>
+<span class="linenos"> 68</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  拿到 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">attn</span><span class="p">)</span><span class="si">}</span><span class="s2"> 层，每层 shape </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">attn</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 69</span>
+<span class="linenos"> 70</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"每一层里，最后一个 query 分给「第 0 个 token」多少注意力"</span><span class="p">)</span>
+<span class="linenos"> 71</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  如果注意力是均匀的，应该是 1/</span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="mi">1</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">S</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 72</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'层'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'给 token 0'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'给最近 8 个'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'其余'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'token0 是均匀的几倍'</span><span class="si">:</span><span class="s2">&gt;18</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 73</span>    <span class="k">for</span> <span class="n">li</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">attn</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">attn</span><span class="p">)</span> <span class="o">-</span> <span class="mi">2</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">attn</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]:</span>
+<span class="linenos"> 74</span>        <span class="n">a</span> <span class="o">=</span> <span class="n">attn</span><span class="p">[</span><span class="n">li</span><span class="p">][</span><span class="mi">0</span><span class="p">,</span> <span class="p">:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="p">:]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>        <span class="c1"># [H, S] 最后一行</span>
+<span class="linenos"> 75</span>        <span class="n">p0</span> <span class="o">=</span> <span class="n">a</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos"> 76</span>        <span class="n">recent</span> <span class="o">=</span> <span class="n">a</span><span class="p">[:,</span> <span class="o">-</span><span class="mi">8</span><span class="p">:]</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos"> 77</span>        <span class="n">rest</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">-</span> <span class="n">p0</span> <span class="o">-</span> <span class="n">recent</span>
+<span class="linenos"> 78</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">li</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p0</span><span class="si">:</span><span class="s2">&gt;12.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">recent</span><span class="si">:</span><span class="s2">&gt;12.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">rest</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos"> 79</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">p0</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;17.1f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos"> 80</span>
+<span class="linenos"> 81</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"把第 0 个 token 的注意力份额按层×头铺开（挑一层）"</span><span class="p">)</span>
+<span class="linenos"> 82</span>    <span class="n">li</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">attn</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>
+<span class="linenos"> 83</span>    <span class="n">a0</span> <span class="o">=</span> <span class="n">attn</span><span class="p">[</span><span class="n">li</span><span class="p">][</span><span class="mi">0</span><span class="p">,</span> <span class="p">:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos"> 84</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  第 </span><span class="si">{</span><span class="n">li</span><span class="si">}</span><span class="s2"> 层，各头给 token 0 的份额："</span><span class="p">)</span>
+<span class="linenos"> 85</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="s2">" "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">v</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">"</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">a0</span><span class="o">.</span><span class="n">tolist</span><span class="p">()))</span>
+<span class="linenos"> 86</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  最大 </span><span class="si">{</span><span class="n">a0</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">  最小 </span><span class="si">{</span><span class="n">a0</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos"> 87</span>          <span class="sa">f</span><span class="s2">"中位数 </span><span class="si">{</span><span class="n">a0</span><span class="o">.</span><span class="n">median</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 88</span>
+<span class="linenos"> 89</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"那个 token 0 是什么"</span><span class="p">)</span>
+<span class="linenos"> 90</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  token id </span><span class="si">{</span><span class="n">ids</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">ids</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()])</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 91</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  它通常没有语义上的重要性。attention sink 的解释是："</span><span class="p">)</span>
+<span class="linenos"> 92</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  softmax 强制每行和为 1，当某个头「这一步不想关注任何东西」时，"</span><span class="p">)</span>
+<span class="linenos"> 93</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  它需要一个地方倾倒这份概率质量，于是选了位置最固定的第一个 token。"</span><span class="p">)</span>
+<span class="linenos"> 94</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这条解释在文献里有，但**本 lab 只测到了现象，没有验证机制**。"</span><span class="p">)</span>
+<span class="linenos"> 95</span>
+<span class="linenos"> 96</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"对滑动窗口的直接后果"</span><span class="p">)</span>
+<span class="linenos"> 97</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  如果窗口把 token 0 划出去，那份质量无处可去，"</span><span class="p">)</span>
+<span class="linenos"> 98</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  会被迫分给窗口内的 token —— 这就是 StreamingLLM 要单独保留"</span><span class="p">)</span>
+<span class="linenos"> 99</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  前几个 token（sink token）的原因。"</span><span class="p">)</span>
+<span class="linenos">100</span>    <span class="k">del</span> <span class="n">model</span>
+<span class="linenos">101</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">102</span>
+<span class="linenos">103</span>
+<span class="linenos">104</span><span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos">105</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos">106</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 滑动窗口：KV 有了上界"</span><span class="p">)</span>
+<span class="linenos">107</span>
+<span class="linenos">108</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  full attention：KV 随上下文线性增长，无上界。"</span><span class="p">)</span>
+<span class="linenos">109</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  滑动窗口（SWA）：只保留最近 W 个 token 的 KV，上界就是 W。"</span><span class="p">)</span>
+<span class="linenos">110</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  代价：窗口外的信息完全看不到（除非靠层数堆出感受野）。"</span><span class="p">)</span>
+<span class="linenos">111</span>
+<span class="linenos">112</span>    <span class="n">L</span><span class="p">,</span> <span class="n">hkv</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">28</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">128</span>
+<span class="linenos">113</span>    <span class="n">per_tok</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">L</span> <span class="o">*</span> <span class="n">hkv</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos">114</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  以 Qwen3-1.7B 的配置算（28 层, 8 KV 头, D=128, bf16）"</span><span class="p">)</span>
+<span class="linenos">115</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  每 token 每层 KV = </span><span class="si">{</span><span class="n">per_tok</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="n">L</span><span class="si">}</span><span class="s2"> B，全模型 </span><span class="si">{</span><span class="n">per_tok</span><span class="si">}</span><span class="s2"> B"</span><span class="p">)</span>
+<span class="linenos">116</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'上下文'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'full KV'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'W=4096'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'W=1024'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">117</span>    <span class="k">for</span> <span class="n">ctx</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">16384</span><span class="p">,</span> <span class="mi">65536</span><span class="p">,</span> <span class="mi">262144</span><span class="p">,</span> <span class="mi">1048576</span><span class="p">]:</span>
+<span class="linenos">118</span>        <span class="n">full</span> <span class="o">=</span> <span class="n">per_tok</span> <span class="o">*</span> <span class="n">ctx</span> <span class="o">/</span> <span class="n">MB</span>
+<span class="linenos">119</span>        <span class="n">w4</span> <span class="o">=</span> <span class="n">per_tok</span> <span class="o">*</span> <span class="nb">min</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="mi">4096</span><span class="p">)</span> <span class="o">/</span> <span class="n">MB</span>
+<span class="linenos">120</span>        <span class="n">w1</span> <span class="o">=</span> <span class="n">per_tok</span> <span class="o">*</span> <span class="nb">min</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="mi">1024</span><span class="p">)</span> <span class="o">/</span> <span class="n">MB</span>
+<span class="linenos">121</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">ctx</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">full</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2">MB </span><span class="si">{</span><span class="n">w4</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2">MB </span><span class="si">{</span><span class="n">w1</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2">MB"</span><span class="p">)</span>
+<span class="linenos">122</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  上下文 1M 时 full 要 114 GB，W=4096 只要 448 MB —— 差 256 倍。"</span><span class="p">)</span>
+<span class="linenos">123</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  更关键的是 **W 那两列不再增长**：显存与每步耗时都变成常数。"</span><span class="p">)</span>
+<span class="linenos">124</span>
+<span class="linenos">125</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"实测：decode 每步耗时 vs 上下文"</span><span class="p">)</span>
+<span class="linenos">126</span>    <span class="n">B</span><span class="p">,</span> <span class="n">H</span> <span class="o">=</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8</span>
+<span class="linenos">127</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> bf16"</span><span class="p">)</span>
+<span class="linenos">128</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'上下文'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'full ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'W=4096 ms'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'加速'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">129</span>    <span class="k">for</span> <span class="n">ctx</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">16384</span><span class="p">,</span> <span class="mi">65536</span><span class="p">,</span> <span class="mi">131072</span><span class="p">]:</span>
+<span class="linenos">130</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">131</span>        <span class="k">try</span><span class="p">:</span>
+<span class="linenos">132</span>            <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">133</span>            <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">134</span>        <span class="k">except</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">OutOfMemoryError</span><span class="p">:</span>
+<span class="linenos">135</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">ctx</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2">  显存不够"</span><span class="p">);</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">();</span> <span class="k">continue</span>
+<span class="linenos">136</span>        <span class="n">t_full</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">))</span>
+<span class="linenos">137</span>        <span class="n">w</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="mi">4096</span><span class="p">)</span>
+<span class="linenos">138</span>        <span class="n">kw</span><span class="p">,</span> <span class="n">vw</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="n">w</span><span class="p">:]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span> <span class="n">v</span><span class="p">[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="n">w</span><span class="p">:]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+<span class="linenos">139</span>        <span class="n">t_win</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">kw</span><span class="p">,</span> <span class="n">vw</span><span class="p">))</span>
+<span class="linenos">140</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">ctx</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_full</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_win</span><span class="si">:</span><span class="s2">&gt;12.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_full</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_win</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">141</span>        <span class="k">del</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">kw</span><span class="p">,</span> <span class="n">vw</span><span class="p">,</span> <span class="n">q</span>
+<span class="linenos">142</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">143</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  W 固定之后，decode 每步耗时不随上下文增长 —— 这是 SWA 的全部卖点。"</span><span class="p">)</span>
+<span class="linenos">144</span>
+<span class="linenos">145</span>
+<span class="linenos">146</span><span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos">147</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos">148</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 线性 attention：把 softmax 换掉之后"</span><span class="p">)</span>
+<span class="linenos">149</span>
+<span class="linenos">150</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  标准 attention：O = softmax(QK^T/√d) V，必须先算 QK^T（S×S）。"</span><span class="p">)</span>
+<span class="linenos">151</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  线性 attention：把 softmax 换成一个可分解的核 φ(q)·φ(k)^T，于是"</span><span class="p">)</span>
+<span class="linenos">152</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      O_i = φ(q_i) · Σ_{j&lt;=i} φ(k_j) v_j^T  /  (φ(q_i) · Σ_{j&lt;=i} φ(k_j))"</span><span class="p">)</span>
+<span class="linenos">153</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  括号里那两个和是**可以增量维护的状态**（一个 d×d 矩阵 + 一个 d 向量）。"</span><span class="p">)</span>
+<span class="linenos">154</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  于是：不需要 S×S，decode 时状态大小与上下文长度**无关**。"</span><span class="p">)</span>
+<span class="linenos">155</span>
+<span class="linenos">156</span>    <span class="k">def</span><span class="w"> </span><span class="nf">linear_attn</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">):</span>
+<span class="linenos">157</span><span class="w">        </span><span class="sd">"""最简单的 φ = elu(x)+1 版本，因果。O(S·d²)。"""</span>
+<span class="linenos">158</span>        <span class="n">phi_q</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">elu</span><span class="p">(</span><span class="n">Q</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+<span class="linenos">159</span>        <span class="n">phi_k</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">elu</span><span class="p">(</span><span class="n">K</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+<span class="linenos">160</span>        <span class="c1"># 累积状态：KV[i] = Σ_{j&lt;=i} φ(k_j) v_j^T,  Z[i] = Σ_{j&lt;=i} φ(k_j)</span>
+<span class="linenos">161</span>        <span class="n">kv</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">"bhsd,bhse-&gt;bhsde"</span><span class="p">,</span> <span class="n">phi_k</span><span class="p">,</span> <span class="n">V</span><span class="p">)</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos">162</span>        <span class="n">z</span> <span class="o">=</span> <span class="n">phi_k</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos">163</span>        <span class="n">num</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">"bhsd,bhsde-&gt;bhse"</span><span class="p">,</span> <span class="n">phi_q</span><span class="p">,</span> <span class="n">kv</span><span class="p">)</span>
+<span class="linenos">164</span>        <span class="n">den</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">"bhsd,bhsd-&gt;bhs"</span><span class="p">,</span> <span class="n">phi_q</span><span class="p">,</span> <span class="n">z</span><span class="p">)</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="nb">min</span><span class="o">=</span><span class="mf">1e-6</span><span class="p">)</span>
+<span class="linenos">165</span>        <span class="k">return</span> <span class="n">num</span> <span class="o">/</span> <span class="n">den</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">166</span>
+<span class="linenos">167</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"复杂度对照（prefill，B=1 H=8 D=64）"</span><span class="p">)</span>
+<span class="linenos">168</span>    <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">64</span>
+<span class="linenos">169</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'S'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'标准 ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'线性 ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'标准/线性'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">170</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'标准峰值MB'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'线性峰值MB'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">171</span>    <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">4096</span><span class="p">]:</span>
+<span class="linenos">172</span>        <span class="n">Q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="linenos">173</span>        <span class="n">K</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="linenos">174</span>        <span class="n">V</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="linenos">175</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">reset_peak_memory_stats</span><span class="p">();</span> <span class="n">base</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">()</span>
+<span class="linenos">176</span>        <span class="n">t_std</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">is_causal</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span> <span class="n">n</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">177</span>        <span class="n">m_std</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">max_memory_allocated</span><span class="p">()</span> <span class="o">-</span> <span class="n">base</span><span class="p">)</span> <span class="o">/</span> <span class="n">MB</span>
+<span class="linenos">178</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">reset_peak_memory_stats</span><span class="p">();</span> <span class="n">base</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">()</span>
+<span class="linenos">179</span>        <span class="n">t_lin</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">linear_attn</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">n</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">180</span>        <span class="n">m_lin</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">max_memory_allocated</span><span class="p">()</span> <span class="o">-</span> <span class="n">base</span><span class="p">)</span> <span class="o">/</span> <span class="n">MB</span>
+<span class="linenos">181</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_std</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_lin</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_std</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_lin</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2">× "</span>
+<span class="linenos">182</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">m_std</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">m_lin</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">183</span>        <span class="k">del</span> <span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span>
+<span class="linenos">184</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">185</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  注意：这个朴素线性实现用 cumsum 物化了 S 份 d×d 状态，"</span><span class="p">)</span>
+<span class="linenos">186</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以它的显存反而更大、也没有更快。**真实的线性 attention 用**"</span><span class="p">)</span>
+<span class="linenos">187</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  **分块递推，不物化中间状态。** 这里量的是「朴素写法」，"</span><span class="p">)</span>
+<span class="linenos">188</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  用来说明复杂度优势不会自动变成性能优势。"</span><span class="p">)</span>
+<span class="linenos">189</span>
+<span class="linenos">190</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"线性 attention 换掉了什么：精确检索"</span><span class="p">)</span>
+<span class="linenos">191</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  做一个最简单的检索任务：序列里埋一个 key-value 对，最后去查它。"</span><span class="p">)</span>
+<span class="linenos">192</span>    <span class="n">S</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">64</span>
+<span class="linenos">193</span>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">194</span>    <span class="n">Q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">195</span>    <span class="n">K</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">196</span>    <span class="n">V</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">197</span>    <span class="n">target</span> <span class="o">=</span> <span class="mi">37</span>
+<span class="linenos">198</span>    <span class="n">Q</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">K</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">target</span><span class="p">]</span> <span class="o">*</span> <span class="mf">8.0</span>        <span class="c1"># 让最后一个 query 明确指向 target</span>
+<span class="linenos">199</span>    <span class="n">std</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">is_causal</span><span class="o">=</span><span class="kc">True</span><span class="p">)[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos">200</span>    <span class="n">lin</span> <span class="o">=</span> <span class="n">linear_attn</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">)[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos">201</span>    <span class="n">want</span> <span class="o">=</span> <span class="n">V</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">target</span><span class="p">]</span>
+<span class="linenos">202</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  埋在位置 </span><span class="si">{</span><span class="n">target</span><span class="si">}</span><span class="s2">，最后一个 query 指向它"</span><span class="p">)</span>
+<span class="linenos">203</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  标准 attention 取回的向量 与目标的余弦相似度: "</span>
+<span class="linenos">204</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">F</span><span class="o">.</span><span class="n">cosine_similarity</span><span class="p">(</span><span class="n">std</span><span class="p">,</span><span class="w"> </span><span class="n">want</span><span class="p">,</span><span class="w"> </span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">205</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  线性 attention 取回的向量 与目标的余弦相似度: "</span>
+<span class="linenos">206</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">F</span><span class="o">.</span><span class="n">cosine_similarity</span><span class="p">(</span><span class="n">lin</span><span class="p">,</span><span class="w"> </span><span class="n">want</span><span class="p">,</span><span class="w"> </span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">207</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  softmax 的指数放大让最大的那一项主导，可以做到近乎精确的检索；"</span><span class="p">)</span>
+<span class="linenos">208</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  线性核没有这个放大，状态是所有 (k,v) 的加权和，信息被摊平了。"</span><span class="p">)</span>
+<span class="linenos">209</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这就是纯线性架构在「大海捞针」类任务上吃亏的原因，"</span><span class="p">)</span>
+<span class="linenos">210</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  也是混合架构（几层 full attention + 多层线性/SSM）流行的原因。"</span><span class="p">)</span>
+<span class="linenos">211</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">212</span>
+<span class="linenos">213</span>
+<span class="linenos">214</span><span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos">215</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos">216</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] RoPE 与长上下文外推"</span><span class="p">)</span>
+<span class="linenos">217</span>
+<span class="linenos">218</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos">219</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">glob</span>
+<span class="linenos">220</span>    <span class="n">cfgs</span> <span class="o">=</span> <span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">expanduser</span><span class="p">(</span>
+<span class="linenos">221</span>        <span class="s2">"/scratch/learn/models/hf/hub/models--Qwen--Qwen3-1.7B/snapshots/*/config.json"</span><span class="p">))</span>
+<span class="linenos">222</span>    <span class="n">D</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span> <span class="n">trained</span> <span class="o">=</span> <span class="mi">128</span><span class="p">,</span> <span class="mf">1000000.0</span><span class="p">,</span> <span class="mi">32768</span>
+<span class="linenos">223</span>    <span class="k">if</span> <span class="n">cfgs</span><span class="p">:</span>
+<span class="linenos">224</span>        <span class="n">c</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">cfgs</span><span class="p">[</span><span class="mi">0</span><span class="p">]))</span>
+<span class="linenos">225</span>        <span class="n">D</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"head_dim"</span><span class="p">,</span> <span class="n">c</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span> <span class="o">//</span> <span class="n">c</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">])</span>
+<span class="linenos">226</span>        <span class="n">base</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rope_theta"</span><span class="p">,</span> <span class="mf">10000.0</span><span class="p">))</span>
+<span class="linenos">227</span>        <span class="n">trained</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"max_position_embeddings"</span><span class="p">,</span> <span class="mi">32768</span><span class="p">)</span>
+<span class="linenos">228</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  从 config 读到：head_dim=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2">  rope_theta=</span><span class="si">{</span><span class="n">base</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos">229</span>              <span class="sa">f</span><span class="s2">"max_position_embeddings=</span><span class="si">{</span><span class="n">trained</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">230</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  rope_scaling = </span><span class="si">{</span><span class="n">c</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'rope_scaling'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">231</span>
+<span class="linenos">232</span>    <span class="n">inv</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">base</span> <span class="o">**</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">/</span> <span class="n">D</span><span class="p">))</span>
+<span class="linenos">233</span>    <span class="n">period</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">pi</span> <span class="o">/</span> <span class="n">inv</span>
+<span class="linenos">234</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  RoPE 把 head_dim 拆成 </span><span class="si">{</span><span class="n">D</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="mi">2</span><span class="si">}</span><span class="s2"> 对，第 i 对的角频率 "</span>
+<span class="linenos">235</span>          <span class="sa">f</span><span class="s2">"= 1/base^(2i/d)"</span><span class="p">)</span>
+<span class="linenos">236</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'第几对'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'角频率'</span><span class="si">:</span><span class="s2">&gt;14</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'周期(token)'</span><span class="si">:</span><span class="s2">&gt;16</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'说明'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">237</span>    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">D</span> <span class="o">//</span> <span class="mi">2</span> <span class="o">-</span> <span class="mi">2</span><span class="p">,</span> <span class="n">D</span> <span class="o">//</span> <span class="mi">2</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]:</span>
+<span class="linenos">238</span>        <span class="n">note</span> <span class="o">=</span> <span class="s2">""</span>
+<span class="linenos">239</span>        <span class="k">if</span> <span class="n">period</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">trained</span><span class="p">:</span>
+<span class="linenos">240</span>            <span class="n">note</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"周期 &gt; 训练长度 </span><span class="si">{</span><span class="n">trained</span><span class="si">}</span><span class="s2">，从未转满一圈"</span>
+<span class="linenos">241</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">i</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">inv</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;14.3e</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">period</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;16.1f</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">note</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">242</span>
+<span class="linenos">243</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  关键：周期大于训练长度的那些维度，在训练时**从未见过完整的一圈**。"</span><span class="p">)</span>
+<span class="linenos">244</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  推理时如果位置超过 </span><span class="si">{</span><span class="n">trained</span><span class="si">}</span><span class="s2">，它们会进入训练中没出现过的角度区间 ——"</span><span class="p">)</span>
+<span class="linenos">245</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这就是长上下文外推失败的直接原因，不是「模型记不住」。"</span><span class="p">)</span>
+<span class="linenos">246</span>
+<span class="linenos">247</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"三种 scaling 改的是什么"</span><span class="p">)</span>
+<span class="linenos">248</span>    <span class="n">S_FACTOR</span> <span class="o">=</span> <span class="mf">4.0</span>
+<span class="linenos">249</span>    <span class="c1"># PI：位置除以 s，等价于所有角频率除以 s，所有周期 × s</span>
+<span class="linenos">250</span>    <span class="n">inv_pi</span> <span class="o">=</span> <span class="n">inv</span> <span class="o">/</span> <span class="n">S_FACTOR</span>
+<span class="linenos">251</span>    <span class="c1"># NTK / base 放大：base -&gt; base * s^(d/(d-2))</span>
+<span class="linenos">252</span>    <span class="n">b_ntk</span> <span class="o">=</span> <span class="n">base</span> <span class="o">*</span> <span class="p">(</span><span class="n">S_FACTOR</span> <span class="o">**</span> <span class="p">(</span><span class="n">D</span> <span class="o">/</span> <span class="p">(</span><span class="n">D</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)))</span>
+<span class="linenos">253</span>    <span class="n">inv_ntk</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">b_ntk</span> <span class="o">**</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">/</span> <span class="n">D</span><span class="p">))</span>
+<span class="linenos">254</span>
+<span class="linenos">255</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  放大倍数 s = </span><span class="si">{</span><span class="n">S_FACTOR</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2">（想把 </span><span class="si">{</span><span class="n">trained</span><span class="si">}</span><span class="s2"> 撑到 </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">trained</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">S_FACTOR</span><span class="p">)</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos">256</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'方案'</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'最高频周期(i=0)'</span><span class="si">:</span><span class="s2">&gt;18</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'中间(i=32)'</span><span class="si">:</span><span class="s2">&gt;14</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">257</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'最低频周期(i=63)'</span><span class="si">:</span><span class="s2">&gt;20</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">258</span>    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">iv</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"原始"</span><span class="p">,</span> <span class="n">inv</span><span class="p">),</span> <span class="p">(</span><span class="s2">"PI"</span><span class="p">,</span> <span class="n">inv_pi</span><span class="p">),</span> <span class="p">(</span><span class="s2">"NTK"</span><span class="p">,</span> <span class="n">inv_ntk</span><span class="p">)]:</span>
+<span class="linenos">259</span>        <span class="n">pp</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">pi</span> <span class="o">/</span> <span class="n">iv</span>
+<span class="linenos">260</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">pp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;18.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">pp</span><span class="p">[</span><span class="mi">32</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;14.1f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">261</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">pp</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;20.1f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">262</span>
+<span class="linenos">263</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  只看最低频那一列，PI 与 NTK **完全一样**（都 ×</span><span class="si">{</span><span class="n">S_FACTOR</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2">）——"</span><span class="p">)</span>
+<span class="linenos">264</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  NTK 的 base 放大公式本来就是这么设计的，让最低频恰好对上 PI。"</span><span class="p">)</span>
+<span class="linenos">265</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  差别全在最高频那一列："</span><span class="p">)</span>
+<span class="linenos">266</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    PI  把 i=0 的周期从 </span><span class="si">{</span><span class="p">(</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">math</span><span class="o">.</span><span class="n">pi</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">inv</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">267</span>          <span class="sa">f</span><span class="s2">"拉到 </span><span class="si">{</span><span class="p">(</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">math</span><span class="o">.</span><span class="n">pi</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">inv_pi</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">（×</span><span class="si">{</span><span class="n">S_FACTOR</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos">268</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    NTK 把 i=0 的周期从 </span><span class="si">{</span><span class="p">(</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">math</span><span class="o">.</span><span class="n">pi</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">inv</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">269</span>          <span class="sa">f</span><span class="s2">"拉到 </span><span class="si">{</span><span class="p">(</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">math</span><span class="o">.</span><span class="n">pi</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">inv_ntk</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">270</span>          <span class="sa">f</span><span class="s2">"（×</span><span class="si">{</span><span class="p">((</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">math</span><span class="o">.</span><span class="n">pi</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">inv_ntk</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">math</span><span class="o">.</span><span class="n">pi</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">inv</span><span class="p">)[</span><span class="mi">0</span><span class="p">])</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">，几乎不变）"</span><span class="p">)</span>
+<span class="linenos">271</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  高频维度负责区分「相邻几个 token」。PI 把它也拉长 4 倍，"</span><span class="p">)</span>
+<span class="linenos">272</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  等于让模型分不清近处的位置；NTK 保住高频，只拉低频。"</span><span class="p">)</span>
+<span class="linenos">273</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  YaRN 在此基础上再按维度分段处理，并加一个注意力温度修正。"</span><span class="p">)</span>
+<span class="linenos">274</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  **本 lab 只算了频率，没有测任何模型质量。**"</span><span class="p">)</span>
+<span class="linenos">275</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  哪种 scaling 更好必须跑长上下文评测（大海捞针、长文困惑度），"</span><span class="p">)</span>
+<span class="linenos">276</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  频率表只能说明它们改了什么，不能说明改得好不好。"</span><span class="p">)</span>
+<span class="linenos">277</span>
+<span class="linenos">278</span>
+<span class="linenos">279</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span> <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">}</span>
+<span class="linenos">280</span>
+<span class="linenos">281</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">282</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos">283</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">284</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos">285</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos">286</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos">287</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L3/sparse_linear.py 全文（287 行）</code><a href="../code/labs/L3/sparse_linear.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p><strong>建议的消融</strong></p>
+<ol>
+<li><strong>验证 sink 的机制</strong>（第一节标为未验证的那条）：在注意力 softmax 里
+   加一个固定的额外 logit（相当于一个"垃圾桶"），看 token 0 的份额会不会下降。
+   这需要改 HF 的 attention 实现，是本章最有价值的一个练习。</li>
+<li>把 [A] 换成一段<strong>以标点开头</strong>或<strong>以罕见 token 开头</strong>的文本，
+   看 sink 是否仍落在位置 0。这能区分"位置效应"与"token 内容效应"。</li>
+<li>[C] 的线性实现改成分块递推（块内并行、块间传状态），
+   看能不能把显存从 1040 MB 降回 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>d</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span>、时间降到标准之下。
+   这是"复杂度优势能否兑现"的实操检验。</li>
+<li>[D] 里把 <code>rope_theta</code> 从 1e6 换成 1e4（老模型的常见值），
+   重算那张表——看训练长度内"从未转满一圈"的维度会多多少。</li>
+</ol>
+<hr />
+<h2 id="_5">七 · 陷阱</h2>
+<ol>
+<li><strong>复杂度更低 ≠ 更快。</strong> 本章朴素线性 attention 在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mrow><mo>&#x0003D;</mo></mrow><mn>4096</mn></mrow></math></span> 上比标准慢 4.3 倍、
+   显存多 130 倍。渐近优势要在足够大的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 上、且实现得当才兑现。</li>
+<li><strong>滑动窗口不能简单地丢掉窗口外的一切。</strong> attention sink 让最前面几个 token
+   承载了大量注意力质量（本章实测 73%），丢掉它们会显著改变行为。</li>
+<li><strong><code>output_attentions=True</code> 需要 eager 实现。</strong> FlashAttention 类后端
+   不物化注意力矩阵，拿不到权重——这本身就是 3.1 的结论。</li>
+<li><strong>PI 与 NTK 在最低频上完全一样</strong>，差别在高频。只比最低频会得出"两者相同"的错误结论。</li>
+<li><strong>频率表说明不了质量。</strong> 判断 scaling 好坏必须跑长上下文评测。</li>
+<li><strong>sink 的机制解释本章没有验证。</strong> 现象是实测的，解释是文献的。</li>
+<li><strong>线性 attention 的"状态与上下文无关"是优点也是上界。</strong> 固定容量意味着
+   信息必然被摊平（本章检索 1.0000 → 0.2393）。</li>
+</ol>
+<hr />
+<h2 id="_6">八 · 自测题</h2>
+<details>
+<summary>1. 为什么用 FlashAttention 后端就拿不到注意力权重矩阵？</summary>
+<p>因为 FlashAttention <strong>从不物化</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 的注意力矩阵——
+这正是它的全部意义（3.1）。它分块计算，块内的打分算完立刻用掉就丢，
+只保留 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span> 三个累加量。</p>
+<p>所以 <code>output_attentions=True</code> 必须配 <code>attn_implementation="eager"</code>，
+也就是回到 3.1 里那个朴素实现（MATH 后端）。代价是显存和速度都差很多，
+只能在很短的序列上做。</p>
+<p>这也意味着：<strong>任何需要看注意力权重的分析（可解释性、剪枝、稀疏化研究）
+都不能直接在生产路径上做。</strong></p>
+</details>
+<details>
+<summary>2. 你把滑动窗口的 W 从 4096 减到 1024，decode 快了多少？KV 省了多少？</summary>
+<p>按 3.3 的式子，两者都应该是 4×——KV 字节和每步时间都正比于 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi></mrow></math></span>。</p>
+<p>本章的 KV 表可以直接读：448.0 MB → 112.0 MB，正好 4×。
+时间没有直接测 W=1024，但 [B] 表里 W=4096 那一列是平的（~0.091 ms），
+说明时间确实只由 W 决定，所以 W 减到 1/4，时间也应到 ~0.023 ms。</p>
+<p><strong>这是一个可以预测再验证的练习</strong>，不需要重新跑就能算出来，
+正是 3.3 §一 那个"时间 = 字节 ÷ 带宽"的用处。</p>
+</details>
+<details>
+<summary>3. 为什么 softmax 能做精确检索，而线性核不能？</summary>
+<p>softmax 里的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mi>s</mi></mrow></msup></mrow></math></span> 是<strong>指数放大</strong>：如果某一项的打分比其余高几个单位，
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>e</mi></mrow></math></span> 的差距就是几倍到几十倍，归一化之后它几乎独占全部权重，
+输出就约等于那一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>v</mi><mi>j</mi></msub></mrow></math></span>。本章实测余弦相似度 1.0000。</p>
+<p>线性核 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003D5;</mi><mo stretchy="false">&#x00028;</mo><mi>q</mi><mo stretchy="false">&#x00029;</mo><mo>&#x000B7;</mo><mi>&#x003D5;</mi><mo stretchy="false">&#x00028;</mo><mi>k</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 是<strong>多项式量级</strong>的，没有这种放大。
+而且它把所有历史压进一个固定大小的状态矩阵里——
+新的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>k</mi><mo>&#x0002C;</mo><mi>v</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 不断加进去，任何单一项的占比都被稀释。本章实测 0.2393。</p>
+<p>一句话：<strong>指数放大是 attention 能做"选择"而不只是"平均"的原因。</strong>
+换掉 softmax 就换掉了这个能力。</p>
+</details>
+<details>
+<summary>4. 一个模型 max_position_embeddings=40960，你要让它处理 160K 上下文。直接外推为什么不行？</summary>
+<p>看频率表最后两行：周期 4080185 和 5063256 token 的那些维度，
+在 40960 以内<strong>连一圈都没转完</strong>。训练时它们只见过角度区间的一小段。</p>
+<p>推理时位置到 160K，这些维度的角度进入训练中从未出现的区间。
+模型对这些输入没有任何学过的行为——不是"忘了"，是<strong>没见过</strong>。</p>
+<p>解决方向是 scaling：把角度压回训练见过的范围。
+PI 直接把位置除以 4（所有频率同等缩小）；
+NTK 通过放大 base，让低频被拉长而高频基本不变（本章表里 6.28 → 6.28）。</p>
+<p>但注意：<strong>scaling 之后仍然需要评测。</strong> 频率落回训练区间是必要条件，
+不是充分条件——模型在插值出来的中间位置上表现如何，只能测。</p>
+</details>
+<details>
+<summary>5. 为什么 GQA 几年内成了默认配置，而线性 attention 讨论更久却没取代 attention？</summary>
+<p>因为两者要过的关不一样。</p>
+<p>GQA 只改"存多少 KV 头"，attention 的计算语义<strong>完全不变</strong>。
+它的收益可以从账本直接算出来（3.3 实测线性可预测），
+风险局限在 KV 侧的表达能力，容易评估。</p>
+<p>线性 attention <strong>改变了模型能看到什么</strong>——固定大小的状态注定摊平信息
+（本章检索 1.0000 → 0.2393）。它必须在完整的能力评测上证明自己，
+而"在大多数任务上接近"不足以让人放弃"在检索任务上精确"。</p>
+<p>这是 3.1 §7.1 那条判据的又一次应用：<strong>精确的优化传播得快，
+改变语义的优化要过质量这一关，而质量这一关很贵也很慢。</strong></p>
+<p>混合架构之所以是当前的主流答案，正因为它试图两头都要：
+少数层保留精确能力，多数层享受廉价状态。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L3/3.3-decode-attention.html">&#8592; 3.3 Decode 侧 attention</a><a class="nav-next" href="../L4/4.0-checkpoint-format.html">4.0 模型文件到底是什么：safetensors 字节布局与加载路径 &#8594;</a></nav>
+</main>
+</body>
+</html>

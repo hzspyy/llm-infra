@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.2 编译工具链：nvcc → PTX → SASS</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">2.2</div>
+  <div class="sidebar-title">编译工具链：nvcc → PTX → SASS</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：八个程序接力，两种代码形态</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#_4">八个程序在接力</a></li>
+<li><a href="#810-143-mb">中间产物：源码 810 字节，预处理后 1.43 MB</a></li>
+<li><a href="#ptx-isa">PTX：虚拟 ISA，无限寄存器</a></li>
+<li><a href="#sass">SASS：真实机器码</a></li>
+<li><a href="#sm_120-sm_120a-sm_120f">sm_120 / sm_120a / sm_120f：三个目标</a></li>
+<li><a href="#-o">-O 级别：主要影响的是指令数</a></li>
+<li><a href="#__launch_bounds__">__launch_bounds__：寄存器预算与运行时间</a></li>
+</ul>
+</li>
+<li><a href="#_5">工程实现 · 源码走读：真实世界的两种代码生成</a><ul>
+<li><a href="#1-fatbincutlass">1. 静态 fatbin：CUTLASS 的路子</a></li>
+<li><a href="#2-jitnvjet">2. 运行时 JIT：nvjet 的路子</a></li>
+<li><a href="#3-triton">3. Triton：第三种路子</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_8">原始现场</a></li>
+<li><a href="#_9">前沿</a></li>
+<li><a href="#_10">陷阱</a></li>
+<li><a href="#_11">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="mod-id">2.2</div>
+  <h1>编译工具链：nvcc → PTX → SASS</h1>
+  <p class="lede">跟踪 nvcc 的中间产物，对照 PTX 与 SASS；检查编译目标、寄存器分配和 spill，并区分静态编译与运行时生成代码。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88 · ptxas 13.0.88</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.2（sm_120 的指令集）· L2.1（占用率与寄存器）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><code>nvcc a.cu -o a</code> 这一行命令，实际调用了<strong>哪些程序</strong>、产生了<strong>哪些中间文件</strong>？</li>
+<li>PTX 和 SASS 到底差在哪？<code>sm_120</code> / <code>sm_120a</code> / <code>sm_120f</code> 三个目标有什么区别？</li>
+<li><strong><code>__launch_bounds__</code> 能让占用率翻 4 倍——但代价是多少？</strong></li>
+</ol>
+<p>本章跟踪一份 CUDA 源文件如何成为可执行程序。
+PTX 是面向虚拟指令集的中间表示，SASS 是针对具体 GPU 的机器指令。
+编译器还负责把变量分配到有限的寄存器；放不下时，一部分变量可能转存到内存。
+后面的例子会展示这种寄存器溢出（spill），以及为什么占用率提高后程序反而可能变慢。</p>
+<hr />
+<h2 id="_2">心智模型：八个程序接力，两种代码形态</h2>
+<figure>
+<svg viewBox="0 0 740 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="nvcc 编译流水线">
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">nvcc 的实际流水线（crater 实测，--dryrun 抓出来的）</text>
+
+    <g stroke="currentColor" stroke-width="1.2" fill="none" opacity="0.7">
+      <line x1="112" y1="56" x2="136" y2="56"/><line x1="236" y1="56" x2="260" y2="56"/>
+      <line x1="360" y1="56" x2="384" y2="56"/><line x1="484" y1="56" x2="508" y2="56"/>
+      <line x1="608" y1="56" x2="632" y2="56"/>
+    </g>
+    <g>
+      <rect x="12" y="38" width="100" height="36" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"/>
+      <text x="62" y="54" text-anchor="middle" font-size="10.5">gcc -E</text>
+      <text x="62" y="68" text-anchor="middle" font-size="9" opacity="0.7">预处理</text>
+
+      <rect x="136" y="38" width="100" height="36" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"/>
+      <text x="186" y="54" text-anchor="middle" font-size="10.5">cudafe++</text>
+      <text x="186" y="68" text-anchor="middle" font-size="9" opacity="0.7">拆主机/设备代码</text>
+
+      <rect x="260" y="38" width="100" height="36" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="310" y="54" text-anchor="middle" font-size="10.5" font-weight="600">cicc</text>
+      <text x="310" y="68" text-anchor="middle" font-size="9" opacity="0.7">NVVM → PTX</text>
+
+      <rect x="384" y="38" width="100" height="36" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="434" y="54" text-anchor="middle" font-size="10.5" font-weight="600">ptxas</text>
+      <text x="434" y="68" text-anchor="middle" font-size="9" opacity="0.7">PTX → SASS</text>
+
+      <rect x="508" y="38" width="100" height="36" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"/>
+      <text x="558" y="54" text-anchor="middle" font-size="10.5">fatbinary</text>
+      <text x="558" y="68" text-anchor="middle" font-size="9" opacity="0.7">打包多架构</text>
+
+      <rect x="632" y="38" width="96" height="36" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"/>
+      <text x="680" y="54" text-anchor="middle" font-size="10.5">gcc</text>
+      <text x="680" y="68" text-anchor="middle" font-size="9" opacity="0.7">链进宿主目标文件</text>
+    </g>
+    <text x="12" y="92" font-size="10.5" opacity="0.8">L0.1 陷阱里那个版本错配，就发生在 <tspan font-family="ui-monospace,monospace" font-size="10">cicc</tspan> 与 <tspan font-family="ui-monospace,monospace" font-size="10">ptxas</tspan> 之间：前者产 PTX 9.3，后者只认 9.0。</text>
+
+    <!-- artifacts -->
+    <line x1="12" y1="108" x2="728" y2="108" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="130" font-size="12" font-weight="600">中间产物（源码 810 字节）</text>
+    <g font-family="ui-monospace, monospace" font-size="10">
+      <text x="24" y="150">demo.cu              810 B</text>
+      <text x="300" y="150">← 你写的</text>
+      <text x="24" y="166">demo.cpp1.ii   1 426 606 B</text>
+      <text x="300" y="166">← 预处理后，<tspan font-family="var(--sans)" font-size="10.5">膨胀 1761 倍</tspan></text>
+      <text x="24" y="182">demo.ptx           3 165 B</text>
+      <text x="300" y="182">← 虚拟 ISA，文本，人能读</text>
+      <text x="24" y="198">demo.sm_120.cubin  7 248 B</text>
+      <text x="300" y="198">← 真实机器码，绑定架构</text>
+      <text x="24" y="214">demo.fatbin        8 192 B</text>
+      <text x="300" y="214">← cubin + PTX 一起打包</text>
+      <text x="24" y="230">demo.o            13 680 B</text>
+      <text x="300" y="230">← fatbin 嵌进宿主目标文件</text>
+    </g>
+
+    <!-- key result -->
+    <line x1="12" y1="248" x2="728" y2="248" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="272" font-size="12" font-weight="600">本章的压轴实测：<tspan font-family="ui-monospace,monospace" font-size="11">__launch_bounds__</tspan> 是用 spill 换占用率</text>
+    <text x="12" y="294" font-size="10.5" opacity="0.8">同一个 kernel，同样的工作量，只改 __launch_bounds__ 的值：</text>
+    <g font-size="10.5">
+      <text x="24" y="316">__launch_bounds__(256)</text>
+      <text x="220" y="316">254 寄存器</text>
+      <text x="330" y="316">spill 0 B</text>
+      <text x="440" y="316">1 blk/SM</text>
+      <text x="560" y="316" font-weight="600">0.012 ms</text>
+      <text x="24" y="336">__launch_bounds__(512)</text>
+      <text x="220" y="336">128 寄存器</text>
+      <text x="330" y="336">spill 396 B</text>
+      <text x="440" y="336">2 blk/SM</text>
+      <text x="560" y="336">0.025 ms（1.98×）</text>
+      <text x="24" y="356">__launch_bounds__(1024)</text>
+      <text x="220" y="356">64 寄存器</text>
+      <text x="330" y="356">spill 2796 B</text>
+      <text x="440" y="356">4 blk/SM</text>
+      <text x="560" y="356" font-weight="600">0.286 ms（23.03×）</text>
+    </g>
+    <rect x="12" y="372" width="716" height="44" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <text x="24" y="392" font-size="11.5" font-weight="600">占用率提高 4 倍，实际速度慢了 23 倍。</text>
+    <text x="24" y="409" font-size="10.5" opacity="0.85">因为溢出的寄存器落在 local memory —— 物理上就在显存里，延迟 929 周期（L1.1 实测）。</text>
+  </g>
+</svg>
+<figcaption>nvcc 的流水线、中间产物，以及寄存器溢出的真实代价。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="_4">八个程序在接力</h3>
+<p><code>nvcc --dryrun</code> 会打印它准备执行的每一条命令而不真的执行。抓出来是：</p>
+<div class="highlight"><pre><span></span><code>gcc -E        预处理（宿主代码路径）
+cudafe++      把 .cu 拆成"宿主部分"与"设备部分"
+gcc -E        预处理（设备代码路径）
+cicc          NVVM 编译器：设备代码 → PTX      ← 属于 nvidia-nvvm 包
+ptxas         PTX → SASS（cubin）              ← 属于 nvidia-cuda-nvcc 包
+fatbinary     把多个架构的 cubin + PTX 打包成 fatbin
+gcc           把 fatbin 嵌进宿主目标文件
+</code></pre></div>
+
+<p><strong><code>cicc</code> 与 <code>ptxas</code> 属于两个不同的 pip 包</strong> —— 这正是 <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 陷阱一节里那个
+<code>Unsupported .version 9.3</code> 的根源：只钉 <code>nvidia-cuda-nvcc</code> 换掉了 ptxas，
+<code>cicc</code> 还是旧版本，产出的 PTX ISA 版本对不上。</p>
+<h3 id="810-143-mb">中间产物：源码 810 字节，预处理后 1.43 MB</h3>
+<p><code>--keep</code> 会保留所有中间文件：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>大小</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>demo.cu</code></td>
+<td>810 B</td>
+<td>你写的源码</td>
+</tr>
+<tr>
+<td><code>demo.cpp1.ii</code></td>
+<td><strong>1 426 606 B</strong></td>
+<td>预处理后（<strong>膨胀 1761 倍</strong>）</td>
+</tr>
+<tr>
+<td><code>demo.cudafe1.gpu</code></td>
+<td>8 074 B</td>
+<td>拆分出的设备代码</td>
+</tr>
+<tr>
+<td><code>demo.ptx</code></td>
+<td>3 165 B</td>
+<td>虚拟 ISA，文本</td>
+</tr>
+<tr>
+<td><code>demo.sm_120.cubin</code></td>
+<td>7 248 B</td>
+<td>真实机器码 ELF</td>
+</tr>
+<tr>
+<td><code>demo.fatbin</code></td>
+<td>8 192 B</td>
+<td>cubin + PTX 打包</td>
+</tr>
+<tr>
+<td><code>demo.o</code></td>
+<td>13 680 B</td>
+<td>最终目标文件</td>
+</tr>
+</tbody>
+</table>
+<p><strong>1761 倍的膨胀</strong>解释了 CUDA 为什么编译这么慢：一个 <code>#include &lt;cuda_runtime.h&gt;</code>
+带进来 1.4 MB 的头文件，每个 <code>.cu</code> 都要重新处理一遍。
+这也是 CuTe-DSL 宣称"编译比 C++ CUTLASS 模板快 20–30×"的部分原因（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）——
+它跳过了整个 C++ 前端。</p>
+<h3 id="ptx-isa">PTX：虚拟 ISA，无限寄存器</h3>
+<div class="highlight"><pre><span></span><code><span class="c">//</span>
+<span class="c">// Generated by NVIDIA NVVM Compiler</span>
+<span class="c">// Cuda compilation tools, release 13.0, V13.0.88</span>
+<span class="c">// Based on NVVM 20.0.0</span>
+<span class="c">//</span>
+<span class="kr">.version</span><span class="w"> </span><span class="m">9.0</span>
+<span class="kr">.target</span><span class="w"> </span><span class="nv">sm_120</span>
+<span class="kr">.address_size</span><span class="w"> </span><span class="m">64</span>
+
+<span class="w">    </span><span class="c">// .globl   _Z11reduce_tileILi256EEvPKfPfi</span>
+<span class="c">// _ZZ11reduce_tileILi256EEvPKfPfiE1s has been demoted</span>
+
+<span class="kr">.visible</span><span class="w"> </span><span class="kr">.entry</span><span class="w"> </span><span class="nv">_Z11reduce_tileILi256EEvPKfPfi</span><span class="p">(</span>
+<span class="w">    </span><span class="kp">.param</span><span class="w"> </span><span class="kt">.u64</span><span class="w"> </span><span class="nv">.ptr</span><span class="w"> </span><span class="kr">.align</span><span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="nv">_Z11reduce_tileILi256EEvPKfPfi_param_0</span><span class="o">,</span>
+<span class="w">    </span><span class="nv">...</span>
+</code></pre></div>
+
+<p>四点值得看：</p>
+<ul>
+<li><strong><code>.version 9.0</code></strong> 是 <strong>PTX ISA 版本</strong>，<code>.target sm_120</code> 是目标架构。两者独立。
+  <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的失败就是 <code>.version</code> 不匹配（9.3 的 PTX 喂给只认 9.0 的 ptxas）。</li>
+<li><strong><code>_Z11reduce_tileILi256EEvPKfPfi</code></strong> 是 C++ name mangling。<code>c++filt</code> 还原：
+  <code>void reduce_tile&lt;256&gt;(float const*, float*, int)</code>。
+  <strong>模板参数被编码进符号名</strong> —— 所以 <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 里能从 kernel 名读出
+  <code>Flash_fwd_kernel_traits&lt;128, 64, 128, 4&gt;</code> 的全部 tile 尺寸。</li>
+<li><strong><code>has been demoted</code></strong> 说的是共享内存变量被降级为局部符号。</li>
+<li>PTX 用的是<strong>无限虚拟寄存器</strong>（<code>%r1</code>, <code>%r2</code>, …）。真正的寄存器分配是 ptxas 干的。</li>
+</ul>
+<p>归约循环在 PTX 里长这样：</p>
+<div class="highlight"><pre><span></span><code><span class="nl">46:</span><span class="w"> </span><span class="k">st</span><span class="kp">.shared</span><span class="kt">.f32</span><span class="w">   </span><span class="p">[</span><span class="nv">%r4</span><span class="p">]</span><span class="o">,</span><span class="w"> </span><span class="nv">%f29</span><span class="p">;</span>
+<span class="nl">47:</span><span class="w"> </span><span class="k">bar</span><span class="nv">.sync</span><span class="w">    </span><span class="m">0</span><span class="p">;</span>
+<span class="nl">50:</span><span class="w"> </span><span class="k">ld</span><span class="kp">.shared</span><span class="kt">.f32</span><span class="w">   </span><span class="nv">%f4</span><span class="o">,</span><span class="w"> </span><span class="p">[</span><span class="nv">%r4</span><span class="o">+</span><span class="m">512</span><span class="p">];</span>
+<span class="nl">51:</span><span class="w"> </span><span class="k">ld</span><span class="kp">.shared</span><span class="kt">.f32</span><span class="w">   </span><span class="nv">%f5</span><span class="o">,</span><span class="w"> </span><span class="p">[</span><span class="nv">%r4</span><span class="p">];</span>
+<span class="nl">52:</span><span class="w"> </span><span class="k">add</span><span class="kt">.f32</span><span class="w">     </span><span class="nv">%f6</span><span class="o">,</span><span class="w"> </span><span class="nv">%f4</span><span class="o">,</span><span class="w"> </span><span class="nv">%f5</span><span class="p">;</span>
+<span class="nl">53:</span><span class="w"> </span><span class="k">st</span><span class="kp">.shared</span><span class="kt">.f32</span><span class="w">   </span><span class="p">[</span><span class="nv">%r4</span><span class="p">]</span><span class="o">,</span><span class="w"> </span><span class="nv">%f6</span><span class="p">;</span>
+</code></pre></div>
+
+<p>清晰对应源码里的 <code>s[t] += s[t + stride]; __syncthreads();</code>。</p>
+<h3 id="sass">SASS：真实机器码</h3>
+<p>同一段在 SASS 里：</p>
+<div class="highlight"><pre><span></span><code>/*0000*/  LDC R1, c[0x0][0x37c] ;                   /* 0x0000df00ff017b82 */
+/*0010*/  S2R R6, SR_TID.X ;                        /* 0x0000000000067919 */
+/*0020*/  LDCU UR4, c[0x0][0x390] ;                 /* 0x00007200ff0477ac */
+/*0030*/  HFMA2 R0, -RZ, RZ, 0, 0 ;                 /* 0x00000000ff007431 */
+/*0040*/  S2R R9, SR_CTAID.X ;                      /* 0x0000000000097919 */
+/*0060*/  LEA R5, R9, R6, 0x8 ;                     /* 0x0000000609057211 */
+/*0070*/  ISETP.GE.AND P0, PT, R5, UR4, PT ;        /* 0x0000000405007c0c */
+/*0080*/  @!P0 LDC.64 R2, c[0x0][0x380] ;           /* 0x0000e000ff028b82 */
+/*00a0*/  @!P0 LDG.E.CONSTANT R0, desc[UR6][R2.64] ;/* 0x0000000602008981 */
+/*0110*/  STS [R5], R0 ;                            /* 0x0000000005007388 */
+</code></pre></div>
+
+<p>指令统计（本 kernel 共 80 条）：</p>
+<div class="highlight"><pre><span></span><code>17 LDS    共享内存读     ← 归约循环的主体
+ 9 STS    共享内存写
+ 9 ISETP  整数比较置谓词
+ 9 BAR    barrier（__syncthreads）
+ 8 NOP
+ 8 FADD   浮点加         ← 真正的"计算"只有 8 条
+ 3 LDC / 2 S2R / 2 LEA / 2 LDCU
+</code></pre></div>
+
+<p><strong>一个"归约" kernel 里，真正的算术只有 8 条 <code>FADD</code>，而访存与同步有 35 条。</strong>
+这就是 memory-bound 算子的样子——<a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 会专门优化它。</p>
+<p>几个 SASS 特有的东西（PTX 里没有）：</p>
+<ul>
+<li><strong><code>@!P0</code></strong>：谓词执行。<a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 讲的 predication，在这里是实物。</li>
+<li><strong><code>UR4</code> / <code>URZ</code></strong>：uniform register（Turing 起引入）。整个 warp 共享同一个值时用它，
+  省下常规寄存器和指令带宽。</li>
+<li><strong><code>.reuse</code> 标志</strong>：告诉硬件这个操作数下一条指令还要用，留在 operand reuse cache 里。</li>
+<li><strong><code>c[0x0][0x37c]</code></strong>：constant bank 0。kernel 参数、grid 维度都放在这里，
+  由 driver 在 launch 时填好——这是 <a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 那 2.68 µs launch 开销的一部分去处。</li>
+<li><strong>右边的 <code>/* 0x... */</code></strong> 是指令的二进制编码。</li>
+</ul>
+<h3 id="sm_120-sm_120a-sm_120f"><code>sm_120</code> / <code>sm_120a</code> / <code>sm_120f</code>：三个目标</h3>
+<table>
+<thead>
+<tr>
+<th>目标</th>
+<th>含义</th>
+<th>目标文件大小</th>
+<th>能在哪跑</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sm_120</code></td>
+<td>只用通用指令</td>
+<td>13 704 B</td>
+<td>sm_120 及未来兼容架构</td>
+</tr>
+<tr>
+<td><code>sm_120a</code></td>
+<td><strong>architecture-specific</strong>，允许该架构独有指令</td>
+<td>14 536 B</td>
+<td><strong>只有 sm_120</strong></td>
+</tr>
+<tr>
+<td><code>sm_120f</code></td>
+<td><strong>family-specific</strong>，sm_12x 全家族</td>
+<td>14 536 B</td>
+<td>sm_120 / 121 / …</td>
+</tr>
+</tbody>
+</table>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 原始现场 ⑤ 里，Triton 生成的 PTX 是 <code>.target sm_120a</code>（架构专属），
+而 FlashInfer 的 JIT 缓存目录叫 <code>120f</code>（家族兼容）。
+<strong>库作者要在"用尽硬件"与"一份二进制覆盖更多卡"之间选。</strong></p>
+<p>多架构 fatbin（同时装 sm_80 / sm_89 / sm_120）：</p>
+<div class="highlight"><pre><span></span><code>多架构 fatbin: 22 872 字节（单架构 14 536）
+  含 cubin: sm_80 sm_89 sm_120
+</code></pre></div>
+
+<p>这就是 PyTorch 的 <code>.so</code> 动辄几百 MB 的原因——每个 kernel 都要为
+Volta 到 Blackwell 的每一代各编一份。</p>
+<h3 id="-o"><code>-O</code> 级别：主要影响的是指令数</h3>
+<table>
+<thead>
+<tr>
+<th><code>-O</code></th>
+<th>寄存器</th>
+<th>SASS 指令数</th>
+<th>smem</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-O0</code></td>
+<td>16</td>
+<td><strong>176</strong></td>
+<td>1024</td>
+</tr>
+<tr>
+<td><code>-O1</code></td>
+<td>12</td>
+<td><strong>88</strong></td>
+<td>1024</td>
+</tr>
+<tr>
+<td><code>-O2</code></td>
+<td>12</td>
+<td>80</td>
+<td>1024</td>
+</tr>
+<tr>
+<td><code>-O3</code></td>
+<td>12</td>
+<td>80</td>
+<td>1024</td>
+</tr>
+</tbody>
+</table>
+<p><strong><code>-O0</code> → <code>-O1</code> 指令数减半</strong>，之后基本饱和。注意 <code>nvcc -O3</code> 只控制宿主代码，
+设备代码要用 <code>-Xptxas -O3</code> 才生效（本实验两个都给了）。</p>
+<h3 id="__launch_bounds__"><code>__launch_bounds__</code>：寄存器预算与运行时间</h3>
+<p><code>__launch_bounds__(N)</code> 告诉编译器"这个 kernel 最多用 N 个线程/block"，
+ptxas 会据此<strong>限制寄存器用量</strong>，使得 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 个线程能同时驻留：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>每线程寄存器上限</mtext><mo>&#x0003D;</mo><mfrac><mrow><mn>65536</mn></mrow><mrow><mi>N</mi></mrow></mfrac></mrow></math></div></p>
+<p>用一个刻意制造寄存器压力的 kernel（160 个交叉依赖的活跃变量）实测：</p>
+<div class="highlight"><pre><span></span><code>kernel                          寄存器    栈帧B  spill存B  spill取B  每SM线程上限
+heavy&lt;64,  256&gt;                   80        0        0        0        819
+heavy&lt;128, 256&gt;                  254        0        0        0        258
+heavy&lt;128, 512&gt;                  128      248      396      412        512   ← 开始溢出
+heavy&lt;128, 1024&gt;                  64     1264     2796     2920       1024   ← 大量溢出
+heavy&lt;200, 1024&gt;                  64     1672     4680     4848       1024
+</code></pre></div>
+
+<p>同一个 kernel（N=128），只改 <code>__launch_bounds__</code>：
+- <code>256</code> → 254 个寄存器，<strong>不溢出</strong>
+- <code>512</code> → 128 个寄存器，溢出 396 字节
+- <code>1024</code> → 64 个寄存器，<strong>溢出 2796 字节</strong></p>
+<p>然后测实际耗时（<strong>三者都用 256 线程启动，工作量完全相同</strong>）：</p>
+<table>
+<thead>
+<tr>
+<th><code>__launch_bounds__</code></th>
+<th>寄存器</th>
+<th>spill</th>
+<th>驻留 block/SM</th>
+<th>耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>256</td>
+<td>254</td>
+<td>0 B</td>
+<td>1</td>
+<td><strong>0.012 ms</strong></td>
+</tr>
+<tr>
+<td>512</td>
+<td>128</td>
+<td>396 B</td>
+<td>2</td>
+<td>0.025 ms（1.98×）</td>
+</tr>
+<tr>
+<td>1024</td>
+<td>64</td>
+<td>2796 B</td>
+<td>4</td>
+<td><strong>0.286 ms（23.03×）</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>占用率提高 4 倍，实际速度慢了 23 倍。</strong></p>
+<p>溢出的变量可能存入 local memory。它由设备内存支持，但访问也可能命中缓存，
+不能给每次访问都套用 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 的显存延迟。应先检查 spill 指令是否位于热循环，
+再结合缓存与访存计数器判断代价。</p>
+<div class="admonition warning">
+<p class="admonition-title">不要只按占用率选择参数</p>
+<p><a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 说"占用率是手段不是目标"，本章给出了量化：
+<strong>为了占用率牺牲寄存器，可能换来 23 倍的减速。</strong></p>
+<p><code>__launch_bounds__</code> 的正确用途是<strong>告诉编译器你确实需要那个 block 大小</strong>
+（比如 kernel 里有 <code>__syncthreads</code> 且逻辑依赖 1024 线程），
+它也可以用于调优，但需要同时检查寄存器溢出与总运行时间，
+不能把占用率变高本身当成优化成功。</p>
+<p>诊断方法：<code>-Xptxas -v</code> 里 <code>spill stores</code> 一旦不为 0 就要警惕，
+超过几百字节且在内循环里，基本可以断定是灾难。</p>
+</div>
+<hr />
+<h2 id="_5">工程实现 · 源码走读：真实世界的两种代码生成</h2>
+<h3 id="1-fatbincutlass">1. 静态 fatbin：CUTLASS 的路子</h3>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 trace 显示 vLLM 的 bf16 GEMM 是
+<code>cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8</code>。
+这是<strong>编译期实例化</strong>的模板，静态打进 <code>.so</code> 的 fatbin 里。</p>
+<p>从名字能读出全部配置：<code>80</code>=sm_80 血统，<code>s16816</code>=<code>m16n8k16</code> 指令，
+<code>128x64_64</code>=tile 尺寸，<code>x3</code>=3 段流水，<code>nn</code>=两个矩阵都不转置，<code>align8</code>=8 元素对齐。</p>
+<p>代价是<strong>组合爆炸</strong>：每种 dtype × tile × 布局 × 架构都要单独实例化。
+<code>libcublasLt.so</code> 里光 sm_120 就有 <strong>1596 个 cubin</strong>（实测 <code>cuobjdump -lelf</code>）：</p>
+<div class="highlight"><pre><span></span><code>1596 sm_120
+1376 sm_90a
+1187 sm_100
+ 482 sm_80
+ 247 sm_89
+</code></pre></div>
+
+<h3 id="2-jitnvjet">2. 运行时 JIT：<code>nvjet</code> 的路子</h3>
+<p>同一次 profile 里，<strong>fp8</strong> GEMM 的 kernel 名是：</p>
+<div class="highlight"><pre><span></span><code>nvjet_sm120_qqtst_mma_64x256x64_4_64x64x64_tmaAB_bz_TNNN
+</code></pre></div>
+
+<p><code>nvjet</code> 是 cuBLASLt 的 <strong>JIT 引擎</strong>。用 <code>cuobjdump</code> 在 <code>.so</code> 里找这个符号：</p>
+<div class="highlight"><pre><span></span><code>$ strings libcublasLt.so.13 | grep -c "nvjet_sm120"
+0
+$ cuobjdump -sass -fun nvjet_sm120_qqtst_... libcublasLt.so.13
+cuobjdump warning : Function listed in --function '...' not found
+</code></pre></div>
+
+<p><strong>它根本不在 <code>.so</code> 里 —— 是运行时生成的。</strong></p>
+<p>这解释了 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 留下的开放问题：我测的 <code>mma.sync.m16n8k32</code> 只有 1022 FLOP/clk/SM，
+而 cuBLAS 的 fp8 达到 1501。因为 cuBLAS 走的是 <code>nvjet</code> 生成的、
+用了 <strong>TMA</strong>（名字里的 <code>tmaAB</code>）的另一条路径，而不是我手写的那条。</p>
+<div class="admonition note">
+<p class="admonition-title">名字里的信息量</p>
+<p><code>nvjet_sm120_qqtst_mma_64x256x64_4_64x64x64_tmaAB_bz_TNNN</code> 拆开：
+<code>sm120</code> 架构 · <code>qq</code> 输入都是 quarter precision(fp8) · <code>tst</code> 输出/累加类型 ·
+<code>64x256x64</code> 线程块 tile · <code>4</code> 流水级数 · <code>64x64x64</code> warp tile ·
+<code>tmaAB</code> A 和 B 都用 TMA 搬运 · <code>bz</code> 沿 K 分块 · <code>TNNN</code> 转置组合。</p>
+<p><strong>C++ 模板实例化名与 JIT kernel 名，都是最省事的性能线索。</strong>
+不用读源码就能知道 tile 尺寸、精度、搬运方式。</p>
+</div>
+<h3 id="3-triton">3. Triton：第三种路子</h3>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 原始现场 ⑧ 展示过 Triton 的缓存目录：源码哈希 → 一个目录，
+里面有 <code>.ttir/.ttgir/.llir/.ptx/.cubin</code> 五份产物。
+它既不是静态 fatbin，也不是 cuBLAS 那种闭源 JIT，
+而是<strong>用户可见的、每一跳都落盘的 JIT</strong>。<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a> 会对比这三条路。</p>
+<hr />
+<h2 id="_6">工程实现 · 自己写一遍</h2>
+<p><code>labs/L2/toolchain_tour.sh</code> 把每一跳都留下产物。三个要点：</p>
+<p><strong>(1) <code>--dryrun</code> 看流水线，<code>--keep</code> 留产物</strong></p>
+<div class="highlight"><pre><span></span><code>nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-O3<span class="w"> </span>-c<span class="w"> </span>demo.cu<span class="w"> </span>-o<span class="w"> </span>demo.o<span class="w"> </span>--dryrun<span class="w">        </span><span class="c1"># 只打印不执行</span>
+nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-O3<span class="w"> </span>-c<span class="w"> </span>demo.cu<span class="w"> </span>-o<span class="w"> </span>demo.o<span class="w"> </span>--keep<span class="w"> </span>--keep-dir<span class="w"> </span>.
+</code></pre></div>
+
+<p><strong>(2) <code>-Xptxas -v</code> 的四个数字要成表看</strong></p>
+<p><code>labs/L2/parse_ptxas.py</code> 把它解析成表并自动算出每 SM 线程上限：</p>
+<div class="highlight"><pre><span></span><code><span class="n">REG_FILE</span> <span class="o">=</span> <span class="mi">65536</span>          <span class="c1"># 每 SM 的 32 位寄存器数（Blackwell 消费级）</span>
+
+<span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">re</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="sa">r</span><span class="s2">"ptxas info\s+: Compiling entry function "</span><span class="p">,</span> <span class="n">txt</span><span class="p">)[</span><span class="mi">1</span><span class="p">:]:</span>
+    <span class="n">reg</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">"Used (\d+) registers"</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+    <span class="n">ss</span>  <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">"(\d+) bytes spill stores"</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+    <span class="n">warn</span> <span class="o">=</span> <span class="s2">"   ← 溢出到 local memory（显存！）"</span> <span class="k">if</span> <span class="n">ss</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="n">ss</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="s2">""</span>
+    <span class="nb">print</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">REG_FILE</span> <span class="o">//</span> <span class="nb">int</span><span class="p">(</span><span class="n">reg</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">)),</span> <span class="n">warn</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这个脚本应该成为你每次写 kernel 的标配。</strong> spill 不为 0 就停下来查。</p>
+<p><strong>(3) 逼出寄存器压力要制造交叉依赖</strong></p>
+<p>第一版实验用 <code>a[k] = fmaf(a[k], b, c)</code>（每个元素独立），
+编译器把循环融合掉了：每个 <code>a[k]</code> 载入、算完、丢弃，<strong>从不同时活跃 160 个</strong>，
+所以怎么调 <code>__launch_bounds__</code> 都不溢出。</p>
+<p>改成交叉依赖后才逼出来：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">N</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">k</span><span class="p">)</span>
+<span class="w">    </span><span class="n">a</span><span class="p">[</span><span class="n">k</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fmaf</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="n">k</span><span class="p">],</span><span class="w"> </span><span class="mf">1.0001f</span><span class="p">,</span><span class="w"> </span><span class="n">a</span><span class="p">[(</span><span class="n">k</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">7</span><span class="p">)</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">N</span><span class="p">]);</span><span class="w">   </span><span class="c1">// ← 依赖另一个元素</span>
+</code></pre></div>
+
+<p><strong>"我造不出这个现象"往往说明我对编译器的能力估计不足</strong>，
+而不是这个现象不存在。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>labs/L2/toolchain_tour.sh<span class="w"> </span>/tmp/tour<span class="w">     </span><span class="c1"># 全流程产物</span>
+python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp/tour/lb.log
+
+<span class="c1"># 单独看某一跳</span>
+nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-ptx<span class="w"> </span>demo.cu<span class="w"> </span>-o<span class="w"> </span>demo.ptx<span class="w">           </span><span class="c1"># 只到 PTX</span>
+ptxas<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-O3<span class="w"> </span>-v<span class="w"> </span>demo.ptx<span class="w"> </span>-o<span class="w"> </span>demo.cubin<span class="w">     </span><span class="c1"># 只做 PTX → SASS</span>
+nvdisasm<span class="w"> </span>-c<span class="w"> </span>demo.cubin<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-40<span class="w">                    </span><span class="c1"># 看 SASS</span>
+cuobjdump<span class="w"> </span>-lelf<span class="w"> </span>demo.o<span class="w">                               </span><span class="c1"># fatbin 里有哪些架构</span>
+c++filt<span class="w"> </span>_Z11reduce_tileILi256EEvPKfPfi<span class="w">               </span><span class="c1"># 还原符号名</span>
+</code></pre></div>
+
+<h3 id="_7">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>去掉 <code>__restrict__</code></td>
+<td>ptxas 的别名分析变保守，可能多出访存指令；对比 SASS 指令数</td>
+</tr>
+<tr>
+<td><code>-Xptxas -O0</code> 但 <code>nvcc -O3</code></td>
+<td>设备代码不优化、宿主代码优化 —— 证明两个 <code>-O</code> 是分开的</td>
+</tr>
+<tr>
+<td>编译成 <code>sm_90</code>（Hopper）再在 5090 上跑</td>
+<td>驱动会 JIT PTX。测首次 launch 的额外耗时（对照 <a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 的 15.1 ms 首 kernel）</td>
+</tr>
+<tr>
+<td><code>--gpu-architecture=compute_120 --gpu-code=compute_120</code>（只留 PTX）</td>
+<td>fatbin 里没有 cubin，每次运行都要 JIT</td>
+</tr>
+<tr>
+<td>把 <code>parse_ptxas.py</code> 用在 vLLM 的编译日志上</td>
+<td>看真实项目里有没有 spill</td>
+</tr>
+<tr>
+<td>用 <code>compute-sanitizer ./a.out</code></td>
+<td>本机已装。检查越界与竞态，比看 SASS 更早发现问题</td>
+</tr>
+</tbody>
+</table>
+<p>第三行值得一做：它能让你亲手量出"架构标志写错"的代价（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 陷阱 3 说过这是最隐蔽的性能坑）。</p>
+<hr />
+<h2 id="_8">原始现场</h2>
+<details>
+<summary>① 完整的中间产物列表</summary>
+<div class="highlight"><pre><span></span><code>$ nvcc -arch=sm_120 -O3 -c demo.cu -o demo.o --keep --keep-dir .
+ptxas info : Used 12 registers, used 1 barriers, 1024 bytes smem
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+
+产物：
+    demo.cpp1.ii                                1426606
+    demo.cpp4.ii                                1253684
+    demo.cu                                         810
+    demo.cudafe1.c                                   14
+    demo.cudafe1.cpp                            1178556
+    demo.cudafe1.gpu                               8074
+    demo.cudafe1.stub.c                            1696
+    demo.fatbin                                    8192
+    demo.fatbin.c                                 22615
+    demo.module_id                                   36
+    demo.o                                        13680
+    demo.ptx                                       3165
+    demo.sm_120.cubin                              7248
+</code></pre></div>
+
+<p><code>demo.fatbin.c</code>（22 615 B）很有意思：它是<strong>把 fatbin 二进制转成 C 数组</strong>的源文件，
+这样 fatbin 就能被普通的 gcc 链进宿主目标文件。
+这就是"GPU 代码怎么塞进 CPU 可执行文件"的答案——<strong>变成一个大字节数组</strong>。</p>
+<p><code>demo.cudafe1.stub.c</code>（1 696 B）里是 <code>&lt;&lt;&lt;&gt;&gt;&gt;</code> 语法糖展开后的真实调用：
+<code>cudaLaunchKernel(...)</code> 加上参数打包。<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 测出的 2.68 µs 就花在这条路上。</p>
+</details>
+<details>
+<summary>② SASS 指令统计与几条典型指令</summary>
+<div class="highlight"><pre><span></span><code>指令统计（本 kernel 共 80 条）
+    17 LDS      共享内存读
+     9 STS      共享内存写
+     9 ISETP    整数比较置谓词
+     9 BAR      barrier
+     8 NOP
+     8 FADD     浮点加   ← 真正的"计算"
+     3 LDC      constant bank 读
+     2 S2R      读特殊寄存器（tid/ctaid）
+     2 LEA      地址计算
+     2 LDCU     uniform constant 读
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code>/*0000*/  LDC R1, c[0x0][0x37c] ;                     ← 从 constant bank 读栈指针
+/*0010*/  S2R R6, SR_TID.X ;                          ← threadIdx.x
+/*0040*/  S2R R9, SR_CTAID.X ;                        ← blockIdx.x
+/*0060*/  LEA R5, R9, R6, 0x8 ;                       ← blockIdx*256 + threadIdx
+/*0070*/  ISETP.GE.AND P0, PT, R5, UR4, PT ;          ← i &lt; n ?
+/*0080*/  @!P0 LDC.64 R2, c[0x0][0x380] ;             ← 谓词执行：只有 i&lt;n 的线程做
+/*00a0*/  @!P0 LDG.E.CONSTANT R0, desc[UR6][R2.64] ;  ← 全局内存读（只读缓存路径）
+/*00b0*/  S2UR UR5, SR_CgaCtaId ;                     ← cluster 内的 CTA id
+/*0110*/  STS [R5], R0 ;                              ← 写共享内存
+</code></pre></div>
+
+<p><code>LDG.E.CONSTANT</code> 里的 <code>.CONSTANT</code> 是因为源码写了 <code>const float* __restrict__</code> ——
+编译器据此走<strong>只读数据缓存</strong>（旧称纹理缓存）路径。<strong>一个 <code>__restrict__</code> 改变了指令选择。</strong></p>
+<p><code>S2UR UR5, SR_CgaCtaId</code> 出现在这里有点意外：<code>Cga</code> = Cooperative Grid Array（cluster）。
+即使源码里没用 cluster，编译器也会读它来算共享内存的基址——
+说明 Blackwell 的共享内存寻址已经是 cluster-aware 的。</p>
+</details>
+<details>
+<summary>③ <code>-Xptxas -v</code> 的完整表格（含 spill）</summary>
+<div class="highlight"><pre><span></span><code>  kernel                              寄存器      栈帧B    spill存B    spill取B    每SM线程上限
+  _Z5heavyILi200ELi1024EEvPfPKfi       64     1672       4680       4848        1024  ← 溢出
+  _Z5heavyILi128ELi1024EEvPfPKfi       64     1264       2796       2920        1024  ← 溢出
+  _Z5heavyILi128ELi512EEvPfPKfi       128      248        396        412         512  ← 溢出
+  _Z5heavyILi128ELi256EEvPfPKfi       254        0          0          0         258
+  _Z5heavyILi64ELi256EEvPfPKfi         80        0          0          0         819
+</code></pre></div>
+
+<p>对应的耗时（三者都用 256 线程启动，工作量完全相同）：</p>
+<div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D  grid=680 block=256
+
+  __launch_bounds__      寄存器  spill 字节  驻留block/SM  耗时 ms
+  256                    254        0            1          0.012
+  512                    128        396          2          0.025  (1.98x)
+  1024                   64         2796         4          0.286  (23.03x)
+
+  ⇒ 占用率提高了 4.0 倍，但因为寄存器溢出到显存，实际慢了 23.03 倍。
+</code></pre></div>
+
+<p>原始文件：<code>results/crater/ptxas_launch_bounds.txt</code>、<code>results/crater/spill_cost_5090.txt</code></p>
+</details>
+<details>
+<summary>④ nvjet 不在 .so 里的证据</summary>
+<div class="highlight"><pre><span></span><code>$ strings -n 20 libcublasLt.so.13 | grep -c "nvjet_sm120"
+0
+
+$ cuobjdump -sass -fun nvjet_sm120_qqtst_mma_64x256x64_4_64x64x64_tmaAB_bz_TNNN \
+            libcublasLt.so.13
+cuobjdump warning : Function listed in --function 'nvjet_...' not found
+（对每一个架构都是这句）
+
+$ cuobjdump -lelf libcublasLt.so.13 | grep -oE "sm_[0-9]+[af]?" | sort | uniq -c | sort -rn
+   1596 sm_120
+   1376 sm_90a
+   1187 sm_100
+    482 sm_80
+    247 sm_89
+    221 sm_90
+    166 sm_75
+    105 sm_86
+</code></pre></div>
+
+<p><strong><code>.so</code> 里有 5000+ 个静态 cubin，但没有一个是 <code>nvjet_</code>。</strong>
+说明 cuBLASLt 对某些路径（至少是 sm_120 的 fp8）走运行时代码生成。</p>
+<p>这也意味着：想知道 cuBLAS 到底发了哪条 mma 指令，
+只能在<strong>运行时</strong>抓（ncu，或设置 <code>CUDA_ENABLE_CUBIN_DUMP</code> 类的环境变量）。
+本机没有 ncu，所以 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 的那个开放问题<strong>仍然开放</strong><span class="unverified">未实测</span>，
+但至少现在知道了它开放的原因，以及下一步该往哪查。</p>
+</details>
+<hr />
+<h2 id="_9">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>cuBLASLt 的 nvjet JIT</strong></td>
+<td>本章实测发现的运行时代码生成路径。它能针对具体的 M/N/K 和布局生成专用 kernel，避开模板组合爆炸</td>
+</tr>
+<tr>
+<td><strong>CuTe-DSL 跳过 C++ 前端</strong></td>
+<td>FlashAttention-4 完全用嵌入 Python 的 CuTe-DSL 写，直接下降到 PTX。编译比 C++ CUTLASS 模板快 20–30×——本章测出的"预处理膨胀 1761 倍"是这个提速的来源之一（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）</td>
+</tr>
+<tr>
+<td><strong>PTX 作为通用中间层</strong></td>
+<td>ZLUDA、SCALE 等项目尝试把 PTX 翻译到 AMD/其他后端。PTX 的"虚拟 ISA"定位让这成为可能</td>
+</tr>
+<tr>
+<td><strong><code>sm_120f</code> 家族目标</strong></td>
+<td>Blackwell 引入的新概念：一份二进制覆盖整个家族。缓解了多架构 fatbin 膨胀</td>
+</tr>
+<tr>
+<td><strong>fatbin 压缩</strong></td>
+<td><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 FlashInfer 编译命令里有 <code>-Xfatbin=-compress-all --compress-mode=size</code>。多架构库的体积问题已经严重到要专门压缩</td>
+</tr>
+<tr>
+<td><strong>编译期 autotuning</strong></td>
+<td>Triton/TileLang 在编译期扫多组 tile 参数选最快的。代价是编译时间爆炸（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>、<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>除本站实测外的内容来自各自文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+</blockquote>
+<hr />
+<h2 id="_10">陷阱</h2>
+<p><strong>1. 以为 <code>nvcc -O3</code> 优化了设备代码。</strong> 它只管宿主代码，设备代码要 <code>-Xptxas -O3</code>。</p>
+<p><strong>2. 忽略 <code>-Xptxas -v</code> 里的 spill。</strong> 本章实测：2796 字节的 spill 带来 <strong>23 倍</strong>减速，
+而且<strong>不会有任何报错或警告</strong>。</p>
+<p><strong>3. 用 <code>__launch_bounds__</code> 提高占用率。</strong> 它是用 spill 换占用率。
+只在你<strong>确实需要</strong>那个 block 大小时用。</p>
+<p><strong>4. 混淆 <code>.version</code> 与 <code>.target</code>。</strong> 前者是 PTX ISA 版本（由 cicc 决定），
+后者是目标架构（由 <code>-arch</code> 决定）。<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的失败是前者不匹配。</p>
+<p><strong>5. 以为 <code>cicc</code> 和 <code>ptxas</code> 是同一个包。</strong> 它们分属 <code>nvidia-nvvm</code> 与 <code>nvidia-cuda-nvcc</code>，
+必须一起钉版本。</p>
+<p><strong>6. 只编译一个架构然后到处部署。</strong> 缺 cubin 时驱动会 JIT PTX——首次 launch 会很慢，
+而且如果 PTX ISA 版本高于驱动支持范围，会直接失败。</p>
+<p><strong>7. 造不出某个现象就以为它不存在。</strong> 本章第一版逼不出 spill，
+是因为编译器把循环融合了，不是因为 spill 不会发生。</p>
+<hr />
+<h2 id="_11">自测题</h2>
+<details>
+<summary>1. 我的 kernel 编译时 <code>-Xptxas -v</code> 报 <code>Used 255 registers</code>。这是好事还是坏事？</summary>
+<p><strong>看情况，但 255 是个特殊数字——它是硬件上限。</strong></p>
+<p>SASS 的寄存器编号是 8 位，<code>R255</code> 是 <code>RZ</code>（零寄存器），所以实际可用是 <strong>254 个</strong>。
+报 255 通常意味着 ptxas 已经用满，<strong>再复杂一点就要 spill</strong>。</p>
+<p>判断步骤：</p>
+<ol>
+<li><strong>看 spill 是否为 0。</strong> 如果是 0，说明刚好装下，<strong>这是最优状态</strong>——
+   254 个寄存器意味着每 SM 只能驻留 258 个线程（1 个 256 线程的 block）。
+   按本章和 <a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 的实测，只要不是 memory-bound 到极限，1 block/SM 通常够用。</li>
+<li><strong>如果 spill 不为 0</strong>，必须处理：减小 tile、拆分 kernel、
+   或者把部分数据放共享内存（smem 延迟 6.5 周期 vs local memory 929 周期）。</li>
+</ol>
+<p><strong>不要</strong>为了"降低寄存器用量"去加 <code>__launch_bounds__</code>——本章实测那会慢 23 倍。</p>
+</details>
+<details>
+<summary>2. 为什么一个 810 字节的 .cu 预处理后会变成 1.43 MB？这对我有什么实际影响？</summary>
+<p>因为 <code>#include &lt;cuda_runtime.h&gt;</code> 递归带进来上千个头文件，
+包含全部的 CUDA API 声明、内建函数、类型定义、内联实现。</p>
+<p><strong>实际影响有三个</strong>：</p>
+<ol>
+<li><strong>编译慢。</strong> 每个 <code>.cu</code> 都要重新处理这 1.4 MB。CUTLASS 这类重模板库
+   编译一个 kernel 要几十秒到几分钟。</li>
+<li><strong>这是 CuTe-DSL / Triton 快的原因之一。</strong> 它们用 Python 描述 kernel，
+   直接生成 IR，完全跳过 C++ 前端。</li>
+<li><strong>增量编译很重要。</strong> 改一行 CUDA 代码要重编整个翻译单元。
+   把 kernel 拆到独立的 <code>.cu</code> 文件能显著改善迭代速度。</li>
+</ol>
+</details>
+<details>
+<summary>3. 我看到某个 kernel 叫 <code>cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8</code>。不读源码，能推出什么？</summary>
+<p>几乎全部关键配置：</p>
+<table>
+<thead>
+<tr>
+<th>片段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cutlass_80</code></td>
+<td>CUTLASS 库，<strong>sm_80（Ampere）血统</strong>的模板</td>
+</tr>
+<tr>
+<td><code>tensorop</code></td>
+<td>用 tensor core（对照 <code>simt</code> = 用 CUDA core）</td>
+</tr>
+<tr>
+<td><code>bf16</code></td>
+<td>输入数据类型</td>
+</tr>
+<tr>
+<td><code>s16816</code></td>
+<td>mma 指令形状 <strong>m16n8k16</strong>（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 讲过）</td>
+</tr>
+<tr>
+<td><code>gemm_relu</code></td>
+<td>GEMM 融合了 ReLU epilogue</td>
+</tr>
+<tr>
+<td><code>bf16</code>（第二个）</td>
+<td>输出类型</td>
+</tr>
+<tr>
+<td><code>128x64_64</code></td>
+<td>线程块 tile：M=128, N=64, K=64</td>
+</tr>
+<tr>
+<td><code>x3</code></td>
+<td><strong>3 段软件流水</strong>（多级 double buffering）</td>
+</tr>
+<tr>
+<td><code>nn</code></td>
+<td>两个矩阵都不转置（Non-transposed × Non-transposed）</td>
+</tr>
+<tr>
+<td><code>align8</code></td>
+<td>按 8 个元素对齐（=16 字节，可用 <code>LDG.128</code>）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>能推出的事</strong>：这个 kernel 跑在 sm_120 上但用的是 Ampere 世代的指令
+（因为 sm_120 没有 tcgen05，<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a>）；tile 是 128×64，可以据此估算 smem 用量
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02248;</mo><mo stretchy="false">&#x00028;</mo><mn>128</mn><mo>&#x0002B;</mo><mn>64</mn><mo stretchy="false">&#x00029;</mo><mo>&#x000D7;</mo><mn>64</mn><mo>&#x000D7;</mo><mn>2</mn><mtext>&#x000A0;</mtext><mtext>B</mtext><mo>&#x000D7;</mo><mn>3</mn><mtext>&#x000A0;</mtext><mtext>段</mtext><mo>&#x0003D;</mo><mn>72</mn></mrow></math></span> KB，
+接近 99 KB 上限（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a>）。</p>
+<p><strong>读 kernel 名是最省事的性能诊断手段。</strong> 不用 profiler、不用读源码。</p>
+</details>
+<details>
+<summary>4. 我把 kernel 编译成 <code>sm_90</code>（Hopper）却在 5090（sm_120）上运行。会发生什么？</summary>
+<p><strong>取决于 fatbin 里有没有 PTX。</strong></p>
+<ul>
+<li><strong>有 PTX</strong>（<code>-gencode=arch=compute_90,code=compute_90</code>）：
+  驱动在首次 launch 时把 PTX <strong>JIT 编译</strong>成 sm_120 的 SASS。
+  能跑，但首次 launch 会有明显延迟（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 实测首个 kernel 15.1 ms，
+  含 JIT 的话会更久），而且用不上 sm_120 的专属指令。</li>
+<li><strong>只有 sm_90 的 cubin、没有 PTX</strong>：直接失败，
+  报 <code>no kernel image is available for execution on the device</code>。</li>
+</ul>
+<p><strong>更隐蔽的情况</strong>：如果你写 <code>-arch=sm_89</code> 编译，5090 上照样能跑（有 PTX 兜底），
+<strong>没有任何警告</strong>，只是可能慢。这就是 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 陷阱 3 说的"最隐蔽的性能坑"。</p>
+<p><strong>判断方法</strong>：<code>cuobjdump -lelf your.so | grep -oE "sm_[0-9]+"</code> 看有没有你的架构。</p>
+</details>
+<details>
+<summary>5. 本章发现 cuBLAS 的 fp8 kernel 是 JIT 生成的、不在 .so 里。如果要彻底查清它用了哪条 mma 指令，你会怎么做？</summary>
+<p>按可行性排序：</p>
+<p><strong>(a) ncu 的指令计数器。</strong> <code>ncu --metrics sm__inst_executed_pipe_tensor.sum</code>
+给出该 kernel 执行了多少条 tensor 指令。用总 FLOP 除以它，
+就得到"每条指令多少 FLOP"，直接判定指令宽度。
+<strong>本机没有 ncu</strong>（<a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 原始现场 ③ 记录了工具清单），需要用 NVIDIA 官方安装包装。</p>
+<p><strong>(b) 运行时 dump cubin。</strong> 设置 <code>CUDA_ENABLE_CUBIN_DUMP=1</code> 或
+<code>CUDA_DEVICE_MAX_CONNECTIONS</code> 相关的调试环境变量（具体名称随版本变），
+让驱动把 JIT 产物落盘，再 <code>nvdisasm</code>。<strong>本机可试</strong>。</p>
+<p><strong>(c) 反推。</strong> 从名字 <code>qqtst_mma_64x256x64_4_64x64x64_tmaAB</code> 里，
+<code>tmaAB</code> 说明用了 TMA。而 TMA 在 sm_120 上的支持范围、
+以及配套的 mma 指令族（<code>kind::mxf8f6f4</code>，<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 探测到可编译），
+可以缩小到几个候选，再逐个手写 benchmark 比对 FLOP/clk/SM。</p>
+<p><strong>(d) 直接写一个用 <code>kind::mxf8f6f4.block_scale</code> 的 kernel 测吞吐</strong>（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 的建议）。
+如果它达到 1501 FLOP/clk/SM，就基本确认了。</p>
+<p><strong>(a) 最直接，(d) 最不依赖工具。</strong> <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 会走 (d)。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.1-cuda-execution-model.html">&#8592; 2.1 CUDA 执行模型与 CUDA Graph</a><a class="nav-next" href="../L2/2.3-memory-bound-ladder.html">2.3 优化阶梯 I：memory-bound 算子 &#8594;</a></nav>
+</main>
+</body>
+</html>

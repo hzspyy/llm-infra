@@ -1,0 +1,1015 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.3 量化工程</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">4.3</div>
+  <div class="sidebar-title">量化工程</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#awq">一 · 手工解包 AWQ</a><ul>
+<li><a href="#_2">自检：还原对不对</a></li>
+</ul>
+</li>
+<li><a href="#_3">二 · 误差有多大，落在哪</a><ul>
+<li><a href="#_4">误差落在哪些权重上</a></li>
+<li><a href="#scale-group_size">scale 的分布：group_size 存在的理由</a></li>
+</ul>
+</li>
+<li><a href="#_5">三 · 换来了什么</a><ul>
+<li><a href="#_6">为什么量化了反而更慢</a></li>
+</ul>
+</li>
+<li><a href="#fp8">四 · fp8：这张卡原生支持</a></li>
+<li><a href="#kv-cache">五 · KV cache 量化：只给字节账</a><ul>
+<li><a href="#kv-fp8">KV 量化不只有 fp8</a></li>
+</ul>
+</li>
+<li><a href="#_7">六 · 三十个名字，三个轴</a><ul>
+<li><a href="#61-compressed-tensors-73">6.1 容器：compressed-tensors 与 §7.3 的矛盾</a></li>
+<li><a href="#62-moe">6.2 作用域：MoE 的专家值得单独量化</a></li>
+</ul>
+</li>
+<li><a href="#_8">七 · 设计取舍</a><ul>
+<li><a href="#71-group_size">7.1 group_size：两个方向的误差</a></li>
+<li><a href="#72-awq-gptq">7.2 AWQ 和 GPTQ 解决的是同一个问题的两面</a></li>
+<li><a href="#73">7.3 为什么量化格式没有统一</a></li>
+</ul>
+</li>
+<li><a href="#lab">八 · 动手 lab</a></li>
+<li><a href="#_9">九 · 陷阱</a></li>
+<li><a href="#_10">十 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L4 · 模型架构与数值</div>
+  <div class="mod-id">4.3</div>
+  <h1>量化工程</h1>
+  <p class="lede">手工解包 AWQ 的 qweight（nibble 顺序是 0,4,1,5,2,6,3,7）并自检；量化误差的绝对值均匀、相对值集中在小权重上，组间 scale 差 212 倍。实测：显存 2.7×、质量退化 2-4%，但 batch=64 小模型上 decode 反而慢 10% —— 量化最稳的收益是装得下，不是快。fp8 GEMM 1.50×。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · vLLM 0.29.0 · Qwen2.5-1.5B bf16/AWQ/GPTQ</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 4.0（量化 checkpoint 的结构）· 4.2（数值格式）· 3.3（decode 的账）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>4.0 看到了量化 checkpoint 的<strong>结构</strong>（qweight/scales/qzeros）。
+这一章把那些整数<strong>解包还原</strong>，看清楚它损失了什么，再量它换来了什么。</p>
+<ol>
+<li>4 bit 的权重具体是怎么存的？能不能自己解包还原出 fp16？</li>
+<li>量化误差有多大？落在哪些权重上？</li>
+<li>量化换来了多少——显存、速度、质量各变了多少？</li>
+</ol>
+<div class="admonition warning">
+<p class="admonition-title">本章最反直觉的一条实测</p>
+<p>在 batch=64、1.5B 模型这个配置下，<strong>AWQ 和 GPTQ 的 decode 吞吐都比 bf16 低</strong>
+（11610 / 11701 vs 12914 tok/s）。量化省的是<strong>显存</strong>，
+不是在所有配置下都省时间。</p>
+</div>
+<hr />
+<h2 id="awq">一 · 手工解包 AWQ</h2>
+<p><code>quantization_config: bits=4 group_size=128 zero_point=True version=gemm</code></p>
+<p>第 0 层 q_proj 的四个张量：</p>
+<div class="highlight"><pre><span></span><code>bias      (1536,)         torch.float16
+qweight   (1536, 192)     torch.int32
+qzeros    (12, 192)       torch.int32
+scales    (12, 1536)      torch.float16
+</code></pre></div>
+
+<p>打包关系：</p>
+<div class="highlight"><pre><span></span><code>qweight (1536, 192) int32 -&gt; 每个 int32 装 8 个 4-bit -&gt; 展开后 1536×1536
+scales  (12, 1536) = [in/128, out]，每 128 行共享一个缩放
+qzeros  (12, 192) int32，同样打包，每 128 行共享一个零点
+</code></pre></div>
+
+<p>还原公式：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>w</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub><mo>&#x0003D;</mo><mo minsize="1.2em" maxsize="1.2em">(</mo><msub><mi>q</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub><mo>&#x02212;</mo><msub><mi>z</mi><mrow><mi>&#x0230A;</mi><mi>i</mi><mo>&#x0002F;</mo><mn>128</mn><mi>&#x0230B;</mi><mo>&#x0002C;</mo><mspace width="0.167em" /><mi>j</mi></mrow></msub><mo minsize="1.2em" maxsize="1.2em">)</mo><mo>&#x000D7;</mo><msub><mi>s</mi><mrow><mi>&#x0230A;</mi><mi>i</mi><mo>&#x0002F;</mo><mn>128</mn><mi>&#x0230B;</mi><mo>&#x0002C;</mo><mspace width="0.167em" /><mi>j</mi></mrow></msub></mrow></math></div></p>
+<p><strong>但有个坑：8 个 nibble 在 int32 里不是顺序排的。</strong> AWQ 的 GEMM 版按
+<code>0,4,1,5,2,6,3,7</code> 交错存放（为了让反量化 kernel 能一次性凑出对齐的向量）。</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">55</span>    <span class="k">return</span> <span class="n">a</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
+<span class="linenos">56</span>
+<span class="linenos">57</span>
+<span class="linenos">58</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos">59</span><span class="k">def</span><span class="w"> </span><span class="nf">unpack_awq</span><span class="p">(</span><span class="n">qweight</span><span class="p">,</span> <span class="n">qzeros</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">bits</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">group_size</span><span class="o">=</span><span class="mi">128</span><span class="p">):</span>
+<span class="linenos">60</span><span class="w">    </span><span class="sd">"""AWQ 的打包：每个 int32 装 8 个 4-bit，但顺序是交错的。</span>
+<span class="linenos">61</span>
+<span class="linenos">62</span><span class="sd">    qweight: [in_features, out_features // 8]  int32</span>
+<span class="linenos">63</span><span class="sd">    qzeros : [in_features // group_size, out_features // 8]  int32</span>
+<span class="linenos">64</span><span class="sd">    scales : [in_features // group_size, out_features]  fp16</span>
+<span class="linenos">65</span><span class="sd">    返回 [in_features, out_features] 的 fp16</span>
+<span class="linenos">66</span><span class="sd">    """</span>
+<span class="linenos">67</span>    <span class="c1"># AWQ 的 GEMM 版把 8 个 nibble 按这个顺序放：0,4,1,5,2,6,3,7</span>
+<span class="linenos">68</span>    <span class="n">order</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">7</span><span class="p">])</span>
+<span class="linenos">69</span>    <span class="n">shifts</span> <span class="o">=</span> <span class="p">(</span><span class="n">order</span> <span class="o">*</span> <span class="n">bits</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">qweight</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+<span class="linenos">70</span>
+<span class="linenos">71</span>    <span class="k">def</span><span class="w"> </span><span class="nf">unpack</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+<span class="linenos">72</span>        <span class="c1"># x: [..., n] int32 -&gt; [..., n*8]</span>
+<span class="linenos">73</span>        <span class="n">out</span> <span class="o">=</span> <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">shifts</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span> <span class="o">&amp;</span> <span class="mh">0xF</span>
+<span class="linenos">74</span>        <span class="k">return</span> <span class="n">out</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">*</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">75</span>
+<span class="linenos">76</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">unpack</span><span class="p">(</span><span class="n">qweight</span><span class="p">)</span>                       <span class="c1"># [in, out]</span>
+<span class="linenos">77</span>    <span class="n">z</span> <span class="o">=</span> <span class="n">unpack</span><span class="p">(</span><span class="n">qzeros</span><span class="p">)</span>                        <span class="c1"># [in/gs, out]</span>
+</pre></div>
+<div class="srcref"><code>labs/L4/quantization.py 第 55–77 行</code><a href="../code/labs/L4/quantization.py.html#labs-L4-quantization-py-L-55">在完整文件中打开 &rarr;</a></div></div>
+<h3 id="_2">自检：还原对不对</h3>
+<p>不需要和原权重比就能自检——<strong>同一组内的取值必须落在 16 个等距格点上，
+间隔恰好等于该组的 scale</strong>：</p>
+<div class="highlight"><pre><span></span><code>取第 0 列的前 128 行（同一组，共享一个 scale/zero）
+不同取值个数: 15   （上限是 2^4 = 16）
+取值: [-0.01624, -0.01392, -0.0116, -0.00928, -0.00696, -0.00464, -0.00232,
+       0.0, 0.00232, 0.00464, 0.00696, 0.00928, 0.0116, 0.01624, 0.01855]
+相邻间隔（= scale）: 0.002319
+scales[0,0] = 0.002319  &lt;- 应当相等
+</code></pre></div>
+
+<p><strong>间隔 0.002319 与 <code>scales[0,0]</code> 精确相等。</strong> 如果 nibble 顺序解错了，
+取值会散开成非等距的一堆，这个自检立刻失败。
+（15 而不是 16 是因为这一组恰好没用满所有格点。）</p>
+<hr />
+<h2 id="_3">二 · 误差有多大，落在哪</h2>
+<p>和未量化的同一个权重逐元素比：</p>
+<div class="highlight"><pre><span></span><code>与未量化权重对照 (1536, 1536)
+  max|err|  = 1.718750
+  mean|err| = 0.014152
+  权重本身 mean|w| = 0.033141
+  平均相对误差 = 42.70%
+  余弦相似度 = 0.960913
+</code></pre></div>
+
+<p><strong>平均相对误差 42.7%。</strong> 这个数字看起来吓人，但余弦相似度是 0.9609——
+方向基本保住了，是幅度上的量化噪声。</p>
+<h3 id="_4">误差落在哪些权重上</h3>
+<div class="highlight"><pre><span></span><code>最大的 0.1% 权重：平均 |err| = 0.145685，占其自身的 39.21%
+最小的 50% 权重：平均 |err| = 0.004600，占其自身的 45.47%
+</code></pre></div>
+
+<p><strong>绝对误差对大小权重是同一量级</strong>（同组共享一个 scale，格点间隔一样），
+所以<strong>相对误差在小权重上更大</strong>。</p>
+<p>这解释了为什么 outlier 是量化的核心难题：一个组里只要有一个大值，
+scale 就被它撑大，同组的所有小值都被压到很粗的格点上。</p>
+<h3 id="scale-group_size">scale 的分布：group_size 存在的理由</h3>
+<div class="highlight"><pre><span></span><code>scale 分布: min=0.001054  中位数=0.008041  max=0.223145  max/min=211.8×
+
+量化误差的上界是 scale/2：
+  最好的组: ±0.000527
+  最差的组: ±0.111572
+</code></pre></div>
+
+<p><strong>组与组之间的 scale 差 212 倍。</strong> 如果整个矩阵共用一个 scale，
+所有权重都要按最大的那个 outlier 缩放——小权重会被直接压成 0。</p>
+<p>group_size 的取舍（按定义算）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">group_size</th>
+<th style="text-align: right;">等效 bit/权重</th>
+<th style="text-align: right;">scales+zeros 开销</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">4.62</td>
+<td style="text-align: right;">15.6%</td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">4.31</td>
+<td style="text-align: right;">7.8%</td>
+</tr>
+<tr>
+<td style="text-align: right;"><strong>128</strong></td>
+<td style="text-align: right;"><strong>4.16</strong></td>
+<td style="text-align: right;"><strong>3.9%</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">4.08</td>
+<td style="text-align: right;">2.0%</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">4.02</td>
+<td style="text-align: right;">0.5%</td>
+</tr>
+</tbody>
+</table>
+<p>组越小量化越准（组内动态范围更窄），但元数据开销越大。128 是当前的常见折中。</p>
+<hr />
+<h2 id="_5">三 · 换来了什么</h2>
+<p>用 vLLM 跑真实的量化 kernel（transformers 里 AWQ/GPTQ 要额外装
+<code>gptqmodel</code>/<code>optimum</code>，而 vLLM 自带，而且这才是这些 checkpoint 实际被用的路径）：</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th style="text-align: right;">困惑度</th>
+<th style="text-align: right;">相对 bf16</th>
+<th style="text-align: right;">权重文件 MB</th>
+<th style="text-align: right;">decode tok/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>bf16 原版</td>
+<td style="text-align: right;">1.8697</td>
+<td style="text-align: right;">1.000×</td>
+<td style="text-align: right;">2944.4</td>
+<td style="text-align: right;"><strong>12913.8</strong></td>
+</tr>
+<tr>
+<td>AWQ 4bit</td>
+<td style="text-align: right;">1.9113</td>
+<td style="text-align: right;">1.022×</td>
+<td style="text-align: right;">1539.8</td>
+<td style="text-align: right;">11610.4</td>
+</tr>
+<tr>
+<td>GPTQ 4bit</td>
+<td style="text-align: right;">1.9445</td>
+<td style="text-align: right;">1.040×</td>
+<td style="text-align: right;">1096.6</td>
+<td style="text-align: right;">11701.4</td>
+</tr>
+</tbody>
+</table>
+<p><strong>三件事：</strong></p>
+<ol>
+<li><strong>显存确实省了</strong>：2944 → 1540 / 1097 MB（1.9× / 2.7×）。
+   注意不是 4×——4.0 §六 讲过，embedding 没被量化，占了很大一块。</li>
+<li><strong>质量退化 2.2% / 4.0%</strong>（困惑度）。</li>
+<li><strong>速度反而更慢。</strong> 两个量化版都比 bf16 低约 10%。</li>
+</ol>
+<div class="admonition warning">
+<p class="admonition-title">关于困惑度这一列</p>
+<p>用的是<strong>一段固定文本</strong>，不是标准数据集。它只能说明"没有量级上的崩塌"，
+<strong>不能说明 AWQ 比 GPTQ 好</strong>（2.2% vs 4.0% 的差距在单样本上没有意义）。
+真正的评测要跑标准集并报方差，本轮没有做。</p>
+</div>
+<h3 id="_6">为什么量化了反而更慢</h3>
+<p>这不矛盾，回到 0.2 的账本：</p>
+<ul>
+<li><strong>decode 的瓶颈是带宽</strong>（3.3 实测算术强度 = 1）——<strong>但那说的是 KV cache</strong>。
+  权重的读取在 batch 大时是<strong>摊薄</strong>的：64 条请求共享一次权重读取。</li>
+<li>batch=64、1.5B 模型的这个配置下，权重带宽已经不是瓶颈；
+  而量化引入了<strong>额外的反量化计算</strong>（解包、乘 scale、减 zero）。</li>
+</ul>
+<p>所以量化的收益随配置变：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>权重带宽占比</th>
+<th>量化的收益</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>batch=1，大模型</td>
+<td>高（每步都要读全部权重）</td>
+<td><strong>大</strong></td>
+</tr>
+<tr>
+<td>batch 很大，小模型</td>
+<td>低（权重读取被摊薄）</td>
+<td>可能为负（本章实测）</td>
+</tr>
+<tr>
+<td>显存装不下</td>
+<td>—</td>
+<td><strong>决定性</strong>（能不能跑）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>量化最稳的收益是"能不能装下"，不是"快多少"。</strong></p>
+<hr />
+<h2 id="fp8">四 · fp8：这张卡原生支持</h2>
+<p><a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 实测：bf16 511 FLOP/clk/SM，fp8 1022——<strong>纯发射率正好 2×</strong>。
+端到端的 4096³ GEMM：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th style="text-align: right;">ms</th>
+<th style="text-align: right;">TFLOP/s</th>
+<th style="text-align: right;">相对 bf16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>bf16 @ bf16</td>
+<td style="text-align: right;">0.6245</td>
+<td style="text-align: right;">220.1</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td>fp8_e4m3 @ fp8_e4m3</td>
+<td style="text-align: right;">0.4163</td>
+<td style="text-align: right;"><strong>330.1</strong></td>
+<td style="text-align: right;"><strong>1.50×</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>拿到 1.50×，不是 2×。</strong> 纯发射率翻倍，但 GEMM 还要搬数据：
+4096³ 的 bf16 输入是 64 MB，fp8 是 32 MB——算力翻倍而访存只减半，
+这个尺寸上已经不是纯算力受限了。</p>
+<p>精度：</p>
+<div class="highlight"><pre><span></span><code>fp8 结果与 fp32 参照的平均相对误差: 3.7711%
+（权重值域 ~N(0,1)，fp8_e4m3 上限 448，这里没有溢出）
+</code></pre></div>
+
+<p>4.2 那张表说过 fp8_e4m3 的相对分辨率是 0.125——3.77% 的平均误差
+与之量级相符（累加在 fp32 里做，所以比单个数的分辨率好）。</p>
+<hr />
+<h2 id="kv-cache">五 · KV cache 量化：只给字节账</h2>
+<p>3.3 的结论是 decode 时间 = KV 字节 ÷ 带宽，所以 KV 的 dtype 减半，时间就该减半。</p>
+<p>我试着量了一下，结果是<strong>反的</strong>：</p>
+<div class="highlight"><pre><span></span><code>  kv_len      dtype      KV 大小        ms    相对 bf16
+    8192   bfloat16    256.0MB    0.1731      1.00×
+    8192 float8_e4m3fn    128.0MB    0.5021      0.34×
+   32768   bfloat16   1024.0MB    0.6500      1.00×
+   32768 float8_e4m3fn    512.0MB    2.0319      0.32×
+</code></pre></div>
+
+<div class="admonition danger">
+<p class="admonition-title">这个 0.34× 是我的实现方式造成的，不是 fp8 KV 的代价</p>
+<p>我的做法是<strong>在框架层把 fp8 显式转回 bf16</strong>，再走普通的 SDPA。
+这多了一次「读 fp8 + 写 bf16」的全量往返，比省下的还多。</p>
+<p>真实的 fp8 KV attention <strong>在 kernel 内部反量化</strong>——只读 fp8 那一份字节，
+在寄存器里转成计算精度，不产生中间张量。</p>
+<p>这和 3.3 §四 分页那次是<strong>完全同一类错误</strong>：
+框架层的模拟量不出 kernel 内部做这件事的代价。
+我在同一本书里连续犯了两次，所以这次直接写进正文。</p>
+<p><strong>本 lab 没有可用的真实 fp8 KV kernel，所以只给字节账：</strong></p>
+</div>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">kv_len</th>
+<th style="text-align: right;">bf16</th>
+<th style="text-align: right;">fp8 / int8</th>
+<th style="text-align: right;">int4</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">256.0 MB</td>
+<td style="text-align: right;">128.0 MB</td>
+<td style="text-align: right;">64.0 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">32768</td>
+<td style="text-align: right;">1024.0 MB</td>
+<td style="text-align: right;">512.0 MB</td>
+<td style="text-align: right;">256.0 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">131072</td>
+<td style="text-align: right;">4096.0 MB</td>
+<td style="text-align: right;">2048.0 MB</td>
+<td style="text-align: right;">1024.0 MB</td>
+</tr>
+</tbody>
+</table>
+<p>字节减半意味着<strong>同样显存能装两倍的并发</strong>，或者同样并发下 decode 快近两倍
+（如果 kernel 实现得当）。要验证后者，需要用 vLLM 的
+<code>--kv-cache-dtype fp8</code> 跑真实负载——那属于 5.x 的范围。</p>
+<h3 id="kv-fp8">KV 量化不只有 fp8</h3>
+<p><code>vllm/config/cache.py</code> 的 <code>CacheDType</code> 有 <strong>17 个取值</strong>（源码事实）：</p>
+<div class="highlight"><pre><span></span><code>auto, bfloat16, float16,
+fp8, fp8_e4m3, fp8_e5m2, fp8_inc, fp8_ds_mla, fp8_per_token_head,
+int8_per_token_head, int4_per_token_head,
+nvfp4, nvfp4_4over6,
+turboquant_3bit_nc, turboquant_4bit_nc, turboquant_k3v4_nc, turboquant_k8v4
+</code></pre></div>
+
+<p>三件事值得读出来：</p>
+<ol>
+<li><strong>int8 / int4 是真实选项</strong>，不只是上表的字节账。
+   int4 把 128K 上下文的 KV 从 4 GB 压到 1 GB——这是长上下文能不能跑的分界。</li>
+<li><strong>后缀 <code>_per_token_head</code> 是量化轴</strong>。KV 的形状是 <code>[tokens, heads, dim]</code>，
+   逐 (token, head) 求 scale，等于把 group_size 沿 <code>dim</code> 取满。
+   这和权重量化的 group_size 是<strong>同一个设计参数</strong>（§7.1）：
+   轴选得越细，元数据越多，误差越小。</li>
+<li><strong><code>turboquant_k3v4</code> 给 K 和 V 不同位宽</strong>（K 用 3 bit，V 用 4 bit）。
+   因为 K 参与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></math></span> 后过 softmax，误差会被指数压缩；
+   V 是直接加权求和，误差<strong>线性</strong>进入输出。
+   <strong>同一个 cache 里两个张量的误差敏感度不同，所以位宽也不该相同。</strong></li>
+</ol>
+<p>第 3 点是本节最值得带走的：<strong>量化的粒度不该由张量的名字决定，
+而该由它的误差如何传播到输出决定。</strong></p>
+<hr />
+<h2 id="_7">六 · 三十个名字，三个轴</h2>
+<p><code>QUANTIZATION_METHODS</code> 有 <strong>30 个</strong>（源码事实）：</p>
+<div class="highlight"><pre><span></span><code>auto_awq, auto_gptq, awq, awq_marlin, gptq, gptq_marlin,
+compressed-tensors, modelopt, modelopt_fp4, modelopt_mixed, modelopt_mxfp8,
+quark, torchao, inc, humming, online, fp_quant,
+fp8, fp8_per_block, fp8_per_channel, fp8_per_tensor, fbgemm_fp8,
+mxfp4, mxfp8, gpt_oss_mxfp4, nvfp4_per_token, deepseek_v4_fp8,
+experts_int8, moe_wna16, int8_per_channel_weight_only
+</code></pre></div>
+
+<p>30 个名字看着吓人，但它们不在同一个层级上。拆成<strong>三个正交的轴</strong>就清楚了：</p>
+<table>
+<thead>
+<tr>
+<th>轴</th>
+<th>问的问题</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>算法</strong></td>
+<td>4 bit 之内怎么分配误差？</td>
+<td>AWQ · GPTQ · round-to-nearest</td>
+</tr>
+<tr>
+<td><strong>容器</strong></td>
+<td>量化好的权重怎么存、怎么描述？</td>
+<td>compressed-tensors · modelopt · quark · torchao</td>
+</tr>
+<tr>
+<td><strong>作用域</strong></td>
+<td>模型的<strong>哪一部分</strong>被量化？</td>
+<td>全部线性层 · 只有 MoE 专家 · KV cache</td>
+</tr>
+</tbody>
+</table>
+<p>同一个模型可以是「AWQ 算法 + compressed-tensors 容器 + 只量化专家」。
+<strong>上面 30 个名字里，很多只是这三个轴的某个组合被起了个名字。</strong></p>
+<h3 id="61-compressed-tensors-73">6.1 容器：compressed-tensors 与 §7.3 的矛盾</h3>
+<p>§7.3 说格式是从 kernel 的最优访存倒推的，所以碎片化很难修复。
+<strong>compressed-tensors 是对这个问题的正面回应</strong>：它不发明新算法，
+而是定义一套<strong>描述</strong>——在 <code>config.json</code> 里声明位宽、量化轴、
+group_size、是否对称、哪些层被跳过，让加载器按描述去挑 kernel。</p>
+<p>这是很典型的一步：<strong>当实现无法统一时，先统一元数据。</strong>
+AWQ 和 GPTQ 的 kernel 仍然各写各的，但"这份权重是什么"
+不再需要靠文件名和目录结构去猜（4.0 §七 讲过靠猜的代价）。</p>
+<p><code>modelopt</code>（NVIDIA）、<code>quark</code>（AMD）、<code>torchao</code>（PyTorch）是同一层的东西，
+各自绑着一个生态。<strong>所以容器层现在也有四五个——统一元数据的努力本身又分裂了。</strong>
+这不讽刺，是常态：标准化的收益归全体，成本归先动的人。</p>
+<h3 id="62-moe">6.2 作用域：MoE 的专家值得单独量化</h3>
+<p><code>experts_int8</code>、<code>moe_wna16</code>、<code>deepseek_v4_fp8</code> 这三个是<strong>按作用域</strong>切的。</p>
+<p>4.4 算过：MoE 模型的参数绝大部分在专家里，而每个 token 只激活其中很小一部分。
+这给量化一个特殊的形状：</p>
+<ul>
+<li><strong>收益特别大</strong> —— 专家占了绝大多数参数，量化它们几乎等于量化整个模型的显存</li>
+<li><strong>精度损失特别小</strong> —— 每个专家只被一小部分 token 用到，
+  单个专家的误差不会传播到所有输出</li>
+<li><strong>但访存模式不同</strong> —— 专家权重是<strong>按 token 路由结果动态选取</strong>的（4.4 §三），
+  反量化必须和 grouped GEMM 融合在一起，不能先整块解包</li>
+</ul>
+<p><code>moe_wna16</code> 这个名字直接写着它的形状：<strong>w</strong>eight-only、<strong>n</strong>-bit、
+<strong>a</strong>ctivation 保持 <strong>16</strong> bit。也就是不动激活，只压专家权重——
+正好对上上面三条。</p>
+<p><strong>可带走的判断：量化的作用域应该跟着「参数量占比 ÷ 激活频率」走。
+占比大而激活少的部分，是最划算的量化目标。</strong>
+稠密模型里所有权重每步都被读，没有这个不均衡可利用；MoE 有，所以它值一套专门的格式。</p>
+<hr />
+<h2 id="_8">七 · 设计取舍</h2>
+<h3 id="71-group_size">7.1 group_size：两个方向的误差</h3>
+<p>这是一个罕见的<strong>两端都有明确代价</strong>的参数：</p>
+<ul>
+<li>组太大 → 组内动态范围宽 → scale 被 outlier 撑大 → 小权重损失惨重
+  （本章实测组间 scale 差 212 倍，可见分布多不均匀）</li>
+<li>组太小 → 元数据开销大 → 等效位宽上升（32 时是 4.62 bit，比 4 高 15%）</li>
+</ul>
+<p>128 之所以成为默认，是因为它落在"元数据开销已经降到 4% 以下"
+和"组内还足够窄"的交点附近。<strong>这个交点位置依赖权重分布</strong>，
+所以不同模型的最优 group_size 未必相同——但没人愿意为每个模型调它。</p>
+<h3 id="72-awq-gptq">7.2 AWQ 和 GPTQ 解决的是同一个问题的两面</h3>
+<p>本章第二节的核心观察：<strong>误差的绝对值均匀，相对值集中在小权重上；
+而 scale 被 outlier 支配。</strong></p>
+<ul>
+<li><strong>GPTQ</strong> 从"重建误差"入手：逐列量化，用 Hessian 信息补偿已量化列带来的误差。
+  它优化的是"给定 4 bit，怎么让输出误差最小"。</li>
+<li><strong>AWQ</strong> 从"哪些权重重要"入手：用激活的幅度找出关键通道，
+  在量化前给它们做通道级缩放，让它们落在更细的格点上。
+  它优化的是"哪些权重值得给好待遇"。</li>
+</ul>
+<p>两者都不改变 4 bit 这个约束，都在约束内重新分配误差。
+<strong>这是量化方法的共同形态：位宽是外生的，方法竞争的是误差分配。</strong></p>
+<h3 id="73">7.3 为什么量化格式没有统一</h3>
+<p>4.0 §七 提过这一点，本章给了更具体的证据：AWQ 的 nibble 顺序是
+<code>0,4,1,5,2,6,3,7</code>——这个顺序不是随意的，它是<strong>为了让反量化 kernel
+能一次凑出对齐的向量</strong>而选的。</p>
+<p>也就是说，<strong>格式是从 kernel 的最优访存倒推出来的</strong>。
+GPTQ 的 kernel 不同，最优布局就不同，于是 shape 转置、多一个 <code>g_idx</code>。</p>
+<p>这类碎片化很难事后修复：改格式要重新量化所有已发布的模型，
+而收益只是"少维护一套 kernel"。<strong>没有人有动机付这个代价。</strong></p>
+<p>可带走的判断：<strong>当格式由性能倒推时，标准化的窗口期在性能定型之前。</strong></p>
+<hr />
+<h2 id="lab">八 · 动手 lab</h2>
+<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L4 &amp;&amp; /scratch/learn/envs/serve/bin/python quantization.py'</span>
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/ckpt/43_quantization.txt</code>（124 行）。</p>
+<details class="fold srcfold"><summary>labs/L4/quantization.py 全文（382 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L4.3 —— 量化工程：把打包的整数拆开，看清楚它到底损失了什么。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">  [A] 手工解包 AWQ 的 qweight，还原成 fp16，和原始权重比</span>
+<span class="linenos">  5</span><span class="sd">  [B] 量化误差的分布：哪些权重损失最大</span>
+<span class="linenos">  6</span><span class="sd">  [C] 质量：真实困惑度对照（bf16 vs AWQ vs GPTQ）</span>
+<span class="linenos">  7</span><span class="sd">  [D] 速度：fp8 GEMM vs bf16 GEMM（这张卡支持 fp8）</span>
+<span class="linenos">  8</span><span class="sd">  [E] KV cache 量化：decode 带宽直接减半</span>
+<span class="linenos">  9</span>
+<span class="linenos"> 10</span><span class="sd">用法：</span>
+<span class="linenos"> 11</span><span class="sd">    python quantization.py</span>
+<span class="linenos"> 12</span><span class="sd">    python quantization.py A C</span>
+<span class="linenos"> 13</span><span class="sd">"""</span>
+<span class="linenos"> 14</span>
+<span class="linenos"> 15</span><span class="kn">import</span><span class="w"> </span><span class="nn">glob</span>
+<span class="linenos"> 16</span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos"> 17</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos"> 20</span>
+<span class="linenos"> 21</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 22</span>
+<span class="linenos"> 23</span><span class="c1"># 模型都已在本地缓存；强制离线，避免 vLLM/transformers 每次去连 Hub</span>
+<span class="linenos"> 24</span><span class="c1"># （连不上时会直接抛 httpx.ConnectError，即使文件就在本地）</span>
+<span class="linenos"> 25</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"HF_HUB_OFFLINE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
+<span class="linenos"> 26</span>
+<span class="linenos"> 27</span><span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos"> 28</span><span class="n">HUB</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"HF_HOME"</span><span class="p">,</span> <span class="s2">"/scratch/learn/models/hf"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/hub"</span>
+<span class="linenos"> 29</span>
+<span class="linenos"> 30</span>
+<span class="linenos"> 31</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 32</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos"> 33</span>
+<span class="linenos"> 34</span>
+<span class="linenos"> 35</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos"> 36</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos"> 37</span>
+<span class="linenos"> 38</span>
+<span class="linenos"> 39</span><span class="k">def</span><span class="w"> </span><span class="nf">snap</span><span class="p">(</span><span class="n">repo</span><span class="p">):</span>
+<span class="linenos"> 40</span>    <span class="n">d</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">HUB</span><span class="si">}</span><span class="s2">/models--</span><span class="si">{</span><span class="n">repo</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'/'</span><span class="p">,</span><span class="w"> </span><span class="s1">'--'</span><span class="p">)</span><span class="si">}</span><span class="s2">/snapshots"</span>
+<span class="linenos"> 41</span>    <span class="n">g</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/*"</span><span class="p">))</span>
+<span class="linenos"> 42</span>    <span class="k">return</span> <span class="n">g</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">g</span> <span class="k">else</span> <span class="kc">None</span>
+<span class="linenos"> 43</span>
+<span class="linenos"> 44</span>
+<span class="linenos"> 45</span><span class="k">def</span><span class="w"> </span><span class="nf">timeit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">30</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">10</span><span class="p">):</span>
+<span class="linenos"> 46</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">warmup</span><span class="p">):</span>
+<span class="linenos"> 47</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 48</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 49</span>    <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 50</span>    <span class="n">a</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 51</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos"> 52</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 53</span>    <span class="n">b</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 54</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 55</span>    <span class="k">return</span> <span class="n">a</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
+<span class="linenos"> 56</span>
+<span class="linenos"> 57</span>
+<span class="linenos"> 58</span><span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos"> 59</span><span class="k">def</span><span class="w"> </span><span class="nf">unpack_awq</span><span class="p">(</span><span class="n">qweight</span><span class="p">,</span> <span class="n">qzeros</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">bits</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">group_size</span><span class="o">=</span><span class="mi">128</span><span class="p">):</span>
+<span class="linenos"> 60</span><span class="w">    </span><span class="sd">"""AWQ 的打包：每个 int32 装 8 个 4-bit，但顺序是交错的。</span>
+<span class="linenos"> 61</span>
+<span class="linenos"> 62</span><span class="sd">    qweight: [in_features, out_features // 8]  int32</span>
+<span class="linenos"> 63</span><span class="sd">    qzeros : [in_features // group_size, out_features // 8]  int32</span>
+<span class="linenos"> 64</span><span class="sd">    scales : [in_features // group_size, out_features]  fp16</span>
+<span class="linenos"> 65</span><span class="sd">    返回 [in_features, out_features] 的 fp16</span>
+<span class="linenos"> 66</span><span class="sd">    """</span>
+<span class="linenos"> 67</span>    <span class="c1"># AWQ 的 GEMM 版把 8 个 nibble 按这个顺序放：0,4,1,5,2,6,3,7</span>
+<span class="linenos"> 68</span>    <span class="n">order</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">7</span><span class="p">])</span>
+<span class="linenos"> 69</span>    <span class="n">shifts</span> <span class="o">=</span> <span class="p">(</span><span class="n">order</span> <span class="o">*</span> <span class="n">bits</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">qweight</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+<span class="linenos"> 70</span>
+<span class="linenos"> 71</span>    <span class="k">def</span><span class="w"> </span><span class="nf">unpack</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+<span class="linenos"> 72</span>        <span class="c1"># x: [..., n] int32 -&gt; [..., n*8]</span>
+<span class="linenos"> 73</span>        <span class="n">out</span> <span class="o">=</span> <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="n">shifts</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span> <span class="o">&amp;</span> <span class="mh">0xF</span>
+<span class="linenos"> 74</span>        <span class="k">return</span> <span class="n">out</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">*</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos"> 75</span>
+<span class="linenos"> 76</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">unpack</span><span class="p">(</span><span class="n">qweight</span><span class="p">)</span>                       <span class="c1"># [in, out]</span>
+<span class="linenos"> 77</span>    <span class="n">z</span> <span class="o">=</span> <span class="n">unpack</span><span class="p">(</span><span class="n">qzeros</span><span class="p">)</span>                        <span class="c1"># [in/gs, out]</span>
+<span class="linenos"> 78</span>    <span class="n">gs</span> <span class="o">=</span> <span class="n">group_size</span>
+<span class="linenos"> 79</span>    <span class="n">z</span> <span class="o">=</span> <span class="n">z</span><span class="o">.</span><span class="n">repeat_interleave</span><span class="p">(</span><span class="n">gs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)[:</span> <span class="n">w</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>
+<span class="linenos"> 80</span>    <span class="n">sc</span> <span class="o">=</span> <span class="n">scales</span><span class="o">.</span><span class="n">repeat_interleave</span><span class="p">(</span><span class="n">gs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)[:</span> <span class="n">w</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>
+<span class="linenos"> 81</span>    <span class="k">return</span> <span class="p">((</span><span class="n">w</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">-</span> <span class="n">z</span><span class="o">.</span><span class="n">float</span><span class="p">())</span> <span class="o">*</span> <span class="n">sc</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">half</span><span class="p">()</span>
+<span class="linenos"> 82</span>
+<span class="linenos"> 83</span>
+<span class="linenos"> 84</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos"> 85</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 手工解包 AWQ，还原成 fp16"</span><span class="p">)</span>
+<span class="linenos"> 86</span>
+<span class="linenos"> 87</span>    <span class="n">d</span> <span class="o">=</span> <span class="n">snap</span><span class="p">(</span><span class="s2">"Qwen/Qwen2.5-1.5B-Instruct-AWQ"</span><span class="p">)</span>
+<span class="linenos"> 88</span>    <span class="k">if</span> <span class="ow">not</span> <span class="n">d</span><span class="p">:</span>
+<span class="linenos"> 89</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  没有 AWQ 模型，跳过"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos"> 90</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">safe_open</span>
+<span class="linenos"> 91</span>    <span class="n">cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/config.json"</span><span class="p">))</span>
+<span class="linenos"> 92</span>    <span class="n">qc</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"quantization_config"</span><span class="p">]</span>
+<span class="linenos"> 93</span>    <span class="n">gs</span><span class="p">,</span> <span class="n">bits</span> <span class="o">=</span> <span class="n">qc</span><span class="p">[</span><span class="s2">"group_size"</span><span class="p">],</span> <span class="n">qc</span><span class="p">[</span><span class="s2">"bits"</span><span class="p">]</span>
+<span class="linenos"> 94</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  quantization_config: bits=</span><span class="si">{</span><span class="n">bits</span><span class="si">}</span><span class="s2"> group_size=</span><span class="si">{</span><span class="n">gs</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos"> 95</span>          <span class="sa">f</span><span class="s2">"zero_point=</span><span class="si">{</span><span class="n">qc</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'zero_point'</span><span class="p">)</span><span class="si">}</span><span class="s2"> version=</span><span class="si">{</span><span class="n">qc</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'version'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 96</span>
+<span class="linenos"> 97</span>    <span class="n">name</span> <span class="o">=</span> <span class="s2">"model.layers.0.self_attn.q_proj"</span>
+<span class="linenos"> 98</span>    <span class="n">ts</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos"> 99</span>    <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/*.safetensors"</span><span class="p">)):</span>
+<span class="linenos">100</span>        <span class="k">with</span> <span class="n">safe_open</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">framework</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span> <span class="k">as</span> <span class="n">sf</span><span class="p">:</span>
+<span class="linenos">101</span>            <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">sf</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+<span class="linenos">102</span>                <span class="k">if</span> <span class="n">k</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="n">name</span> <span class="o">+</span> <span class="s2">"."</span><span class="p">):</span>
+<span class="linenos">103</span>                    <span class="n">ts</span><span class="p">[</span><span class="n">k</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">)[</span><span class="o">-</span><span class="mi">1</span><span class="p">]]</span> <span class="o">=</span> <span class="n">sf</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+<span class="linenos">104</span>    <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">ts</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
+<span class="linenos">105</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">k</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">shape</span><span class="p">))</span><span class="si">:</span><span class="s2">&lt;16</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">v</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">106</span>
+<span class="linenos">107</span>    <span class="n">qw</span><span class="p">,</span> <span class="n">qz</span><span class="p">,</span> <span class="n">sc</span> <span class="o">=</span> <span class="n">ts</span><span class="p">[</span><span class="s2">"qweight"</span><span class="p">],</span> <span class="n">ts</span><span class="p">[</span><span class="s2">"qzeros"</span><span class="p">],</span> <span class="n">ts</span><span class="p">[</span><span class="s2">"scales"</span><span class="p">]</span>
+<span class="linenos">108</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  打包关系："</span><span class="p">)</span>
+<span class="linenos">109</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    qweight </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">qw</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2"> int32 -&gt; 每个 int32 装 </span><span class="si">{</span><span class="mi">32</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="n">bits</span><span class="si">}</span><span class="s2"> 个 "</span>
+<span class="linenos">110</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">bits</span><span class="si">}</span><span class="s2">-bit -&gt; 展开后 </span><span class="si">{</span><span class="n">qw</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">×</span><span class="si">{</span><span class="n">qw</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="p">(</span><span class="mi">32</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="n">bits</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">111</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    scales  </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">sc</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2"> = [in/</span><span class="si">{</span><span class="n">gs</span><span class="si">}</span><span class="s2">, out]，每 </span><span class="si">{</span><span class="n">gs</span><span class="si">}</span><span class="s2"> 行共享一个缩放"</span><span class="p">)</span>
+<span class="linenos">112</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    qzeros  </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">qz</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2"> int32，同样打包，每 </span><span class="si">{</span><span class="n">gs</span><span class="si">}</span><span class="s2"> 行共享一个零点"</span><span class="p">)</span>
+<span class="linenos">113</span>
+<span class="linenos">114</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">unpack_awq</span><span class="p">(</span><span class="n">qw</span><span class="p">,</span> <span class="n">qz</span><span class="p">,</span> <span class="n">sc</span><span class="p">,</span> <span class="n">bits</span><span class="p">,</span> <span class="n">gs</span><span class="p">)</span>
+<span class="linenos">115</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  还原出来的权重 </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">116</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    前 8 个值: </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">w</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="p">:</span><span class="mi">8</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">117</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    整体 min=</span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.5f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">118</span>          <span class="sa">f</span><span class="s2">"max=</span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.5f</span><span class="si">}</span><span class="s2"> std=</span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">std</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.5f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">119</span>
+<span class="linenos">120</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"每个权重只有 16 个可能取值（4 bit）"</span><span class="p">)</span>
+<span class="linenos">121</span>    <span class="n">g0</span> <span class="o">=</span> <span class="n">w</span><span class="p">[:</span><span class="n">gs</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">122</span>    <span class="n">uniq</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">unique</span><span class="p">(</span><span class="n">g0</span><span class="p">)</span>
+<span class="linenos">123</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    取第 0 列的前 </span><span class="si">{</span><span class="n">gs</span><span class="si">}</span><span class="s2"> 行（同一组，共享一个 scale/zero）"</span><span class="p">)</span>
+<span class="linenos">124</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    不同取值个数: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">uniq</span><span class="p">)</span><span class="si">}</span><span class="s2">   （上限是 2^</span><span class="si">{</span><span class="n">bits</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="mi">2</span><span class="w"> </span><span class="o">**</span><span class="w"> </span><span class="n">bits</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos">125</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    取值: </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">v</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">uniq</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">126</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    相邻间隔（= scale）: "</span>
+<span class="linenos">127</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">round</span><span class="p">((</span><span class="n">uniq</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">uniq</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span><span class="w"> </span><span class="mi">6</span><span class="p">)</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="n">uniq</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'n/a'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">128</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    scales[0,0] = </span><span class="si">{</span><span class="n">sc</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">  &lt;- 应当相等"</span><span class="p">)</span>
+<span class="linenos">129</span>
+<span class="linenos">130</span>
+<span class="linenos">131</span><span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos">132</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos">133</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 量化误差有多大，落在哪里"</span><span class="p">)</span>
+<span class="linenos">134</span>
+<span class="linenos">135</span>    <span class="n">d_q</span> <span class="o">=</span> <span class="n">snap</span><span class="p">(</span><span class="s2">"Qwen/Qwen2.5-1.5B-Instruct-AWQ"</span><span class="p">)</span>
+<span class="linenos">136</span>    <span class="n">d_f</span> <span class="o">=</span> <span class="n">snap</span><span class="p">(</span><span class="s2">"Qwen/Qwen2.5-1.5B-Instruct"</span><span class="p">)</span>
+<span class="linenos">137</span>    <span class="k">if</span> <span class="ow">not</span> <span class="n">d_q</span><span class="p">:</span>
+<span class="linenos">138</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  缺 AWQ 模型"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos">139</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">safe_open</span>
+<span class="linenos">140</span>    <span class="n">cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d_q</span> <span class="o">+</span> <span class="s2">"/config.json"</span><span class="p">))</span>
+<span class="linenos">141</span>    <span class="n">gs</span><span class="p">,</span> <span class="n">bits</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"quantization_config"</span><span class="p">][</span><span class="s2">"group_size"</span><span class="p">],</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"quantization_config"</span><span class="p">][</span><span class="s2">"bits"</span><span class="p">]</span>
+<span class="linenos">142</span>
+<span class="linenos">143</span>    <span class="n">name</span> <span class="o">=</span> <span class="s2">"model.layers.0.self_attn.q_proj"</span>
+<span class="linenos">144</span>    <span class="n">ts</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos">145</span>    <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">d_q</span> <span class="o">+</span> <span class="s2">"/*.safetensors"</span><span class="p">)):</span>
+<span class="linenos">146</span>        <span class="k">with</span> <span class="n">safe_open</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">framework</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span> <span class="k">as</span> <span class="n">sf</span><span class="p">:</span>
+<span class="linenos">147</span>            <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">sf</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+<span class="linenos">148</span>                <span class="k">if</span> <span class="n">k</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="n">name</span> <span class="o">+</span> <span class="s2">"."</span><span class="p">):</span>
+<span class="linenos">149</span>                    <span class="n">ts</span><span class="p">[</span><span class="n">k</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">)[</span><span class="o">-</span><span class="mi">1</span><span class="p">]]</span> <span class="o">=</span> <span class="n">sf</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
+<span class="linenos">150</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">unpack_awq</span><span class="p">(</span><span class="n">ts</span><span class="p">[</span><span class="s2">"qweight"</span><span class="p">],</span> <span class="n">ts</span><span class="p">[</span><span class="s2">"qzeros"</span><span class="p">],</span> <span class="n">ts</span><span class="p">[</span><span class="s2">"scales"</span><span class="p">],</span> <span class="n">bits</span><span class="p">,</span> <span class="n">gs</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">151</span>    <span class="n">sc</span> <span class="o">=</span> <span class="n">ts</span><span class="p">[</span><span class="s2">"scales"</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">152</span>
+<span class="linenos">153</span>    <span class="c1"># 未量化的同一个权重</span>
+<span class="linenos">154</span>    <span class="n">ref</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">155</span>    <span class="k">if</span> <span class="n">d_f</span><span class="p">:</span>
+<span class="linenos">156</span>        <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">d_f</span> <span class="o">+</span> <span class="s2">"/*.safetensors"</span><span class="p">)):</span>
+<span class="linenos">157</span>            <span class="k">with</span> <span class="n">safe_open</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">framework</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span> <span class="k">as</span> <span class="n">sf</span><span class="p">:</span>
+<span class="linenos">158</span>                <span class="k">if</span> <span class="n">name</span> <span class="o">+</span> <span class="s2">".weight"</span> <span class="ow">in</span> <span class="n">sf</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+<span class="linenos">159</span>                    <span class="n">ref</span> <span class="o">=</span> <span class="n">sf</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">name</span> <span class="o">+</span> <span class="s2">".weight"</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">T</span>  <span class="c1"># [in, out]</span>
+<span class="linenos">160</span>    <span class="k">if</span> <span class="n">ref</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">161</span>        <span class="n">err</span> <span class="o">=</span> <span class="p">(</span><span class="n">w</span> <span class="o">-</span> <span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span>
+<span class="linenos">162</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  与未量化权重对照 </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">ref</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">163</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    max|err|  = </span><span class="si">{</span><span class="n">err</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">164</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    mean|err| = </span><span class="si">{</span><span class="n">err</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">165</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    权重本身 mean|w| = </span><span class="si">{</span><span class="n">ref</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">166</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    平均相对误差 = </span><span class="si">{</span><span class="p">(</span><span class="n">err</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">ref</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">167</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    余弦相似度 = "</span>
+<span class="linenos">168</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">cosine_similarity</span><span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">flatten</span><span class="p">(),</span><span class="w"> </span><span class="n">ref</span><span class="o">.</span><span class="n">flatten</span><span class="p">(),</span><span class="w"> </span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">169</span>        <span class="n">sub</span><span class="p">(</span><span class="s2">"误差最大的权重是不是绝对值最大的那些"</span><span class="p">)</span>
+<span class="linenos">170</span>        <span class="n">big</span> <span class="o">=</span> <span class="n">ref</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">ref</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">quantile</span><span class="p">(</span><span class="mf">0.999</span><span class="p">)</span>
+<span class="linenos">171</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    最大的 0.1% 权重：平均 |err| = </span><span class="si">{</span><span class="n">err</span><span class="p">[</span><span class="n">big</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">172</span>              <span class="sa">f</span><span class="s2">"，占其自身的 </span><span class="si">{</span><span class="p">(</span><span class="n">err</span><span class="p">[</span><span class="n">big</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">ref</span><span class="p">[</span><span class="n">big</span><span class="p">]</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">173</span>        <span class="n">small</span> <span class="o">=</span> <span class="n">ref</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span> <span class="o">&lt;</span> <span class="n">ref</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">quantile</span><span class="p">(</span><span class="mf">0.5</span><span class="p">)</span>
+<span class="linenos">174</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    最小的 50% 权重：平均 |err| = </span><span class="si">{</span><span class="n">err</span><span class="p">[</span><span class="n">small</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">175</span>              <span class="sa">f</span><span class="s2">"，占其自身的 </span><span class="si">{</span><span class="p">(</span><span class="n">err</span><span class="p">[</span><span class="n">small</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">ref</span><span class="p">[</span><span class="n">small</span><span class="p">]</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">176</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"    量化误差的绝对值对大小权重是**同一量级**（同组共享 scale），"</span><span class="p">)</span>
+<span class="linenos">177</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"    所以**相对误差**在小权重上大得多。"</span><span class="p">)</span>
+<span class="linenos">178</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"    AWQ 的核心思想正是：按激活的重要性挑出关键通道，"</span><span class="p">)</span>
+<span class="linenos">179</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"    在缩放上给它们更好的待遇。"</span><span class="p">)</span>
+<span class="linenos">180</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  量化后的权重 </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">181</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  每组的 scale 就是这一组的量化步长。scale 的分布："</span><span class="p">)</span>
+<span class="linenos">182</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    min=</span><span class="si">{</span><span class="n">sc</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">  中位数=</span><span class="si">{</span><span class="n">sc</span><span class="o">.</span><span class="n">median</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos">183</span>          <span class="sa">f</span><span class="s2">"max=</span><span class="si">{</span><span class="n">sc</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">  max/min=</span><span class="si">{</span><span class="n">sc</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="o">/</span><span class="n">sc</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">184</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  **量化误差的上界是 scale/2**（四舍五入到最近的格点）。"</span><span class="p">)</span>
+<span class="linenos">185</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    最好的组: ±</span><span class="si">{</span><span class="n">sc</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="o">/</span><span class="mi">2</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">186</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    最差的组: ±</span><span class="si">{</span><span class="n">sc</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="o">/</span><span class="mi">2</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">187</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  组与组之间差 </span><span class="si">{</span><span class="n">sc</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="o">/</span><span class="n">sc</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> 倍 —— "</span><span class="p">)</span>
+<span class="linenos">188</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  这就是 group_size 存在的意义：一个 scale 管全矩阵的话，"</span><span class="p">)</span>
+<span class="linenos">189</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  所有权重都要按最大的那个 outlier 缩放，小权重会被压成 0。"</span><span class="p">)</span>
+<span class="linenos">190</span>
+<span class="linenos">191</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"group_size 的取舍（按定义算，不是实测）"</span><span class="p">)</span>
+<span class="linenos">192</span>    <span class="n">out_f</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos">193</span>    <span class="k">for</span> <span class="n">g</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">1024</span><span class="p">]:</span>
+<span class="linenos">194</span>        <span class="n">per_group</span> <span class="o">=</span> <span class="n">g</span> <span class="o">*</span> <span class="n">bits</span> <span class="o">+</span> <span class="mi">16</span> <span class="o">+</span> <span class="n">bits</span>
+<span class="linenos">195</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    group_size=</span><span class="si">{</span><span class="n">g</span><span class="si">:</span><span class="s2">&gt;5</span><span class="si">}</span><span class="s2">  等效 </span><span class="si">{</span><span class="n">per_group</span><span class="o">/</span><span class="n">g</span><span class="si">:</span><span class="s2">&gt;5.2f</span><span class="si">}</span><span class="s2"> bit/权重  "</span>
+<span class="linenos">196</span>              <span class="sa">f</span><span class="s2">"scales+zeros 开销 </span><span class="si">{</span><span class="p">(</span><span class="mi">16</span><span class="o">+</span><span class="n">bits</span><span class="p">)</span><span class="o">/</span><span class="p">(</span><span class="n">g</span><span class="o">*</span><span class="n">bits</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;6.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">197</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  组越小，量化越准（每组的动态范围更窄），但元数据开销越大。"</span><span class="p">)</span>
+<span class="linenos">198</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  128 是当前的常见折中。"</span><span class="p">)</span>
+<span class="linenos">199</span>
+<span class="linenos">200</span>
+<span class="linenos">201</span><span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos">202</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos">203</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 质量与速度：用 vLLM 跑真实的量化 kernel"</span><span class="p">)</span>
+<span class="linenos">204</span>
+<span class="linenos">205</span>    <span class="c1"># 用 vLLM 而不是 transformers：AWQ/GPTQ 在 transformers 里要额外装</span>
+<span class="linenos">206</span>    <span class="c1"># gptqmodel / optimum，而 vLLM 自带这两种格式的 kernel，</span>
+<span class="linenos">207</span>    <span class="c1"># 而且这才是这些 checkpoint 实际被使用的路径。</span>
+<span class="linenos">208</span>    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_ENABLE_V1_MULTIPROCESSING"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
+<span class="linenos">209</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos">210</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos">211</span>
+<span class="linenos">212</span>    <span class="n">text</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"Machine learning models are trained on large corpora of text. "</span>
+<span class="linenos">213</span>            <span class="s2">"The transformer architecture, introduced in 2017, uses self-attention "</span>
+<span class="linenos">214</span>            <span class="s2">"to model dependencies between tokens regardless of their distance. "</span>
+<span class="linenos">215</span>            <span class="s2">"Modern language models scale this architecture to billions of parameters, "</span>
+<span class="linenos">216</span>            <span class="s2">"requiring careful engineering of memory bandwidth, numerical precision, "</span>
+<span class="linenos">217</span>            <span class="s2">"and parallel execution across many accelerators. Quantization reduces "</span>
+<span class="linenos">218</span>            <span class="s2">"the number of bits used to store each weight, trading some accuracy for "</span>
+<span class="linenos">219</span>            <span class="s2">"lower memory footprint and higher throughput during inference. "</span><span class="p">)</span> <span class="o">*</span> <span class="mi">4</span>
+<span class="linenos">220</span>
+<span class="linenos">221</span>    <span class="n">repos</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">"bf16 原版"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen2.5-1.5B-Instruct"</span><span class="p">),</span>
+<span class="linenos">222</span>             <span class="p">(</span><span class="s2">"AWQ 4bit"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen2.5-1.5B-Instruct-AWQ"</span><span class="p">),</span>
+<span class="linenos">223</span>             <span class="p">(</span><span class="s2">"GPTQ 4bit"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4"</span><span class="p">)]</span>
+<span class="linenos">224</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  用同一段文本算困惑度（越低越好）+ 量一次 decode 吞吐。"</span><span class="p">)</span>
+<span class="linenos">225</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  ⚠ **一段文本不构成模型质量评测**，只用来看量化有没有量级上的退化。"</span><span class="p">)</span>
+<span class="linenos">226</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  真正的评测要跑标准数据集，本轮没有做。"</span><span class="p">)</span>
+<span class="linenos">227</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'模型'</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'困惑度'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对 bf16'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">228</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'权重显存 MB'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'decode tok/s'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">229</span>    <span class="n">base_ppl</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">230</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">repo</span> <span class="ow">in</span> <span class="n">repos</span><span class="p">:</span>
+<span class="linenos">231</span>        <span class="k">if</span> <span class="ow">not</span> <span class="n">snap</span><span class="p">(</span><span class="n">repo</span><span class="p">):</span>
+<span class="linenos">232</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2"> 未下载，跳过"</span><span class="p">);</span> <span class="k">continue</span>
+<span class="linenos">233</span>        <span class="k">try</span><span class="p">:</span>
+<span class="linenos">234</span>            <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">repo</span><span class="p">,</span> <span class="n">gpu_memory_utilization</span><span class="o">=</span><span class="mf">0.45</span><span class="p">,</span>
+<span class="linenos">235</span>                      <span class="n">max_model_len</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">236</span>                      <span class="n">disable_log_stats</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">237</span>            <span class="n">out</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="n">text</span><span class="p">],</span>
+<span class="linenos">238</span>                               <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos">239</span>                                              <span class="n">prompt_logprobs</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span>
+<span class="linenos">240</span>                               <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos">241</span>            <span class="n">lps</span> <span class="o">=</span> <span class="p">[</span><span class="n">d</span><span class="p">[</span><span class="n">t</span><span class="p">]</span><span class="o">.</span><span class="n">logprob</span> <span class="k">for</span> <span class="n">d</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span>
+<span class="linenos">242</span>                   <span class="nb">zip</span><span class="p">(</span><span class="n">out</span><span class="o">.</span><span class="n">prompt_logprobs</span><span class="p">[</span><span class="mi">1</span><span class="p">:],</span> <span class="n">out</span><span class="o">.</span><span class="n">prompt_token_ids</span><span class="p">[</span><span class="mi">1</span><span class="p">:])]</span>
+<span class="linenos">243</span>            <span class="n">ppl</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="nb">sum</span><span class="p">(</span><span class="n">lps</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">lps</span><span class="p">))</span>
+<span class="linenos">244</span>            <span class="c1"># decode 吞吐：128 条各生成 64 token</span>
+<span class="linenos">245</span>            <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos">246</span>            <span class="n">sp</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">247</span>            <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span><span class="n">text</span><span class="p">[:</span><span class="mi">200</span><span class="p">]]</span> <span class="o">*</span> <span class="mi">64</span>
+<span class="linenos">248</span>            <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>       <span class="c1"># 预热</span>
+<span class="linenos">249</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos">250</span>            <span class="n">o2</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">251</span>            <span class="n">dt</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos">252</span>            <span class="n">ntok</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">o2</span><span class="p">)</span>
+<span class="linenos">253</span>            <span class="k">if</span> <span class="n">base_ppl</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">254</span>                <span class="n">base_ppl</span> <span class="o">=</span> <span class="n">ppl</span>
+<span class="linenos">255</span>            <span class="n">szmb</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">getsize</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">256</span>                       <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">snap</span><span class="p">(</span><span class="n">repo</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/*.safetensors"</span><span class="p">))</span> <span class="o">/</span> <span class="n">MB</span>
+<span class="linenos">257</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ppl</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ppl</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">base_ppl</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2">× "</span>
+<span class="linenos">258</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">szmb</span><span class="si">:</span><span class="s2">&gt;13.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ntok</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">dt</span><span class="si">:</span><span class="s2">&gt;13.1f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">259</span>            <span class="c1"># 同进程建第二个引擎前必须显式 shutdown，否则显存不还</span>
+<span class="linenos">260</span>            <span class="c1"># （这是 B1 就记下的坑，见 plan 的踩坑清单第 9 条）</span>
+<span class="linenos">261</span>            <span class="k">try</span><span class="p">:</span>
+<span class="linenos">262</span>                <span class="n">llm</span><span class="o">.</span><span class="n">llm_engine</span><span class="o">.</span><span class="n">engine_core</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+<span class="linenos">263</span>            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>                                 <span class="c1"># noqa: BLE001</span>
+<span class="linenos">264</span>                <span class="k">pass</span>
+<span class="linenos">265</span>            <span class="k">del</span> <span class="n">llm</span>
+<span class="linenos">266</span>            <span class="kn">import</span><span class="w"> </span><span class="nn">gc</span><span class="p">;</span> <span class="n">gc</span><span class="o">.</span><span class="n">collect</span><span class="p">();</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">267</span>        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                              <span class="c1"># noqa: BLE001</span>
+<span class="linenos">268</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2"> 失败: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">90</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">269</span>            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">270</span>
+<span class="linenos">271</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"权重占用（按文件大小，不含 KV 与激活）"</span><span class="p">)</span>
+<span class="linenos">272</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">repo</span> <span class="ow">in</span> <span class="n">repos</span><span class="p">:</span>
+<span class="linenos">273</span>        <span class="n">d</span> <span class="o">=</span> <span class="n">snap</span><span class="p">(</span><span class="n">repo</span><span class="p">)</span>
+<span class="linenos">274</span>        <span class="k">if</span> <span class="ow">not</span> <span class="n">d</span><span class="p">:</span>
+<span class="linenos">275</span>            <span class="k">continue</span>
+<span class="linenos">276</span>        <span class="n">sz</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">getsize</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/*.safetensors"</span><span class="p">))</span>
+<span class="linenos">277</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">sz</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2"> MB"</span><span class="p">)</span>
+<span class="linenos">278</span>
+<span class="linenos">279</span>
+<span class="linenos">280</span><span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos">281</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos">282</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] fp8 GEMM vs bf16 GEMM（这张卡支持 fp8）"</span><span class="p">)</span>
+<span class="linenos">283</span>
+<span class="linenos">284</span>    <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+<span class="linenos">285</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  需要 CUDA"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos">286</span>    <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">287</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> sm_</span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">major</span><span class="si">}{</span><span class="n">p</span><span class="o">.</span><span class="n">minor</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">288</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  L1.2 实测：bf16 511 FLOP/clk/SM，fp8 1022 —— 纯发射率正好 2×。"</span><span class="p">)</span>
+<span class="linenos">289</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这里看端到端的 GEMM 能拿到多少。"</span><span class="p">)</span>
+<span class="linenos">290</span>
+<span class="linenos">291</span>    <span class="n">n</span> <span class="o">=</span> <span class="mi">4096</span>
+<span class="linenos">292</span>    <span class="n">a16</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">293</span>    <span class="n">b16</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">294</span>    <span class="n">flops</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">n</span> <span class="o">**</span> <span class="mi">3</span>
+<span class="linenos">295</span>    <span class="n">t16</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">a16</span> <span class="o">@</span> <span class="n">b16</span><span class="p">)</span>
+<span class="linenos">296</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'路径'</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'TFLOP/s'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对 bf16'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">297</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'bf16 @ bf16'</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t16</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">flops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t16</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="mf">1.0</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">298</span>
+<span class="linenos">299</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos">300</span>        <span class="n">a8</span> <span class="o">=</span> <span class="n">a16</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">)</span>
+<span class="linenos">301</span>        <span class="n">b8</span> <span class="o">=</span> <span class="n">b16</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">)</span>
+<span class="linenos">302</span>        <span class="n">sa</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">303</span>        <span class="k">def</span><span class="w"> </span><span class="nf">fp8mm</span><span class="p">():</span>
+<span class="linenos">304</span>            <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">_scaled_mm</span><span class="p">(</span><span class="n">a8</span><span class="p">,</span> <span class="n">b8</span><span class="o">.</span><span class="n">t</span><span class="p">()</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">t</span><span class="p">(),</span>
+<span class="linenos">305</span>                                    <span class="n">scale_a</span><span class="o">=</span><span class="n">sa</span><span class="p">,</span> <span class="n">scale_b</span><span class="o">=</span><span class="n">sa</span><span class="p">,</span>
+<span class="linenos">306</span>                                    <span class="n">out_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">307</span>        <span class="n">fp8mm</span><span class="p">()</span>
+<span class="linenos">308</span>        <span class="n">t8</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="n">fp8mm</span><span class="p">)</span>
+<span class="linenos">309</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'fp8_e4m3 @ fp8_e4m3'</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t8</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">310</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">flops</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t8</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">&gt;10.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t16</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t8</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">311</span>        <span class="n">ref</span> <span class="o">=</span> <span class="p">(</span><span class="n">a16</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">@</span> <span class="n">b16</span><span class="o">.</span><span class="n">float</span><span class="p">())</span>
+<span class="linenos">312</span>        <span class="n">got</span> <span class="o">=</span> <span class="n">fp8mm</span><span class="p">()</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">313</span>        <span class="n">rel</span> <span class="o">=</span> <span class="p">((</span><span class="n">got</span> <span class="o">-</span> <span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span> <span class="o">/</span> <span class="n">ref</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">314</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  fp8 结果与 fp32 参照的平均相对误差: </span><span class="si">{</span><span class="n">rel</span><span class="si">:</span><span class="s2">.4%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">315</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  （权重值域 ~N(0,1)，fp8_e4m3 上限 448，这里没有溢出）"</span><span class="p">)</span>
+<span class="linenos">316</span>    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
+<span class="linenos">317</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  fp8 路径失败: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">150</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">318</span>
+<span class="linenos">319</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"为什么端到端拿不到 2×"</span><span class="p">)</span>
+<span class="linenos">320</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  纯发射率是 2×，但 GEMM 还要搬数据。4096³ 的 bf16 输入是 64 MB，"</span><span class="p">)</span>
+<span class="linenos">321</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  fp8 是 32 MB —— 算力翻倍而访存只减半，"</span><span class="p">)</span>
+<span class="linenos">322</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  在这个尺寸上很可能已经不是纯算力受限了。"</span><span class="p">)</span>
+<span class="linenos">323</span>    <span class="k">del</span> <span class="n">a16</span><span class="p">,</span> <span class="n">b16</span>
+<span class="linenos">324</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">325</span>
+<span class="linenos">326</span>
+<span class="linenos">327</span><span class="c1"># ---------------------------------------------------------------- E</span>
+<span class="linenos">328</span><span class="k">def</span><span class="w"> </span><span class="nf">section_E</span><span class="p">():</span>
+<span class="linenos">329</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[E] KV cache 量化：decode 带宽直接减半"</span><span class="p">)</span>
+<span class="linenos">330</span>
+<span class="linenos">331</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+<span class="linenos">332</span>    <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">128</span>
+<span class="linenos">333</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> query头=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2"> KV头=</span><span class="si">{</span><span class="n">HKV</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">334</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  3.3 的结论：decode 时间 = KV 字节 / 带宽。dtype 减半，时间就该减半。"</span><span class="p">)</span>
+<span class="linenos">335</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'kv_len'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'dtype'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'KV 大小'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对 bf16'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">336</span>    <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">8192</span><span class="p">,</span> <span class="mi">32768</span><span class="p">]:</span>
+<span class="linenos">337</span>        <span class="n">base</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">338</span>        <span class="k">for</span> <span class="n">dt</span><span class="p">,</span> <span class="n">nb</span> <span class="ow">in</span> <span class="p">[(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]:</span>
+<span class="linenos">339</span>            <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">340</span>            <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">341</span>            <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos">342</span>            <span class="n">kv</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">HKV</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="n">nb</span>
+<span class="linenos">343</span>            <span class="k">if</span> <span class="n">dt</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">:</span>
+<span class="linenos">344</span>                <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">enable_gqa</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos">345</span>                <span class="n">base</span> <span class="o">=</span> <span class="n">t</span>
+<span class="linenos">346</span>            <span class="k">else</span><span class="p">:</span>
+<span class="linenos">347</span>                <span class="n">k8</span><span class="p">,</span> <span class="n">v8</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dt</span><span class="p">),</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dt</span><span class="p">)</span>
+<span class="linenos">348</span>                <span class="k">try</span><span class="p">:</span>
+<span class="linenos">349</span>                    <span class="c1"># SDPA 不吃 fp8；模拟真实做法：kernel 内反量化再算</span>
+<span class="linenos">350</span>                    <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">():</span>
+<span class="linenos">351</span>                        <span class="k">return</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span>
+<span class="linenos">352</span>                            <span class="n">q</span><span class="p">,</span> <span class="n">k8</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">),</span> <span class="n">v8</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">),</span>
+<span class="linenos">353</span>                            <span class="n">enable_gqa</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">354</span>                    <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="n">run</span><span class="p">)</span>
+<span class="linenos">355</span>                <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                      <span class="c1"># noqa: BLE001</span>
+<span class="linenos">356</span>                    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'fp8'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">  失败 </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">50</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">357</span>                    <span class="k">continue</span>
+<span class="linenos">358</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">dt</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'torch.'</span><span class="p">,</span><span class="w"> </span><span class="s1">''</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB "</span>
+<span class="linenos">359</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">base</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos">360</span>            <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
+<span class="linenos">361</span>            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">362</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  ⚠ 上面 fp8 那行是**在框架层显式反量化**再走普通 attention，"</span><span class="p">)</span>
+<span class="linenos">363</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  多了一次读 fp8 + 写 bf16，所以它反而更慢 —— 这和 3.3 §四 分页那次"</span><span class="p">)</span>
+<span class="linenos">364</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  是同一类错误：框架层模拟量不出 kernel 内部做这件事的代价。"</span><span class="p">)</span>
+<span class="linenos">365</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  真实的 fp8 KV attention 在 kernel 内部反量化，只读 fp8 那一份字节。"</span><span class="p">)</span>
+<span class="linenos">366</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  **本 lab 没有真实 fp8 KV kernel 可用，所以只给出字节账：**"</span><span class="p">)</span>
+<span class="linenos">367</span>    <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">8192</span><span class="p">,</span> <span class="mi">32768</span><span class="p">,</span> <span class="mi">131072</span><span class="p">]:</span>
+<span class="linenos">368</span>        <span class="n">kv16</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">HKV</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos">369</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    kv_len=</span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">  bf16 </span><span class="si">{</span><span class="n">kv16</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB  "</span>
+<span class="linenos">370</span>              <span class="sa">f</span><span class="s2">"fp8 </span><span class="si">{</span><span class="n">kv16</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB  int4 </span><span class="si">{</span><span class="n">kv16</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB"</span><span class="p">)</span>
+<span class="linenos">371</span>
+<span class="linenos">372</span>
+<span class="linenos">373</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span>
+<span class="linenos">374</span>            <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">,</span> <span class="s2">"E"</span><span class="p">:</span> <span class="n">section_E</span><span class="p">}</span>
+<span class="linenos">375</span>
+<span class="linenos">376</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">377</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos">378</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">379</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos">380</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos">381</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos">382</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L4/quantization.py 全文（382 行）</code><a href="../code/labs/L4/quantization.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p><strong>建议的消融</strong></p>
+<ol>
+<li><strong>把 nibble 顺序改成 <code>0,1,2,3,4,5,6,7</code></strong>（顺序解包），再跑一次 [A] 的自检。
+   预测：取值不再等距，与 <code>scales[0,0]</code> 对不上。
+   <strong>这验证了那个自检确实有判别力。</strong></li>
+<li>用 vLLM 的 <code>--kv-cache-dtype fp8</code> 跑一次真实负载，补上第五节缺的那个测量。
+   这是本章最大的一个缺口。</li>
+<li>[C] 换成真正的评测集（wikitext-2 的困惑度），并报多次运行的方差。
+   本章那三个困惑度数字只能说明"没崩"。</li>
+<li>把 [C] 的 batch 从 64 改成 1，看量化的速度收益是否转正。
+   按第三节的分析应该会——<strong>先预测再验证</strong>。</li>
+</ol>
+<hr />
+<h2 id="_9">九 · 陷阱</h2>
+<ol>
+<li><strong>nibble 在 int32 里不是顺序排的</strong>（AWQ 是 <code>0,4,1,5,2,6,3,7</code>）。解错了不报错，
+   还原出的权重看似合理但全错。用"取值等距且间隔=scale"自检。</li>
+<li><strong>"4 bit"不等于 4× 压缩。</strong> 本章实测 1.9×/2.7×，因为 embedding 没量化（4.0）。</li>
+<li><strong>量化不一定更快。</strong> 本章 batch=64 小模型上两个量化版都慢约 10%。</li>
+<li><strong>平均相对误差 42.7% 听起来很糟，但余弦相似度 0.96。</strong> 看单一指标会误判。</li>
+<li><strong>框架层的 dtype 转换量不出 kernel 内量化的代价。</strong> 本章第五节测出 0.34×，
+   是实现方式的问题（同 3.3 §四）。</li>
+<li><strong>一段文本的困惑度不是质量评测。</strong> 2.2% vs 4.0% 的差距在单样本上无意义。</li>
+<li><strong>同进程建第二个 vLLM 引擎前必须 <code>engine_core.shutdown()</code></strong>，否则显存不还，
+   第二个模型直接起不来。</li>
+<li><strong>fp8 端到端拿不到发射率的 2×</strong>（本章 1.50×），因为访存只减半。</li>
+</ol>
+<hr />
+<h2 id="_10">十 · 自测题</h2>
+<details>
+<summary>1. 你解包了一个 4-bit 权重，怎么在没有原始权重的情况下验证解对了？</summary>
+<p><strong>同一组内的取值必须落在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>2</mn><mrow><mtext>bits</mtext></mrow></msup></mrow></math></span> 个等距格点上，间隔恰好等于该组的 scale。</strong></p>
+<p>本章实测：取第 0 列的前 128 行（同一组），得到 15 个不同取值，
+相邻间隔 0.002319，而 <code>scales[0,0] = 0.002319</code>——精确相等。</p>
+<p>如果 nibble 顺序解错了，你会把不同组/不同位置的 4-bit 值混在一起，
+取值会散成非等距的一堆，这个检查立刻失败。</p>
+<p>这是一个<strong>自洽性检查</strong>：不需要外部参照，靠格式自身的约束就能验证。
+写解析器时应该优先找这类检查。</p>
+</details>
+<details>
+<summary>2. 量化后模型更慢，是不是说明量化没用？</summary>
+<p>不是。量化最稳的收益是<strong>显存</strong>，不是速度。本章实测 2944 → 1097 MB。</p>
+<p>速度收益取决于<strong>权重带宽在总时间里的占比</strong>：
+- batch=1 或大模型：每步都要读全部权重，权重带宽是瓶颈 → 量化收益大
+- batch 很大、模型小：权重读取被 64 条请求摊薄，已经不是瓶颈 →
+  反量化的额外计算反而拖慢（本章实测慢约 10%）</p>
+<p>而且还有一类收益是二值的：<strong>显存装不下的时候，量化决定能不能跑</strong>。
+这时候"快多少"根本不是问题。</p>
+<p>判断方法：先量出你的配置下权重读取占多少时间（用 0.2 的账本 + 2.6 的 profiler）。</p>
+</details>
+<details>
+<summary>3. 为什么量化误差的相对值在小权重上更大？这对 AWQ 意味着什么？</summary>
+<p>因为<strong>同一组共享一个 scale</strong>，格点间隔对组内所有权重都一样。
+绝对误差上界是 scale/2，与权重本身的大小无关。</p>
+<p>所以小权重的相对误差更大。本章实测：最大的 0.1% 权重相对误差 39.21%，
+最小的 50% 权重 45.47%（绝对误差分别是 0.146 和 0.0046，差 32 倍）。</p>
+<p>而 scale 本身被组内的 outlier 支配（本章组间 scale 差 212 倍）。</p>
+<p>AWQ 的应对是：<strong>用激活的幅度找出"重要"的通道</strong>，在量化前给它们做通道级缩放，
+把它们移到能被更细格点表示的位置。它没有改变 4 bit 这个约束，
+只是重新分配了误差——把误差从重要通道挪到不重要的通道上。</p>
+</details>
+<details>
+<summary>4. fp8 的纯发射率是 bf16 的 2×，为什么 GEMM 只快 1.50×？</summary>
+<p>因为 GEMM 不只是算，还要搬数据。</p>
+<p>4096³ 的输入：bf16 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><msup><mn>4096</mn><mn>2</mn></msup><mo>&#x000D7;</mo><mn>2</mn><mtext>B</mtext><mo>&#x0003D;</mo><mn>64</mn></mrow></math></span> MB，fp8 是 32 MB。
+<strong>算力翻倍，但访存只减半。</strong> 如果这个尺寸上已经有一部分时间花在访存上，
+那部分只快 2× 中的一半。</p>
+<p>一般规律：一个优化在纯指标上的收益，端到端只有在"该指标确实是唯一瓶颈"时才能拿满。
+本书里反复出现同一形态——
+3.2 的 exp 占比、4.3 的量化速度、2.7 的 max-autotune，都是这个道理。</p>
+<p>判据：先用 roofline（0.2）确认瓶颈在哪一侧，再估收益上限。</p>
+</details>
+<details>
+<summary>5. vLLM 支持 30 种量化方法。要不要一个个学？</summary>
+<p>不要。它们不在同一个层级上，拆成<strong>三个正交的轴</strong>就只剩三件事：</p>
+<ul>
+<li><strong>算法</strong>（4 bit 之内怎么分配误差）：AWQ · GPTQ · round-to-nearest</li>
+<li><strong>容器</strong>（怎么存、怎么描述）：compressed-tensors · modelopt · quark · torchao</li>
+<li><strong>作用域</strong>（哪一部分被量化）：全部线性层 · 只有 MoE 专家 · KV cache</li>
+</ul>
+<p>30 个名字里很多只是某个组合被单独起了名（<code>gpt_oss_mxfp4</code> = mxfp4 算法 +
+特定模型的作用域约定）。<strong>认轴，不认名字。</strong></p>
+<p>这是读任何一个大选项空间的通法：先找出正交的维度，
+剩下的名字就是组合，不需要逐个记。</p>
+</details>
+<details>
+<summary>6. 为什么 MoE 值得一套专门的量化格式（experts_int8 / moe_wna16）？</summary>
+<p>因为 MoE 有一个稠密模型没有的不均衡：<strong>参数量占比 ÷ 激活频率</strong>。</p>
+<p>专家占了绝大多数参数，但每个 token 只激活其中很小一部分（4.4）。于是：</p>
+<ul>
+<li><strong>收益特别大</strong>：量化专家几乎等于量化整个模型的显存</li>
+<li><strong>精度损失特别小</strong>：单个专家只被一小部分 token 用到，误差不会传播到所有输出</li>
+<li><strong>但访存模式不同</strong>：专家权重是按路由结果<strong>动态选取</strong>的，
+  反量化必须和 grouped GEMM 融合，不能先整块解包——所以要专门的 kernel</li>
+</ul>
+<p><code>moe_wna16</code> 的名字直接写着它的形状：<strong>w</strong>eight-only、<strong>n</strong>-bit、
+<strong>a</strong>ctivation 保持 <strong>16</strong> bit。</p>
+<p>稠密模型里所有权重每步都被读，没有这个不均衡可利用，所以不需要这一套。</p>
+<p><strong>可带走的判断：量化的作用域应该跟着「参数量占比 ÷ 激活频率」走。</strong></p>
+</details>
+<details>
+<summary>7. `turboquant_k3v4` 给 K 用 3 bit、V 用 4 bit。为什么不一样？</summary>
+<p>因为<strong>同一个 cache 里两个张量的误差敏感度不同</strong>：</p>
+<ul>
+<li><strong>K</strong> 参与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></math></span>，结果要过 softmax。softmax 对输入的小扰动有压缩作用
+  （尤其在分数差距明显时），K 的误差被指数压掉一部分。</li>
+<li><strong>V</strong> 是直接被 attention 权重加权求和，误差<strong>线性</strong>进入输出，没有任何衰减。</li>
+</ul>
+<p>所以在同样的字节预算下，从 K 拿一个 bit 给 V 是划算的。</p>
+<p>一般化：<strong>量化的粒度不该由张量的名字决定，而该由它的误差如何传播到输出决定。</strong>
+同样的思路解释了为什么 embedding 和 lm_head 常常不量化（4.0 §六），
+以及为什么 §7.2 里 AWQ/GPTQ 都在"重新分配误差"而不是改变位宽。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L4/4.2-numerics.html">&#8592; 4.2 数值系统与确定性</a><a class="nav-next" href="../L4/4.4-moe.html">4.4 MoE：稀疏激活的系统代价 &#8594;</a></nav>
+</main>
+</body>
+</html>

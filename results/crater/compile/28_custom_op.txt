@@ -1,0 +1,139 @@
+torch 2.13.0+cu130  device cuda
+
+==============================================================================
+[A] 起点：一个能跑、但 PyTorch 完全不认识的 kernel
+==============================================================================
+  前向对不对: max|err| = 2.842e-14
+  返回类型: <class 'torch.Tensor'>  shape=(64,)
+
+--- 它在 dispatcher 里存在吗 ------------------------------------------------------
+  l28::fused_scale_sum         **不存在**
+  aten::add.Tensor             存在
+  它只是一个 pybind 出来的 python 可调用对象，dispatcher 里没有它。
+
+--- requires_grad 会怎样 -------------------------------------------------------
+  out.requires_grad = False   grad_fn = None
+  没有反向。autograd 根本不知道发生过这次计算。
+
+--- torch.compile 遇到它会怎样 —— 这里有个陷阱 ------------------------------------------
+  explain(): 图数量 1   图断裂 0   捕获算子 1
+  看起来一切正常。但把图打印出来：
+    def forward(self, L_stack0_ : torch.Tensor):
+        l_stack0_ = L_stack0_
+        mul = l_stack0_ * 2;  l_stack0_ = None
+        return (mul,)
+
+  **kernel 调用根本不在图里。** 图的入参 L_stack0_ 是已经算好的结果，
+  只有后面那个 `* 2` 被捕获了。Dynamo 在图外 eager 执行了这次调用。
+
+  用 fullgraph=True 才会说实话：
+  Unsupported: Attempted to call function marked as skipped
+
+  教训：explain() 报 0 次断裂**不等于**全部captured。
+  想确认有没有东西被漏在图外，用 fullgraph=True，或者把图打出来看。
+
+==============================================================================
+[B] 注册成一个真正的算子
+==============================================================================
+  注册完成。现在它在 dispatcher 里：
+    name: l28::fused_scale_sum
+    schema: l28::fused_scale_sum(Tensor x, Tensor w) -> Tensor
+    debug: registered at /scratch/learn/envs/serve/lib/python3.12/site-packages/torch/_library/custom_ops.py:1104
+    alias analysis kind: FROM_SCHEMA
+    Meta: registered at /scratch/learn/envs/serve/lib/python3.12/site-packages/torch/_library/custom_ops.py:1104 :: (none) [ boxed ]
+    Autograd[alias]: registered at /scratch/learn/envs/serve/lib/python3.12/site-packages/torch/_library/custom_ops.py:1104 :: (none) [ boxed ]
+    CompositeExplicitAutograd[alias]: registered at /scratch/learn/envs/serve/lib/python3.12/site-packages/torch/_library/custom_ops.py:1104 :: (none) [ boxed ]
+
+--- 它出现在哪些 dispatch key 上 ---------------------------------------------------
+  CUDA                         False
+  CPU                          False
+  Meta                         True
+  Autograd                     True
+  CompositeExplicitAutograd    True
+
+  注意 CUDA 和 CPU 都是 False，而 CompositeExplicitAutograd 是 True：
+  `torch.library.custom_op` 默认注册的是**与后端无关**的实现，
+  由 CompositeExplicitAutograd 这个别名键覆盖所有后端（2.0 §3.3 那张表）。
+  想按设备分别注册，用 `custom_op(..., device_types='cuda')` 或 `register_kernel`。
+
+  Meta 和 Autograd 这两行虽然是 True，但注册的是**占位实现**：
+  它们会在被调用时报错，提示你还没写 fake / autograd。
+  这正是接下来两节要补的两件事。
+
+==============================================================================
+[C] 少了 fake（meta）函数会怎样
+==============================================================================
+  eager 调用没问题: torch.Size([64])
+
+--- 但 torch.compile 需要在不真的执行的情况下推出形状 ----------------------------------------
+  失败: TorchRuntimeError
+    RuntimeError when making fake tensor call
+      Explanation: Dynamo failed to run FX node with fake tensors: call_function l28.no_fake.default(*(FakeTensor(..., device='cuda:0', size=(64, 512)), F
+      Hint: Your code may result in an error when running in eager. Please double check that your code doesn't contain a similar error when actually runni
+    
+      Developer debug context: 
+    
+     For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb4315.html
+    
+
+--- 补上 fake 之后 --------------------------------------------------------------
+  成功，shape=(64,)
+  Meta key 现在有 kernel 了: True
+
+--- 编译后的图里，这个算子长什么样 ---------------------------------------------------------
+def forward(self, L_a_ : torch.Tensor, L_b_ : torch.Tensor):
+    l_a_ = L_a_
+    l_b_ = L_b_
+    no_fake_default = torch.ops.l28.no_fake.default(l_a_, l_b_);  l_a_ = l_b_ = None
+    mul = no_fake_default * 2;  no_fake_default = None
+    return (mul,)
+
+  它是图里的一个**不透明节点**：Inductor 知道它的形状，
+  知道要在这里调用它，但不知道它内部在算什么。
+
+==============================================================================
+[D] 接上反向，并用 gradcheck 验一遍
+==============================================================================
+  Autograd key 现在有 kernel 了: True
+
+--- gradcheck：用有限差分逐个元素验梯度 --------------------------------------------------
+  gradcheck 通过: True
+
+--- 和参照实现对拍 -----------------------------------------------------------------
+  dx max|err| = 0.000e+00
+  dw max|err| = 0.000e+00
+
+--- 失败现场：反向写错但前向是对的 ---------------------------------------------------------
+  前向仍然正确: max|err| = 0.000e+00
+  gradcheck 抓到了:
+    Jacobian mismatch for output 0 with respect to input 0,
+    numerical:tensor([[ 0.5888,  0.0000,  0.0000,  ...,  0.0000,  0.0000,  0.0000],
+            [ 0.0000,  0.0000,  0.0000,  ...,  0.0000,  0.0000,  0.0000],
+            [-0.3647,  0.0000,  0.0000,  ...,  0.0000,  0.0000,  0.0000],
+            ...,
+            [ 0.0000,  0.0000,  0.0000,  ...,  0.0000,  0.0000,  1.0632],
+            [ 0.0000,  0.0000,  0.0000,  ...,  0.0000,  0.0000,  0.6348],
+            [ 0.0000,  0.0000,  0.0000,  ...,  0.0000,  0.0000,  1.3555]],
+           device='cuda:0', dtype=torch.float64)
+    analytical:tensor([[ 0.5888,  0.0000,  0.0000,  ...,  0.0000,  0.0000,  0.0000],
+
+==============================================================================
+[E] 注册之后它能被融合吗
+==============================================================================
+  两者数值一致: True
+
+  自定义算子 + 后续逐元素
+    Inductor 生成 triton kernel: 1
+    图里对外部算子的调用: ['torch.ops.aten.add', 'torch.ops.aten.mul', 'torch.ops.aten.relu', 'torch.ops.inductor._alloc_from_pool', 'torch.ops.l28.fusible_probe']
+
+  等价的纯 torch 写法
+    Inductor 生成 triton kernel: 1
+    图里对外部算子的调用: ['torch.ops.aten.add', 'torch.ops.aten.mul', 'torch.ops.aten.relu', 'torch.ops.aten.sum', 'torch.ops.inductor._alloc_from_pool']
+
+  自定义算子（编译后）    0.022 ms
+  纯 torch（编译后）      0.015 ms
+  我的 kernel（裸调）      0.019 ms
+  eager 纯 torch          0.138 ms
+
+  自定义算子是一个**不透明的边界**：Inductor 不能把它前后的算子
+  融进它，也不能把它拆开重排。写得比库快，才值得付这个边界的代价。

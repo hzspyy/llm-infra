@@ -1,0 +1,1153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.2 资源账本：字节、FLOP 与 roofline</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">0.2</div>
+  <div class="sidebar-title">资源账本：字节、FLOP 与 roofline</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">为什么先算资源需求</a></li>
+<li><a href="#_2">第一步：从配置中找到维度</a></li>
+<li><a href="#_3">第二步：算一层要保存多少权重</a></li>
+<li><a href="#kv-cache">第三步：算 KV cache 为什么越生成越大</a></li>
+<li><a href="#_4">第四步：算一次前向做多少运算</a></li>
+<li><a href="#_5">第五步：把运算量与读取量放在一起</a></li>
+<li><a href="#roofline">Roofline 给的是参照，不是完整延迟预测</a></li>
+<li><a href="#_6">怎样把公式与代码对应起来</a></li>
+<li><a href="#_7">引擎自己怎么算这本账</a></li>
+<li><a href="#sglang">广度对照：SGLang 把同一本账拆得更细</a></li>
+<li><a href="#_8">读这本账时容易出错的地方</a></li>
+<li><a href="#_9">可以在本地做的练习</a></li>
+<li><a href="#_10">自测：这些数字能说明什么</a></li>
+<li><a href="#_11">接下来读什么</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L0 · 坐标系</div>
+  <div class="mod-id">0.2</div>
+  <h1>资源账本：字节、FLOP 与 roofline</h1>
+  <p class="lede">参数 / 激活 / KV 的字节数，prefill 与 decode 的 FLOP，arithmetic intensity 与 roofline；建立心算能力。</p>
+  <div class="chips"><span class="chip">实测机器 历史记录：Qwen3-1.7B · crater RTX 5090 D</span><span class="chip">数据日期 2026-09-09；正文重写不代表新增性能测量</span><span class="chip">前置 L0.0（矩阵乘与张量）；L0.1（prefill 与 decode）</span></div>
+</header><article class="prose"><h2 id="_1">为什么先算资源需求</h2>
+<p>读性能报告时，我们常看到“某模型每秒生成多少 token”，却不知道这个数字是否合理。
+一个比较直接的起点是：先算模型要读取多少数据、执行多少运算，
+再看机器完成这些工作大约需要多久。</p>
+<p>本章用 Qwen3-1.7B 做例子，依次计算权重、KV cache 和主要矩阵运算的规模。
+这些计算是一份简化模型，不是 GPU 执行轨迹。
+它的作用是帮助你提出问题，例如“为什么显存增加了这么多”或“为什么 batch 增大后吞吐提高”，
+而不是只靠配置文件就精确预测延迟。</p>
+<p>先约定单位。GB 使用十进制，1 GB 等于十亿字节；GiB 使用二进制，
+1 GiB 等于 2 的 30 次方字节。bf16 的每个元素占 2 字节。
+后面的容量计算都先保留字节数，再换算显示，避免把 GB 和 GiB 混在一起。</p>
+<h2 id="_2">第一步：从配置中找到维度</h2>
+<p>配置文件给出模型结构所需的数字。先读下面这份真实文件，
+然后在表中找到各字段的作用：</p>
+<details class="fold srcfold"><summary>results/crater/raw/11_config.json 全文（30 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="p">{</span>
+<span class="linenos"> 2</span><span class="w">  </span><span class="nt">"architectures"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos"> 3</span><span class="w">    </span><span class="s2">"Qwen3ForCausalLM"</span>
+<span class="linenos"> 4</span><span class="w">  </span><span class="p">],</span>
+<span class="linenos"> 5</span><span class="w">  </span><span class="nt">"attention_bias"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="linenos"> 6</span><span class="w">  </span><span class="nt">"attention_dropout"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="linenos"> 7</span><span class="w">  </span><span class="nt">"bos_token_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">151643</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="w">  </span><span class="nt">"eos_token_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">151645</span><span class="p">,</span>
+<span class="linenos"> 9</span><span class="w">  </span><span class="nt">"head_dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span><span class="p">,</span>
+<span class="linenos">10</span><span class="w">  </span><span class="nt">"hidden_act"</span><span class="p">:</span><span class="w"> </span><span class="s2">"silu"</span><span class="p">,</span>
+<span class="linenos">11</span><span class="w">  </span><span class="nt">"hidden_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="linenos">12</span><span class="w">  </span><span class="nt">"initializer_range"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.02</span><span class="p">,</span>
+<span class="linenos">13</span><span class="w">  </span><span class="nt">"intermediate_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">6144</span><span class="p">,</span>
+<span class="linenos">14</span><span class="w">  </span><span class="nt">"max_position_embeddings"</span><span class="p">:</span><span class="w"> </span><span class="mi">40960</span><span class="p">,</span>
+<span class="linenos">15</span><span class="w">  </span><span class="nt">"max_window_layers"</span><span class="p">:</span><span class="w"> </span><span class="mi">28</span><span class="p">,</span>
+<span class="linenos">16</span><span class="w">  </span><span class="nt">"model_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"qwen3"</span><span class="p">,</span>
+<span class="linenos">17</span><span class="w">  </span><span class="nt">"num_attention_heads"</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="linenos">18</span><span class="w">  </span><span class="nt">"num_hidden_layers"</span><span class="p">:</span><span class="w"> </span><span class="mi">28</span><span class="p">,</span>
+<span class="linenos">19</span><span class="w">  </span><span class="nt">"num_key_value_heads"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos">20</span><span class="w">  </span><span class="nt">"rms_norm_eps"</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-06</span><span class="p">,</span>
+<span class="linenos">21</span><span class="w">  </span><span class="nt">"rope_scaling"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos">22</span><span class="w">  </span><span class="nt">"rope_theta"</span><span class="p">:</span><span class="w"> </span><span class="mi">1000000</span><span class="p">,</span>
+<span class="linenos">23</span><span class="w">  </span><span class="nt">"sliding_window"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos">24</span><span class="w">  </span><span class="nt">"tie_word_embeddings"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos">25</span><span class="w">  </span><span class="nt">"torch_dtype"</span><span class="p">:</span><span class="w"> </span><span class="s2">"bfloat16"</span><span class="p">,</span>
+<span class="linenos">26</span><span class="w">  </span><span class="nt">"transformers_version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"4.51.0"</span><span class="p">,</span>
+<span class="linenos">27</span><span class="w">  </span><span class="nt">"use_cache"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos">28</span><span class="w">  </span><span class="nt">"use_sliding_window"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="linenos">29</span><span class="w">  </span><span class="nt">"vocab_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">151936</span>
+<span class="linenos">30</span><span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/raw/11_config.json 全文（30 行）</code><a href="../code/results/crater/raw/11_config.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<table>
+<thead>
+<tr>
+<th>记号</th>
+<th>配置字段</th>
+<th style="text-align: right;">本例取值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L</td>
+<td>num_hidden_layers</td>
+<td style="text-align: right;">28</td>
+<td>Transformer 层数</td>
+</tr>
+<tr>
+<td>d</td>
+<td>hidden_size</td>
+<td style="text-align: right;">2048</td>
+<td>每个位置的隐藏向量维度</td>
+</tr>
+<tr>
+<td>h</td>
+<td>num_attention_heads</td>
+<td style="text-align: right;">16</td>
+<td>query head 数量</td>
+</tr>
+<tr>
+<td>g</td>
+<td>num_key_value_heads</td>
+<td style="text-align: right;">8</td>
+<td>key/value head 数量</td>
+</tr>
+<tr>
+<td>q</td>
+<td>head_dim</td>
+<td style="text-align: right;">128</td>
+<td>每个 head 的维度</td>
+</tr>
+<tr>
+<td>f</td>
+<td>intermediate_size</td>
+<td style="text-align: right;">6144</td>
+<td>FFN 中间维度</td>
+</tr>
+<tr>
+<td>V</td>
+<td>vocab_size</td>
+<td style="text-align: right;">151936</td>
+<td>embedding / 输出词表维度</td>
+</tr>
+</tbody>
+</table>
+<p>这里的 query head 数与 KV head 数不同。GQA 让多组 query 共享较少的 K/V head，
+所以计算 KV 时要用 g，而不是 h。这个区别既影响投影参数量，也影响缓存大小。</p>
+<p>先不要把这些数字当作一张必须背下来的表。你需要学会的是：
+看到一项矩阵操作，能从配置中找出输入维度和输出维度。</p>
+<h2 id="_3">第二步：算一层要保存多少权重</h2>
+<p>对于一个没有 bias 的线性变换，输入维度为 a、输出维度为 b，
+权重矩阵就有 a × b 个元素。先按这个规则计算 attention 的四个投影：</p>
+<table>
+<thead>
+<tr>
+<th>投影</th>
+<th style="text-align: right;">输入维度</th>
+<th style="text-align: right;">输出维度</th>
+<th style="text-align: right;">参数个数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Q</td>
+<td style="text-align: right;">d</td>
+<td style="text-align: right;">hq</td>
+<td style="text-align: right;">d × hq</td>
+</tr>
+<tr>
+<td>K</td>
+<td style="text-align: right;">d</td>
+<td style="text-align: right;">gq</td>
+<td style="text-align: right;">d × gq</td>
+</tr>
+<tr>
+<td>V</td>
+<td style="text-align: right;">d</td>
+<td style="text-align: right;">gq</td>
+<td style="text-align: right;">d × gq</td>
+</tr>
+<tr>
+<td>O</td>
+<td style="text-align: right;">hq</td>
+<td style="text-align: right;">d</td>
+<td style="text-align: right;">hq × d</td>
+</tr>
+</tbody>
+</table>
+<p>因此，一层的投影参数数为：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>P</mi><mrow><mi>a</mi><mi>t</mi><mi>t</mi><mi>n</mi></mrow></msub><mo>&#x0003D;</mo><mn>2</mn><mi>d</mi><mi>h</mi><mi>q</mi><mo>&#x0002B;</mo><mn>2</mn><mi>d</mi><mi>g</mi><mi>q</mi></mrow></math></div></p>
+<p>本例代入 d=2048、h=16、g=8、q=128，可以分别检查 Q/O 与 K/V 的大小。
+这一步只数投影矩阵，不把归一化等小参数算进去。</p>
+<p>SwiGLU FFN 包含 gate、up、down 三个矩阵。前两个把维度从 d 提到 f，
+最后一个从 f 降回 d，因此：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>P</mi><mrow><mi>f</mi><mi>f</mi><mi>n</mi></mrow></msub><mo>&#x0003D;</mo><mn>3</mn><mi>d</mi><mi>f</mi></mrow></math></div></p>
+<p>把每层相加，再乘层数，就得到主干线性层的参数量。
+embedding 有 Vd 个元素；如果 lm_head 与 embedding 共享权重，
+计算独立参数时不应把它们重复算两次。</p>
+<p>已有脚本给出的主要矩阵统计如下。它省略了一些归一化等小项，
+所以应称为结构估算，不能代替完整的参数清单：</p>
+<table>
+<thead>
+<tr>
+<th>部分</th>
+<th style="text-align: right;">估算参数个数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>28 层 attention 投影</td>
+<td style="text-align: right;">352,321,536</td>
+</tr>
+<tr>
+<td>28 层 FFN</td>
+<td style="text-align: right;">1,056,964,608</td>
+</tr>
+<tr>
+<td>共享 embedding / lm_head</td>
+<td style="text-align: right;">311,164,928</td>
+</tr>
+<tr>
+<td>合计</td>
+<td style="text-align: right;">1,720,451,072</td>
+</tr>
+</tbody>
+</table>
+<p>按 bf16 存储，以上主要权重约占 3.44 GB。这里约六成参数属于 FFN。
+因此，即使你的优化目标是 attention，也不能忽略 FFN 对权重读取量的影响。</p>
+<p>权重文件大小与加载后的显存占用还不是同一个量：重复存储、权重共享、
+量化辅助数据、运行时 workspace 都可能改变两者的关系。
+要确认共享，应同时看加载代码和加载后的张量，而不只看参数名。</p>
+<h2 id="kv-cache">第三步：算 KV cache 为什么越生成越大</h2>
+<p>权重通常由一批请求共享；KV cache 则描述某条请求已经处理过的上下文。
+两个请求没有可复用前缀时，不能仅因它们使用同一模型就共用全部 KV。</p>
+<p>对本例普通 GQA attention，一个 token 在一层需要保存：
+g 个 K head，以及 g 个 V head，每个 head 有 q 个元素。
+设每个元素占 s 字节，则所有层的缓存量为：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>K</mi><mrow><mi>t</mi><mi>o</mi><mi>k</mi><mi>e</mi><mi>n</mi></mrow></msub><mo>&#x0003D;</mo><mn>2</mn><mi>L</mi><mi>g</mi><mi>q</mi><mi>s</mi></mrow></math></div></p>
+<p>代入 28 层、8 个 KV head、每 head 128 个元素、每元素 2 字节：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>K</mi><mrow><mi>t</mi><mi>o</mi><mi>k</mi><mi>e</mi><mi>n</mi></mrow></msub><mo>&#x0003D;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>28</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn><mo>&#x0003D;</mo><mn>114688</mn><mtext>&#x000A0;bytes</mtext></mrow></math></div></p>
+<p>这等于 112 KiB，也约为 114.69 KB。一个长度为 4096 的上下文因此需要：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>4096</mn><mo>&#x000D7;</mo><mn>114688</mn><mo>&#x0003D;</mo><mn>469762048</mn><mtext>&#x000A0;bytes</mtext></mrow></math></div></p>
+<p>也就是 448 MiB，约 0.47 GB。它只是一条请求的 KV。
+如果 32 条请求都具有这么长的上下文，且不共享缓存，KV 总量约为 15.03 GB。</p>
+<p>实际分页缓存会按块分配，末块还可能没有填满；引擎也可能提前预留缓存池。
+所以“按 token 算出的有效数据量”“已经分配的块容量”和“GPU 总显存占用”
+是三个不同的量。<a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a> 会把它们与 block table、空闲块和引用计数联系起来。</p>
+<p>这条公式不是所有架构的通用公式。量化 KV、滑动窗口、MLA 或其他状态表示，
+都需要按实际存储布局重新推导，不能只把模型名字换掉继续使用。</p>
+<h2 id="_4">第四步：算一次前向做多少运算</h2>
+<p>一个 M×K 矩阵乘 K×N 矩阵，要得到 M×N 个输出。
+每个输出沿 K 维累加乘积。按一次乘法和一次加法各计一个 FLOP 的惯例，
+主要运算量约为 2MKN。</p>
+<p>设主干线性层参数量为 P_body，输出层参数量为 P_head，
+prompt 长度为 S。只需生成一个首 token、也不请求 prompt logprobs 时，
+可以按以下方式估算线性层计算：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>F</mi><mrow><mi>l</mi><mi>i</mi><mi>n</mi><mi>e</mi><mi>a</mi><mi>r</mi><mo>&#x0002C;</mo><mi>p</mi><mi>r</mi><mi>e</mi><mi>f</mi><mi>i</mi><mi>l</mi><mi>l</mi></mrow></msub><mo>&#x02248;</mo><mn>2</mn><mi>S</mi><msub><mi>P</mi><mrow><mi>b</mi><mi>o</mi><mi>d</mi><mi>y</mi></mrow></msub><mo>&#x0002B;</mo><mn>2</mn><msub><mi>P</mi><mrow><mi>h</mi><mi>e</mi><mi>a</mi><mi>d</mi></mrow></msub></mrow></math></div></p>
+<p>第一项处理 prompt 的各个位置；第二项只为末位置计算输出 logits。
+这是当前估算采用的执行需求。训练或需要其他位置 logits 的任务，必须另算。</p>
+<p>attention 还要形成 Q 与 K 的匹配，并用这些权重汇总 V。
+在普通 causal attention 的粗略模型中，计算量随 S 的平方增长。
+这里用：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>F</mi><mrow><mi>a</mi><mi>t</mi><mi>t</mi><mi>e</mi><mi>n</mi><mi>t</mi><mi>i</mi><mi>o</mi><mi>n</mi><mo>&#x0002C;</mo><mi>p</mi><mi>r</mi><mi>e</mi><mi>f</mi><mi>i</mi><mi>l</mi><mi>l</mi></mrow></msub><mo>&#x02248;</mo><mn>2</mn><mi>L</mi><msup><mi>S</mi><mn>2</mn></msup><mi>h</mi><mi>q</mi></mrow></math></div></p>
+<p>它省略了 softmax 等操作，也没有描述具体 kernel 的 tile、padding 和访存。
+因此应把它读作数量级与主要项估算，而不是实际执行的精确指令数。</p>
+<p>decode 则不同：每条请求本轮只处理一个新位置，仍需访问历史 K/V。
+如果有 B 条等长请求，历史长度为 C，主要运算量可写成：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>F</mi><mrow><mi>d</mi><mi>e</mi><mi>c</mi><mi>o</mi><mi>d</mi><mi>e</mi></mrow></msub><mo>&#x02248;</mo><mn>2</mn><mi>B</mi><mo stretchy="false">&#x00028;</mo><msub><mi>P</mi><mrow><mi>b</mi><mi>o</mi><mi>d</mi><mi>y</mi></mrow></msub><mo>&#x0002B;</mo><msub><mi>P</mi><mrow><mi>h</mi><mi>e</mi><mi>a</mi><mi>d</mi></mrow></msub><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mn>4</mn><mi>L</mi><mi>B</mi><mi>C</mi><mi>h</mi><mi>q</mi></mrow></math></div></p>
+<p>这说明 batch 与上下文长度都会影响 decode，但影响的是不同部分：
+batch 增大会增加本轮的新位置数，上下文变长则增加 attention 需要读取和处理的历史。</p>
+<h2 id="_5">第五步：把运算量与读取量放在一起</h2>
+<p>算术强度（arithmetic intensity）是运算量除以数据搬运量，单位是 FLOP/byte。
+它描述平均每搬一个字节，进行了多少运算。</p>
+<p>在一个理想化的 decode 模型中，可以先把每步读取量估为：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>D</mi><mrow><mi>d</mi><mi>e</mi><mi>c</mi><mi>o</mi><mi>d</mi><mi>e</mi></mrow></msub><mo>&#x02248;</mo><mi>W</mi><mo>&#x0002B;</mo><mi>B</mi><mi>C</mi><msub><mi>K</mi><mrow><mi>t</mi><mi>o</mi><mi>k</mi><mi>e</mi><mi>n</mi></mrow></msub></mrow></math></div></p>
+<p>W 是本轮涉及的权重字节数，后一项是历史 KV 字节数。
+这里假设一批请求能共享一次主要权重读取；实际缓存命中、重复读取和中间张量
+还会改变真实流量，因此这个式子不是硬件计数器的替代品。</p>
+<p>由此可以理解 batch 的作用。B 从 1 增加时，权重项不必按请求数等比例增长，
+每份权重能参与更多位置的计算；但 KV 项仍随请求数增长。
+所以 batch 可以提高总吞吐，却不会让收益无限线性增长。</p>
+<p>也不要把总吞吐与单请求速度混淆。一次花 10 ms 为 32 条请求各生成一个 token，
+总吞吐是 3200 token/s；单条请求仍要等这一轮约 10 ms，而不是 1/3200 秒。</p>
+<h2 id="roofline">Roofline 给的是参照，不是完整延迟预测</h2>
+<p>假设机器的计算吞吐参照为 R FLOP/s，内存带宽参照为 BW byte/s。
+完成 F 次运算和 D 字节搬运，分别需要的理想时间为 F/R 与 D/BW。
+若把二者视为可以充分重叠，可用较大者作为时间下限的模型：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>T</mi><mrow><mi>m</mi><mi>o</mi><mi>d</mi><mi>e</mi><mi>l</mi></mrow></msub><mo>&#x0003D;</mo><mo>max</mo><mo stretchy="false">&#x00028;</mo><mi>F</mi><mo>&#x0002F;</mo><mi>R</mi><mo>&#x0002C;</mo><mspace width="0.278em" /><mi>D</mi><mo>&#x0002F;</mo><mi>B</mi><mi>W</mi><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
+<p>这就是 roofline 分析的基本想法。若数据搬运项更大，优先检查访存；
+若计算项更大，优先检查计算路径。但真实请求还包含调度、同步、通信及其他操作，
+它们没有自动包含在这两个除法里。</p>
+<p>本章的 R 和 BW 来自微基准，而非对所有工作负载都成立的物理上限。
+因此更准确的叫法是“基于这些参照值的估计下限”。
+如果后来出现更高的有效带宽，应先检查流量口径、缓存和参照测试，
+不要马上认定硬件超过了物理极限。</p>
+<p>已有计算结果同时保存了主要 FLOP、字节数和估计时间：</p>
+<details class="fold srcfold"><summary>results/crater/ledger_qwen3_1.7b_ctx4096.json 全文（100 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="p">{</span>
+<span class="linenos">  2</span><span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Qwen3-1.7B"</span><span class="p">,</span>
+<span class="linenos">  3</span><span class="w">  </span><span class="nt">"ctx"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos">  4</span><span class="w">  </span><span class="nt">"w_dtype"</span><span class="p">:</span><span class="w"> </span><span class="s2">"bf16"</span><span class="p">,</span>
+<span class="linenos">  5</span><span class="w">  </span><span class="nt">"kv_dtype"</span><span class="p">:</span><span class="w"> </span><span class="s2">"bf16"</span><span class="p">,</span>
+<span class="linenos">  6</span><span class="w">  </span><span class="nt">"params"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos">  7</span><span class="w">    </span><span class="nt">"attn"</span><span class="p">:</span><span class="w"> </span><span class="mi">352321536</span><span class="p">,</span>
+<span class="linenos">  8</span><span class="w">    </span><span class="nt">"ffn"</span><span class="p">:</span><span class="w"> </span><span class="mi">1056964608</span><span class="p">,</span>
+<span class="linenos">  9</span><span class="w">    </span><span class="nt">"embed"</span><span class="p">:</span><span class="w"> </span><span class="mi">311164928</span><span class="p">,</span>
+<span class="linenos"> 10</span><span class="w">    </span><span class="nt">"total"</span><span class="p">:</span><span class="w"> </span><span class="mi">1720451072</span><span class="p">,</span>
+<span class="linenos"> 11</span><span class="w">    </span><span class="nt">"weight_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">3440902144</span>
+<span class="linenos"> 12</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos"> 13</span><span class="w">  </span><span class="nt">"kv"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 14</span><span class="w">    </span><span class="nt">"bytes_per_token"</span><span class="p">:</span><span class="w"> </span><span class="mi">114688</span><span class="p">,</span>
+<span class="linenos"> 15</span><span class="w">    </span><span class="nt">"bytes_at_ctx"</span><span class="p">:</span><span class="w"> </span><span class="mi">469762048</span><span class="p">,</span>
+<span class="linenos"> 16</span><span class="w">    </span><span class="nt">"gqa_saving"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.0</span>
+<span class="linenos"> 17</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos"> 18</span><span class="w">  </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 19</span><span class="w">    </span><span class="nt">"linear"</span><span class="p">:</span><span class="w"> </span><span class="mi">11545494421504</span><span class="p">,</span>
+<span class="linenos"> 20</span><span class="w">    </span><span class="nt">"linear_body"</span><span class="p">:</span><span class="w"> </span><span class="mi">11544872091648</span><span class="p">,</span>
+<span class="linenos"> 21</span><span class="w">    </span><span class="nt">"linear_head"</span><span class="p">:</span><span class="w"> </span><span class="mi">622329856</span><span class="p">,</span>
+<span class="linenos"> 22</span><span class="w">    </span><span class="nt">"attention"</span><span class="p">:</span><span class="w"> </span><span class="mf">1924145348608.0</span><span class="p">,</span>
+<span class="linenos"> 23</span><span class="w">    </span><span class="nt">"total"</span><span class="p">:</span><span class="w"> </span><span class="mf">13469639770112.0</span><span class="p">,</span>
+<span class="linenos"> 24</span><span class="w">    </span><span class="nt">"t_lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">58.05879211255172</span>
+<span class="linenos"> 25</span><span class="w">  </span><span class="p">},</span>
+<span class="linenos"> 26</span><span class="w">  </span><span class="nt">"kv_budget_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mf">25389097856.000004</span><span class="p">,</span>
+<span class="linenos"> 27</span><span class="w">  </span><span class="nt">"max_concurrent_seqs"</span><span class="p">:</span><span class="w"> </span><span class="mi">54</span><span class="p">,</span>
+<span class="linenos"> 28</span><span class="w">  </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos"> 29</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos"> 30</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos"> 31</span><span class="w">      </span><span class="nt">"flops"</span><span class="p">:</span><span class="w"> </span><span class="mi">4380426240</span><span class="p">,</span>
+<span class="linenos"> 32</span><span class="w">      </span><span class="nt">"bytes_weight"</span><span class="p">:</span><span class="w"> </span><span class="mi">3440902144</span><span class="p">,</span>
+<span class="linenos"> 33</span><span class="w">      </span><span class="nt">"bytes_kv"</span><span class="p">:</span><span class="w"> </span><span class="mi">469762048</span><span class="p">,</span>
+<span class="linenos"> 34</span><span class="w">      </span><span class="nt">"bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">3910664192</span><span class="p">,</span>
+<span class="linenos"> 35</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.1201233409304197</span><span class="p">,</span>
+<span class="linenos"> 36</span><span class="w">      </span><span class="nt">"roofline"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 37</span><span class="w">        </span><span class="nt">"t_memory_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.5739907799644572</span><span class="p">,</span>
+<span class="linenos"> 38</span><span class="w">        </span><span class="nt">"t_compute_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.018881147586206896</span><span class="p">,</span>
+<span class="linenos"> 39</span><span class="w">        </span><span class="nt">"t_lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.5739907799644572</span><span class="p">,</span>
+<span class="linenos"> 40</span><span class="w">        </span><span class="nt">"bound_by"</span><span class="p">:</span><span class="w"> </span><span class="s2">"memory"</span><span class="p">,</span>
+<span class="linenos"> 41</span><span class="w">        </span><span class="nt">"machine_balance_flops_per_byte"</span><span class="p">:</span><span class="w"> </span><span class="mf">152.70190219179887</span>
+<span class="linenos"> 42</span><span class="w">      </span><span class="p">},</span>
+<span class="linenos"> 43</span><span class="w">      </span><span class="nt">"fits_in_memory"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos"> 44</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos"> 45</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos"> 46</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos"> 47</span><span class="w">      </span><span class="nt">"flops"</span><span class="p">:</span><span class="w"> </span><span class="mi">35043409920</span><span class="p">,</span>
+<span class="linenos"> 48</span><span class="w">      </span><span class="nt">"bytes_weight"</span><span class="p">:</span><span class="w"> </span><span class="mi">3440902144</span><span class="p">,</span>
+<span class="linenos"> 49</span><span class="w">      </span><span class="nt">"bytes_kv"</span><span class="p">:</span><span class="w"> </span><span class="mi">3758096384</span><span class="p">,</span>
+<span class="linenos"> 50</span><span class="w">      </span><span class="nt">"bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">7198998528</span><span class="p">,</span>
+<span class="linenos"> 51</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.867817347607604</span><span class="p">,</span>
+<span class="linenos"> 52</span><span class="w">      </span><span class="nt">"roofline"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 53</span><span class="w">        </span><span class="nt">"t_memory_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.738365384058448</span><span class="p">,</span>
+<span class="linenos"> 54</span><span class="w">        </span><span class="nt">"t_compute_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.15104918068965517</span><span class="p">,</span>
+<span class="linenos"> 55</span><span class="w">        </span><span class="nt">"t_lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.738365384058448</span><span class="p">,</span>
+<span class="linenos"> 56</span><span class="w">        </span><span class="nt">"bound_by"</span><span class="p">:</span><span class="w"> </span><span class="s2">"memory"</span><span class="p">,</span>
+<span class="linenos"> 57</span><span class="w">        </span><span class="nt">"machine_balance_flops_per_byte"</span><span class="p">:</span><span class="w"> </span><span class="mf">152.70190219179887</span>
+<span class="linenos"> 58</span><span class="w">      </span><span class="p">},</span>
+<span class="linenos"> 59</span><span class="w">      </span><span class="nt">"fits_in_memory"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos"> 60</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos"> 61</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos"> 62</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="linenos"> 63</span><span class="w">      </span><span class="nt">"flops"</span><span class="p">:</span><span class="w"> </span><span class="mi">140173639680</span><span class="p">,</span>
+<span class="linenos"> 64</span><span class="w">      </span><span class="nt">"bytes_weight"</span><span class="p">:</span><span class="w"> </span><span class="mi">3440902144</span><span class="p">,</span>
+<span class="linenos"> 65</span><span class="w">      </span><span class="nt">"bytes_kv"</span><span class="p">:</span><span class="w"> </span><span class="mi">15032385536</span><span class="p">,</span>
+<span class="linenos"> 66</span><span class="w">      </span><span class="nt">"bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">18473287680</span><span class="p">,</span>
+<span class="linenos"> 67</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.587909748829289</span><span class="p">,</span>
+<span class="linenos"> 68</span><span class="w">      </span><span class="nt">"roofline"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 69</span><span class="w">        </span><span class="nt">"t_memory_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">12.159078312380702</span><span class="p">,</span>
+<span class="linenos"> 70</span><span class="w">        </span><span class="nt">"t_compute_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.6041967227586207</span><span class="p">,</span>
+<span class="linenos"> 71</span><span class="w">        </span><span class="nt">"t_lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">12.159078312380702</span><span class="p">,</span>
+<span class="linenos"> 72</span><span class="w">        </span><span class="nt">"bound_by"</span><span class="p">:</span><span class="w"> </span><span class="s2">"memory"</span><span class="p">,</span>
+<span class="linenos"> 73</span><span class="w">        </span><span class="nt">"machine_balance_flops_per_byte"</span><span class="p">:</span><span class="w"> </span><span class="mf">152.70190219179887</span>
+<span class="linenos"> 74</span><span class="w">      </span><span class="p">},</span>
+<span class="linenos"> 75</span><span class="w">      </span><span class="nt">"fits_in_memory"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos"> 76</span><span class="w">    </span><span class="p">},</span>
+<span class="linenos"> 77</span><span class="w">    </span><span class="p">{</span>
+<span class="linenos"> 78</span><span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">54</span><span class="p">,</span>
+<span class="linenos"> 79</span><span class="w">      </span><span class="nt">"flops"</span><span class="p">:</span><span class="w"> </span><span class="mi">236543016960</span><span class="p">,</span>
+<span class="linenos"> 80</span><span class="w">      </span><span class="nt">"bytes_weight"</span><span class="p">:</span><span class="w"> </span><span class="mi">3440902144</span><span class="p">,</span>
+<span class="linenos"> 81</span><span class="w">      </span><span class="nt">"bytes_kv"</span><span class="p">:</span><span class="w"> </span><span class="mi">25367150592</span><span class="p">,</span>
+<span class="linenos"> 82</span><span class="w">      </span><span class="nt">"bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">28808052736</span><span class="p">,</span>
+<span class="linenos"> 83</span><span class="w">      </span><span class="nt">"arithmetic_intensity"</span><span class="p">:</span><span class="w"> </span><span class="mf">8.2110033304821</span><span class="p">,</span>
+<span class="linenos"> 84</span><span class="w">      </span><span class="nt">"roofline"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 85</span><span class="w">        </span><span class="nt">"t_memory_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">18.9613984966761</span><span class="p">,</span>
+<span class="linenos"> 86</span><span class="w">        </span><span class="nt">"t_compute_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.0195819696551724</span><span class="p">,</span>
+<span class="linenos"> 87</span><span class="w">        </span><span class="nt">"t_lower_bound_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">18.9613984966761</span><span class="p">,</span>
+<span class="linenos"> 88</span><span class="w">        </span><span class="nt">"bound_by"</span><span class="p">:</span><span class="w"> </span><span class="s2">"memory"</span><span class="p">,</span>
+<span class="linenos"> 89</span><span class="w">        </span><span class="nt">"machine_balance_flops_per_byte"</span><span class="p">:</span><span class="w"> </span><span class="mf">152.70190219179887</span>
+<span class="linenos"> 90</span><span class="w">      </span><span class="p">},</span>
+<span class="linenos"> 91</span><span class="w">      </span><span class="nt">"fits_in_memory"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos"> 92</span><span class="w">    </span><span class="p">}</span>
+<span class="linenos"> 93</span><span class="w">  </span><span class="p">],</span>
+<span class="linenos"> 94</span><span class="w">  </span><span class="nt">"machine_balance"</span><span class="p">:</span><span class="w"> </span><span class="mf">152.70190219179887</span><span class="p">,</span>
+<span class="linenos"> 95</span><span class="w">  </span><span class="nt">"hw_source"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos"> 96</span><span class="w">    </span><span class="nt">"host"</span><span class="p">:</span><span class="w"> </span><span class="s2">"sg-admin-260624-2348f-default0-0"</span><span class="p">,</span>
+<span class="linenos"> 97</span><span class="w">    </span><span class="nt">"gpu"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA GeForce RTX 5090 D"</span><span class="p">,</span>
+<span class="linenos"> 98</span><span class="w">    </span><span class="nt">"measured_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-09T16:11:51+00:00"</span>
+<span class="linenos"> 99</span><span class="w">  </span><span class="p">}</span>
+<span class="linenos">100</span><span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/ledger_qwen3_1.7b_ctx4096.json 全文（100 行）</code><a href="../code/results/crater/ledger_qwen3_1.7b_ctx4096.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p>阅读时请注意：这份 JSON 主要由公式生成。文件位于 results 目录，
+并不意味着里面每个数都是从真实执行中测出来的。</p>
+<h2 id="_6">怎样把公式与代码对应起来</h2>
+<p>先看 <code>Arch.from_hf()</code>：它从配置中取出哪些字段。
+再看 <code>p_attn_per_layer</code>、<code>p_ffn_per_layer</code> 和 <code>kv_bytes_per_token()</code>，
+检查它们是否就是前面推导的矩阵数与字节数。</p>
+<p>最后看 <code>prefill_flops()</code> 和 <code>decode_step()</code>。
+遇到某个假设时，在代码旁写出它针对哪种架构和输出需求。
+这个脚本含有其他模型的分支，但没有因此获得对所有模型布局的验证。</p>
+<details class="fold srcfold"><summary>labs/L0/ledger.py 全文（346 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L0 lab · 资源账本：把一个模型翻译成字节数、FLOP 数和时间下界。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">这套材料里几乎每一个优化，本质上都是在改这张账单的某一项：</span>
+<span class="linenos">  5</span><span class="sd">  - 量化改的是「权重字节」这一行</span>
+<span class="linenos">  6</span><span class="sd">  - GQA / MLA / KV 量化改的是「每 token KV 字节」这一行</span>
+<span class="linenos">  7</span><span class="sd">  - FlashAttention 改的是「attention 中间结果的访存」这一行</span>
+<span class="linenos">  8</span><span class="sd">  - continuous batching 改的是「权重字节被多少个请求摊薄」这一行</span>
+<span class="linenos">  9</span><span class="sd">  - 投机解码改的是「每次搬完权重能产出几个 token」这一行</span>
+<span class="linenos"> 10</span>
+<span class="linenos"> 11</span><span class="sd">所以先学会算这张账，后面每一章才有位置放。</span>
+<span class="linenos"> 12</span>
+<span class="linenos"> 13</span><span class="sd">用法：</span>
+<span class="linenos"> 14</span><span class="sd">    python ledger.py --config path/to/config.json --ctx 4096 --batch 1,8,32</span>
+<span class="linenos"> 15</span><span class="sd">    python ledger.py --config ... --hw hw_crater.json      # 带上实测 roofline</span>
+<span class="linenos"> 16</span><span class="sd">"""</span>
+<span class="linenos"> 17</span>
+<span class="linenos"> 18</span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos"> 19</span>
+<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="linenos"> 21</span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos"> 22</span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="linenos"> 23</span><span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="linenos"> 24</span>
+<span class="linenos"> 25</span><span class="n">BYTES</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"fp32"</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="s2">"bf16"</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">"fp16"</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">"fp8"</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">"int8"</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">"fp4"</span><span class="p">:</span> <span class="mf">0.5</span><span class="p">,</span> <span class="s2">"int4"</span><span class="p">:</span> <span class="mf">0.5</span><span class="p">}</span>
+<span class="linenos"> 26</span>
+<span class="linenos"> 27</span>
+<span class="linenos"> 28</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 29</span>
+<span class="linenos"> 30</span><span class="nd">@dataclass</span>
+<span class="linenos"> 31</span><span class="k">class</span><span class="w"> </span><span class="nc">Arch</span><span class="p">:</span>
+<span class="linenos"> 32</span><span class="w">    </span><span class="sd">"""从 HF config.json 里抽出真正影响账单的那几个数。"""</span>
+<span class="linenos"> 33</span>    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
+<span class="linenos"> 34</span>    <span class="n">n_layer</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos"> 35</span>    <span class="n">d_model</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos"> 36</span>    <span class="n">n_head</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos"> 37</span>    <span class="n">n_kv_head</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos"> 38</span>    <span class="n">d_head</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos"> 39</span>    <span class="n">d_ffn</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos"> 40</span>    <span class="n">vocab</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos"> 41</span>    <span class="n">tied_embeddings</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="linenos"> 42</span>    <span class="c1"># MoE</span>
+<span class="linenos"> 43</span>    <span class="n">n_expert</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos"> 44</span>    <span class="n">n_expert_active</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos"> 45</span>    <span class="n">d_ffn_shared</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos"> 46</span>    <span class="n">extra</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+<span class="linenos"> 47</span>
+<span class="linenos"> 48</span>    <span class="nd">@classmethod</span>
+<span class="linenos"> 49</span>    <span class="k">def</span><span class="w"> </span><span class="nf">from_hf</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">cfg</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"Arch"</span><span class="p">:</span>
+<span class="linenos"> 50</span>        <span class="n">d</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span>
+<span class="linenos"> 51</span>        <span class="n">n_head</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">]</span>
+<span class="linenos"> 52</span>        <span class="n">d_head</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"head_dim"</span><span class="p">)</span> <span class="ow">or</span> <span class="n">d</span> <span class="o">//</span> <span class="n">n_head</span>
+<span class="linenos"> 53</span>        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+<span class="linenos"> 54</span>            <span class="n">name</span><span class="o">=</span><span class="n">name</span> <span class="ow">or</span> <span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"_name_or_path"</span><span class="p">,</span> <span class="s2">"?"</span><span class="p">),</span>
+<span class="linenos"> 55</span>            <span class="n">n_layer</span><span class="o">=</span><span class="n">cfg</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">],</span>
+<span class="linenos"> 56</span>            <span class="n">d_model</span><span class="o">=</span><span class="n">d</span><span class="p">,</span>
+<span class="linenos"> 57</span>            <span class="n">n_head</span><span class="o">=</span><span class="n">n_head</span><span class="p">,</span>
+<span class="linenos"> 58</span>            <span class="n">n_kv_head</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"num_key_value_heads"</span><span class="p">,</span> <span class="n">n_head</span><span class="p">),</span>
+<span class="linenos"> 59</span>            <span class="n">d_head</span><span class="o">=</span><span class="n">d_head</span><span class="p">,</span>
+<span class="linenos"> 60</span>            <span class="n">d_ffn</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"intermediate_size"</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">d</span><span class="p">),</span>
+<span class="linenos"> 61</span>            <span class="n">vocab</span><span class="o">=</span><span class="n">cfg</span><span class="p">[</span><span class="s2">"vocab_size"</span><span class="p">],</span>
+<span class="linenos"> 62</span>            <span class="n">tied_embeddings</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"tie_word_embeddings"</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+<span class="linenos"> 63</span>            <span class="n">n_expert</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"num_experts"</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"n_routed_experts"</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">,</span>
+<span class="linenos"> 64</span>            <span class="n">n_expert_active</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"num_experts_per_tok"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">,</span>
+<span class="linenos"> 65</span>            <span class="n">d_ffn_shared</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"moe_intermediate_size"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">,</span>
+<span class="linenos"> 66</span>        <span class="p">)</span>
+<span class="linenos"> 67</span>
+<span class="linenos"> 68</span>    <span class="c1"># -- 参数量 ------------------------------------------------------------</span>
+<span class="linenos"> 69</span>
+<span class="linenos"> 70</span>    <span class="nd">@property</span>
+<span class="linenos"> 71</span>    <span class="k">def</span><span class="w"> </span><span class="nf">p_attn_per_layer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos"> 72</span><span class="w">        </span><span class="sd">"""q/k/v/o 四个投影。注意 k、v 用的是 n_kv_head——GQA 省的就是这里。"""</span>
+<span class="linenos"> 73</span>        <span class="n">q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span>
+<span class="linenos"> 74</span>        <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_kv_head</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span>
+<span class="linenos"> 75</span>        <span class="n">v</span> <span class="o">=</span> <span class="n">k</span>
+<span class="linenos"> 76</span>        <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_head</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span>
+<span class="linenos"> 77</span>        <span class="k">return</span> <span class="n">q</span> <span class="o">+</span> <span class="n">k</span> <span class="o">+</span> <span class="n">v</span> <span class="o">+</span> <span class="n">o</span>
+<span class="linenos"> 78</span>
+<span class="linenos"> 79</span>    <span class="nd">@property</span>
+<span class="linenos"> 80</span>    <span class="k">def</span><span class="w"> </span><span class="nf">p_ffn_per_layer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos"> 81</span><span class="w">        </span><span class="sd">"""SwiGLU 有三个矩阵：gate、up、down。"""</span>
+<span class="linenos"> 82</span>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_expert</span><span class="p">:</span>
+<span class="linenos"> 83</span>            <span class="n">d_e</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_ffn_shared</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_ffn</span>
+<span class="linenos"> 84</span>            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_expert</span> <span class="o">*</span> <span class="mi">3</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span> <span class="o">*</span> <span class="n">d_e</span>
+<span class="linenos"> 85</span>        <span class="k">return</span> <span class="mi">3</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_ffn</span>
+<span class="linenos"> 86</span>
+<span class="linenos"> 87</span>    <span class="nd">@property</span>
+<span class="linenos"> 88</span>    <span class="k">def</span><span class="w"> </span><span class="nf">p_ffn_active_per_layer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos"> 89</span><span class="w">        </span><span class="sd">"""MoE 下每个 token 实际点亮的 FFN 参数。稠密模型两者相等。"""</span>
+<span class="linenos"> 90</span>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_expert</span><span class="p">:</span>
+<span class="linenos"> 91</span>            <span class="n">d_e</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_ffn_shared</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_ffn</span>
+<span class="linenos"> 92</span>            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_expert_active</span> <span class="o">*</span> <span class="mi">3</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span> <span class="o">*</span> <span class="n">d_e</span>
+<span class="linenos"> 93</span>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">p_ffn_per_layer</span>
+<span class="linenos"> 94</span>
+<span class="linenos"> 95</span>    <span class="nd">@property</span>
+<span class="linenos"> 96</span>    <span class="k">def</span><span class="w"> </span><span class="nf">p_embed</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos"> 97</span>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span> <span class="o">*</span> <span class="p">(</span><span class="mi">1</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tied_embeddings</span> <span class="k">else</span> <span class="mi">2</span><span class="p">)</span>
+<span class="linenos"> 98</span>
+<span class="linenos"> 99</span>    <span class="nd">@property</span>
+<span class="linenos">100</span>    <span class="k">def</span><span class="w"> </span><span class="nf">p_total</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos">101</span>        <span class="n">per_layer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">p_attn_per_layer</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">p_ffn_per_layer</span>
+<span class="linenos">102</span>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_layer</span> <span class="o">*</span> <span class="n">per_layer</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">p_embed</span>
+<span class="linenos">103</span>
+<span class="linenos">104</span>    <span class="nd">@property</span>
+<span class="linenos">105</span>    <span class="k">def</span><span class="w"> </span><span class="nf">p_body</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos">106</span><span class="w">        </span><span class="sd">"""28 层主干里，每个 token 都要过一遍的线性层参数（不含 lm_head）。"""</span>
+<span class="linenos">107</span>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_layer</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">p_attn_per_layer</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">p_ffn_active_per_layer</span><span class="p">)</span>
+<span class="linenos">108</span>
+<span class="linenos">109</span>    <span class="nd">@property</span>
+<span class="linenos">110</span>    <span class="k">def</span><span class="w"> </span><span class="nf">p_head</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos">111</span><span class="w">        </span><span class="sd">"""lm_head：隐状态 → 词表 logits 的那个大矩阵。"""</span>
+<span class="linenos">112</span>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span>
+<span class="linenos">113</span>
+<span class="linenos">114</span>    <span class="nd">@property</span>
+<span class="linenos">115</span>    <span class="k">def</span><span class="w"> </span><span class="nf">p_linear_active</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos">116</span><span class="w">        </span><span class="sd">"""decode 一步要**读一遍**的线性层参数总量（主干 + lm_head）。</span>
+<span class="linenos">117</span>
+<span class="linenos">118</span><span class="sd">        注意这是「字节」口径：decode 每步都要把 lm_head 整个读进来。</span>
+<span class="linenos">119</span><span class="sd">        FLOP 口径在 prefill 时不同——见 prefill_flops() 的注释。</span>
+<span class="linenos">120</span><span class="sd">        """</span>
+<span class="linenos">121</span>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">p_body</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">p_head</span>
+<span class="linenos">122</span>
+<span class="linenos">123</span>    <span class="c1"># -- KV cache ----------------------------------------------------------</span>
+<span class="linenos">124</span>
+<span class="linenos">125</span>    <span class="k">def</span><span class="w"> </span><span class="nf">kv_bytes_per_token</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"bf16"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="linenos">126</span><span class="w">        </span><span class="sd">"""K 和 V 各一份，所以有那个 2。这是 decode 阶段增长最快的一项。"""</span>
+<span class="linenos">127</span>        <span class="k">return</span> <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_layer</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_kv_head</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_head</span> <span class="o">*</span> <span class="n">BYTES</span><span class="p">[</span><span class="n">kv_dtype</span><span class="p">]</span>
+<span class="linenos">128</span>
+<span class="linenos">129</span>
+<span class="linenos">130</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos">131</span>
+<span class="linenos">132</span><span class="k">def</span><span class="w"> </span><span class="nf">prefill_flops</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="n">Arch</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos">133</span><span class="w">    </span><span class="sd">"""一次 prefill 的 FLOP 拆分。</span>
+<span class="linenos">134</span>
+<span class="linenos">135</span><span class="sd">    这里有个容易高估 18% 的坑：**lm_head 只作用在最后一个 token 上**。</span>
+<span class="linenos">136</span><span class="sd">    prefill 的目的是把 prompt 的 KV 填好并产出第一个 token，</span>
+<span class="linenos">137</span><span class="sd">    中间那 S-1 个位置的 logits 没人要，引擎不会算（vLLM 只对</span>
+<span class="linenos">138</span><span class="sd">    `logits_indices` 指定的位置做 lm_head）。</span>
+<span class="linenos">139</span><span class="sd">    如果按 `p_linear_active * seq` 算，会把 lm_head 多算 S-1 倍——</span>
+<span class="linenos">140</span><span class="sd">    对 Qwen3-1.7B、S=4096 来说，凭空多出 2.55 TFLOP（总量的 18%）。</span>
+<span class="linenos">141</span><span class="sd">    """</span>
+<span class="linenos">142</span>    <span class="n">linear_body</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">p_body</span> <span class="o">*</span> <span class="n">seq</span>
+<span class="linenos">143</span>    <span class="n">linear_head</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">p_head</span> <span class="o">*</span> <span class="mi">1</span>
+<span class="linenos">144</span>    <span class="c1"># QK^T 与 AV 各一次：2 * S^2 * n_head * d_head * 2(乘加)，causal 掩掉一半</span>
+<span class="linenos">145</span>    <span class="n">attn</span> <span class="o">=</span> <span class="n">a</span><span class="o">.</span><span class="n">n_layer</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">seq</span> <span class="o">*</span> <span class="n">seq</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">n_head</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span> <span class="o">*</span> <span class="mf">0.5</span>
+<span class="linenos">146</span>    <span class="k">return</span> <span class="p">{</span><span class="s2">"linear"</span><span class="p">:</span> <span class="n">linear_body</span> <span class="o">+</span> <span class="n">linear_head</span><span class="p">,</span> <span class="s2">"linear_body"</span><span class="p">:</span> <span class="n">linear_body</span><span class="p">,</span>
+<span class="linenos">147</span>            <span class="s2">"linear_head"</span><span class="p">:</span> <span class="n">linear_head</span><span class="p">,</span> <span class="s2">"attention"</span><span class="p">:</span> <span class="n">attn</span><span class="p">,</span>
+<span class="linenos">148</span>            <span class="s2">"total"</span><span class="p">:</span> <span class="n">linear_body</span> <span class="o">+</span> <span class="n">linear_head</span> <span class="o">+</span> <span class="n">attn</span><span class="p">}</span>
+<span class="linenos">149</span>
+<span class="linenos">150</span>
+<span class="linenos">151</span><span class="k">def</span><span class="w"> </span><span class="nf">decode_step</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="n">Arch</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">batch</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span>
+<span class="linenos">152</span>                <span class="n">w_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"bf16"</span><span class="p">,</span> <span class="n">kv_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"bf16"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos">153</span><span class="w">    </span><span class="sd">"""decode 一步（每条序列出 1 个 token）的 FLOP 与字节。</span>
+<span class="linenos">154</span>
+<span class="linenos">155</span><span class="sd">    关键不对称：</span>
+<span class="linenos">156</span><span class="sd">      - 权重字节与 batch **无关**（一整批共享同一份权重）</span>
+<span class="linenos">157</span><span class="sd">      - KV 字节与 batch × 上下文长度 **成正比**</span>
+<span class="linenos">158</span><span class="sd">    这个不对称正是 continuous batching 有效、而超长上下文又会把收益吃掉的原因。</span>
+<span class="linenos">159</span><span class="sd">    """</span>
+<span class="linenos">160</span>    <span class="c1"># decode 时每条序列都要出 logits，所以 lm_head 对每个 batch 元素都算一次</span>
+<span class="linenos">161</span>    <span class="n">flops_linear</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">p_body</span> <span class="o">+</span> <span class="n">a</span><span class="o">.</span><span class="n">p_head</span><span class="p">)</span> <span class="o">*</span> <span class="n">batch</span>
+<span class="linenos">162</span>    <span class="n">flops_attn</span> <span class="o">=</span> <span class="n">a</span><span class="o">.</span><span class="n">n_layer</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">ctx</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">n_head</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">d_head</span><span class="p">)</span> <span class="o">*</span> <span class="n">batch</span>
+<span class="linenos">163</span>    <span class="n">flops</span> <span class="o">=</span> <span class="n">flops_linear</span> <span class="o">+</span> <span class="n">flops_attn</span>
+<span class="linenos">164</span>
+<span class="linenos">165</span>    <span class="n">bytes_w</span> <span class="o">=</span> <span class="n">a</span><span class="o">.</span><span class="n">p_linear_active</span> <span class="o">*</span> <span class="n">BYTES</span><span class="p">[</span><span class="n">w_dtype</span><span class="p">]</span>
+<span class="linenos">166</span>    <span class="n">bytes_kv</span> <span class="o">=</span> <span class="n">batch</span> <span class="o">*</span> <span class="n">ctx</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">kv_bytes_per_token</span><span class="p">(</span><span class="n">kv_dtype</span><span class="p">)</span>
+<span class="linenos">167</span>    <span class="n">total_bytes</span> <span class="o">=</span> <span class="n">bytes_w</span> <span class="o">+</span> <span class="n">bytes_kv</span>
+<span class="linenos">168</span>
+<span class="linenos">169</span>    <span class="k">return</span> <span class="p">{</span>
+<span class="linenos">170</span>        <span class="s2">"flops"</span><span class="p">:</span> <span class="n">flops</span><span class="p">,</span>
+<span class="linenos">171</span>        <span class="s2">"bytes_weight"</span><span class="p">:</span> <span class="n">bytes_w</span><span class="p">,</span>
+<span class="linenos">172</span>        <span class="s2">"bytes_kv"</span><span class="p">:</span> <span class="n">bytes_kv</span><span class="p">,</span>
+<span class="linenos">173</span>        <span class="s2">"bytes_total"</span><span class="p">:</span> <span class="n">total_bytes</span><span class="p">,</span>
+<span class="linenos">174</span>        <span class="s2">"arithmetic_intensity"</span><span class="p">:</span> <span class="n">flops</span> <span class="o">/</span> <span class="n">total_bytes</span><span class="p">,</span>
+<span class="linenos">175</span>    <span class="p">}</span>
+<span class="linenos">176</span>
+<span class="linenos">177</span>
+<span class="linenos">178</span><span class="k">def</span><span class="w"> </span><span class="nf">roofline_tpot_ms</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">hw</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos">179</span><span class="w">    </span><span class="sd">"""把字节数和 FLOP 数换算成时间下界。</span>
+<span class="linenos">180</span>
+<span class="linenos">181</span><span class="sd">    memory 时间 = 搬运字节 / 实测显存带宽</span>
+<span class="linenos">182</span><span class="sd">    compute 时间 = FLOP / 实测稠密 GEMM 吞吐</span>
+<span class="linenos">183</span><span class="sd">    实际耗时 &gt;= max(两者)。取不到这个下界，说明有别的开销（launch、同步、</span>
+<span class="linenos">184</span><span class="sd">    kernel 效率、CPU 调度），那就是要去 profile 的地方。</span>
+<span class="linenos">185</span><span class="sd">    """</span>
+<span class="linenos">186</span>    <span class="n">bw</span> <span class="o">=</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"memory_bandwidth"</span><span class="p">][</span><span class="s2">"copy_gbps"</span><span class="p">]</span> <span class="o">*</span> <span class="mf">1e9</span>
+<span class="linenos">187</span>    <span class="n">tflops</span> <span class="o">=</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"gemm"</span><span class="p">][</span><span class="s2">"bf16"</span><span class="p">][</span><span class="s2">"peak_tflops"</span><span class="p">]</span> <span class="o">*</span> <span class="mf">1e12</span>
+<span class="linenos">188</span>    <span class="n">t_mem</span> <span class="o">=</span> <span class="n">step</span><span class="p">[</span><span class="s2">"bytes_total"</span><span class="p">]</span> <span class="o">/</span> <span class="n">bw</span>
+<span class="linenos">189</span>    <span class="n">t_cmp</span> <span class="o">=</span> <span class="n">step</span><span class="p">[</span><span class="s2">"flops"</span><span class="p">]</span> <span class="o">/</span> <span class="n">tflops</span>
+<span class="linenos">190</span>    <span class="k">return</span> <span class="p">{</span>
+<span class="linenos">191</span>        <span class="s2">"t_memory_ms"</span><span class="p">:</span> <span class="n">t_mem</span> <span class="o">*</span> <span class="mf">1e3</span><span class="p">,</span>
+<span class="linenos">192</span>        <span class="s2">"t_compute_ms"</span><span class="p">:</span> <span class="n">t_cmp</span> <span class="o">*</span> <span class="mf">1e3</span><span class="p">,</span>
+<span class="linenos">193</span>        <span class="s2">"t_lower_bound_ms"</span><span class="p">:</span> <span class="nb">max</span><span class="p">(</span><span class="n">t_mem</span><span class="p">,</span> <span class="n">t_cmp</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e3</span><span class="p">,</span>
+<span class="linenos">194</span>        <span class="s2">"bound_by"</span><span class="p">:</span> <span class="s2">"memory"</span> <span class="k">if</span> <span class="n">t_mem</span> <span class="o">&gt;</span> <span class="n">t_cmp</span> <span class="k">else</span> <span class="s2">"compute"</span><span class="p">,</span>
+<span class="linenos">195</span>        <span class="s2">"machine_balance_flops_per_byte"</span><span class="p">:</span> <span class="n">tflops</span> <span class="o">/</span> <span class="n">bw</span><span class="p">,</span>
+<span class="linenos">196</span>    <span class="p">}</span>
+<span class="linenos">197</span>
+<span class="linenos">198</span>
+<span class="linenos">199</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos">200</span>
+<span class="linenos">201</span><span class="k">def</span><span class="w"> </span><span class="nf">human_bytes</span><span class="p">(</span><span class="n">n</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="linenos">202</span>    <span class="k">for</span> <span class="n">unit</span><span class="p">,</span> <span class="n">div</span> <span class="ow">in</span> <span class="p">((</span><span class="s2">"TB"</span><span class="p">,</span> <span class="mf">1e12</span><span class="p">),</span> <span class="p">(</span><span class="s2">"GB"</span><span class="p">,</span> <span class="mf">1e9</span><span class="p">),</span> <span class="p">(</span><span class="s2">"MB"</span><span class="p">,</span> <span class="mf">1e6</span><span class="p">),</span> <span class="p">(</span><span class="s2">"KB"</span><span class="p">,</span> <span class="mf">1e3</span><span class="p">)):</span>
+<span class="linenos">203</span>        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="n">div</span><span class="p">:</span>
+<span class="linenos">204</span>            <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">n</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">div</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">unit</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">205</span>    <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">n</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> B"</span>
+<span class="linenos">206</span>
+<span class="linenos">207</span>
+<span class="linenos">208</span><span class="k">def</span><span class="w"> </span><span class="nf">human_count</span><span class="p">(</span><span class="n">n</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="linenos">209</span>    <span class="k">for</span> <span class="n">unit</span><span class="p">,</span> <span class="n">div</span> <span class="ow">in</span> <span class="p">((</span><span class="s2">"B"</span><span class="p">,</span> <span class="mf">1e9</span><span class="p">),</span> <span class="p">(</span><span class="s2">"M"</span><span class="p">,</span> <span class="mf">1e6</span><span class="p">),</span> <span class="p">(</span><span class="s2">"K"</span><span class="p">,</span> <span class="mf">1e3</span><span class="p">)):</span>
+<span class="linenos">210</span>        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="n">div</span><span class="p">:</span>
+<span class="linenos">211</span>            <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">n</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">div</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}{</span><span class="n">unit</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">212</span>    <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">n</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">213</span>
+<span class="linenos">214</span>
+<span class="linenos">215</span><span class="k">def</span><span class="w"> </span><span class="nf">report</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="n">Arch</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">batches</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">hw</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+<span class="linenos">216</span>           <span class="n">w_dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">kv_dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos">217</span>    <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"model"</span><span class="p">:</span> <span class="n">a</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="s2">"ctx"</span><span class="p">:</span> <span class="n">ctx</span><span class="p">,</span> <span class="s2">"w_dtype"</span><span class="p">:</span> <span class="n">w_dtype</span><span class="p">,</span> <span class="s2">"kv_dtype"</span><span class="p">:</span> <span class="n">kv_dtype</span><span class="p">}</span>
+<span class="linenos">218</span>
+<span class="linenos">219</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="s1">'='</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">78</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">220</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">   L=</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">n_layer</span><span class="si">}</span><span class="s2"> d=</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">d_model</span><span class="si">}</span><span class="s2"> heads=</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">n_head</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">n_kv_head</span><span class="si">}</span><span class="s2">(kv) "</span>
+<span class="linenos">221</span>          <span class="sa">f</span><span class="s2">"d_head=</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">d_head</span><span class="si">}</span><span class="s2"> ffn=</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">d_ffn</span><span class="si">}</span><span class="s2"> vocab=</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">vocab</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">222</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'='</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">78</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">223</span>
+<span class="linenos">224</span>    <span class="c1"># --- 参数账 ---</span>
+<span class="linenos">225</span>    <span class="n">p_attn</span> <span class="o">=</span> <span class="n">a</span><span class="o">.</span><span class="n">n_layer</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">p_attn_per_layer</span>
+<span class="linenos">226</span>    <span class="n">p_ffn</span> <span class="o">=</span> <span class="n">a</span><span class="o">.</span><span class="n">n_layer</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">p_ffn_per_layer</span>
+<span class="linenos">227</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">[1] 参数账"</span><span class="p">)</span>
+<span class="linenos">228</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  attention 投影      </span><span class="si">{</span><span class="n">human_count</span><span class="p">(</span><span class="n">p_attn</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">p_attn</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">a</span><span class="o">.</span><span class="n">p_total</span><span class="si">:</span><span class="s2">5.1%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">229</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  FFN                 </span><span class="si">{</span><span class="n">human_count</span><span class="p">(</span><span class="n">p_ffn</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">p_ffn</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">a</span><span class="o">.</span><span class="n">p_total</span><span class="si">:</span><span class="s2">5.1%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">230</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  embedding</span><span class="si">{</span><span class="s1">'(tied)'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">a</span><span class="o">.</span><span class="n">tied_embeddings</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'+lm_head'</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">231</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">human_count</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">p_embed</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">  (</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">p_embed</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">a</span><span class="o">.</span><span class="n">p_total</span><span class="si">:</span><span class="s2">5.1%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">232</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'总计'</span><span class="si">:</span><span class="s2">&lt;19</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">human_count</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">p_total</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">233</span>          <span class="sa">f</span><span class="s2">"   权重占显存 @</span><span class="si">{</span><span class="n">w_dtype</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">p_total</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">BYTES</span><span class="p">[</span><span class="n">w_dtype</span><span class="p">])</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">234</span>    <span class="n">out</span><span class="p">[</span><span class="s2">"params"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"attn"</span><span class="p">:</span> <span class="n">p_attn</span><span class="p">,</span> <span class="s2">"ffn"</span><span class="p">:</span> <span class="n">p_ffn</span><span class="p">,</span> <span class="s2">"embed"</span><span class="p">:</span> <span class="n">a</span><span class="o">.</span><span class="n">p_embed</span><span class="p">,</span>
+<span class="linenos">235</span>                     <span class="s2">"total"</span><span class="p">:</span> <span class="n">a</span><span class="o">.</span><span class="n">p_total</span><span class="p">,</span>
+<span class="linenos">236</span>                     <span class="s2">"weight_bytes"</span><span class="p">:</span> <span class="n">a</span><span class="o">.</span><span class="n">p_total</span> <span class="o">*</span> <span class="n">BYTES</span><span class="p">[</span><span class="n">w_dtype</span><span class="p">]}</span>
+<span class="linenos">237</span>
+<span class="linenos">238</span>    <span class="c1"># --- KV 账 ---</span>
+<span class="linenos">239</span>    <span class="n">kv_tok</span> <span class="o">=</span> <span class="n">a</span><span class="o">.</span><span class="n">kv_bytes_per_token</span><span class="p">(</span><span class="n">kv_dtype</span><span class="p">)</span>
+<span class="linenos">240</span>    <span class="n">kv_nogqa</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">n_layer</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">n_head</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">d_head</span> <span class="o">*</span> <span class="n">BYTES</span><span class="p">[</span><span class="n">kv_dtype</span><span class="p">]</span>
+<span class="linenos">241</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">[2] KV cache 账"</span><span class="p">)</span>
+<span class="linenos">242</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  每 token           </span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">kv_tok</span><span class="p">)</span><span class="si">}</span><span class="s2">   "</span>
+<span class="linenos">243</span>          <span class="sa">f</span><span class="s2">"(若不用 GQA 会是 </span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">kv_nogqa</span><span class="p">)</span><span class="si">}</span><span class="s2">，省了 </span><span class="si">{</span><span class="n">kv_nogqa</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">kv_tok</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">×)"</span><span class="p">)</span>
+<span class="linenos">244</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">ctx</span><span class="si">}</span><span class="s2"> token 上下文  </span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">kv_tok</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ctx</span><span class="p">)</span><span class="si">}</span><span class="s2">  / 每条序列"</span><span class="p">)</span>
+<span class="linenos">245</span>    <span class="n">out</span><span class="p">[</span><span class="s2">"kv"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"bytes_per_token"</span><span class="p">:</span> <span class="n">kv_tok</span><span class="p">,</span> <span class="s2">"bytes_at_ctx"</span><span class="p">:</span> <span class="n">kv_tok</span> <span class="o">*</span> <span class="n">ctx</span><span class="p">,</span>
+<span class="linenos">246</span>                 <span class="s2">"gqa_saving"</span><span class="p">:</span> <span class="n">kv_nogqa</span> <span class="o">/</span> <span class="n">kv_tok</span><span class="p">}</span>
+<span class="linenos">247</span>
+<span class="linenos">248</span>    <span class="c1"># --- prefill ---</span>
+<span class="linenos">249</span>    <span class="n">pf</span> <span class="o">=</span> <span class="n">prefill_flops</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+<span class="linenos">250</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">[3] prefill </span><span class="si">{</span><span class="n">ctx</span><span class="si">}</span><span class="s2"> token 的 FLOP"</span><span class="p">)</span>
+<span class="linenos">251</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  线性层(主干)       </span><span class="si">{</span><span class="n">pf</span><span class="p">[</span><span class="s1">'linear_body'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e12</span><span class="si">:</span><span class="s2">8.2f</span><span class="si">}</span><span class="s2"> TFLOP  (</span><span class="si">{</span><span class="n">pf</span><span class="p">[</span><span class="s1">'linear_body'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">pf</span><span class="p">[</span><span class="s1">'total'</span><span class="p">]</span><span class="si">:</span><span class="s2">5.1%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">252</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  lm_head(仅末位)    </span><span class="si">{</span><span class="n">pf</span><span class="p">[</span><span class="s1">'linear_head'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e12</span><span class="si">:</span><span class="s2">8.4f</span><span class="si">}</span><span class="s2"> TFLOP  (</span><span class="si">{</span><span class="n">pf</span><span class="p">[</span><span class="s1">'linear_head'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">pf</span><span class="p">[</span><span class="s1">'total'</span><span class="p">]</span><span class="si">:</span><span class="s2">5.2%</span><span class="si">}</span><span class="s2">)"</span>
+<span class="linenos">253</span>          <span class="sa">f</span><span class="s2">"   ← 只算最后一个 token，不是 S 个"</span><span class="p">)</span>
+<span class="linenos">254</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  attention 打分     </span><span class="si">{</span><span class="n">pf</span><span class="p">[</span><span class="s1">'attention'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e12</span><span class="si">:</span><span class="s2">8.2f</span><span class="si">}</span><span class="s2"> TFLOP  (</span><span class="si">{</span><span class="n">pf</span><span class="p">[</span><span class="s1">'attention'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">pf</span><span class="p">[</span><span class="s1">'total'</span><span class="p">]</span><span class="si">:</span><span class="s2">5.1%</span><span class="si">}</span><span class="s2">)"</span>
+<span class="linenos">255</span>          <span class="sa">f</span><span class="s2">"   ← 随 S² 增长，长上下文时会反超"</span><span class="p">)</span>
+<span class="linenos">256</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'总计'</span><span class="si">:</span><span class="s2">&lt;18</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">pf</span><span class="p">[</span><span class="s1">'total'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e12</span><span class="si">:</span><span class="s2">8.2f</span><span class="si">}</span><span class="s2"> TFLOP"</span><span class="p">)</span>
+<span class="linenos">257</span>    <span class="n">out</span><span class="p">[</span><span class="s2">"prefill"</span><span class="p">]</span> <span class="o">=</span> <span class="n">pf</span>
+<span class="linenos">258</span>    <span class="k">if</span> <span class="n">hw</span><span class="p">:</span>
+<span class="linenos">259</span>        <span class="n">t</span> <span class="o">=</span> <span class="n">pf</span><span class="p">[</span><span class="s2">"total"</span><span class="p">]</span> <span class="o">/</span> <span class="p">(</span><span class="n">hw</span><span class="p">[</span><span class="s2">"gemm"</span><span class="p">][</span><span class="s2">"bf16"</span><span class="p">][</span><span class="s2">"peak_tflops"</span><span class="p">]</span> <span class="o">*</span> <span class="mf">1e12</span><span class="p">)</span>
+<span class="linenos">260</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  → 用实测 </span><span class="si">{</span><span class="n">hw</span><span class="p">[</span><span class="s1">'gemm'</span><span class="p">][</span><span class="s1">'bf16'</span><span class="p">][</span><span class="s1">'peak_tflops'</span><span class="p">]</span><span class="si">}</span><span class="s2"> TFLOPS 算，"</span>
+<span class="linenos">261</span>              <span class="sa">f</span><span class="s2">"理论下界 </span><span class="si">{</span><span class="n">t</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e3</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> ms（TTFT 不可能低于它）"</span><span class="p">)</span>
+<span class="linenos">262</span>        <span class="n">out</span><span class="p">[</span><span class="s2">"prefill"</span><span class="p">][</span><span class="s2">"t_lower_bound_ms"</span><span class="p">]</span> <span class="o">=</span> <span class="n">t</span> <span class="o">*</span> <span class="mf">1e3</span>
+<span class="linenos">263</span>
+<span class="linenos">264</span>    <span class="c1"># --- 显存预算：真正决定 batch 上限的东西 ---</span>
+<span class="linenos">265</span>    <span class="n">kv_budget</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">266</span>    <span class="n">max_seqs</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos">267</span>    <span class="k">if</span> <span class="n">hw</span><span class="p">:</span>
+<span class="linenos">268</span>        <span class="n">total</span> <span class="o">=</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"device"</span><span class="p">][</span><span class="s2">"total_mem_gb"</span><span class="p">]</span> <span class="o">*</span> <span class="mf">1e9</span>
+<span class="linenos">269</span>        <span class="n">util</span> <span class="o">=</span> <span class="mf">0.90</span>                      <span class="c1"># vLLM 默认 gpu_memory_utilization</span>
+<span class="linenos">270</span>        <span class="n">overhead</span> <span class="o">=</span> <span class="mf">1.5e9</span>                 <span class="c1"># 激活、通信缓冲、CUDA context 的粗估</span>
+<span class="linenos">271</span>        <span class="n">kv_budget</span> <span class="o">=</span> <span class="n">total</span> <span class="o">*</span> <span class="n">util</span> <span class="o">-</span> <span class="n">a</span><span class="o">.</span><span class="n">p_total</span> <span class="o">*</span> <span class="n">BYTES</span><span class="p">[</span><span class="n">w_dtype</span><span class="p">]</span> <span class="o">-</span> <span class="n">overhead</span>
+<span class="linenos">272</span>        <span class="n">max_seqs</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">kv_budget</span> <span class="o">/</span> <span class="p">(</span><span class="n">kv_tok</span> <span class="o">*</span> <span class="n">ctx</span><span class="p">))</span>
+<span class="linenos">273</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">[3.5] 显存预算（</span><span class="si">{</span><span class="n">hw</span><span class="p">[</span><span class="s1">'device'</span><span class="p">][</span><span class="s1">'name'</span><span class="p">]</span><span class="si">}</span><span class="s2">, </span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB, util=0.90）"</span><span class="p">)</span>
+<span class="linenos">274</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  权重 </span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">p_total</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">BYTES</span><span class="p">[</span><span class="n">w_dtype</span><span class="p">])</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">275</span>              <span class="sa">f</span><span class="s2">" + 杂项 ~</span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">overhead</span><span class="p">)</span><span class="si">}</span><span class="s2"> ⇒ 留给 KV 约 </span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">kv_budget</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">276</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  在 </span><span class="si">{</span><span class="n">ctx</span><span class="si">}</span><span class="s2"> token 上下文下，最多同时驻留 ≈ </span><span class="si">{</span><span class="n">max_seqs</span><span class="si">}</span><span class="s2"> 条序列。"</span><span class="p">)</span>
+<span class="linenos">277</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  这才是 batch 的物理天花板——不是调度器想开多大就开多大。"</span><span class="p">)</span>
+<span class="linenos">278</span>        <span class="n">out</span><span class="p">[</span><span class="s2">"kv_budget_bytes"</span><span class="p">]</span> <span class="o">=</span> <span class="n">kv_budget</span>
+<span class="linenos">279</span>        <span class="n">out</span><span class="p">[</span><span class="s2">"max_concurrent_seqs"</span><span class="p">]</span> <span class="o">=</span> <span class="n">max_seqs</span>
+<span class="linenos">280</span>
+<span class="linenos">281</span>    <span class="c1"># --- decode ---</span>
+<span class="linenos">282</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">[4] decode 一步（上下文 </span><span class="si">{</span><span class="n">ctx</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos">283</span>    <span class="n">hdr</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'FLOP'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'权重字节'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'KV字节'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'强度'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">284</span>    <span class="k">if</span> <span class="n">hw</span><span class="p">:</span>
+<span class="linenos">285</span>        <span class="n">hdr</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="s1">'访存ms'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'算力ms'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'下界ms'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'瓶颈'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'tok/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'装得下'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">286</span>    <span class="nb">print</span><span class="p">(</span><span class="n">hdr</span><span class="p">)</span>
+<span class="linenos">287</span>    <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">288</span>    <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">batches</span><span class="p">:</span>
+<span class="linenos">289</span>        <span class="n">st</span> <span class="o">=</span> <span class="n">decode_step</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">w_dtype</span><span class="o">=</span><span class="n">w_dtype</span><span class="p">,</span> <span class="n">kv_dtype</span><span class="o">=</span><span class="n">kv_dtype</span><span class="p">)</span>
+<span class="linenos">290</span>        <span class="n">line</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">b</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">st</span><span class="p">[</span><span class="s1">'flops'</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2">G </span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s1">'bytes_weight'</span><span class="p">])</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">291</span>                <span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="n">human_bytes</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s1">'bytes_kv'</span><span class="p">])</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">st</span><span class="p">[</span><span class="s1">'arithmetic_intensity'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;7.1f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">292</span>        <span class="n">row</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"batch"</span><span class="p">:</span> <span class="n">b</span><span class="p">,</span> <span class="o">**</span><span class="n">st</span><span class="p">}</span>
+<span class="linenos">293</span>        <span class="k">if</span> <span class="n">hw</span><span class="p">:</span>
+<span class="linenos">294</span>            <span class="n">rf</span> <span class="o">=</span> <span class="n">roofline_tpot_ms</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">hw</span><span class="p">)</span>
+<span class="linenos">295</span>            <span class="n">fits</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"bytes_kv"</span><span class="p">]</span> <span class="o">&lt;=</span> <span class="n">kv_budget</span>
+<span class="linenos">296</span>            <span class="n">line</span> <span class="o">+=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="n">rf</span><span class="p">[</span><span class="s1">'t_memory_ms'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">rf</span><span class="p">[</span><span class="s1">'t_compute_ms'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">297</span>                     <span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="n">rf</span><span class="p">[</span><span class="s1">'t_lower_bound_ms'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">rf</span><span class="p">[</span><span class="s1">'bound_by'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">298</span>                     <span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="n">b</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">rf</span><span class="p">[</span><span class="s1">'t_lower_bound_ms'</span><span class="p">]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e-3</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;9.0f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">299</span>                     <span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="s1">'是'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">fits</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'✗ 放不下'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">300</span>            <span class="n">row</span><span class="p">[</span><span class="s2">"roofline"</span><span class="p">]</span> <span class="o">=</span> <span class="n">rf</span>
+<span class="linenos">301</span>            <span class="n">row</span><span class="p">[</span><span class="s2">"fits_in_memory"</span><span class="p">]</span> <span class="o">=</span> <span class="n">fits</span>
+<span class="linenos">302</span>        <span class="nb">print</span><span class="p">(</span><span class="n">line</span><span class="p">)</span>
+<span class="linenos">303</span>        <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">row</span><span class="p">)</span>
+<span class="linenos">304</span>    <span class="n">out</span><span class="p">[</span><span class="s2">"decode"</span><span class="p">]</span> <span class="o">=</span> <span class="n">rows</span>
+<span class="linenos">305</span>
+<span class="linenos">306</span>    <span class="k">if</span> <span class="n">hw</span><span class="p">:</span>
+<span class="linenos">307</span>        <span class="n">mb</span> <span class="o">=</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"gemm"</span><span class="p">][</span><span class="s2">"bf16"</span><span class="p">][</span><span class="s2">"peak_tflops"</span><span class="p">]</span> <span class="o">*</span> <span class="mf">1e12</span> <span class="o">/</span> <span class="p">(</span><span class="n">hw</span><span class="p">[</span><span class="s2">"memory_bandwidth"</span><span class="p">][</span><span class="s2">"copy_gbps"</span><span class="p">]</span> <span class="o">*</span> <span class="mf">1e9</span><span class="p">)</span>
+<span class="linenos">308</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  机器平衡点 (machine balance) = </span><span class="si">{</span><span class="n">mb</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> FLOP/byte。"</span><span class="p">)</span>
+<span class="linenos">309</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  decode 的算术强度远低于它 ⇒ 天然 memory-bound：GPU 绝大部分算力在空转，"</span><span class="p">)</span>
+<span class="linenos">310</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  时间几乎全花在把权重和 KV 从显存搬进片上。这是所有 decode 优化的出发点。"</span><span class="p">)</span>
+<span class="linenos">311</span>        <span class="n">out</span><span class="p">[</span><span class="s2">"machine_balance"</span><span class="p">]</span> <span class="o">=</span> <span class="n">mb</span>
+<span class="linenos">312</span>
+<span class="linenos">313</span>    <span class="nb">print</span><span class="p">()</span>
+<span class="linenos">314</span>    <span class="k">return</span> <span class="n">out</span>
+<span class="linenos">315</span>
+<span class="linenos">316</span>
+<span class="linenos">317</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">318</span>    <span class="n">ap</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+<span class="linenos">319</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--config"</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s2">"HF config.json 路径"</span><span class="p">)</span>
+<span class="linenos">320</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--name"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">""</span><span class="p">)</span>
+<span class="linenos">321</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--ctx"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">4096</span><span class="p">)</span>
+<span class="linenos">322</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--batch"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"1,8,32,128"</span><span class="p">)</span>
+<span class="linenos">323</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--w-dtype"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">choices</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">BYTES</span><span class="p">))</span>
+<span class="linenos">324</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--kv-dtype"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"bf16"</span><span class="p">,</span> <span class="n">choices</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">BYTES</span><span class="p">))</span>
+<span class="linenos">325</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--hw"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s2">"probe_hw.py 产出的 JSON"</span><span class="p">)</span>
+<span class="linenos">326</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--out"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="linenos">327</span>    <span class="n">args</span> <span class="o">=</span> <span class="n">ap</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos">328</span>
+<span class="linenos">329</span>    <span class="n">cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">config</span><span class="p">)</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+<span class="linenos">330</span>    <span class="c1"># 多模态 config 把语言塔放在 text_config 里</span>
+<span class="linenos">331</span>    <span class="k">if</span> <span class="s2">"text_config"</span> <span class="ow">in</span> <span class="n">cfg</span> <span class="ow">and</span> <span class="s2">"hidden_size"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">cfg</span><span class="p">:</span>
+<span class="linenos">332</span>        <span class="n">cfg</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"text_config"</span><span class="p">]</span>
+<span class="linenos">333</span>    <span class="n">arch</span> <span class="o">=</span> <span class="n">Arch</span><span class="o">.</span><span class="n">from_hf</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">name</span> <span class="ow">or</span> <span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">config</span><span class="p">)</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+<span class="linenos">334</span>    <span class="n">hw</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">hw</span><span class="p">)</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span> <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">hw</span> <span class="k">else</span> <span class="kc">None</span>
+<span class="linenos">335</span>    <span class="n">batches</span> <span class="o">=</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">args</span><span class="o">.</span><span class="n">batch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">","</span><span class="p">)]</span>
+<span class="linenos">336</span>
+<span class="linenos">337</span>    <span class="n">res</span> <span class="o">=</span> <span class="n">report</span><span class="p">(</span><span class="n">arch</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">ctx</span><span class="p">,</span> <span class="n">batches</span><span class="p">,</span> <span class="n">hw</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">w_dtype</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">)</span>
+<span class="linenos">338</span>    <span class="k">if</span> <span class="n">hw</span><span class="p">:</span>
+<span class="linenos">339</span>        <span class="n">res</span><span class="p">[</span><span class="s2">"hw_source"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"host"</span><span class="p">:</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"device"</span><span class="p">][</span><span class="s2">"host"</span><span class="p">],</span> <span class="s2">"gpu"</span><span class="p">:</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"device"</span><span class="p">][</span><span class="s2">"name"</span><span class="p">],</span>
+<span class="linenos">340</span>                            <span class="s2">"measured_at"</span><span class="p">:</span> <span class="n">hw</span><span class="p">[</span><span class="s2">"measured_at"</span><span class="p">]}</span>
+<span class="linenos">341</span>    <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">out</span><span class="p">:</span>
+<span class="linenos">342</span>        <span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">out</span><span class="p">)</span><span class="o">.</span><span class="n">write_text</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">res</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span> <span class="n">encoding</span><span class="o">=</span><span class="s2">"utf-8"</span><span class="p">)</span>
+<span class="linenos">343</span>
+<span class="linenos">344</span>
+<span class="linenos">345</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">346</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/ledger.py 全文（346 行）</code><a href="../code/labs/L0/ledger.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p>硬件参照来自另一份脚本。它测试的是若干具体操作，而不是模型请求本身：</p>
+<details class="fold srcfold"><summary>labs/L0/probe_hw.py 全文（234 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L0 lab · 测出这张卡真正的 roofline 顶点，而不是抄 datasheet。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">厂商标称值（spec sheet）几乎永远达不到：显存带宽标称是引脚速率的理论上限，</span>
+<span class="linenos">  5</span><span class="sd">tensor core TFLOPS 常常是 2:4 稀疏后的数字。做容量规划和判断「这个 kernel 慢不慢」时，</span>
+<span class="linenos">  6</span><span class="sd">必须用**这台机器实际能达到的**上限做分母。</span>
+<span class="linenos">  7</span>
+<span class="linenos">  8</span><span class="sd">本脚本测四件事：</span>
+<span class="linenos">  9</span><span class="sd">  1. 显存带宽 (device-to-device)  —— decode 阶段的分母</span>
+<span class="linenos"> 10</span><span class="sd">  2. 稠密 GEMM 吞吐 (bf16 / fp16 / fp8)  —— prefill 阶段的分母</span>
+<span class="linenos"> 11</span><span class="sd">  3. kernel launch 开销  —— 解释 CUDA Graph 为什么有用</span>
+<span class="linenos"> 12</span><span class="sd">  4. H2D / D2H PCIe 带宽  —— 权重加载与 KV 传输的分母</span>
+<span class="linenos"> 13</span>
+<span class="linenos"> 14</span><span class="sd">输出 JSON 到 stdout 或 --out 指定的文件。</span>
+<span class="linenos"> 15</span><span class="sd">"""</span>
+<span class="linenos"> 16</span>
+<span class="linenos"> 17</span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos"> 18</span>
+<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos"> 21</span><span class="kn">import</span><span class="w"> </span><span class="nn">platform</span>
+<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">statistics</span>
+<span class="linenos"> 23</span><span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="linenos"> 24</span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos"> 25</span><span class="kn">from</span><span class="w"> </span><span class="nn">datetime</span><span class="w"> </span><span class="kn">import</span> <span class="n">datetime</span><span class="p">,</span> <span class="n">timezone</span>
+<span class="linenos"> 26</span>
+<span class="linenos"> 27</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 28</span>
+<span class="linenos"> 29</span>
+<span class="linenos"> 30</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 31</span><span class="c1"># 计时基元：用 CUDA event 而不是 time.time()。</span>
+<span class="linenos"> 32</span><span class="c1"># CUDA kernel 是异步下发的，host 侧计时器测到的是「下发耗时」而非「执行耗时」。</span>
+<span class="linenos"> 33</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 34</span>
+<span class="linenos"> 35</span><span class="k">def</span><span class="w"> </span><span class="nf">time_cuda</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">warmup</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">,</span> <span class="n">iters</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="linenos"> 36</span><span class="w">    </span><span class="sd">"""返回单次执行的中位耗时（毫秒）。"""</span>
+<span class="linenos"> 37</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">warmup</span><span class="p">):</span>
+<span class="linenos"> 38</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 39</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 40</span>
+<span class="linenos"> 41</span>    <span class="n">samples</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos"> 42</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">iters</span><span class="p">):</span>
+<span class="linenos"> 43</span>        <span class="n">start</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 44</span>        <span class="n">end</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 45</span>        <span class="n">start</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 46</span>        <span class="n">fn</span><span class="p">()</span>
+<span class="linenos"> 47</span>        <span class="n">end</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos"> 48</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos"> 49</span>        <span class="n">samples</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">start</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">end</span><span class="p">))</span>
+<span class="linenos"> 50</span>    <span class="k">return</span> <span class="n">statistics</span><span class="o">.</span><span class="n">median</span><span class="p">(</span><span class="n">samples</span><span class="p">)</span>
+<span class="linenos"> 51</span>
+<span class="linenos"> 52</span>
+<span class="linenos"> 53</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 54</span><span class="c1"># 1. 显存带宽</span>
+<span class="linenos"> 55</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 56</span>
+<span class="linenos"> 57</span><span class="k">def</span><span class="w"> </span><span class="nf">probe_memory_bandwidth</span><span class="p">(</span><span class="n">mb</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">512</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos"> 58</span><span class="w">    </span><span class="sd">"""用大块 copy 逼近显存带宽上限。</span>
+<span class="linenos"> 59</span>
+<span class="linenos"> 60</span><span class="sd">    copy_ 读一遍写一遍，所以搬运字节数 = 2 * size。</span>
+<span class="linenos"> 61</span><span class="sd">    选 512MB 是为了确保远超 L2（5090 约 96MB，L40S 约 96MB），</span>
+<span class="linenos"> 62</span><span class="sd">    否则测到的是 L2 带宽而不是显存带宽。</span>
+<span class="linenos"> 63</span><span class="sd">    """</span>
+<span class="linenos"> 64</span>    <span class="n">n</span> <span class="o">=</span> <span class="n">mb</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">//</span> <span class="mi">2</span>  <span class="c1"># fp16 元素数</span>
+<span class="linenos"> 65</span>    <span class="n">src</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos"> 66</span>    <span class="n">dst</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">src</span><span class="p">)</span>
+<span class="linenos"> 67</span>    <span class="n">src</span><span class="o">.</span><span class="n">normal_</span><span class="p">()</span>
+<span class="linenos"> 68</span>
+<span class="linenos"> 69</span>    <span class="n">ms</span> <span class="o">=</span> <span class="n">time_cuda</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">dst</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">src</span><span class="p">))</span>
+<span class="linenos"> 70</span>    <span class="n">moved_bytes</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">src</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">src</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
+<span class="linenos"> 71</span>    <span class="n">gbps</span> <span class="o">=</span> <span class="n">moved_bytes</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
+<span class="linenos"> 72</span>
+<span class="linenos"> 73</span>    <span class="c1"># 只读的场景（decode 读 KV cache 更接近这个）用 sum 近似</span>
+<span class="linenos"> 74</span>    <span class="n">ms_read</span> <span class="o">=</span> <span class="n">time_cuda</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">src</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+<span class="linenos"> 75</span>    <span class="n">read_gbps</span> <span class="o">=</span> <span class="n">src</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">src</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms_read</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
+<span class="linenos"> 76</span>
+<span class="linenos"> 77</span>    <span class="k">return</span> <span class="p">{</span>
+<span class="linenos"> 78</span>        <span class="s2">"copy_gbps"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">gbps</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos"> 79</span>        <span class="s2">"readonly_gbps"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">read_gbps</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos"> 80</span>        <span class="s2">"buffer_mb"</span><span class="p">:</span> <span class="n">mb</span><span class="p">,</span>
+<span class="linenos"> 81</span>        <span class="s2">"note"</span><span class="p">:</span> <span class="s2">"copy_ 计入读+写两份流量；readonly 用 reduction 近似纯读"</span><span class="p">,</span>
+<span class="linenos"> 82</span>    <span class="p">}</span>
+<span class="linenos"> 83</span>
+<span class="linenos"> 84</span>
+<span class="linenos"> 85</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 86</span><span class="c1"># 2. 稠密 GEMM 吞吐</span>
+<span class="linenos"> 87</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 88</span>
+<span class="linenos"> 89</span><span class="k">def</span><span class="w"> </span><span class="nf">probe_gemm</span><span class="p">(</span><span class="n">sizes</span><span class="o">=</span><span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">8192</span><span class="p">))</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos"> 90</span><span class="w">    </span><span class="sd">"""测 tensor core 实际能到的稠密 TFLOPS。</span>
+<span class="linenos"> 91</span>
+<span class="linenos"> 92</span><span class="sd">    GEMM 的 FLOP 数 = 2*M*N*K（一次乘 + 一次加）。</span>
+<span class="linenos"> 93</span><span class="sd">    用方阵 M=N=K，规模要够大才能摊薄启动与尾效应。</span>
+<span class="linenos"> 94</span><span class="sd">    """</span>
+<span class="linenos"> 95</span>    <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos"> 96</span>    <span class="k">for</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">[(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="s2">"bf16"</span><span class="p">),</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span> <span class="s2">"fp16"</span><span class="p">)]:</span>
+<span class="linenos"> 97</span>        <span class="n">best</span> <span class="o">=</span> <span class="mf">0.0</span>
+<span class="linenos"> 98</span>        <span class="n">detail</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos"> 99</span>        <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sizes</span><span class="p">:</span>
+<span class="linenos">100</span>            <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">s</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">101</span>            <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">s</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">102</span>            <span class="n">ms</span> <span class="o">=</span> <span class="n">time_cuda</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">mm</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">),</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">iters</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+<span class="linenos">103</span>            <span class="n">tflops</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">s</span><span class="o">**</span><span class="mi">3</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e12</span>
+<span class="linenos">104</span>            <span class="n">detail</span><span class="p">[</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="s2">"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">round</span><span class="p">(</span><span class="n">tflops</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="linenos">105</span>            <span class="n">best</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">best</span><span class="p">,</span> <span class="n">tflops</span><span class="p">)</span>
+<span class="linenos">106</span>            <span class="k">del</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span>
+<span class="linenos">107</span>            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">108</span>        <span class="n">out</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"peak_tflops"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">best</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="s2">"by_size"</span><span class="p">:</span> <span class="n">detail</span><span class="p">}</span>
+<span class="linenos">109</span>
+<span class="linenos">110</span>    <span class="c1"># FP8：Ada(sm_89) 与 Blackwell(sm_120) 都有 FP8 tensor core，</span>
+<span class="linenos">111</span>    <span class="c1"># 走 torch._scaled_mm（per-tensor scale）。</span>
+<span class="linenos">112</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos">113</span>        <span class="n">s</span> <span class="o">=</span> <span class="mi">8192</span>
+<span class="linenos">114</span>        <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">s</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">)</span>
+<span class="linenos">115</span>        <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">s</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">)</span><span class="o">.</span><span class="n">t</span><span class="p">()</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">t</span><span class="p">()</span>
+<span class="linenos">116</span>        <span class="n">scale</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">117</span>        <span class="n">ms</span> <span class="o">=</span> <span class="n">time_cuda</span><span class="p">(</span>
+<span class="linenos">118</span>            <span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">_scaled_mm</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">scale_a</span><span class="o">=</span><span class="n">scale</span><span class="p">,</span> <span class="n">scale_b</span><span class="o">=</span><span class="n">scale</span><span class="p">,</span>
+<span class="linenos">119</span>                                     <span class="n">out_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">),</span>
+<span class="linenos">120</span>            <span class="n">warmup</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">iters</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+<span class="linenos">121</span>        <span class="n">out</span><span class="p">[</span><span class="s2">"fp8_e4m3"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"peak_tflops"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">s</span><span class="o">**</span><span class="mi">3</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e12</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos">122</span>                           <span class="s2">"by_size"</span><span class="p">:</span> <span class="p">{</span><span class="nb">str</span><span class="p">(</span><span class="n">s</span><span class="p">):</span> <span class="nb">round</span><span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">s</span><span class="o">**</span><span class="mi">3</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e12</span><span class="p">,</span> <span class="mi">1</span><span class="p">)}}</span>
+<span class="linenos">123</span>        <span class="k">del</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span>
+<span class="linenos">124</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos">125</span>    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+<span class="linenos">126</span>        <span class="n">out</span><span class="p">[</span><span class="s2">"fp8_e4m3"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">}</span>
+<span class="linenos">127</span>
+<span class="linenos">128</span>    <span class="k">return</span> <span class="n">out</span>
+<span class="linenos">129</span>
+<span class="linenos">130</span>
+<span class="linenos">131</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos">132</span><span class="c1"># 3. kernel launch 开销</span>
+<span class="linenos">133</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos">134</span>
+<span class="linenos">135</span><span class="k">def</span><span class="w"> </span><span class="nf">probe_launch_overhead</span><span class="p">(</span><span class="n">n_kernels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">500</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos">136</span><span class="w">    </span><span class="sd">"""一个「什么都不做」的小 kernel，重复下发，测每次的摊销成本。</span>
+<span class="linenos">137</span>
+<span class="linenos">138</span><span class="sd">    这是 CUDA Graph 存在的理由：decode 阶段每步要下发几百个小 kernel，</span>
+<span class="linenos">139</span><span class="sd">    如果每个都要 CPU 走一遍 driver，CPU 就成了瓶颈。</span>
+<span class="linenos">140</span><span class="sd">    """</span>
+<span class="linenos">141</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">142</span>
+<span class="linenos">143</span>    <span class="k">def</span><span class="w"> </span><span class="nf">burst</span><span class="p">():</span>
+<span class="linenos">144</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_kernels</span><span class="p">):</span>
+<span class="linenos">145</span>            <span class="n">x</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="mf">1.0</span><span class="p">)</span>
+<span class="linenos">146</span>
+<span class="linenos">147</span>    <span class="n">ms_eager</span> <span class="o">=</span> <span class="n">time_cuda</span><span class="p">(</span><span class="n">burst</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">iters</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">148</span>
+<span class="linenos">149</span>    <span class="c1"># 同样的序列用 CUDA Graph 捕获后重放</span>
+<span class="linenos">150</span>    <span class="n">g</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
+<span class="linenos">151</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos">152</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">g</span><span class="p">):</span>
+<span class="linenos">153</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_kernels</span><span class="p">):</span>
+<span class="linenos">154</span>            <span class="n">x</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="mf">1.0</span><span class="p">)</span>
+<span class="linenos">155</span>    <span class="n">ms_graph</span> <span class="o">=</span> <span class="n">time_cuda</span><span class="p">(</span><span class="n">g</span><span class="o">.</span><span class="n">replay</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">iters</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">156</span>
+<span class="linenos">157</span>    <span class="k">return</span> <span class="p">{</span>
+<span class="linenos">158</span>        <span class="s2">"n_kernels"</span><span class="p">:</span> <span class="n">n_kernels</span><span class="p">,</span>
+<span class="linenos">159</span>        <span class="s2">"eager_us_per_kernel"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">ms_eager</span> <span class="o">*</span> <span class="mi">1000</span> <span class="o">/</span> <span class="n">n_kernels</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos">160</span>        <span class="s2">"graph_us_per_kernel"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">ms_graph</span> <span class="o">*</span> <span class="mi">1000</span> <span class="o">/</span> <span class="n">n_kernels</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos">161</span>        <span class="s2">"graph_speedup"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">ms_eager</span> <span class="o">/</span> <span class="n">ms_graph</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos">162</span>    <span class="p">}</span>
+<span class="linenos">163</span>
+<span class="linenos">164</span>
+<span class="linenos">165</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos">166</span><span class="c1"># 4. PCIe 带宽</span>
+<span class="linenos">167</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos">168</span>
+<span class="linenos">169</span><span class="k">def</span><span class="w"> </span><span class="nf">probe_pcie</span><span class="p">(</span><span class="n">mb</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos">170</span>    <span class="n">n</span> <span class="o">=</span> <span class="n">mb</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos">171</span>    <span class="n">host_pinned</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">172</span>    <span class="n">host_paged</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>
+<span class="linenos">173</span>    <span class="n">dev</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos">174</span>
+<span class="linenos">175</span>    <span class="k">def</span><span class="w"> </span><span class="nf">gbps</span><span class="p">(</span><span class="n">ms</span><span class="p">):</span>
+<span class="linenos">176</span>        <span class="k">return</span> <span class="nb">round</span><span class="p">(</span><span class="n">n</span> <span class="o">/</span> <span class="p">(</span><span class="n">ms</span> <span class="o">*</span> <span class="mf">1e-3</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="linenos">177</span>
+<span class="linenos">178</span>    <span class="k">return</span> <span class="p">{</span>
+<span class="linenos">179</span>        <span class="s2">"h2d_pinned_gbps"</span><span class="p">:</span> <span class="n">gbps</span><span class="p">(</span><span class="n">time_cuda</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">dev</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">host_pinned</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span> <span class="n">iters</span><span class="o">=</span><span class="mi">20</span><span class="p">)),</span>
+<span class="linenos">180</span>        <span class="s2">"d2h_pinned_gbps"</span><span class="p">:</span> <span class="n">gbps</span><span class="p">(</span><span class="n">time_cuda</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">host_pinned</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">dev</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span> <span class="n">iters</span><span class="o">=</span><span class="mi">20</span><span class="p">)),</span>
+<span class="linenos">181</span>        <span class="s2">"h2d_pageable_gbps"</span><span class="p">:</span> <span class="n">gbps</span><span class="p">(</span><span class="n">time_cuda</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">dev</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">host_paged</span><span class="p">),</span> <span class="n">iters</span><span class="o">=</span><span class="mi">20</span><span class="p">)),</span>
+<span class="linenos">182</span>        <span class="s2">"buffer_mb"</span><span class="p">:</span> <span class="n">mb</span><span class="p">,</span>
+<span class="linenos">183</span>        <span class="s2">"note"</span><span class="p">:</span> <span class="s2">"pageable 需要 driver 先拷到临时 pinned 缓冲，所以更慢——这是 pin_memory 的意义"</span><span class="p">,</span>
+<span class="linenos">184</span>    <span class="p">}</span>
+<span class="linenos">185</span>
+<span class="linenos">186</span>
+<span class="linenos">187</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos">188</span>
+<span class="linenos">189</span><span class="k">def</span><span class="w"> </span><span class="nf">device_facts</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos">190</span>    <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">191</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos">192</span>        <span class="n">smi</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+<span class="linenos">193</span>            <span class="p">[</span><span class="s2">"nvidia-smi"</span><span class="p">,</span> <span class="s2">"--query-gpu=name,memory.total,driver_version,clocks.max.sm,clocks.max.mem,power.limit"</span><span class="p">,</span>
+<span class="linenos">194</span>             <span class="s2">"--format=csv,noheader"</span><span class="p">],</span>
+<span class="linenos">195</span>            <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">15</span><span class="p">)</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+<span class="linenos">196</span>    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+<span class="linenos">197</span>        <span class="n">smi</span> <span class="o">=</span> <span class="s2">""</span>
+<span class="linenos">198</span>    <span class="k">return</span> <span class="p">{</span>
+<span class="linenos">199</span>        <span class="s2">"name"</span><span class="p">:</span> <span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="p">,</span>
+<span class="linenos">200</span>        <span class="s2">"compute_capability"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">major</span><span class="si">}</span><span class="s2">.</span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">minor</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span>
+<span class="linenos">201</span>        <span class="s2">"sm_count"</span><span class="p">:</span> <span class="n">p</span><span class="o">.</span><span class="n">multi_processor_count</span><span class="p">,</span>
+<span class="linenos">202</span>        <span class="s2">"total_mem_gb"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">total_memory</span> <span class="o">/</span> <span class="mf">1e9</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos">203</span>        <span class="s2">"l2_cache_mb"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s2">"L2_cache_size"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e6</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+<span class="linenos">204</span>        <span class="s2">"nvidia_smi"</span><span class="p">:</span> <span class="n">smi</span><span class="p">,</span>
+<span class="linenos">205</span>        <span class="s2">"torch"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="p">,</span>
+<span class="linenos">206</span>        <span class="s2">"cuda"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">cuda</span><span class="p">,</span>
+<span class="linenos">207</span>        <span class="s2">"host"</span><span class="p">:</span> <span class="n">platform</span><span class="o">.</span><span class="n">node</span><span class="p">(),</span>
+<span class="linenos">208</span>    <span class="p">}</span>
+<span class="linenos">209</span>
+<span class="linenos">210</span>
+<span class="linenos">211</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">212</span>    <span class="n">ap</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+<span class="linenos">213</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--out"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="linenos">214</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--quick"</span><span class="p">,</span> <span class="n">action</span><span class="o">=</span><span class="s2">"store_true"</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s2">"跳过大 GEMM，快速冒烟"</span><span class="p">)</span>
+<span class="linenos">215</span>    <span class="n">args</span> <span class="o">=</span> <span class="n">ap</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos">216</span>
+<span class="linenos">217</span>    <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">(),</span> <span class="s2">"需要 CUDA"</span>
+<span class="linenos">218</span>    <span class="n">result</span> <span class="o">=</span> <span class="p">{</span>
+<span class="linenos">219</span>        <span class="s2">"measured_at"</span><span class="p">:</span> <span class="n">datetime</span><span class="o">.</span><span class="n">now</span><span class="p">(</span><span class="n">timezone</span><span class="o">.</span><span class="n">utc</span><span class="p">)</span><span class="o">.</span><span class="n">astimezone</span><span class="p">()</span><span class="o">.</span><span class="n">isoformat</span><span class="p">(</span><span class="n">timespec</span><span class="o">=</span><span class="s2">"seconds"</span><span class="p">),</span>
+<span class="linenos">220</span>        <span class="s2">"device"</span><span class="p">:</span> <span class="n">device_facts</span><span class="p">(),</span>
+<span class="linenos">221</span>        <span class="s2">"memory_bandwidth"</span><span class="p">:</span> <span class="n">probe_memory_bandwidth</span><span class="p">(</span><span class="mi">128</span> <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">quick</span> <span class="k">else</span> <span class="mi">512</span><span class="p">),</span>
+<span class="linenos">222</span>        <span class="s2">"gemm"</span><span class="p">:</span> <span class="n">probe_gemm</span><span class="p">((</span><span class="mi">2048</span><span class="p">,)</span> <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">quick</span> <span class="k">else</span> <span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">8192</span><span class="p">)),</span>
+<span class="linenos">223</span>        <span class="s2">"launch_overhead"</span><span class="p">:</span> <span class="n">probe_launch_overhead</span><span class="p">(</span><span class="mi">100</span> <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">quick</span> <span class="k">else</span> <span class="mi">500</span><span class="p">),</span>
+<span class="linenos">224</span>        <span class="s2">"pcie"</span><span class="p">:</span> <span class="n">probe_pcie</span><span class="p">(</span><span class="mi">64</span> <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">quick</span> <span class="k">else</span> <span class="mi">256</span><span class="p">),</span>
+<span class="linenos">225</span>    <span class="p">}</span>
+<span class="linenos">226</span>    <span class="n">text</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">227</span>    <span class="nb">print</span><span class="p">(</span><span class="n">text</span><span class="p">)</span>
+<span class="linenos">228</span>    <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">out</span><span class="p">:</span>
+<span class="linenos">229</span>        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">out</span><span class="p">,</span> <span class="s2">"w"</span><span class="p">,</span> <span class="n">encoding</span><span class="o">=</span><span class="s2">"utf-8"</span><span class="p">)</span> <span class="k">as</span> <span class="n">fh</span><span class="p">:</span>
+<span class="linenos">230</span>            <span class="n">fh</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">text</span> <span class="o">+</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">231</span>
+<span class="linenos">232</span>
+<span class="linenos">233</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">234</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/probe_hw.py 全文（234 行）</code><a href="../code/labs/L0/probe_hw.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h2 id="_7">引擎自己怎么算这本账</h2>
+<p>上面是解析模型。vLLM 启动时算同一本账，但有两处差别值得单独看，
+因为它们正好是解析式估算算不出来的部分。</p>
+<p><strong>第一处：一个 KV 页实际占多少字节。</strong> <code>v1/kv_cache_interface.py:419</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@property</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">unpadded_page_size_bytes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_states</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">state_content_size_bytes</span>
+
+<span class="nd">@property</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">page_size_bytes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size_padded</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size_padded</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">unpadded_page_size_bytes</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size_padded</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">unpadded_page_size_bytes</span>
+</code></pre></div>
+
+<p><code>num_states</code> 对普通 full attention 是 2（K 和 V），这和我们的公式一致。
+但 <code>page_size_padded</code> 是一个逃生口：某些 attention 后端（例如需要特定对齐的
+FlashInfer 或 MLA）要求页大小按硬件对齐补齐，<strong>实际占用因此可能大于理论值</strong>。
+补齐量取决于后端实现，公式里没有这一项。</p>
+<p>同文件 439 行的 <code>AttentionSpec</code> 派生出 <code>FullAttentionSpec</code>；
+滑动窗口、Mamba 状态、跨层共享各有自己的子类。换句话说，
+「KV cache」在当前引擎里不是一种结构，而是一族结构。<a class="xref" href="../L3/3.4-sparse-linear-attention.html" title="稀疏、线性与混合架构">L3.4</a> 会展开。</p>
+<p><strong>第二处：非 KV 的显存不是估的，是量出来的。</strong>
+<code>labs/L0/ledger.py</code> 里我们写了一个固定的 <code>overhead = 1.5e9</code>。
+vLLM 的做法在 <code>v1/worker/gpu_worker.py:513</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">available_kv_cache_memory_bytes</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">requested_memory</span>
+    <span class="o">-</span> <span class="n">profile_result</span><span class="o">.</span><span class="n">non_kv_cache_memory</span>
+    <span class="o">-</span> <span class="n">cudagraph_memory_estimate_applied</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><code>non_kv_cache_memory</code> 来自同文件 553 行的 <code>memory_profiling(...)</code>：
+启动时真的按最大规模跑一遍 dummy forward，测出激活峰值。
+之所以要测，是因为激活峰值取决于 batch 形状、attention 后端实现和算子融合情况，
+没有闭式解。</p>
+<p>第三项 <code>cudagraph_memory_estimate_applied</code> 是 CUDA Graph 捕获需要预留的显存池。
+<strong>开启 CUDA Graph 会占掉一部分本来可以给 KV 的显存</strong>，
+也就是用并发度换取更低的提交开销。<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a> 会回到这个取舍。</p>
+<p>这一节可以概括成一句可复用的判断：解析模型给数量级和方向，
+实测给出当前实现下的真值。两者都需要，因为只有模型会漏掉实现细节，
+只有实测则说不出为什么。</p>
+<h2 id="sglang">广度对照：SGLang 把同一本账拆得更细</h2>
+<p>vLLM 用一个 <code>KVCacheSpec</code> 描述「一个 KV 页多大」。
+SGLang 把同一件事放在 <code>model_executor/pool_configurator.py</code>，
+需要处理的情况明显更多：</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">DefaultPoolConfigurator</span><span class="p">(</span><span class="n">MemoryPoolConfigurator</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Configurator for standard models: MHA, MLA, DSA, FP4.</span>
+<span class="sd">       coeff = cell_size (bytes per token across all layers)"""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kvc</span><span class="p">:</span> <span class="n">KVCacheConfigurator</span><span class="p">):</span>
+        <span class="c1"># 1) 混合架构：Mamba 层不产生 KV，只有 full-attention 层算进 cell_size</span>
+        <span class="k">if</span> <span class="n">mambaish</span> <span class="o">:=</span> <span class="n">mambaish_config</span><span class="p">(</span><span class="n">kvc</span><span class="o">.</span><span class="n">model_config</span><span class="p">):</span>
+            <span class="n">effective_layer_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">mambaish</span><span class="o">.</span><span class="n">full_attention_layer_ids</span>
+                                   <span class="k">if</span> <span class="n">kvc</span><span class="o">.</span><span class="n">layer_info</span><span class="o">.</span><span class="n">start_layer</span> <span class="o">&lt;=</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">kvc</span><span class="o">.</span><span class="n">layer_info</span><span class="o">.</span><span class="n">end_layer</span><span class="p">]</span>
+            <span class="n">num_layers</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">effective_layer_ids</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">num_layers</span> <span class="o">=</span> <span class="n">kvc</span><span class="o">.</span><span class="n">layer_info</span><span class="o">.</span><span class="n">num_effective_layers</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_cell_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_compute_cell_size</span><span class="p">(</span><span class="n">kvc</span><span class="p">,</span> <span class="n">num_layers</span><span class="p">)</span>
+
+        <span class="c1"># 2) 投机解码：draft 模型自己也要 KV，要把 cell_size 按比例放大</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">kvc</span><span class="o">.</span><span class="n">spec_algorithm</span><span class="o">.</span><span class="n">is_eagle</span><span class="p">()</span> <span class="ow">or</span> <span class="n">kvc</span><span class="o">.</span><span class="n">spec_algorithm</span><span class="o">.</span><span class="n">is_standalone</span><span class="p">())</span> \
+                <span class="ow">and</span> <span class="ow">not</span> <span class="n">kvc</span><span class="o">.</span><span class="n">is_draft_worker</span><span class="p">:</span>
+            <span class="n">eagle_draft_num_layers</span> <span class="o">=</span> <span class="n">kvc</span><span class="o">.</span><span class="n">spec_aux_config</span><span class="o">.</span><span class="n">eagle_draft_num_layers</span>
+            <span class="o">...</span>
+            <span class="c1"># 3) DeepSeek DSA：稀疏 attention 的 indexer 也占显存，</span>
+            <span class="c1">#    要先从 cell_size 里减掉再按 draft 层数缩放</span>
+            <span class="k">if</span> <span class="n">is_deepseek_dsa</span><span class="p">(</span><span class="n">kvc</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">hf_config</span><span class="p">):</span>
+                <span class="n">target_indexer_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_compute_dsa_indexer_cell_size</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+                <span class="n">target_kv_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cell_size</span> <span class="o">-</span> <span class="n">target_indexer_size</span>
+</code></pre></div>
+
+<p>我们那个一行的 <code>kv_bytes_per_token()</code>，在真实引擎里对应这一串条件分支。
+原因是「每 token 的 KV 字节」已经不是一个常数：</p>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>这本账怎么变</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mamba / 线性 attention 混合层（<a class="xref" href="../L3/3.4-sparse-linear-attention.html" title="稀疏、线性与混合架构">L3.4</a>）</td>
+<td>那些层不产生 KV，<code>num_layers</code> 要按 full-attention 层数算</td>
+</tr>
+<tr>
+<td>滑动窗口层</td>
+<td>KV 有上界，不随上下文线性增长（SGLang 另有 <code>swa_max_total_num_tokens</code>）</td>
+</tr>
+<tr>
+<td>投机解码 EAGLE（<a class="xref" href="../L5/5.5-speculative-decoding.html" title="投机解码">L5.5</a>）</td>
+<td>draft 模型也要一份 KV，<code>cell_size</code> 要放大</td>
+</tr>
+<tr>
+<td>DeepSeek DSA 稀疏 attention</td>
+<td>除 KV 外还有 indexer 的显存</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>K/V 压成一个低秩隐向量，<code>cell_size</code> 的结构不同</td>
+</tr>
+<tr>
+<td>pipeline 并行</td>
+<td>有些层的 KV 在别的 PP stage 上，本地 <code>cell_size</code> 可能是 0</td>
+</tr>
+</tbody>
+</table>
+<p>对照两家实现的用处在这里：一个公式足以应付常见情况，
+读第二份实现才能看到边界条件长什么样，以及它们为什么存在。
+<a class="xref" href="../L3/3.4-sparse-linear-attention.html" title="稀疏、线性与混合架构">L3.4</a>、<a class="xref" href="../L5/5.5-speculative-decoding.html" title="投机解码">L5.5</a>、<span class="xref pending" title="推理并行：TP / PP / EP / CP（尚未写）">L6.2</span> 会分别回到表中的几行。</p>
+<h2 id="_8">读这本账时容易出错的地方</h2>
+<p><strong>1. 拿厂商标称带宽当分母。</strong> 标称与实测可能差 15%（L40S 标称 864 GB/s，
+实测 649.7 GB/s）。判断「我的 kernel 达到了 78% 还是 92% 带宽」时，
+这 15% 会改变你要不要继续优化的结论。分母应该用自己测的值。</p>
+<p><strong>2. 把「AI TOPS」当算力。</strong> 厂商宣传数字通常是稀疏（2:4）后的、
+最低精度的理论峰值，与 bf16 稠密 GEMM 实际能到的数字可能差 4 倍以上。</p>
+<p><strong>3. 忘了 KV 按 token 计费，不按序列。</strong> 「支持 128 并发」这句话缺少条件，
+必须同时说明上下文长度：在同样的显存下，54 条 4K 序列与 6 条 32K 序列大致相当。</p>
+<p><strong>4. 以为 decode 慢是因为算力不够。</strong> 用账本里的数字：crater 的机器平衡点是
+152.7 FLOP/byte，而 4096 上下文的 decode 算术强度 batch=1 时是 1.12、
+batch=32 时是 8.21，分别约为平衡点的 <strong>0.7%</strong> 和 <strong>5.4%</strong>。
+这个配置离算力上限很远，加算力不改变它，除非同时增加带宽。
+（这几个数在 <code>results/crater/ledger_qwen3_1.7b_ctx4096.json</code> 的
+<code>arithmetic_intensity</code> 与 <code>machine_balance_flops_per_byte</code> 字段。）</p>
+<h2 id="_9">可以在本地做的练习</h2>
+<p>只使用已有配置计算字节与 FLOP，不需要启动 GPU。
+下面的命令不指定输出文件，用于查看脚本计算：</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L0/ledger.py<span class="w">   </span>--config<span class="w"> </span>results/crater/raw/11_config.json<span class="w">   </span>--ctx<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--batch<span class="w"> </span><span class="m">1</span>,8,32
+</code></pre></div>
+
+<p>先预测，再改变一个量：</p>
+<ol>
+<li>将上下文长度翻倍。检查 KV 大小、线性层 prefill FLOP 和 attention FLOP 分别如何变化。</li>
+<li>将 batch 从 1 改为 8。检查权重项与 KV 项是否按同样比例变化。</li>
+<li>只把 KV dtype 改成更低精度。先算理论字节变化，再说明为什么这还不能证明推理加速。</li>
+<li>从权重清单中选一个投影矩阵，用 shape 算参数数，再与脚本核对。</li>
+</ol>
+<h2 id="_10">自测：这些数字能说明什么</h2>
+<details>
+<summary>模型权重能放进显存，为什么请求仍可能 OOM？</summary>
+<p>还需要 KV、激活、workspace、图捕获等空间。权重只是显存需求的一项。
+应先判断是加载时失败，还是随着请求数或上下文增长才失败，
+再分别检查固定开销与随请求增长的开销。</p>
+</details>
+<details>
+<summary>把 KV 元素字节数减半，是否意味着每步延迟减半？</summary>
+<p>不意味着。只有 KV 相关的数据量在该模型中减半；权重、其他操作和转换开销仍然存在。
+先估算 KV 在总量中的比例，再检查低精度路径需要哪些额外计算。</p>
+</details>
+<details>
+<summary>一次 decode 的算术强度很低，是否所有 kernel 都是 memory-bound？</summary>
+<p>不是。整步汇总值把不同操作混在一起了。某些 kernel 可能受计算、同步或提交开销限制。
+需要结合 <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 kernel 记录，再按操作拆分分析。</p>
+</details>
+<h2 id="_11">接下来读什么</h2>
+<p><a class="xref" href="../L0/0.3-heterogeneous-baseline.html" title="异构对照：同一模型在两种 GPU 上">L0.3</a> 保持模型不变，比较两种 GPU。
+重点不是记住谁快多少，而是练习把工作量、机器能力和真实调用时间放在同一张表里，
+同时说清楚哪些差异已经观察到，哪些原因还没有被证明。</p></article><nav class="pagenav"><a class="nav-prev" href="../L0/0.1-request-lifecycle.html">&#8592; 0.1 从 HTTP 到 SASS：一次请求的完整调用栈</a><a class="nav-next" href="../L0/0.3-heterogeneous-baseline.html">0.3 异构对照：同一模型在两种 GPU 上 &#8594;</a></nav>
+</main>
+</body>
+</html>

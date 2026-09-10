@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.2 Tensor Core 世代史与 sm_120 的岔路</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">1.2</div>
+  <div class="sidebar-title">Tensor Core 世代史与 sm_120 的岔路</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：五代指令，两条分叉</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#mmasync">一条 mma.sync 到底在做什么</a></li>
+<li><a href="#_4">五代演化，每一代解决一个具体矛盾</a></li>
+<li><a href="#sm_100a-sm_120a">编译探针：区分 sm_100a 与 sm_120a 的指令支持</a></li>
+<li><a href="#gemm">纯发射吞吐：GEMM 优化的真正天花板</a></li>
+<li><a href="#tflops">关键一步：把 TFLOPS 换算成时钟无关的常数</a></li>
+<li><a href="#_5">一个超过"上限"的数字：怎么处理</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 源码走读：三条代码路径的现实成本</a></li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_8">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_9">原始现场</a></li>
+<li><a href="#_10">前沿</a></li>
+<li><a href="#_11">陷阱</a></li>
+<li><a href="#_12">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L1 · 硬件与操作系统底座</div>
+  <div class="mod-id">1.2</div>
+  <h1>Tensor Core 世代史与 sm_120 的岔路</h1>
+  <p class="lede">沿矩阵乘加指令理解线程协作、数据布局与硬件代际变化；用编译探针区分目标支持，分别讨论指令微基准和实际 GEMM。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（内存层次与并发）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>tensor core 指令从 Volta 到 Blackwell 演化了五代。每一代<strong>具体多了什么</strong>，为什么必须换指令而不是加速旧指令？</li>
+<li>「Blackwell」是一个架构还是两个？<strong>sm_100 和 sm_120 的代码能互换吗</strong>？</li>
+<li>我的 GEMM 跑到 cuBLAS 的 95% 就算到头了吗？<strong>硬件的真正上限</strong>怎么测？</li>
+</ol>
+<p>Tensor Core 是执行矩阵乘加的硬件单元。程序不是直接把任意大小的矩阵交给它，
+而是先把矩阵分块，并按指令要求分配到线程、寄存器或共享内存中。
+本章沿着指令接口的变化看这些要求为什么不同。编译探针可以检查指定工具链
+是否接受某条指令；接受编译不等于已经在相应 GPU 上运行过。</p>
+<hr />
+<h2 id="_2">心智模型：五代指令，两条分叉</h2>
+<figure>
+<svg viewBox="0 0 740 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="tensor core 指令代际演化">
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">tensor core 指令的代际与分叉</text>
+
+    <!-- timeline -->
+    <line x1="60" y1="60" x2="700" y2="60" stroke="currentColor" stroke-width="1.2" opacity="0.5"/>
+    <g font-size="10.5">
+      <circle cx="90"  cy="60" r="4" fill="currentColor"/><text x="72"  y="48">Volta</text>
+      <circle cx="200" cy="60" r="4" fill="currentColor"/><text x="176" y="48">Ampere</text>
+      <circle cx="310" cy="60" r="4" fill="currentColor"/><text x="292" y="48">Ada</text>
+      <circle cx="430" cy="60" r="4" fill="currentColor"/><text x="406" y="48">Hopper</text>
+      <circle cx="600" cy="60" r="4" fill="currentColor"/><text x="562" y="48">Blackwell</text>
+    </g>
+
+    <g font-family="ui-monospace, monospace" font-size="9.5">
+      <text x="66"  y="82">mma.sync</text>
+      <text x="66"  y="94">m8n8k4</text>
+      <text x="170" y="82">mma.sync</text>
+      <text x="170" y="94">m16n8k16</text>
+      <text x="284" y="82">+ fp8</text>
+      <text x="284" y="94">m16n8k32</text>
+      <text x="400" y="82">wgmma</text>
+      <text x="400" y="94">.mma_async</text>
+    </g>
+    <text x="90"  y="112" font-size="9.5" opacity="0.7" text-anchor="middle">warp 级</text>
+    <text x="200" y="112" font-size="9.5" opacity="0.7" text-anchor="middle">warp 级</text>
+    <text x="310" y="112" font-size="9.5" opacity="0.7" text-anchor="middle">warp 级</text>
+    <text x="430" y="112" font-size="9.5" opacity="0.7" text-anchor="middle">warp-group 级(4warp)</text>
+
+    <!-- fork -->
+    <path d="M600,68 L660,140" stroke="currentColor" stroke-width="1.6" fill="none"/>
+    <path d="M600,68 L520,140" stroke="currentColor" stroke-width="1.6" fill="none"/>
+
+    <rect x="404" y="146" width="216" height="96" rx="5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <text x="512" y="166" text-anchor="middle" font-size="11.5" font-weight="600">sm_120 / 121 · 消费级</text>
+    <text x="512" y="183" text-anchor="middle" font-size="10">RTX 5090 / 5080 / RTX PRO</text>
+    <text x="416" y="203" font-family="ui-monospace, monospace" font-size="9.5">mma.sync（Ampere 血统）</text>
+    <text x="416" y="217" font-family="ui-monospace, monospace" font-size="9.5">+ FP4 / block_scale</text>
+    <text x="416" y="234" font-size="10" opacity="0.75">没有 tcgen05，没有 TMEM</text>
+
+    <rect x="640" y="146" width="90" height="96" rx="5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <text x="685" y="166" text-anchor="middle" font-size="11.5" font-weight="600">sm_100/103</text>
+    <text x="685" y="183" text-anchor="middle" font-size="10">B200 / B300</text>
+    <text x="648" y="203" font-family="ui-monospace, monospace" font-size="9.5">tcgen05.mma</text>
+    <text x="648" y="217" font-family="ui-monospace, monospace" font-size="9.5">+ TMEM</text>
+    <text x="648" y="234" font-size="10" opacity="0.75">另一套模型</text>
+
+    <text x="404" y="266" font-size="11">同叫 Blackwell，<tspan font-weight="600">两套不兼容的 tensor core 编程模型</tspan>。</text>
+    <text x="404" y="284" font-size="10.5" opacity="0.8">kernel 作者要维护三条路径：Hopper / sm_100 / sm_120。</text>
+
+    <!-- measured -->
+    <line x1="12" y1="304" x2="728" y2="304" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="328" font-size="12" font-weight="600">本机实测（RTX 5090 D, sm_120）</text>
+    <text x="12" y="350" font-size="11">mma.sync m16n8k16 bf16 纯发射：<tspan font-weight="600">251.9 TFLOPS</tspan> = 511 FLOP/clk/SM</text>
+    <text x="12" y="370" font-size="11">mma.sync m16n8k32 fp8  纯发射：<tspan font-weight="600">506.3 TFLOPS</tspan> = 1022 FLOP/clk/SM（恰好 2×）</text>
+    <text x="12" y="392" font-size="11">tcgen05.alloc 在 sm_120a：<tspan font-family="ui-monospace, monospace" font-size="10">ptxas fatal — not supported</tspan>；换 sm_100a 立刻通过</text>
+    <text x="12" y="412" font-size="10.5" opacity="0.75">511 × 170 SM × 2.41 GHz(基频) = 209.7 TFLOPS = NVIDIA 对 5090 的标称值，逐位对上</text>
+  </g>
+</svg>
+<figcaption>五代指令的演化与 Blackwell 的分叉。所有数字为本机实测。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="mmasync">一条 <code>mma.sync</code> 到底在做什么</h3>
+<p>先把最基础的一条看清楚：</p>
+<div class="highlight"><pre><span></span><code>mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+    {%0,%1,%2,%3},           // D：4 个 float
+    {%4,%5,%6,%7},           // A：4 个 uint32（每个装 2 个 bf16）
+    {%8,%9},                 // B：2 个 uint32
+    {%0,%1,%2,%3};           // C：累加进 D
+</code></pre></div>
+
+<p>关键词逐个拆：</p>
+<ul>
+<li><strong><code>mma</code></strong> — matrix multiply-accumulate，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mi>A</mi><mo>&#x000D7;</mo><mi>B</mi><mo>&#x0002B;</mo><mi>C</mi></mrow></math></span></li>
+<li><strong><code>sync</code></strong> — 整个 warp <strong>必须</strong>一起执行。这不是 32 个线程各做各的，
+  而是 32 个线程各持有矩阵的一小片（fragment），硬件把它们拼成完整矩阵</li>
+<li><strong><code>m16n8k16</code></strong> — 形状：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>A</mi></mrow></math></span> 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>16</mn><mo>&#x000D7;</mo><mn>16</mn></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>16</mn><mo>&#x000D7;</mo><mn>8</mn></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>16</mn><mo>&#x000D7;</mo><mn>8</mn></mrow></math></span></li>
+<li><strong><code>row.col</code></strong> — A 行主序、B 列主序。这是硬件规定的，不匹配就得先转置</li>
+<li><strong><code>f32.bf16.bf16.f32</code></strong> — D、A、B、C 的类型。<strong>输入 bf16，累加 f32</strong></li>
+</ul>
+<p>每条指令的 FLOP：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span>。</p>
+<p><strong>寄存器布局是硬件写死的</strong>：哪个线程持有矩阵的哪几个元素，由 ISA 文档的图规定。
+这就是为什么写 tensor core kernel 这么痛苦——你不能随便摆数据，
+必须先把数据搬成硬件要的那个古怪布局。<code>ldmatrix</code> 指令就是为此存在的（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）。</p>
+<h3 id="_4">五代演化，每一代解决一个具体矛盾</h3>
+<table>
+<thead>
+<tr>
+<th>代</th>
+<th>架构</th>
+<th>指令</th>
+<th>解决了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Volta (sm_70)</td>
+<td><code>mma.sync.m8n8k4</code></td>
+<td>首次把矩阵乘做成一条指令。形状很小，需要大量指令</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Turing (sm_75)</td>
+<td>+ int8/int4</td>
+<td>推理量化</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Ampere (sm_80)</td>
+<td><code>mma.sync.m16n8k16</code> + <code>cp.async</code></td>
+<td>形状变大摊薄指令开销；<strong>异步拷贝</strong>让搬数据不占寄存器、不阻塞计算</td>
+</tr>
+<tr>
+<td>4a</td>
+<td>Ada (sm_89)</td>
+<td>+ fp8 <code>m16n8k32</code></td>
+<td>fp8 元素 1 字节，同样的寄存器装两倍数据 → k 翻倍 → 吞吐翻倍</td>
+</tr>
+<tr>
+<td>4b</td>
+<td>Hopper (sm_90)</td>
+<td><strong><code>wgmma.mma_async</code></strong> + TMA</td>
+<td>从 <strong>warp 级</strong>升到 <strong>warp-group 级</strong>（4 个 warp 协作）；异步执行；TMA 把整块搬运交给专用硬件</td>
+</tr>
+<tr>
+<td>5a</td>
+<td>Blackwell 数据中心 (sm_100)</td>
+<td><strong><code>tcgen05.mma</code></strong> + <strong>TMEM</strong></td>
+<td>累加器从寄存器文件搬到专用的 Tensor Memory，tensor core 不再和 CUDA core 抢寄存器带宽</td>
+</tr>
+<tr>
+<td>5b</td>
+<td>Blackwell 消费级 (sm_120)</td>
+<td><code>mma.sync</code> + FP4 + <code>block_scale</code></td>
+<td><strong>没有 tcgen05，没有 TMEM</strong>。走 Ampere 血统，加上 FP4 与块缩放</td>
+</tr>
+</tbody>
+</table>
+<p><strong>一条主线</strong>：每一代都在把"一条指令干的活"变大、把"数据搬运"变异步。
+原因是 tensor core 的算力增长远快于寄存器带宽和访存带宽增长——
+要喂饱它，就必须减少每次喂食的开销。</p>
+<h3 id="sm_100a-sm_120a">编译探针：区分 sm_100a 与 sm_120a 的指令支持</h3>
+<p>以下探针检查指定指令能否通过相应目标的编译：</p>
+<div class="highlight"><pre><span></span><code><span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">tcgen05_smoke</span><span class="p">(</span><span class="kt">uint32_t</span><span class="o">*</span><span class="w"> </span><span class="n">tmem_addr</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">asm</span><span class="w"> </span><span class="k">volatile</span><span class="p">(</span><span class="s">"tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 32;</span><span class="se">\n</span><span class="s">"</span>
+<span class="w">                 </span><span class="o">::</span><span class="w"> </span><span class="s">"r"</span><span class="p">((</span><span class="kt">uint32_t</span><span class="p">)(</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">tmem_addr</span><span class="p">));</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code>nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_120a<span class="w"> </span>-cubin<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>tcgen05_probe.cu<span class="w">   </span><span class="c1"># 消费级 Blackwell</span>
+nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_100a<span class="w"> </span>-cubin<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>tcgen05_probe.cu<span class="w">   </span><span class="c1"># 数据中心 Blackwell</span>
+</code></pre></div>
+
+<p>实测输出：</p>
+<div class="highlight"><pre><span></span><code>########## 在 sm_120a 上编译 tcgen05（预期失败）
+ptxas ...tcgen05_probe.ptx, line 23; error : Instruction 'tcgen05.alloc' not supported on .target 'sm_120a'
+ptxas ...tcgen05_probe.ptx, line 23; error : Feature '.cta_group::1' not supported on .target 'sm_120a'
+ptxas fatal   : Ptx assembly aborted due to errors
+
+########## 换成 sm_100a（数据中心 Blackwell）
+(无输出 = 编译成功)
+</code></pre></div>
+
+<p><strong>同一份源码，一个架构编不过，另一个直接通过。</strong> 这就是为什么：</p>
+<ul>
+<li><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 kernel trace 里，5090 上跑的 GEMM 叫 <code>cutlass_80_tensorop_...</code> ——
+  <strong><code>80</code> 是 sm_80（Ampere）</strong>。消费级 Blackwell 用的是 Ampere 血统的 kernel。</li>
+<li>CUTLASS 的 Blackwell 模板用 <code>sm_100a</code> 编译，<strong>在 sm_120 上根本编不过</strong>；
+  移植到工作站卡要走另一套模板。</li>
+<li>「支持 Blackwell」这句话没有信息量。必须问：sm_100 还是 sm_120？</li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">`a` / `f` / 裸架构：三种编译目标</p>
+<p>你会看到 <code>sm_120</code>、<code>sm_120a</code>、<code>sm_120f</code> 三种写法：</p>
+<ul>
+<li><strong><code>sm_120</code></strong>：只用通用指令，生成的 cubin 在 sm_120 上跑</li>
+<li><strong><code>sm_120a</code></strong>（architecture-specific）：允许该架构<strong>独有</strong>的指令，
+  <strong>只能</strong>在 sm_120 上跑，连 sm_121 都不行</li>
+<li><strong><code>sm_120f</code></strong>（family-specific）：介于两者之间，可在 sm_12x 全家族上跑</li>
+</ul>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 原始现场 ⑤ 里的 PTX 头写着 <code>.target sm_120a</code>，
+而 FlashInfer 的 JIT 缓存目录叫 <code>120f</code> —— 一个用架构专属，一个用家族兼容。
+库作者要在"用尽硬件"和"一份二进制覆盖更多卡"之间选。</p>
+</div>
+<h3 id="gemm">纯发射吞吐：GEMM 优化的真正天花板</h3>
+<p>cuBLAS 给的 TFLOPS 里混着访存、tile 调度、尾效应。想知道 tensor core <strong>本身</strong>多快，
+就写一个完全不碰内存的 kernel：数据全在寄存器，反复发 mma。</p>
+<p><code>labs/L1/tensor_core.cu</code> 实测（RTX 5090 D）：</p>
+<div class="highlight"><pre><span></span><code>[A] mma.sync.m16n8k16 bf16 纯发射吞吐（不碰内存）
+    warps/block    blocks/SM      TFLOPS
+    4              1              250.3
+    8              4              251.9
+    峰值 251.9 TFLOPS
+
+[B] mma.sync.m16n8k32 fp8-e4m3 纯发射吞吐
+    峰值 506.3 TFLOPS   （是 bf16 的 2.00×）
+</code></pre></div>
+
+<p><strong>fp8 恰好是 bf16 的 2.00 倍</strong>，而且原因是纯指令级的：k 维从 16 到 32，
+每条指令的 FLOP 从 4096 到 8192。不是魔法。</p>
+<h3 id="tflops">关键一步：把 TFLOPS 换算成时钟无关的常数</h3>
+<p>TFLOPS 会随频率浮动，而频率会因功耗墙、温度、负载类型剧烈变化。
+直接比较 TFLOPS 时，应同时检查频率与功耗状态。
+为了分析每个 SM 每周期完成的工作量，还可以换算为：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><mtext>FLOP</mtext></mrow><mrow><mtext>clock</mtext><mo>&#x000D7;</mo><mtext>SM</mtext></mrow></mfrac></mrow></math></div></p>
+<p>这个归一化指标有助于减少频率差异的影响，但仍取决于指令路径和利用率。
+采样频率时要覆盖 kernel 的运行区间：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>ms</th>
+<th>TFLOPS</th>
+<th>GHz</th>
+<th>W</th>
+<th><strong>FLOP/clk/SM</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自写 mma bf16（不碰内存）</td>
+<td>—</td>
+<td>251.9</td>
+<td><strong>2.90</strong></td>
+<td>~150</td>
+<td><strong>511</strong></td>
+</tr>
+<tr>
+<td>cuBLAS <code>torch.mm</code> bf16</td>
+<td>5.033</td>
+<td>218.4</td>
+<td><strong>2.62</strong></td>
+<td>575</td>
+<td><strong>491</strong></td>
+</tr>
+<tr>
+<td>自写 mma fp8（不碰内存）</td>
+<td>—</td>
+<td>506.3</td>
+<td>2.90</td>
+<td>~150</td>
+<td><strong>1022</strong></td>
+</tr>
+<tr>
+<td>cuBLAS <code>_scaled_mm</code> fp8</td>
+<td>2.031</td>
+<td>541.5</td>
+<td><strong>2.12</strong></td>
+<td>569</td>
+<td><strong>1501</strong></td>
+</tr>
+</tbody>
+</table>
+<p>三个立刻能读出来的事实：</p>
+<p><strong>(1) 我的 mma 常数 = NVIDIA 标称值。</strong></p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>511</mn><mtext>&#x000A0;</mtext><mtext>FLOP/clk/SM</mtext><mo>&#x000D7;</mo><mn>170</mn><mtext>&#x000A0;</mtext><mtext>SM</mtext><mo>&#x000D7;</mo><mn>2.41</mn><mtext>&#x000A0;</mtext><mtext>GHz(基频)</mtext><mo>&#x0003D;</mo><mn>209.7</mn><mtext>&#x000A0;</mtext><mtext>TFLOPS</mtext></mrow></math></div></p>
+<p>正是 NVIDIA 对 RTX 5090 的 bf16 稠密标称。<strong>厂商的标称值是按基频算的</strong>，
+实际 boost 到 2.90 GHz 就能跑到 251.9。这解释了 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 里
+「实测 232 TFLOPS 却高于某些标称」的疑问。</p>
+<p><strong>(2) cuBLAS 的 bf16 达到 491 / 511 = 96%。</strong> 一个真实的、要读写显存的 GEMM
+能到纯发射上限的 96%，说明 cuBLAS 的 tiling 和流水做得极好。
+<strong>这也是 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 里你自己写 GEMM 的目标线。</strong></p>
+<p><strong>(3) 频率差异比想象中大。</strong> 我的 mma kernel 在 <strong>2.90 GHz / 150 W</strong> 运行——
+因为它不碰显存，没有显存功耗。cuBLAS 的 GEMM 被顶到 <strong>575 W 功耗墙</strong>，
+频率掉到 2.12–2.62 GHz。</p>
+<p><strong>在功耗受限的卡上，"不访存"本身就是一种加速。</strong> 这个效应在 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 优化 GEMM 时会遇到：
+减少访存不只省带宽，还能换来更高的频率。</p>
+<h3 id="_5">一个超过"上限"的数字：怎么处理</h3>
+<p>上表最后一行有问题：cuBLAS fp8 达到 <strong>1501 FLOP/clk/SM</strong>，
+而我测的 <code>mma.sync.m16n8k32</code> 上限只有 <strong>1022</strong>。<strong>真实 GEMM 超过了纯指令上限 47%。</strong></p>
+<p>一个数字超过物理上界时，一定有一个假设是错的。逐个排查：</p>
+<ol>
+<li><strong>fp8 GEMM 真的在算吗？</strong> 验了：结果对 bf16 参考的相对误差 0.0377，
+   量级也对（bf16 均值 1.1283 / fp8 均值 1.1275）。<strong>在算。</strong></li>
+<li><strong>频率采样对吗？</strong> 第一版在 <code>torch.cuda.synchronize()</code> <strong>之后</strong>读 NVML，
+   读到 0.18 GHz / 27 W —— GPU 早就掉回空闲了。改成后台线程并发采样才拿到 2.12 GHz。</li>
+<li><strong>是不是 f16 累加更快？</strong> 消费卡有"FP32 累加半速"的传说。实测
+   <code>mma.sync...f16.f16.f16.f16</code> 只有 <strong>288.5 TFLOPS，仅比 f32 累加快 1.15×</strong>，不是 2×。
+   <strong>传说在 sm_120 上不成立。</strong></li>
+<li><strong>是不是有我没测的更宽指令？</strong> 去问编译器：</li>
+</ol>
+<div class="highlight"><pre><span></span><code>mma.sync.aligned.m16n8k32...e4m3                        支持
+mma.sync.aligned.m16n8k64...e4m3                        error: Incorrect instruction type
+mma.sync.aligned.kind::mxf8f6f4.block_scale.m16n8k32... 支持   ← ★
+</code></pre></div>
+
+<p><strong><code>kind::mxf8f6f4.block_scale</code> 这一族在 sm_120 上是支持的</strong>，而我没有测它。</p>
+<p><strong>结论</strong>：我测出的 1022 是 <strong><code>m16n8k32</code> 这一条指令</strong>的上限，不是<strong>硬件</strong>的上限。
+cuBLASLt 是否使用了更宽的 fp8 指令路径，仍需反汇编或其他实现证据确认；
+<code>mxf8f6f4</code> 族目前只是候选解释。</p>
+<div class="admonition warning">
+<p class="admonition-title">这一节的方法比结论重要</p>
+<p>「我的上限被真实实现超过了」是个<strong>好消息</strong>——它说明我漏掉了一条路径，
+而不是硬件超自然。处理顺序永远是：
+<strong>先验正确性 → 再验测量方法 → 再验假设 → 最后才怀疑硬件。</strong></p>
+<p>本站把这个结论标为<strong>未完成</strong>：<code>kind::mxf8f6f4</code> 族的实测吞吐
+<span class="unverified">未实测</span>。settle 它的检查是：
+用该指令重写 <code>tensor_core.cu</code> 的 fp8 kernel，看是否 ≥ 1501 FLOP/clk/SM。
+<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 会补上。</p>
+</div>
+<hr />
+<h2 id="_6">工程实现 · 源码走读：三条代码路径的现实成本</h2>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 里看到 vLLM 在 5090 上跑的 GEMM 是 <code>cutlass_80_tensorop_bf16_s16816gemm_*</code>。
+<code>s16816</code> 正是 <code>m16n8k16</code> 的 CUTLASS 命名。<strong>在最新的消费卡上跑着 sm_80 的 kernel。</strong></p>
+<p>这对库作者意味着什么，可以直接从 FlashInfer 的目录结构读出来：</p>
+<div class="highlight"><pre><span></span><code>flashinfer/data/include/flashinfer/attention/
+├── hopper/                        ← Hopper 专用（wgmma + TMA）
+│   ├── kernel_traits.cuh
+│   └── quantization/kernel_traits.cuh
+├── ...                            ← 通用 / Ampere 血统
+flashinfer/cute_dsl/sparse/
+└── sm100_blk64/                   ← 数据中心 Blackwell 专用
+    ├── flash_fwd_kernel_sm100.h
+    └── flash_fwd_launch_template.h
+</code></pre></div>
+
+<p><strong>目录名就是分叉的证据</strong>：<code>hopper/</code>、<code>sm100_blk64/</code>，
+以及默认路径（sm_80/89/120 共用）。一个 attention 库要维护<strong>至少三套</strong>实现。</p>
+<p>再看 JIT 缓存目录名（<a class="xref" href="../L0/0.3-heterogeneous-baseline.html" title="异构对照：同一模型在两种 GPU 上">L0.3</a> 原始现场 ③）：</p>
+<div class="highlight"><pre><span></span><code>crater(5090):   .cache/flashinfer/0.6.18/120f/cached_ops/sampling
+worldvln(L40S): .cache/flashinfer/0.6.18/89/cached_ops/sampling
+</code></pre></div>
+
+<p>以及编译命令里的宏：</p>
+<div class="highlight"><pre><span></span><code>-gencode=arch=compute_120f,code=sm_120f
+-DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1     ← 只在 sm_120 上出现
+-DFLASHINFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16
+-DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2
+</code></pre></div>
+
+<p><code>FP4_E2M1</code> 与 <code>FP8_E8M0</code>（块缩放用的指数格式）只在 Blackwell 上启用。
+<strong>这是 <a class="xref" href="../L4/4.3-quantization.html" title="量化工程">L4.3</a> 讲 NVFP4 时的硬件前提</strong>：FP4 tensor core 只有 Blackwell 有，
+Ada 与 Hopper 都没有。</p>
+<hr />
+<h2 id="_7">工程实现 · 自己写一遍</h2>
+<p>写 tensor core kernel 的最小可运行形态，关键只有两点。</p>
+<p><strong>(1) 内联 PTX 的约束语法</strong></p>
+<div class="highlight"><pre><span></span><code><span class="k">asm</span><span class="w"> </span><span class="k">volatile</span><span class="p">(</span>
+<span class="w">    </span><span class="s">"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "</span>
+<span class="w">    </span><span class="s">"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};</span><span class="se">\n</span><span class="s">"</span>
+<span class="w">    </span><span class="o">:</span><span class="w"> </span><span class="s">"+f"</span><span class="p">(</span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">0</span><span class="p">]),</span><span class="w"> </span><span class="s">"+f"</span><span class="p">(</span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">1</span><span class="p">]),</span><span class="w"> </span><span class="s">"+f"</span><span class="p">(</span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">2</span><span class="p">]),</span><span class="w"> </span><span class="s">"+f"</span><span class="p">(</span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">3</span><span class="p">])</span><span class="w">   </span><span class="c1">// 输出+输入</span>
+<span class="w">    </span><span class="o">:</span><span class="w"> </span><span class="s">"r"</span><span class="p">(</span><span class="n">a0</span><span class="p">),</span><span class="w"> </span><span class="s">"r"</span><span class="p">(</span><span class="n">a1</span><span class="p">),</span><span class="w"> </span><span class="s">"r"</span><span class="p">(</span><span class="n">a2</span><span class="p">),</span><span class="w"> </span><span class="s">"r"</span><span class="p">(</span><span class="n">a3</span><span class="p">),</span><span class="w"> </span><span class="s">"r"</span><span class="p">(</span><span class="n">b0</span><span class="p">),</span><span class="w"> </span><span class="s">"r"</span><span class="p">(</span><span class="n">b1</span><span class="p">));</span><span class="w">       </span><span class="c1">// 只读输入</span>
+</code></pre></div>
+
+<p><code>"+f"</code> = 读写的 float 寄存器，<code>"r"</code> = 只读的 32 位寄存器。
+<code>volatile</code> 阻止编译器把它当纯函数优化掉。</p>
+<p><strong>(2) 测吞吐必须用多组独立累加器</strong></p>
+<div class="highlight"><pre><span></span><code><span class="kt">float</span><span class="w"> </span><span class="n">c</span><span class="p">[</span><span class="mi">4</span><span class="p">][</span><span class="mi">4</span><span class="p">];</span><span class="w">              </span><span class="c1">// 4 组累加器</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">iters</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#pragma unroll</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">rep</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">rep</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">rep</span><span class="p">)</span>
+<span class="w">    </span><span class="cp">#pragma unroll</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">j</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">          </span><span class="c1">// ← 4 组轮转，互不依赖</span>
+<span class="w">        </span><span class="k">asm</span><span class="w"> </span><span class="k">volatile</span><span class="p">(</span><span class="s">"mma.sync..."</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="s">"+f"</span><span class="p">(</span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">0</span><span class="p">]),</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>有意思的是：本例中改成独立累加器<strong>只带来 0.2% 的提升</strong>（251.4 → 251.9）。
+说明 sm_120 的 mma 流水线足够短，单条依赖链就能填满。
+<strong>但这个结论是测出来的，不是猜的</strong>——在 Hopper 的 <code>wgmma</code>（异步、延迟长得多）上
+结论会完全不同。</p>
+<p><strong>(3) 防优化</strong></p>
+<div class="highlight"><pre><span></span><code><span class="kt">float</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">j</span><span class="p">)</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">2</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">c</span><span class="p">[</span><span class="n">j</span><span class="p">][</span><span class="mi">3</span><span class="p">];</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">s</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mf">1234.5f</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="n">sink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">s</span><span class="p">;</span><span class="w">    </span><span class="c1">// 结果被"用"了，但几乎不产生额外开销</span>
+</code></pre></div>
+
+<p>如果不写这行，编译器会发现 <code>c</code> 从未被读取，把整个循环删掉，你会测出无穷大的 TFLOPS。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># 指令代际支持 + 纯发射吞吐</span>
+nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-arch<span class="o">=</span>sm_120a<span class="w"> </span>-o<span class="w"> </span>tensor_core<span class="w"> </span>labs/L1/tensor_core.cu
+./tensor_core
+
+<span class="c1"># 判决性实验：tcgen05 在两个 Blackwell 上</span>
+nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_120a<span class="w"> </span>-cubin<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>labs/L1/tcgen05_probe.cu<span class="w">   </span><span class="c1"># 失败</span>
+nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_100a<span class="w"> </span>-cubin<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>labs/L1/tcgen05_probe.cu<span class="w">   </span><span class="c1"># 通过</span>
+
+<span class="c1"># 把 cuBLAS 放到时钟无关的尺子上</span>
+python<span class="w"> </span>labs/L1/verify_gemm_ceiling.py
+</code></pre></div>
+
+<h3 id="_8">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>把 <code>-arch=sm_120a</code> 改成 <code>sm_89</code></td>
+<td>在 5090 上仍能跑（驱动 JIT 或向后兼容），但 fp8 路径可能变慢——<strong>架构标志不匹配不会报错，只会变慢</strong>，这是最隐蔽的性能坑</td>
+</tr>
+<tr>
+<td>去掉 <code>if (s == 1234.5f) *sink = s;</code></td>
+<td>TFLOPS 变成天文数字。亲手见一次"编译器把你的 benchmark 删了"</td>
+</tr>
+<tr>
+<td>把累加器从 4 组减到 1 组</td>
+<td>在 sm_120 上几乎无变化（本章实测）。这个"负结果"本身是关于流水线深度的信息</td>
+</tr>
+<tr>
+<td>用 <code>nvidia-smi -q -d CLOCK</code> 边跑边看</td>
+<td>观察 mma kernel（不访存）与 cuBLAS GEMM（访存）的频率差</td>
+</tr>
+<tr>
+<td>试试 <code>kind::mxf8f6f4.block_scale</code> 那条指令</td>
+<td>这是本章留下的开放问题——如果你测出 ≥1501 FLOP/clk/SM，谜就解开了</td>
+</tr>
+</tbody>
+</table>
+<p>最后一行不是客套：<strong>这是一个本章没做完的实验</strong>，做完它你就补上了本站的一个空缺。</p>
+<hr />
+<h2 id="_9">原始现场</h2>
+<details>
+<summary>① tcgen05 编译探针的完整输出</summary>
+<div class="highlight"><pre><span></span><code>########## 在 sm_120a 上编译 tcgen05（预期失败）
+ptxas /tmp/tmpxft_0023a8c1_00000000-6_tcgen05_probe.ptx, line 23;
+    error : Instruction 'tcgen05.alloc' not supported on .target 'sm_120a'
+ptxas /tmp/tmpxft_0023a8c1_00000000-6_tcgen05_probe.ptx, line 23;
+    error : Feature '.cta_group::1' not supported on .target 'sm_120a'
+ptxas fatal   : Ptx assembly aborted due to errors
+
+########## 换成 sm_100a（数据中心 Blackwell）
+(无输出 = 编译成功)
+</code></pre></div>
+
+<p>注意报错来自 <strong>ptxas</strong>（后端汇编器）而不是 nvcc 前端。
+说明 PTX 本身语法合法，是<strong>目标架构</strong>不认识这条指令。
+这也是 <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 陷阱一节里那个 <code>Unsupported .version 9.3</code> 的同一个组件。</p>
+<p>原始文件：<code>results/crater/tcgen05_probe_5090.txt</code></p>
+</details>
+<details>
+<summary>② 指令代际支持矩阵（程序打印，非查表）</summary>
+<div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D  sm_120  SM=170
+
+[C] 本卡的 tensor core 指令代际支持
+    mma.sync.m8n8k4 (f16)            Volta  第一代       支持
+    mma.sync.m16n8k16 (bf16)         Ampere 第三代       支持
+    mma.sync.m16n8k32 (fp8)          Ada    第四代       支持
+    wgmma.mma_async (warp-group)     Hopper 第四代       不支持
+    tcgen05.mma (+ TMEM)             Blackwell 数据中心 不支持
+    mma.sync + FP4 (e2m1)            Blackwell 消费级    支持
+</code></pre></div>
+
+<p><code>wgmma</code> 那一行值得单独看：<strong>Hopper 的 warp-group mma 在更新的 Blackwell 上不支持</strong>。
+指令集不是单调递增的，每一代都可能废弃上一代的东西。
+这就是为什么「compute capability 更高 = 更强」是错的。</p>
+</details>
+<details>
+<summary>③ 纯发射吞吐的完整扫描</summary>
+<div class="highlight"><pre><span></span><code>[A] mma.sync.m16n8k16 bf16 纯发射吞吐（不碰内存）
+    warps/block    blocks/SM      TFLOPS
+    4              1              250.3
+    4              2              251.6
+    4              4              251.8
+    8              1              251.9
+    8              2              251.9
+    8              4              251.9
+    峰值 251.9 TFLOPS
+
+[B2] 同一条 mma，改成 f16 累加
+    f16 累加峰值 288.5 TFLOPS   （f32 累加是 252.0，比值 1.15×）
+
+[B] mma.sync.m16n8k32 fp8-e4m3 纯发射吞吐
+    4              1              501.4
+    8              4              506.3
+    峰值 506.3 TFLOPS   （是 bf16 的 2.00×）
+</code></pre></div>
+
+<p><strong>吞吐几乎不随并发变化</strong>（250.3 → 251.9，不到 1%）。
+对照 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 的访存实验（1 → 2 blocks/SM 带宽涨 8%），
+说明 <strong>tensor core 的发射不需要靠并发掩盖延迟</strong>——它是纯吞吐单元。</p>
+<p><code>[B2]</code> 的 1.15× 否定了「消费卡 FP32 累加半速」的说法。
+这个传说在 Turing/Ampere 的 GeForce 上是真的，在 sm_120 上不再成立。
+<strong>旧结论要重新测，不能直接沿用。</strong></p>
+</details>
+<details>
+<summary>④ 频率与功耗：两种 kernel 的完全不同处境</summary>
+<p><code>nvidia-smi</code> 在两种负载运行时的采样（<code>clocks.sm, power.draw, temperature.gpu</code>）：</p>
+<div class="highlight"><pre><span></span><code>########## torch fp8 GEMM 运行时
+2235 MHz, 193.02 W, 59
+2122 MHz, 294.09 W, 61
+2122 MHz, 576.11 W, 62      ← 顶到 575 W 功耗墙
+2115 MHz, 575.27 W, 62
+2107 MHz, 574.94 W, 64
+2100 MHz, 575.12 W, 64      ← 频率被压到 2.10 GHz
+
+########## 自写 mma kernel 运行时（不碰显存）
+2895 MHz, 203.45 W, 57
+2902 MHz, 159.00 W, 52      ← 2.90 GHz，功耗只有 159 W
+2902 MHz, 121.71 W, 52
+2902 MHz,  96.31 W, 50
+</code></pre></div>
+
+<p><strong>同一张卡，两种负载，频率差 38%，功耗差 6 倍。</strong></p>
+<p>原因：显存（GDDR7）和数据搬运本身极其耗电。一个纯计算 kernel 的功耗只有 100–200 W，
+而一个真实 GEMM 会把 575 W 的预算吃光，逼迫 GPU 降频。</p>
+<p><strong>工程含义</strong>：在功耗受限的卡上，减少访存不只是省带宽，
+还会<strong>换来更高的核心频率</strong>。这是 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 优化 GEMM 时一个容易被忽略的收益来源。</p>
+</details>
+<details>
+<summary>⑤ 时钟无关尺子的完整输出</summary>
+<div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D  SM=170   矩阵 8192x8192x8192, FLOP=1.100T
+
+[正确性] fp8 结果 vs bf16 参考：相对误差 0.0377  -&gt; 确实算了
+          bf16 均值 1.1283 / fp8 均值 1.1275
+
+路径                       ms    TFLOPS    GHz      W  FLOP/clk/SM
+bf16 torch.mm         5.033     218.4   2.62    575          491
+fp8 _scaled_mm        2.031     541.5   2.12    569         1501
+
+参照（labs/L1/tensor_core.cu 的纯 mma.sync 发射，不碰内存）：
+    bf16 f32累加   511 FLOP/clk/SM
+    fp8  f32累加  1022 FLOP/clk/SM
+</code></pre></div>
+
+<p>第一版这张表是这样的（<strong>错的</strong>）：</p>
+<div class="highlight"><pre><span></span><code>bf16 torch.mm         4.949     222.2   0.18     27         7260
+fp8 _scaled_mm        2.033     540.8   0.18     27        17672
+</code></pre></div>
+
+<p><code>0.18 GHz / 27 W / 7260 FLOP/clk/SM</code> —— 因为在 <code>synchronize()</code> 之后才采样 NVML，
+GPU 已经掉回空闲。<strong>荒谬的数字是好事，它一眼就能被识破。</strong>
+真正危险的是那种"看起来合理但错了"的数字。</p>
+<p>原始文件：<code>results/crater/gemm_ceiling_5090.txt</code></p>
+</details>
+<hr />
+<h2 id="_10">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>FlashAttention-4</strong></td>
+<td>为 Blackwell 重写：ping-pong 流水重叠 MMA 与 softmax；用多项式近似<strong>在 FMA 单元上软件仿真 <code>exp()</code></strong>，绕开 MUFU（超越函数单元）的吞吐瓶颈；TMEM + 2-CTA MMA 减少 smem 流量。这些全部依赖 sm_100 的特性（<a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a>）</td>
+</tr>
+<tr>
+<td><strong>CuTe-DSL</strong></td>
+<td>FA4 完全用嵌入 Python 的 CuTe-DSL 写，没有 C++ 部分；编译速度比 C++ CUTLASS 模板快 20–30×，同时保留寄存器分配与流水调度的控制权（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）</td>
+</tr>
+<tr>
+<td><strong>NVFP4 vs MXFP4</strong></td>
+<td>NVFP4 用 FP8-E4M3 做块缩放、组大小 16；MXFP4 用 2 的幂次（E8M0）、组大小 32。前者每值 4.5 bit，后者 4.25 bit，但前者保留更多组内动态范围。<strong>FP4 tensor core 只有 Blackwell 有</strong>（<a class="xref" href="../L4/4.3-quantization.html" title="量化工程">L4.3</a>）</td>
+</tr>
+<tr>
+<td><strong>sm_120 上的 block_scale 指令族</strong></td>
+<td>本章探测到 <code>kind::mxf8f6f4.block_scale</code> 在 sm_120 上可编译。它很可能就是 cuBLASLt fp8 超过我实测上限的原因——<strong>本站待测</strong></td>
+</tr>
+<tr>
+<td><strong>kernel 作者的三路径负担</strong></td>
+<td>Hopper / sm_100 / sm_120 三套代码。TileLang、ThunderKittens、Helion 等新 DSL 的一个卖点就是把这三条路径抽象掉（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>除本站实测外的内容来自各自论文与文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+</blockquote>
+<hr />
+<h2 id="_11">陷阱</h2>
+<p><strong>1. 以为 compute capability 越高越强。</strong> sm_120 &gt; sm_100 但用不了 tcgen05。
+指令集不是单调递增的。</p>
+<p><strong>2. 以为「支持 Blackwell」是一句有意义的话。</strong> 必须问 sm_100 还是 sm_120。</p>
+<p><strong>3. <code>-arch</code> 写错了不会报错。</strong> 用 <code>sm_89</code> 编译在 5090 上照样能跑（驱动 JIT），
+但可能用不上新指令。<strong>这是最隐蔽的性能坑</strong>——没有任何报错，只是慢。</p>
+<p><strong>4. 忘了防优化。</strong> 结果没被使用，编译器会删掉整个循环，你会测出天文数字。</p>
+<p><strong>5. 跨实验比较 TFLOPS。</strong> 频率会因功耗墙、温度、负载类型变化 38%。
+要比就比 FLOP/clk/SM。</p>
+<p><strong>6. 在 <code>synchronize()</code> 之后采样频率。</strong> 本章踩过：读到 0.18 GHz。
+必须并发采样。</p>
+<p><strong>7. 沿用旧架构的经验结论。</strong> 「消费卡 FP32 累加半速」在 Ampere 时代是真的，
+本章实测在 sm_120 上只差 15%。<strong>每换一代都要重测。</strong></p>
+<p><strong>8. 把自己测出的上限当成硬件上限。</strong> 本章的 fp8 上限被 cuBLAS 超了 47%，
+因为我只测了一条指令。<strong>"上限"永远要加限定词：哪条指令、什么累加精度、什么频率。</strong></p>
+<hr />
+<h2 id="_12">自测题</h2>
+<details>
+<summary>1. 为什么 fp8 的吞吐正好是 bf16 的 2.00 倍，而不是 1.8 或 2.3？</summary>
+<p>因为它是<strong>指令级</strong>的，不是硬件魔法：</p>
+<ul>
+<li>bf16：<code>m16n8k16</code>，每条指令 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span> FLOP</li>
+<li>fp8：<code>m16n8k32</code>，每条指令 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>32</mn><mo>&#x0003D;</mo><mn>8192</mn></mrow></math></span> FLOP</li>
+</ul>
+<p>而两条指令的<strong>发射速率相同</strong>（每 SM 每时钟能发同样多条 mma）。
+所以吞吐比 = FLOP/指令 之比 = 2.00，精确到小数点后两位。</p>
+<p>k 维之所以能翻倍：fp8 元素只有 1 字节，同样的 4 个 <code>uint32</code> 寄存器
+（16 字节）能装 16 个 fp8 而只能装 8 个 bf16。<strong>寄存器容量固定，元素变小，k 就能变大。</strong></p>
+<p>推论：fp4（0.5 字节）能到 <code>m16n8k64</code>，理论上再翻倍。<a class="xref" href="../L4/4.3-quantization.html" title="量化工程">L4.3</a> 会实测。</p>
+</details>
+<details>
+<summary>2. 我在 5090 上跑 CUTLASS 的 Blackwell GEMM 模板，编译报一堆 tcgen05 错误。怎么办？</summary>
+<p><strong>不是配置问题，是架构不匹配。</strong> CUTLASS 的 Blackwell 模板针对 <code>sm_100a</code>
+（数据中心 Blackwell，有 TMEM 和 tcgen05）。sm_120 没有这些硬件。</p>
+<p>正确做法：用 CUTLASS 面向 <strong>sm_120 / sm_89</strong> 的模板（<code>mma.sync</code> 血统），
+或者直接用 <code>cutlass_80_tensorop_*</code> 那条路径——<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 trace 显示
+vLLM 在 5090 上跑的正是它。</p>
+<p><strong>不要试图"修"这个编译错误。</strong> 它不是错误，是硬件事实。</p>
+</details>
+<details>
+<summary>3. 我的自写 GEMM 达到了 cuBLAS 的 95%。还有优化空间吗？怎么判断？</summary>
+<p>分两步判断。</p>
+<p><strong>第一步：cuBLAS 自己离硬件上限有多远？</strong> 本章实测 bf16 是 <strong>491 / 511 = 96%</strong>。
+所以你达到 cuBLAS 的 95% ≈ 硬件上限的 91%，<strong>剩余空间不到 10%</strong>，基本到头了。</p>
+<p><strong>第二步：换个精度看看。</strong> fp8 上 cuBLAS 达到 1501 FLOP/clk/SM，
+而我测的 <code>m16n8k32</code> 上限只有 1022——说明存在更宽的指令路径。
+如果你的 fp8 GEMM 用的是 <code>m16n8k32</code>，那你的天花板就是 1022，
+无论怎么优化都追不上 cuBLAS。<strong>这时候要换指令，不是调 tile。</strong></p>
+<p><strong>方法要点</strong>：永远先确定"我用的这条指令的上限是多少"，
+再看"我离它多远"，最后才是"有没有更好的指令"。
+只盯着 cuBLAS 的百分比，会在错误的层面上优化。</p>
+</details>
+<details>
+<summary>4. 我的 kernel 在 nsight 里显示 tensor core 利用率 60%，但换成访存更少的版本后利用率降到 55%，总时间反而变短了。为什么？</summary>
+<p>两个原因，本章都测到了。</p>
+<p><strong>(1) 频率。</strong> 访存少 → 功耗低 → 频率高。本章实测：纯计算 kernel 2.90 GHz / 150 W，
+访存密集的 GEMM 2.12 GHz / 575 W（顶到功耗墙）。
+<strong>频率涨 37%，即使"利用率"降了，绝对吞吐也可能涨。</strong></p>
+<p><strong>(2) "利用率"的分母是时间。</strong> 利用率 = tensor core 忙的时间 / 总时间。
+如果你把总时间缩短了，而 tensor core 的绝对工作量不变，利用率反而可能下降。</p>
+<p><strong>结论</strong>：利用率是诊断指标，不是优化目标。<strong>唯一的目标是墙钟时间。</strong>
+<a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 会讲怎么正确使用 ncu 的各项指标。</p>
+</details>
+<details>
+<summary>5. 本章留下一个未解问题：cuBLAS fp8 达到 1501 FLOP/clk/SM 而我测的上限是 1022。你会怎么把它彻底解决？</summary>
+<p>按证据强度排序，三条路：</p>
+<p><strong>(a) 直接测那条指令。</strong> 用 <code>mma.sync.aligned.kind::mxf8f6f4.block_scale.m16n8k32...</code>
+重写 <code>tensor_core.cu</code> 的 fp8 kernel。如果测出 ≥1501 FLOP/clk/SM，谜底就是它。
+<strong>这是最直接的判决性实验。</strong></p>
+<p><strong>(b) 反汇编 cuBLASLt。</strong> <code>cuobjdump -sass libcublasLt.so</code> 提取 sm_120 的 cubin，
+搜 <code>QGMMA</code> / <code>HMMA</code> 类指令，看它实际发的是哪一条。
+（本章试过 <code>nvdisasm</code>，但它不能直接处理含 fatbin 的 <code>.so</code>，需要先用 <code>cuobjdump</code> 抽取。）</p>
+<p><strong>(c) 用 ncu 采 <code>sm__inst_executed_pipe_tensor</code> 类计数器。</strong>
+知道总共发了多少条 tensor 指令，除以总 FLOP，就能反推每条指令的 FLOP，
+进而识别指令宽度。这个方法不需要反汇编，<a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 会讲。</p>
+<p><strong>任选一条做完，本站就能把那个 <code>未实测</code> 标记去掉。</strong></p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L1/1.1-gpu-microarch.html">&#8592; 1.1 GPU 微架构与内存层次</a><a class="nav-next" href="../L1/1.3-host-pcie-numa.html">1.3 主机侧：NUMA、PCIe 与 DMA &#8594;</a></nav>
+</main>
+</body>
+</html>

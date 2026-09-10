@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.5 文本闭环（下）：从 logits 到你看到的那段文字</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">0.5</div>
+  <div class="sidebar-title">文本闭环（下）：从 logits 到你看到的那段文字</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：五道工序</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#logits">一、logits 长什么样</a></li>
+<li><a href="#logitslogprobprob">二、logits、logprob、prob</a></li>
+<li><a href="#temperature">三、temperature</a></li>
+<li><a href="#top-k-top-p">四、top-k 与 top-p</a></li>
+<li><a href="#_4">五、采样是抽样，不是取最大</a></li>
+<li><a href="#detokenize">六、增量 detokenize：一个真实的乱码</a></li>
+<li><a href="#_5">七、停止条件：三条路径，三个层次</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 源码走读</a></li>
+<li><a href="#_7">工程实现 · 自己写一遍</a><ul>
+<li><a href="#_8">完整源码</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_9">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L0 · 坐标系</div>
+  <div class="mod-id">0.5</div>
+  <h1>文本闭环（下）：从 logits 到你看到的那段文字</h1>
+  <p class="lede">接上一章：logits → logprob → temperature/top-k/top-p → 采到的 token → 增量 detokenize → 停止条件。含一次首 token 与随后两步生成的逐步对照。</p>
+  <div class="chips"><span class="chip">实测机器 crater（RTX 5090 D）· Qwen3-1.7B bf16 · torch 2.13.0+cu130</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L0.4（文本 → 张量）· L0.0（模型输出 logits）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><code>temperature</code> 到底改变了分布的什么？<code>top_p</code> 的截断点怎么定？</li>
+<li>为什么流式输出时<strong>不能</strong>每收到一个 token 就单独 decode？</li>
+<li>生成什么时候停？停止条件有哪几种，分别在哪一层判断？</li>
+</ol>
+<p><a class="xref" href="../L0/0.4-text-to-tensor.html" title="文本闭环（上）：从 Unicode 字节到模型输入张量">L0.4</a> 走完了「文本 → 张量」。这一章走另一半：
+模型吐出 151,936 个实数之后，到底经过哪些步骤才变成屏幕上的字。</p>
+<p>本章所有数字都来自一次真实的前向：Qwen3-1.7B，prompt 是 <code>'中国的首都是'</code>。</p>
+<hr />
+<h2 id="_2">心智模型：五道工序</h2>
+<figure>
+<svg viewBox="0 0 740 450" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="从 logits 到文本">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">prompt '中国的首都是' 之后的一步（Qwen3-1.7B 实测）</text>
+
+    <g font-size="10.5">
+      <line x1="12" y1="30" x2="728" y2="30" stroke="currentColor" stroke-width="1" opacity="0.35"/>
+      <text x="12" y="50" font-weight="600">logits</text>
+      <text x="120" y="50" font-family="ui-monospace,monospace">[151936] fp32</text>
+      <text x="290" y="50">min −4.44  max 22.12  std 2.35</text>
+
+      <text x="12" y="74" font-weight="600">÷ temperature</text>
+      <text x="120" y="74" font-family="ui-monospace,monospace">z / T</text>
+      <text x="290" y="74">T 小 → 分布更尖；T=0 特判为 argmax</text>
+
+      <text x="12" y="98" font-weight="600">top-k / top-p</text>
+      <text x="120" y="98" font-family="ui-monospace,monospace">置 −inf</text>
+      <text x="290" y="98">把候选集从 151936 砍到几个</text>
+
+      <text x="12" y="122" font-weight="600">softmax</text>
+      <text x="120" y="122" font-family="ui-monospace,monospace">→ 概率</text>
+      <text x="290" y="122">归一化，和为 1</text>
+
+      <text x="12" y="146" font-weight="600">multinomial</text>
+      <text x="120" y="146" font-family="ui-monospace,monospace">→ 一个 id</text>
+      <text x="290" y="146">有放回抽样，不是取最大</text>
+
+      <text x="12" y="170" font-weight="600">增量 detokenize</text>
+      <text x="120" y="170" font-family="ui-monospace,monospace">→ 一段文字</text>
+      <text x="290" y="170">维护字节缓冲，不能逐 token decode</text>
+      <line x1="12" y1="182" x2="728" y2="182" stroke="currentColor" stroke-width="1" opacity="0.35"/>
+    </g>
+
+    <text x="12" y="208" font-size="12" font-weight="600">temperature 改变的是「模型在几个选项之间犹豫」</text>
+    <g font-size="10.5" font-family="ui-monospace, monospace">
+      <text x="24" y="230">   T      最大概率     熵    exp(熵) = 有效候选数</text>
+      <text x="24" y="248"> 0.2      1.0000  0.0006          1.0</text>
+      <text x="24" y="264"> 0.5      0.9659  0.2063          1.2</text>
+      <text x="24" y="280"> 1.0      0.5546  2.6288         13.9</text>
+      <text x="24" y="296"> 1.5      0.1283  7.3256       1518.6</text>
+      <text x="24" y="312"> 3.0      0.0022 11.3643      86190.6</text>
+    </g>
+    <text x="24" y="334" font-size="10.5">词表 151,936；均匀分布时 exp(熵) = 151,936。T=3 已经接近乱采。</text>
+
+    <line x1="12" y1="352" x2="728" y2="352" stroke="currentColor" stroke-width="1" opacity="0.35"/>
+    <text x="12" y="374" font-size="12" font-weight="600">一个真实的流式乱码</text>
+    <g font-size="10.5">
+      <text x="24" y="396">罕见字 <tspan font-family="ui-monospace,monospace">'𩸽'</tspan> 被切成 3 个 token，每个单独 decode 都是 <tspan font-family="ui-monospace,monospace">'�'</tspan>：</text>
+      <text x="40" y="416" font-family="ui-monospace,monospace">逐 token decode 拼接 → '���'     整体 decode → '𩸽'</text>
+      <text x="24" y="438">正确做法是维护字节缓冲：<tspan font-family="ui-monospace,monospace">f0 a9</tspan> 吐出空 → <tspan font-family="ui-monospace,monospace">b8</tspan> 吐出空 → <tspan font-family="ui-monospace,monospace">bd</tspan> 吐出 <tspan font-family="ui-monospace,monospace">'𩸽'</tspan></text>
+    </g>
+  </g>
+</svg>
+<figcaption>从 logits 到文本的五道工序；temperature 的量化效果；一个真实的流式乱码及其修法。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="logits">一、logits 长什么样</h3>
+<p>一次真实前向（原样）：</p>
+<div class="highlight"><pre><span></span><code>prompt '中国的首都是' -&gt; 3 个 token [105538, 59975, 100132]
+logits 形状 (1, 3, 151936)，取最后一个位置 -&gt; (151936,)
+量级：min -4.44  max 22.12  mean 3.50  std 2.35
+
+  排名       id token              logit      prob   logprob
+   0    68990 '北京'             22.1250  0.554616   -0.5895
+   1   101314 '哪里'             20.1250  0.075059   -2.5895
+   2     2130 '____'           19.6250  0.045526   -3.0895
+   3    99245 '什么'             19.1250  0.027613   -3.5895
+   4   104673 '哪个'             19.0000  0.024368   -3.7145
+   5    99459 '哪'              19.0000  0.024368   -3.7145
+   6     9909 '（'              18.8750  0.021505   -3.8395
+   7    58695 '中国'             18.2500  0.011511   -4.4645
+</code></pre></div>
+
+<p>三点值得注意：</p>
+<ul>
+<li><strong><code>'中国的首都是'</code> 只切成 3 个 token</strong>，不是 6 个。
+  Qwen3 的词表里「中国」「的首都」「是」各是一个 token（<a class="xref" href="../L0/0.4-text-to-tensor.html" title="文本闭环（上）：从 Unicode 字节到模型输入张量">L0.4</a>）。</li>
+<li>最高分 <code>'北京'</code> 的概率是 <strong>0.5546</strong>，不是接近 1。
+  模型认为还有一半的可能性是别的（比如把这句话当成填空题，接 <code>'哪里'</code>）。</li>
+<li>排名 4 和 5 的 logit <strong>完全相同</strong>（19.0000）。这是 bf16 的精度所致——
+  bf16 只有 8 位尾数，19.0 附近的间隔是 0.125，两个不同的实数落到了同一个可表示值上。</li>
+</ul>
+<h3 id="logitslogprobprob">二、logits、logprob、prob</h3>
+<p>三者的关系：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>p</mi><mi>i</mi></msub><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>i</mi></msub></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>j</mi></msub></mrow></msup></mrow></mfrac><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>&#x02113;</mi><mi>i</mi></msub><mo>&#x0003D;</mo><mi>log</mi><msub><mi>p</mi><mi>i</mi></msub><mo>&#x0003D;</mo><msub><mi>z</mi><mi>i</mi></msub><mo>&#x02212;</mo><mi>log</mi><munder><mo>&#x02211;</mo><mi>j</mi></munder><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>j</mi></msub></mrow></msup></mrow></math></div></p>
+<p><code>logits</code> 是模型直接输出的实数，没有归一化。<strong>给所有 logit 加同一个常数不改变分布</strong>——
+分子分母同乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mi>c</mi></msup></mrow></math></span> 约掉。本站验证：</p>
+<div class="highlight"><pre><span></span><code>验证 1：给所有 logit 加 100，softmax 不变
+  最大绝对差 = 5.274e-16
+验证 2：exp(logprob) == prob
+  最大绝对差 = 7.451e-09
+验证 3：概率之和 = 1.000024
+</code></pre></div>
+
+<div class="admonition note">
+<p class="admonition-title">概率之和不是 1.000000</p>
+<p>实测 <strong>1.000024</strong>，差了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2.4</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>5</mn></mrow></msup></mrow></math></span>。</p>
+<p>原因：模型用 bf16 算出 logits，我把它转成 fp32 再做 softmax。
+对 151,936 个数求和，fp32 的舍入误差会累积到这个量级
+（对照 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 关于归约累加精度的实测）。</p>
+<p><strong>工程含义</strong>：不要写 <code>assert probs.sum() == 1.0</code>。
+判断分布是否有效要用容差，而且容差要随词表大小放宽。</p>
+</div>
+<p><strong>为什么 API 返回 logprob 而不是 prob。</strong> 序列的联合概率是各步概率的乘积，
+很快就会小到 fp32 存不下：</p>
+<div class="highlight"><pre><span></span><code>例：连续采 10 个概率各 0.5546 的 token，
+    联合概率 = 2.754e-03，而 logprob 相加 = -5.89
+</code></pre></div>
+
+<p>10 步就到了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>3</mn></mrow></msup></mrow></math></span>，100 步就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>26</mn></mrow></msup></mrow></math></span>，1000 步直接下溢成 0。
+取对数之后乘法变加法，数值范围完全没问题。</p>
+<p>所以凡是涉及<strong>序列打分</strong>的地方——beam search、投机解码的验证（<a class="xref" href="../L5/5.5-speculative-decoding.html" title="投机解码">L5.5</a>）、
+RL 里算 ratio（<span class="xref pending" title="RL infra：rollout、policy 版本与权重同步（尚未写）">L7.6</span>）——用的都是 logprob。</p>
+<h3 id="temperature">三、temperature</h3>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>p</mi><mi>i</mi></msub><mo>&#x0003D;</mo><mo>softmax</mo><mo stretchy="false">&#x00028;</mo><msub><mi>z</mi><mi>i</mi></msub><mo>&#x0002F;</mo><mi>T</mi><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math></span> 只是在进 softmax 之前除一下。<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x0003C;</mo><mn>1</mn></mrow></math></span> 把差距拉大，分布更尖；
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x0003E;</mo><mn>1</mn></mrow></math></span> 把差距压缩，分布更平。</p>
+<p>本站实测：</p>
+<table>
+<thead>
+<tr>
+<th><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math></span></th>
+<th>最大概率</th>
+<th>熵</th>
+<th><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mtext>熵</mtext></mrow></msup></mrow></math></span></th>
+<th>top-3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0.0</td>
+<td>1.0000</td>
+<td>0.0000</td>
+<td>1.0</td>
+<td>argmax</td>
+</tr>
+<tr>
+<td>0.2</td>
+<td>1.0000</td>
+<td>0.0006</td>
+<td>1.0</td>
+<td><code>北京, 哪里, ____</code></td>
+</tr>
+<tr>
+<td>0.5</td>
+<td>0.9659</td>
+<td>0.2063</td>
+<td>1.2</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>1.0</td>
+<td>0.5546</td>
+<td>2.6288</td>
+<td><strong>13.9</strong></td>
+<td>同上</td>
+</tr>
+<tr>
+<td>1.5</td>
+<td>0.1283</td>
+<td>7.3256</td>
+<td>1518.6</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>3.0</td>
+<td>0.0022</td>
+<td>11.3643</td>
+<td>86190.6</td>
+<td>同上</td>
+</tr>
+</tbody>
+</table>
+<p><strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mtext>熵</mtext></mrow></msup></mrow></math></span> 这一列叫「有效候选数」</strong>（perplexity 的另一种用法），
+可以理解成模型实际在多少个选项之间犹豫。词表 151,936，
+均匀分布时这个值就是 151,936。</p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span> 时是 13.9——模型基本在十几个词里选。
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x0003D;</mo><mn>3</mn></mrow></math></span> 时涨到 86,190，已经接近乱采。</p>
+<p><strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span> 是特例</strong>：不是真的除以 0，而是直接取 argmax（贪心解码）。
+实现上要单独判断，否则会得到 <code>inf</code>/<code>nan</code>。</p>
+<h3 id="top-k-top-p">四、top-k 与 top-p</h3>
+<p>两者都是<strong>截断</strong>：把不要的候选的 logit 置为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span>，softmax 之后自然是 0。</p>
+<ul>
+<li><strong>top-k</strong>：只保留最大的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 个。</li>
+<li><strong>top-p</strong>（核采样）：按概率从大到小累加，累计<strong>达到</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 之后的全部丢掉。</li>
+</ul>
+<p>本站实测：</p>
+<div class="highlight"><pre><span></span><code>策略                    候选数       覆盖概率 候选
+原始                 151936     1.0000   ['北京', '哪里', '____', '什么']
+top_k=1                 1     0.5546   ['北京']
+top_k=5                 6     0.7515   ['北京', '哪里', '____', '什么']
+top_k=50               52     0.9075   ['北京', '哪里', '____', '什么']
+top_p=0.5               1     0.5546   ['北京']
+top_p=0.9              46     0.9008   ['北京', '哪里', '____', '什么']
+top_p=0.99            146     0.9900   ['北京', '哪里', '____', '什么']
+</code></pre></div>
+
+<div class="admonition warning">
+<p class="admonition-title">top_k=5 为什么留下了 6 个</p>
+<p>因为<strong>并列</strong>。排名 4 和 5 的 logit 都是 19.0000（bf16 精度所致），
+本站的实现用 <code>logits &lt; kth</code> 做掩码，会把所有等于第 k 大值的都保留下来。
+<code>top_k=50</code> 同理留下了 52 个。</p>
+<p>不同引擎在这里的行为不一致：有的保留全部并列，有的按索引顺序截断到恰好 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 个。
+这是一个真实的实现差异，会导致同样的种子在不同引擎上采到不同的 token。
+<strong>做跨引擎复现时，这是要排查的地方之一。</strong></p>
+</div>
+<p><strong>top-k 与 top-p 的区别在模型确定时最明显。</strong>
+上表里 <code>top_p=0.5</code> 只留 1 个（因为 <code>'北京'</code> 一个就占了 0.5546），
+而 <code>top_k=50</code> 仍然保留 52 个，包括一堆概率极低的。</p>
+<p>反过来，模型不确定时 top-p 会自动放宽。所以 top-p 是<strong>自适应</strong>的，
+这也是它更常用的原因。两者常一起用：先 top-k 砍掉长尾（限制计算量），
+再 top-p 动态收紧。</p>
+<p>top-p 的实现有一个容易写错的边界：</p>
+<p>{{src:labs/L0/sampling_walk.py:53:69}}</p>
+<p>问题在于「第一个使累计超过 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 的 token」要不要保留。
+如果不保留，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 很小时可能一个候选都不剩。
+本站的做法是把 mask 右移一位；另一种等价写法是用「不含自己的累计」来判断。
+两种写法本站都实现了并对拍：</p>
+<div class="highlight"><pre><span></span><code>top_p=0.5: 候选集相同 = True  (我的 1 个 / 参照 1 个)
+top_p=0.9: 候选集相同 = True  (我的 46 个 / 参照 46 个)
+top_p=0.95: 候选集相同 = True  (我的 146 个 / 参照 146 个)
+</code></pre></div>
+
+<h3 id="_4">五、采样是抽样，不是取最大</h3>
+<div class="highlight"><pre><span></span><code>token                理论概率       实测频率     次数
+'北京'               0.7380     0.7580    758
+'哪里'               0.0999     0.0870     87
+'____'             0.0606     0.0590     59
+'哪个'               0.0324     0.0490     49
+'什么'               0.0367     0.0260     26
+'哪'                0.0324     0.0210     21
+</code></pre></div>
+
+<p>（这里的「理论概率」是 top-k 截断<strong>之后重新归一化</strong>的结果，
+所以 <code>'北京'</code> 从 0.5546 涨到了 0.7380。）</p>
+<p>1000 次抽样的频率与概率吻合。<strong>同样的 prompt 每次跑结果不同，
+随机性就是在这一步引入的。</strong></p>
+<p>要复现必须固定随机种子。但注意：<strong>引擎的种子和你的不是同一个</strong>——
+vLLM 在 GPU 上采样，用的是它自己的生成器状态，
+即使你传了 <code>seed</code> 参数，也只保证同一个引擎、同一个批次构成下可复现。</p>
+<h3 id="detokenize">六、增量 detokenize：一个真实的乱码</h3>
+<p>先看一个<strong>没问题</strong>的例子：</p>
+<div class="highlight"><pre><span></span><code>'风吹过山谷' -&gt; 3 个 token
+  i       id      单独 decode 字节
+  0   109520           '风吹' e9 a3 8e e5 90 b9
+  1    38182            '过' e8 bf 87
+  2   113599           '山谷' e5 b1 b1 e8 b0 b7
+</code></pre></div>
+
+<p>这三个 token 各自都是完整字符，逐个 decode 恰好没问题。
+<strong>但这只是运气好。</strong> 换一个词表里没有的罕见字：</p>
+<div class="highlight"><pre><span></span><code>'𩸽' (4 字节) -&gt; 3 个 token
+  i       id token         单独 decode
+  0   103914 'ð©'                '�'
+  1      116 '¸'                 '�'
+  2      121 '½'                 '�'
+
+  逐 token decode 再拼接 -&gt; '���'   ← 三个替换符
+  整体 decode            -&gt; '𩸽'
+  两者相同：False
+</code></pre></div>
+
+<p><code>𩸽</code> 不在词表里，退回字节级，4 个字节被切成 3 个 token
+（<code>f0 a9</code> 是一个 token，<code>b8</code>、<code>bd</code> 各一个）。
+<strong>每个 token 单独 decode 都得到替换符 U+FFFD</strong>，因为它们都不是完整的 UTF-8 序列。</p>
+<p>流式接口是一个 token 一个 token 往外吐的。
+如果每次都单独 decode，用户会先看到几个 <code>�</code>——而且永远看不到正确的字。</p>
+<p><strong>正确做法是维护一个字节缓冲。</strong> 本站实现：</p>
+<p>{{src:labs/L0/sampling_walk.py:104:124}}</p>
+<p>实测效果：</p>
+<div class="highlight"><pre><span></span><code>推入 id=103914   字节 f0 a9        -&gt; 吐出 ''  缓冲剩 2 字节
+推入 id=116      字节 b8           -&gt; 吐出 ''  缓冲剩 3 字节
+推入 id=121      字节 bd           -&gt; 吐出 '𩸽'  缓冲剩 0 字节
+拼接结果 '𩸽'
+</code></pre></div>
+
+<p>前两次什么都不吐，第三次一次性吐出完整字符。</p>
+<div class="admonition warning">
+<p class="admonition-title">取 token 的原始字节本身就是个坑</p>
+<p>本站第一版写这个 lab 时用 <code>tok.convert_tokens_to_string(...).encode("utf-8")</code>
+去取字节，结果拿到的是 <code>ef bf bd</code>——<strong>那是替换符 U+FFFD 的字节</strong>，
+和原始字节毫无关系。演示「正确做法」的代码本身是错的。</p>
+<p>必须反查字节级映射表（<a class="xref" href="../L0/0.4-text-to-tensor.html" title="文本闭环（上）：从 Unicode 字节到模型输入张量">L0.4</a> 讲的 <code>Ġ</code> 那套）才能拿到真实字节：</p>
+<p>{{src:labs/L0/sampling_walk.py:72:102}}</p>
+</div>
+<h3 id="_5">七、停止条件：三条路径，三个层次</h3>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>判断对象</th>
+<th>在哪一层</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>eos token</strong></td>
+<td>token id</td>
+<td>采样之后、detokenize 之前（引擎调度层）</td>
+</tr>
+<tr>
+<td><strong>stop string</strong></td>
+<td>文本</td>
+<td>detokenize 之后（需要跨 token）</td>
+</tr>
+<tr>
+<td><strong>max_tokens</strong></td>
+<td>计数</td>
+<td>任意层。<strong>唯一保证会终止的一条</strong></td>
+</tr>
+</tbody>
+</table>
+<p><code>stop string</code> 必须在文本上判断，不能在 token 上判断——
+停止串可能横跨两个 token。比如停止串是 <code>"\n\n"</code>，
+而模型采到的是一个内容为 <code>"。\n\n好"</code> 的 token，只看 token id 是发现不了的。</p>
+<p>本站实测一次生成：</p>
+<div class="highlight"><pre><span></span><code>停止原因：max_tokens
+生成 200 个 token：'&lt;think&gt;\n嗯，用户让我用一句话说明风是什么。首先，我需要确定用户的需求...'
+</code></pre></div>
+
+<p><strong>200 个 token 还没停</strong>，因为 Qwen3 默认开启思考模式，
+先输出一大段 <code>&lt;think&gt;</code> 内容。这正说明 <code>max_tokens</code> 的必要性——
+没有它，一次请求可能跑很久。</p>
+<p>换成 stop string：</p>
+<div class="highlight"><pre><span></span><code>停止原因：stop string '。' @ step 11
+输出：'&lt;think&gt;\n嗯，用户让我用一句话说明风是什么。'
+</code></pre></div>
+
+<p>11 步就停了。</p>
+<hr />
+<h2 id="_6">工程实现 · 源码走读</h2>
+<p><strong>采样在哪里执行</strong>是一个有工程后果的选择。</p>
+<p>朴素做法是把 logits 拷回 CPU，用 numpy/torch 在 CPU 上采样。
+问题：logits 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">[</mo><mi>B</mi><mo>&#x0002C;</mo><mi>V</mi><mo stretchy="false">]</mo></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi><mo>&#x0003D;</mo><mn>151936</mn></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x0003D;</mo><mn>64</mn></mrow></math></span> 时就是
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>64</mn><mo>&#x000D7;</mo><mn>151936</mn><mo>&#x000D7;</mo><mn>4</mn><mtext>&#x000A0;</mtext><mtext>B</mtext><mo>&#x02248;</mo><mn>39</mn></mrow></math></span> MB。
+每一步都拷 39 MB 过 PCIe，按 <a class="xref" href="../L1/1.3-host-pcie-numa.html" title="主机侧：NUMA、PCIe 与 DMA">L1.3</a> 实测的 ~25 GB/s 算就是 1.5 ms——
+而一步 decode 本身可能才 5 ms。</p>
+<p><strong>所以推理引擎全部在 GPU 上采样。</strong> vLLM 的 <code>Sampler</code> 是一组 CUDA kernel：
+temperature 缩放、top-k/top-p 过滤、multinomial 抽样都在 GPU 上完成，
+只把最终的 token id（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 个 int32，几百字节）拷回 CPU。</p>
+<p>这条设计也解释了 <a class="xref" href="../L2/2.6b-graph-anatomy.html" title="算子图的样子：Dynamo FX 图、Inductor 输出与真实文本">L2.6b</a> 讲的另一件事：
+<strong>热路径里不能有 <code>.item()</code></strong>。采样结果如果在 GPU 上就地拼回序列，
+整个 decode 步可以不做任何同步；一旦调用 <code>.item()</code> 判断「是不是 eos」，
+就会强制同步，打断 CPU-GPU 流水（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 实测 4.76 µs）。</p>
+<p>vLLM 的做法是：把「是否遇到 eos」也在 GPU 上算成一个 mask，
+异步拷回 CPU，下一步再检查——用一步的延迟换掉同步。</p>
+<p>detokenize 同样不在关键路径上：
+vLLM 的 detokenizer 跑在与 EngineCore <strong>不同的进程</strong>里（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 走读过），
+GPU 只管产出 token id。</p>
+<hr />
+<h2 id="_7">工程实现 · 自己写一遍</h2>
+<p>整个采样管线不到 40 行，不依赖任何库：</p>
+<p>{{src:labs/L0/sampling_walk.py:36:69}}</p>
+<h3 id="_8">完整源码</h3>
+<details class="fold srcfold"><summary>labs/L0/sampling_walk.py 全文（348 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L0.5 lab · 从 logits 到你看到的那段文字。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">L0.4 走完了「文本 -&gt; 张量」。这个脚本走另一半：模型吐出一串实数之后，</span>
+<span class="linenos">  5</span><span class="sd">到底经过哪些步骤才变成屏幕上的字符。</span>
+<span class="linenos">  6</span>
+<span class="linenos">  7</span><span class="sd">按顺序打印：</span>
+<span class="linenos">  8</span><span class="sd">    [0] 一次真实前向的 logits —— 形状、量级、top-k</span>
+<span class="linenos">  9</span><span class="sd">    [1] logits -&gt; logprob -&gt; prob —— 三者的关系与各自的用途</span>
+<span class="linenos"> 10</span><span class="sd">    [2] temperature 改变了什么 —— 同一组 logits，不同温度下的分布</span>
+<span class="linenos"> 11</span><span class="sd">    [3] top-k / top-p 的截断 —— 候选集怎么变</span>
+<span class="linenos"> 12</span><span class="sd">    [4] 采样：同一分布采 1000 次，看频率是否符合概率</span>
+<span class="linenos"> 13</span><span class="sd">    [5] 增量 detokenize —— 流式输出为什么不能逐 token decode</span>
+<span class="linenos"> 14</span><span class="sd">    [6] 停止条件 —— eos / stop string / max_tokens 三条路径</span>
+<span class="linenos"> 15</span><span class="sd">    [7] 与引擎对齐 —— 自己实现的 top-p 与 vLLM 的输出对比</span>
+<span class="linenos"> 16</span>
+<span class="linenos"> 17</span><span class="sd">用法：python sampling_walk.py [--model Qwen/Qwen3-1.7B]</span>
+<span class="linenos"> 18</span><span class="sd">"""</span>
+<span class="linenos"> 19</span>
+<span class="linenos"> 20</span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos"> 21</span>
+<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="linenos"> 23</span><span class="kn">import</span><span class="w"> </span><span class="nn">collections</span>
+<span class="linenos"> 24</span><span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos"> 25</span>
+<span class="linenos"> 26</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 27</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+<span class="linenos"> 28</span>
+<span class="linenos"> 29</span><span class="n">SEP</span> <span class="o">=</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="mi">78</span>
+<span class="linenos"> 30</span>
+<span class="linenos"> 31</span>
+<span class="linenos"> 32</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 33</span><span class="c1"># 自己实现采样：每一步都不用库</span>
+<span class="linenos"> 34</span><span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="linenos"> 35</span>
+<span class="linenos"> 36</span><span class="k">def</span><span class="w"> </span><span class="nf">apply_temperature</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">t</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos"> 37</span><span class="w">    </span><span class="sd">"""t &lt; 1 让分布更尖，t &gt; 1 更平。t -&gt; 0 等价于 argmax。"""</span>
+<span class="linenos"> 38</span>    <span class="k">if</span> <span class="n">t</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos"> 39</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full_like</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos"> 40</span>        <span class="n">out</span><span class="p">[</span><span class="n">logits</span><span class="o">.</span><span class="n">argmax</span><span class="p">()]</span> <span class="o">=</span> <span class="mf">0.0</span>
+<span class="linenos"> 41</span>        <span class="k">return</span> <span class="n">out</span>
+<span class="linenos"> 42</span>    <span class="k">return</span> <span class="n">logits</span> <span class="o">/</span> <span class="n">t</span>
+<span class="linenos"> 43</span>
+<span class="linenos"> 44</span>
+<span class="linenos"> 45</span><span class="k">def</span><span class="w"> </span><span class="nf">top_k_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos"> 46</span><span class="w">    </span><span class="sd">"""只保留最大的 k 个，其余置为 -inf。"""</span>
+<span class="linenos"> 47</span>    <span class="k">if</span> <span class="n">k</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">k</span> <span class="o">&gt;=</span> <span class="n">logits</span><span class="o">.</span><span class="n">numel</span><span class="p">():</span>
+<span class="linenos"> 48</span>        <span class="k">return</span> <span class="n">logits</span>
+<span class="linenos"> 49</span>    <span class="n">kth</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span><span class="o">.</span><span class="n">values</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos"> 50</span>    <span class="k">return</span> <span class="n">logits</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">logits</span> <span class="o">&lt;</span> <span class="n">kth</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos"> 51</span>
+<span class="linenos"> 52</span>
+<span class="linenos"> 53</span><span class="k">def</span><span class="w"> </span><span class="nf">top_p_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">p</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos"> 54</span><span class="w">    </span><span class="sd">"""核采样：按概率从大到小累加，累计超过 p 之后的全部丢掉。</span>
+<span class="linenos"> 55</span>
+<span class="linenos"> 56</span><span class="sd">    注意边界：第一个使累计**达到或超过** p 的 token 要保留，</span>
+<span class="linenos"> 57</span><span class="sd">    否则 p 很小时可能一个都不剩。</span>
+<span class="linenos"> 58</span><span class="sd">    """</span>
+<span class="linenos"> 59</span>    <span class="k">if</span> <span class="n">p</span> <span class="o">&gt;=</span> <span class="mf">1.0</span><span class="p">:</span>
+<span class="linenos"> 60</span>        <span class="k">return</span> <span class="n">logits</span>
+<span class="linenos"> 61</span>    <span class="n">probs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos"> 62</span>    <span class="n">sorted_probs</span><span class="p">,</span> <span class="n">sorted_idx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">probs</span><span class="p">,</span> <span class="n">descending</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 63</span>    <span class="n">cum</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">sorted_probs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos"> 64</span>    <span class="c1"># cum &gt; p 的位置要丢；但把这个 mask 右移一位，保住第一个越界的那个</span>
+<span class="linenos"> 65</span>    <span class="n">remove</span> <span class="o">=</span> <span class="n">cum</span> <span class="o">&gt;</span> <span class="n">p</span>
+<span class="linenos"> 66</span>    <span class="n">remove</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">=</span> <span class="n">remove</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos"> 67</span>    <span class="n">remove</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span>
+<span class="linenos"> 68</span>    <span class="n">drop_idx</span> <span class="o">=</span> <span class="n">sorted_idx</span><span class="p">[</span><span class="n">remove</span><span class="p">]</span>
+<span class="linenos"> 69</span>    <span class="k">return</span> <span class="n">logits</span><span class="o">.</span><span class="n">index_fill</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">drop_idx</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos"> 70</span>
+<span class="linenos"> 71</span>
+<span class="linenos"> 72</span><span class="k">def</span><span class="w"> </span><span class="nf">make_byte_decoder</span><span class="p">():</span>
+<span class="linenos"> 73</span><span class="w">    </span><span class="sd">"""字节级 BPE 把 0..255 映射到可打印字符（Ġ Ĉ 之类），这里做反向表。</span>
+<span class="linenos"> 74</span>
+<span class="linenos"> 75</span><span class="sd">    没有这张表就拿不到 token 的**真实字节**——直接 decode 会在多字节字符</span>
+<span class="linenos"> 76</span><span class="sd">    被拆开时得到 U+FFFD，而 U+FFFD 的字节是 ef bf bd，和原始字节毫无关系。</span>
+<span class="linenos"> 77</span>
+<span class="linenos"> 78</span><span class="sd">    映射规则（GPT-2 定义，之后所有字节级 BPE 都沿用）：</span>
+<span class="linenos"> 79</span><span class="sd">      本来就可打印的字节（! 到 ~、¡ 到 ¬、® 到 ÿ）映射到自己；</span>
+<span class="linenos"> 80</span><span class="sd">      其余 68 个（控制字符、空格、以及几个空洞）依次映射到 U+0100 往后。</span>
+<span class="linenos"> 81</span><span class="sd">      所以空格 0x20 -&gt; U+0120 'Ġ'，换行 0x0A -&gt; U+010A 'Ċ'。</span>
+<span class="linenos"> 82</span><span class="sd">    """</span>
+<span class="linenos"> 83</span>    <span class="n">printable</span> <span class="o">=</span> <span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="nb">ord</span><span class="p">(</span><span class="s2">"!"</span><span class="p">),</span> <span class="nb">ord</span><span class="p">(</span><span class="s2">"~"</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
+<span class="linenos"> 84</span>                 <span class="o">+</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="nb">ord</span><span class="p">(</span><span class="s2">"¡"</span><span class="p">),</span> <span class="nb">ord</span><span class="p">(</span><span class="s2">"¬"</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
+<span class="linenos"> 85</span>                 <span class="o">+</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="nb">ord</span><span class="p">(</span><span class="s2">"®"</span><span class="p">),</span> <span class="nb">ord</span><span class="p">(</span><span class="s2">"ÿ"</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)))</span>
+<span class="linenos"> 86</span>    <span class="n">b2u</span> <span class="o">=</span> <span class="p">{</span><span class="n">b</span><span class="p">:</span> <span class="nb">chr</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">printable</span><span class="p">}</span>
+<span class="linenos"> 87</span>    <span class="n">n</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos"> 88</span>    <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">256</span><span class="p">):</span>
+<span class="linenos"> 89</span>        <span class="k">if</span> <span class="n">b</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">b2u</span><span class="p">:</span>
+<span class="linenos"> 90</span>            <span class="n">b2u</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">=</span> <span class="nb">chr</span><span class="p">(</span><span class="mi">256</span> <span class="o">+</span> <span class="n">n</span><span class="p">)</span>
+<span class="linenos"> 91</span>            <span class="n">n</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos"> 92</span>    <span class="k">return</span> <span class="p">{</span><span class="n">c</span><span class="p">:</span> <span class="n">b</span> <span class="k">for</span> <span class="n">b</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">b2u</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+<span class="linenos"> 93</span>
+<span class="linenos"> 94</span>
+<span class="linenos"> 95</span><span class="k">def</span><span class="w"> </span><span class="nf">token_bytes</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="n">tid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">byte_dec</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="linenos"> 96</span><span class="w">    </span><span class="sd">"""取一个 token 的原始字节。词表里存的是映射后的字符串。"""</span>
+<span class="linenos"> 97</span>    <span class="n">piece</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">convert_ids_to_tokens</span><span class="p">([</span><span class="n">tid</span><span class="p">])[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos"> 98</span>    <span class="k">try</span><span class="p">:</span>
+<span class="linenos"> 99</span>        <span class="k">return</span> <span class="nb">bytes</span><span class="p">(</span><span class="n">byte_dec</span><span class="p">[</span><span class="n">ch</span><span class="p">]</span> <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="n">piece</span><span class="p">)</span>
+<span class="linenos">100</span>    <span class="k">except</span> <span class="ne">KeyError</span><span class="p">:</span>                     <span class="c1"># 特殊 token（&lt;|im_end|&gt; 等）不走字节映射</span>
+<span class="linenos">101</span>        <span class="k">return</span> <span class="n">piece</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">)</span>
+<span class="linenos">102</span>
+<span class="linenos">103</span>
+<span class="linenos">104</span><span class="k">class</span><span class="w"> </span><span class="nc">IncrementalDetokenizer</span><span class="p">:</span>
+<span class="linenos">105</span><span class="w">    </span><span class="sd">"""流式输出用的增量解码器：维护一个字节缓冲。</span>
+<span class="linenos">106</span>
+<span class="linenos">107</span><span class="sd">    直接对每个 token 调 decode 会在多字节字符被拆开时产生 U+FFFD 替换符。</span>
+<span class="linenos">108</span><span class="sd">    正确做法是把字节攒起来，只吐出能构成完整字符的部分。</span>
+<span class="linenos">109</span><span class="sd">    """</span>
+<span class="linenos">110</span>
+<span class="linenos">111</span>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">112</span>        <span class="bp">self</span><span class="o">.</span><span class="n">buf</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span>
+<span class="linenos">113</span>
+<span class="linenos">114</span>    <span class="k">def</span><span class="w"> </span><span class="nf">push</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_bytes</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="linenos">115</span>        <span class="bp">self</span><span class="o">.</span><span class="n">buf</span> <span class="o">+=</span> <span class="n">token_bytes</span>
+<span class="linenos">116</span>        <span class="c1"># 从后往前找最长的可解码前缀；未完成的多字节序列留在缓冲里</span>
+<span class="linenos">117</span>        <span class="k">for</span> <span class="n">cut</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buf</span><span class="p">),</span> <span class="nb">max</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buf</span><span class="p">)</span> <span class="o">-</span> <span class="mi">4</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">),</span> <span class="o">-</span><span class="mi">1</span><span class="p">):</span>
+<span class="linenos">118</span>            <span class="k">try</span><span class="p">:</span>
+<span class="linenos">119</span>                <span class="n">text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">buf</span><span class="p">[:</span><span class="n">cut</span><span class="p">]</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">)</span>
+<span class="linenos">120</span>            <span class="k">except</span> <span class="ne">UnicodeDecodeError</span><span class="p">:</span>
+<span class="linenos">121</span>                <span class="k">continue</span>
+<span class="linenos">122</span>            <span class="bp">self</span><span class="o">.</span><span class="n">buf</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">buf</span><span class="p">[</span><span class="n">cut</span><span class="p">:]</span>
+<span class="linenos">123</span>            <span class="k">return</span> <span class="n">text</span>
+<span class="linenos">124</span>        <span class="k">return</span> <span class="s2">""</span>
+<span class="linenos">125</span>
+<span class="linenos">126</span>
+<span class="linenos">127</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">128</span>    <span class="n">ap</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+<span class="linenos">129</span>    <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--model"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"Qwen/Qwen3-1.7B"</span><span class="p">)</span>
+<span class="linenos">130</span>    <span class="n">args</span> <span class="o">=</span> <span class="n">ap</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos">131</span>
+<span class="linenos">132</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoTokenizer</span>
+<span class="linenos">133</span>    <span class="n">tok</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+<span class="linenos">134</span>    <span class="n">dev</span> <span class="o">=</span> <span class="s2">"cuda"</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="k">else</span> <span class="s2">"cpu"</span>
+<span class="linenos">135</span>    <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+<span class="linenos">136</span>        <span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span> <span class="k">if</span> <span class="n">dev</span> <span class="o">==</span> <span class="s2">"cuda"</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<span class="linenos">137</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  device=</span><span class="si">{</span><span class="n">dev</span><span class="si">}</span><span class="s2">  model=</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">138</span>
+<span class="linenos">139</span>    <span class="c1"># ---------------------------------------------------------------- [0]</span>
+<span class="linenos">140</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[0] 一次真实前向的 logits"</span><span class="p">)</span>
+<span class="linenos">141</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="s2">"中国的首都是"</span>
+<span class="linenos">142</span>    <span class="n">ids</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">prompt</span><span class="p">)</span>
+<span class="linenos">143</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">144</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">145</span>        <span class="n">out</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos">146</span>    <span class="n">logits</span> <span class="o">=</span> <span class="n">out</span><span class="o">.</span><span class="n">logits</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>      <span class="c1"># 只要最后一个位置</span>
+<span class="linenos">147</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    prompt </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个 token </span><span class="si">{</span><span class="n">ids</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">148</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    logits 形状 </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">out</span><span class="o">.</span><span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">，取最后一个位置 -&gt; </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">149</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    量级：min </span><span class="si">{</span><span class="n">logits</span><span class="o">.</span><span class="n">min</span><span class="p">()</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">  max </span><span class="si">{</span><span class="n">logits</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos">150</span>          <span class="sa">f</span><span class="s2">"mean </span><span class="si">{</span><span class="n">logits</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">  std </span><span class="si">{</span><span class="n">logits</span><span class="o">.</span><span class="n">std</span><span class="p">()</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">151</span>    <span class="n">top</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mi">8</span><span class="p">)</span>
+<span class="linenos">152</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    </span><span class="si">{</span><span class="s1">'排名'</span><span class="si">:</span><span class="s2">&gt;4s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'id'</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'token'</span><span class="si">:</span><span class="s2">&lt;14s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'logit'</span><span class="si">:</span><span class="s2">&gt;9s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'prob'</span><span class="si">:</span><span class="s2">&gt;9s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'logprob'</span><span class="si">:</span><span class="s2">&gt;9s</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">153</span>    <span class="n">probs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">154</span>    <span class="n">logprobs</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">155</span>    <span class="k">for</span> <span class="n">r</span><span class="p">,</span> <span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">top</span><span class="o">.</span><span class="n">values</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">top</span><span class="o">.</span><span class="n">indices</span><span class="o">.</span><span class="n">tolist</span><span class="p">())):</span>
+<span class="linenos">156</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">r</span><span class="si">:</span><span class="s2">&gt;4d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">i</span><span class="si">:</span><span class="s2">&gt;8d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">i</span><span class="p">])</span><span class="si">!r:</span><span class="s2">&lt;14s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">v</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">157</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">probs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;9.6f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">logprobs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">158</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">159</span>
+<span class="linenos">160</span>    <span class="c1"># ---------------------------------------------------------------- [1]</span>
+<span class="linenos">161</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[1] logits / logprob / prob 三者的关系"</span><span class="p">)</span>
+<span class="linenos">162</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    logits 是模型直接输出的实数，没有归一化，加一个常数不改变分布。"</span><span class="p">)</span>
+<span class="linenos">163</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    prob    = softmax(logits)            —— 归一化，和为 1"</span><span class="p">)</span>
+<span class="linenos">164</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    logprob = log_softmax(logits)        —— log(prob)，永远 &lt;= 0"</span><span class="p">)</span>
+<span class="linenos">165</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    验证 1：给所有 logit 加 100，softmax 不变"</span><span class="p">)</span>
+<span class="linenos">166</span>    <span class="n">shifted</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits</span> <span class="o">+</span> <span class="mf">100.0</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">167</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      最大绝对差 = </span><span class="si">{</span><span class="p">(</span><span class="n">shifted</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">probs</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">168</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    验证 2：exp(logprob) == prob"</span><span class="p">)</span>
+<span class="linenos">169</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      最大绝对差 = </span><span class="si">{</span><span class="p">(</span><span class="n">logprobs</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">probs</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">170</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    验证 3：概率之和 = </span><span class="si">{</span><span class="n">probs</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">171</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    为什么 API 返回的是 logprob 而不是 prob："</span><span class="p">)</span>
+<span class="linenos">172</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    概率会小到 1e-30，fp32 存不下也没法比较；取对数之后是 -70 这种数，"</span><span class="p">)</span>
+<span class="linenos">173</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    而且多个 token 的联合概率取对数就变成求和，数值稳定。"</span><span class="p">)</span>
+<span class="linenos">174</span>    <span class="n">seq_lp</span> <span class="o">=</span> <span class="n">logprobs</span><span class="p">[</span><span class="n">top</span><span class="o">.</span><span class="n">indices</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">175</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    例：连续采 10 个概率各 </span><span class="si">{</span><span class="n">probs</span><span class="p">[</span><span class="n">top</span><span class="o">.</span><span class="n">indices</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> 的 token，"</span><span class="p">)</span>
+<span class="linenos">176</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"        联合概率 = </span><span class="si">{</span><span class="n">probs</span><span class="p">[</span><span class="n">top</span><span class="o">.</span><span class="n">indices</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="o">**</span><span class="mi">10</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos">177</span>          <span class="sa">f</span><span class="s2">"而 logprob 相加 = </span><span class="si">{</span><span class="n">seq_lp</span><span class="o">*</span><span class="mi">10</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">178</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">179</span>
+<span class="linenos">180</span>    <span class="c1"># ---------------------------------------------------------------- [2]</span>
+<span class="linenos">181</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[2] temperature"</span><span class="p">)</span>
+<span class="linenos">182</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    softmax(z/T)：T 只是在进 softmax 之前除一下。"</span><span class="p">)</span>
+<span class="linenos">183</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">'T'</span><span class="si">:</span><span class="s2">&gt;6s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'最大概率'</span><span class="si">:</span><span class="s2">&gt;10s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'熵'</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'有效候选数 exp(熵)'</span><span class="si">:</span><span class="s2">&gt;18s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'top-3'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">184</span>    <span class="k">for</span> <span class="n">T</span> <span class="ow">in</span> <span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.2</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">,</span> <span class="mf">1.5</span><span class="p">,</span> <span class="mf">3.0</span><span class="p">):</span>
+<span class="linenos">185</span>        <span class="n">lg</span> <span class="o">=</span> <span class="n">apply_temperature</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">T</span><span class="p">)</span>
+<span class="linenos">186</span>        <span class="n">p</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">lg</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">187</span>        <span class="n">ent</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="n">p</span> <span class="o">*</span> <span class="n">p</span><span class="o">.</span><span class="n">clamp_min</span><span class="p">(</span><span class="mf">1e-30</span><span class="p">)</span><span class="o">.</span><span class="n">log</span><span class="p">())</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos">188</span>        <span class="n">t3</span> <span class="o">=</span> <span class="p">[</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">i</span><span class="p">])</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span><span class="o">.</span><span class="n">indices</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span>
+<span class="linenos">189</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">T</span><span class="si">:</span><span class="s2">&gt;6.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ent</span><span class="si">:</span><span class="s2">&gt;8.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ent</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;18.1f</span><span class="si">}</span><span class="s2">   </span><span class="si">{</span><span class="n">t3</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">190</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    「有效候选数」= exp(熵)，可以理解成模型实际在几个选项之间犹豫。"</span><span class="p">)</span>
+<span class="linenos">191</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    词表 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">probs</span><span class="p">)</span><span class="si">}</span><span class="s2">，均匀分布时 exp(熵) = </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">probs</span><span class="p">)</span><span class="si">}</span><span class="s2">。"</span><span class="p">)</span>
+<span class="linenos">192</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    T=0 是特例：不是除以 0，而是直接取 argmax（贪心解码）。"</span><span class="p">)</span>
+<span class="linenos">193</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">194</span>
+<span class="linenos">195</span>    <span class="c1"># ---------------------------------------------------------------- [3]</span>
+<span class="linenos">196</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[3] top-k 与 top-p 的截断"</span><span class="p">)</span>
+<span class="linenos">197</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">'策略'</span><span class="si">:</span><span class="s2">&lt;16s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'候选数'</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'覆盖概率'</span><span class="si">:</span><span class="s2">&gt;10s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'候选'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">198</span>    <span class="n">base_p</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">199</span>    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">lg</span> <span class="ow">in</span> <span class="p">[</span>
+<span class="linenos">200</span>        <span class="p">(</span><span class="s2">"原始"</span><span class="p">,</span> <span class="n">logits</span><span class="p">),</span>
+<span class="linenos">201</span>        <span class="p">(</span><span class="s2">"top_k=1"</span><span class="p">,</span> <span class="n">top_k_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mi">1</span><span class="p">)),</span>
+<span class="linenos">202</span>        <span class="p">(</span><span class="s2">"top_k=5"</span><span class="p">,</span> <span class="n">top_k_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mi">5</span><span class="p">)),</span>
+<span class="linenos">203</span>        <span class="p">(</span><span class="s2">"top_k=50"</span><span class="p">,</span> <span class="n">top_k_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mi">50</span><span class="p">)),</span>
+<span class="linenos">204</span>        <span class="p">(</span><span class="s2">"top_p=0.5"</span><span class="p">,</span> <span class="n">top_p_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">)),</span>
+<span class="linenos">205</span>        <span class="p">(</span><span class="s2">"top_p=0.9"</span><span class="p">,</span> <span class="n">top_p_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mf">0.9</span><span class="p">)),</span>
+<span class="linenos">206</span>        <span class="p">(</span><span class="s2">"top_p=0.99"</span><span class="p">,</span> <span class="n">top_p_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mf">0.99</span><span class="p">)),</span>
+<span class="linenos">207</span>    <span class="p">]:</span>
+<span class="linenos">208</span>        <span class="n">keep</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">lg</span><span class="p">)</span>
+<span class="linenos">209</span>        <span class="n">n</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">keep</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+<span class="linenos">210</span>        <span class="n">cov</span> <span class="o">=</span> <span class="n">base_p</span><span class="p">[</span><span class="n">keep</span><span class="p">]</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos">211</span>        <span class="n">show</span> <span class="o">=</span> <span class="p">[</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">i</span><span class="p">])</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">lg</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="n">n</span><span class="p">))</span><span class="o">.</span><span class="n">indices</span><span class="o">.</span><span class="n">tolist</span><span class="p">()]</span>
+<span class="linenos">212</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;16s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">n</span><span class="si">:</span><span class="s2">&gt;8d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">cov</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2">   </span><span class="si">{</span><span class="n">show</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">213</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    top-k 固定候选个数，top-p 固定覆盖的概率质量。"</span><span class="p">)</span>
+<span class="linenos">214</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    区别在模型确定时最明显：模型很确定时 top-p 只留 1~2 个，"</span><span class="p">)</span>
+<span class="linenos">215</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    top-k=50 却仍会保留 50 个（包括一堆概率极低的）。"</span><span class="p">)</span>
+<span class="linenos">216</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    两者常常一起用：先 top-k 砍掉长尾，再 top-p 动态收紧。"</span><span class="p">)</span>
+<span class="linenos">217</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">218</span>
+<span class="linenos">219</span>    <span class="c1"># ---------------------------------------------------------------- [4]</span>
+<span class="linenos">220</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[4] 采样 1000 次，频率对不对得上概率"</span><span class="p">)</span>
+<span class="linenos">221</span>    <span class="n">lg</span> <span class="o">=</span> <span class="n">top_k_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mi">5</span><span class="p">)</span>
+<span class="linenos">222</span>    <span class="n">p</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">lg</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">223</span>    <span class="n">g</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">()</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">224</span>    <span class="n">draws</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">multinomial</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="mi">1000</span><span class="p">,</span> <span class="n">replacement</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g</span><span class="p">)</span>
+<span class="linenos">225</span>    <span class="n">cnt</span> <span class="o">=</span> <span class="n">collections</span><span class="o">.</span><span class="n">Counter</span><span class="p">(</span><span class="n">draws</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
+<span class="linenos">226</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">'token'</span><span class="si">:</span><span class="s2">&lt;14s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'理论概率'</span><span class="si">:</span><span class="s2">&gt;10s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'实测频率'</span><span class="si">:</span><span class="s2">&gt;10s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'次数'</span><span class="si">:</span><span class="s2">&gt;6s</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">227</span>    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">cnt</span><span class="o">.</span><span class="n">most_common</span><span class="p">():</span>
+<span class="linenos">228</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">i</span><span class="p">])</span><span class="si">!r:</span><span class="s2">&lt;14s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">c</span><span class="o">/</span><span class="mi">1000</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">c</span><span class="si">:</span><span class="s2">&gt;6d</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">229</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    采样是**有放回**的多项分布抽样，不是「选最大的」。"</span><span class="p">)</span>
+<span class="linenos">230</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    同样的 prompt 每次跑结果不同，就是这一步引入的随机性。"</span><span class="p">)</span>
+<span class="linenos">231</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    要复现必须固定随机种子——而且引擎的种子和你的不是同一个。"</span><span class="p">)</span>
+<span class="linenos">232</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">233</span>
+<span class="linenos">234</span>    <span class="c1"># ---------------------------------------------------------------- [5]</span>
+<span class="linenos">235</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[5] 增量 detokenize：流式输出的坑"</span><span class="p">)</span>
+<span class="linenos">236</span>    <span class="n">text</span> <span class="o">=</span> <span class="s2">"风吹过山谷"</span>
+<span class="linenos">237</span>    <span class="n">tids</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">text</span><span class="p">)</span>
+<span class="linenos">238</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">text</span><span class="si">!r}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">tids</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个 token"</span><span class="p">)</span>
+<span class="linenos">239</span>    <span class="n">byte_dec</span> <span class="o">=</span> <span class="n">make_byte_decoder</span><span class="p">()</span>
+<span class="linenos">240</span>    <span class="n">byte_map</span> <span class="o">=</span> <span class="p">{</span><span class="n">t</span><span class="p">:</span> <span class="n">token_bytes</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">byte_dec</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">tids</span><span class="p">}</span>
+<span class="linenos">241</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">'i'</span><span class="si">:</span><span class="s2">&gt;3s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'id'</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'单独 decode'</span><span class="si">:</span><span class="s2">&gt;14s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'字节'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">242</span>    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">tids</span><span class="p">):</span>
+<span class="linenos">243</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">i</span><span class="si">:</span><span class="s2">&gt;3d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;8d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">t</span><span class="p">])</span><span class="si">!r:</span><span class="s2">&gt;14s</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">244</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">' '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s1">'</span><span class="si">{</span><span class="n">b</span><span class="si">:</span><span class="s1">02x</span><span class="si">}</span><span class="s1">'</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">byte_map</span><span class="p">[</span><span class="n">t</span><span class="p">])</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">245</span>
+<span class="linenos">246</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    这三个 token 各自都是完整字符，所以逐个 decode 恰好没问题。"</span><span class="p">)</span>
+<span class="linenos">247</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    但这只是运气好。换一个词表里没有的罕见字："</span><span class="p">)</span>
+<span class="linenos">248</span>    <span class="n">rare</span> <span class="o">=</span> <span class="s2">"𩸽"</span>                     <span class="c1"># 一个 4 字节的罕见汉字，词表里没有，只能退回字节</span>
+<span class="linenos">249</span>    <span class="n">rids</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">rare</span><span class="p">)</span>
+<span class="linenos">250</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">rare</span><span class="si">!r}</span><span class="s2"> (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">rare</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s1">'utf-8'</span><span class="p">))</span><span class="si">}</span><span class="s2"> 字节) -&gt; </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">rids</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个 token"</span><span class="p">)</span>
+<span class="linenos">251</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">'i'</span><span class="si">:</span><span class="s2">&gt;3s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'id'</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'token'</span><span class="si">:</span><span class="s2">&lt;10s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'单独 decode'</span><span class="si">:</span><span class="s2">&gt;12s</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">252</span>    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">rids</span><span class="p">):</span>
+<span class="linenos">253</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">i</span><span class="si">:</span><span class="s2">&gt;3d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;8d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">convert_ids_to_tokens</span><span class="p">([</span><span class="n">t</span><span class="p">])[</span><span class="mi">0</span><span class="p">]</span><span class="si">!r:</span><span class="s2">&lt;10s</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">254</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">t</span><span class="p">])</span><span class="si">!r:</span><span class="s2">&gt;12s</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">255</span>    <span class="n">naive</span> <span class="o">=</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">([</span><span class="n">t</span><span class="p">])</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">)</span>
+<span class="linenos">256</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">      逐 token decode 再拼接 -&gt; </span><span class="si">{</span><span class="n">naive</span><span class="si">!r}</span><span class="s2">   ← 三个替换符"</span><span class="p">)</span>
+<span class="linenos">257</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      整体 decode            -&gt; </span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">rids</span><span class="p">)</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">258</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      两者相同：</span><span class="si">{</span><span class="n">naive</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">rids</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">259</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    流式接口是一个 token 一个 token 往外吐的，如果每次都单独 decode，"</span><span class="p">)</span>
+<span class="linenos">260</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    用户就会先看到几个 '�' 再看到正确的字——或者永远看不到正确的字。"</span><span class="p">)</span>
+<span class="linenos">261</span>
+<span class="linenos">262</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    用字节缓冲的正确做法（本脚本的 IncrementalDetokenizer）："</span><span class="p">)</span>
+<span class="linenos">263</span>    <span class="n">det</span> <span class="o">=</span> <span class="n">IncrementalDetokenizer</span><span class="p">()</span>
+<span class="linenos">264</span>    <span class="n">pieces</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">265</span>    <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">:</span>
+<span class="linenos">266</span>        <span class="n">b</span> <span class="o">=</span> <span class="n">token_bytes</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">byte_dec</span><span class="p">)</span>
+<span class="linenos">267</span>        <span class="n">piece</span> <span class="o">=</span> <span class="n">det</span><span class="o">.</span><span class="n">push</span><span class="p">(</span><span class="n">b</span><span class="p">)</span>
+<span class="linenos">268</span>        <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">piece</span><span class="p">)</span>
+<span class="linenos">269</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      推入 id=</span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&lt;8d</span><span class="si">}</span><span class="s2"> 字节 </span><span class="si">{</span><span class="s1">' '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s1">'</span><span class="si">{</span><span class="n">x</span><span class="si">:</span><span class="s1">02x</span><span class="si">}</span><span class="s1">'</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">b</span><span class="p">)</span><span class="si">:</span><span class="s2">&lt;12s</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos">270</span>              <span class="sa">f</span><span class="s2">"-&gt; 吐出 </span><span class="si">{</span><span class="n">piece</span><span class="si">!r}</span><span class="s2">  缓冲剩 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">det</span><span class="o">.</span><span class="n">buf</span><span class="p">)</span><span class="si">}</span><span class="s2"> 字节"</span><span class="p">)</span>
+<span class="linenos">271</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      拼接结果 </span><span class="si">{</span><span class="s1">''</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">272</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">273</span>
+<span class="linenos">274</span>    <span class="c1"># ---------------------------------------------------------------- [6]</span>
+<span class="linenos">275</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[6] 停止条件"</span><span class="p">)</span>
+<span class="linenos">276</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    三条独立的路径，在不同的层判断："</span><span class="p">)</span>
+<span class="linenos">277</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    1. eos token：采到 </span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">eos_token</span><span class="si">!r}</span><span class="s2"> (id </span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">eos_token_id</span><span class="si">}</span><span class="s2">) 就停。"</span><span class="p">)</span>
+<span class="linenos">278</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"       在采样之后、detokenize 之前判断，属于引擎的调度层。"</span><span class="p">)</span>
+<span class="linenos">279</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    2. stop string：生成的**文本**里出现了指定字符串就停。"</span><span class="p">)</span>
+<span class="linenos">280</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"       必须在 detokenize 之后判断，而且要处理跨 token 的情况——"</span><span class="p">)</span>
+<span class="linenos">281</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"       停止串可能横跨两个 token，只看单个 token 会漏。"</span><span class="p">)</span>
+<span class="linenos">282</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    3. max_tokens：计数到了就停。这是唯一保证会终止的一条。"</span><span class="p">)</span>
+<span class="linenos">283</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    实测一次带 eos 的生成："</span><span class="p">)</span>
+<span class="linenos">284</span>    <span class="n">msgs</span> <span class="o">=</span> <span class="p">[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"用一句话说明风是什么。"</span><span class="p">}]</span>
+<span class="linenos">285</span>    <span class="n">prompt2</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">msgs</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">286</span>    <span class="n">ids2</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">prompt2</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">287</span>    <span class="n">cur</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids2</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">288</span>    <span class="n">det2</span> <span class="o">=</span> <span class="n">IncrementalDetokenizer</span><span class="p">()</span>
+<span class="linenos">289</span>    <span class="n">g2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">1234</span><span class="p">)</span>
+<span class="linenos">290</span>    <span class="n">stop_reason</span><span class="p">,</span> <span class="n">produced</span> <span class="o">=</span> <span class="s2">"max_tokens"</span><span class="p">,</span> <span class="p">[]</span>
+<span class="linenos">291</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">292</span>        <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">200</span><span class="p">):</span>
+<span class="linenos">293</span>            <span class="n">lg2</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">cur</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+<span class="linenos">294</span>            <span class="n">lg2</span> <span class="o">=</span> <span class="n">top_p_filter</span><span class="p">(</span><span class="n">apply_temperature</span><span class="p">(</span><span class="n">lg2</span><span class="p">,</span> <span class="mf">0.7</span><span class="p">),</span> <span class="mf">0.9</span><span class="p">)</span>
+<span class="linenos">295</span>            <span class="n">p2</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">lg2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">296</span>            <span class="n">nxt</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">multinomial</span><span class="p">(</span><span class="n">p2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g2</span><span class="p">))</span>
+<span class="linenos">297</span>            <span class="k">if</span> <span class="n">nxt</span> <span class="o">==</span> <span class="n">tok</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">:</span>
+<span class="linenos">298</span>                <span class="n">stop_reason</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"eos (id </span><span class="si">{</span><span class="n">nxt</span><span class="si">}</span><span class="s2">) @ step </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">299</span>                <span class="k">break</span>
+<span class="linenos">300</span>            <span class="n">produced</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">nxt</span><span class="p">)</span>
+<span class="linenos">301</span>            <span class="n">cur</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">cur</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="n">nxt</span><span class="p">]],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">302</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    停止原因：</span><span class="si">{</span><span class="n">stop_reason</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">303</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    生成 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">produced</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个 token：</span><span class="si">{</span><span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">produced</span><span class="p">)</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">304</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    再演示 stop string：把 '。' 作为停止串，它可能横跨 token 边界。"</span><span class="p">)</span>
+<span class="linenos">305</span>    <span class="n">det3</span> <span class="o">=</span> <span class="n">IncrementalDetokenizer</span><span class="p">()</span>
+<span class="linenos">306</span>    <span class="n">cur3</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids2</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos">307</span>    <span class="n">g3</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">1234</span><span class="p">)</span>
+<span class="linenos">308</span>    <span class="n">acc</span><span class="p">,</span> <span class="n">why</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span> <span class="s2">"max_tokens"</span>
+<span class="linenos">309</span>    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos">310</span>        <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">200</span><span class="p">):</span>
+<span class="linenos">311</span>            <span class="n">lg3</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">cur3</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+<span class="linenos">312</span>            <span class="n">lg3</span> <span class="o">=</span> <span class="n">top_p_filter</span><span class="p">(</span><span class="n">apply_temperature</span><span class="p">(</span><span class="n">lg3</span><span class="p">,</span> <span class="mf">0.7</span><span class="p">),</span> <span class="mf">0.9</span><span class="p">)</span>
+<span class="linenos">313</span>            <span class="n">nxt3</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">multinomial</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">lg3</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">),</span> <span class="mi">1</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g3</span><span class="p">))</span>
+<span class="linenos">314</span>            <span class="k">if</span> <span class="n">nxt3</span> <span class="o">==</span> <span class="n">tok</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">:</span>
+<span class="linenos">315</span>                <span class="n">why</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"eos @ step </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">316</span>                <span class="k">break</span>
+<span class="linenos">317</span>            <span class="n">piece</span> <span class="o">=</span> <span class="n">det3</span><span class="o">.</span><span class="n">push</span><span class="p">(</span><span class="n">token_bytes</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="n">nxt3</span><span class="p">,</span> <span class="n">byte_dec</span><span class="p">))</span>
+<span class="linenos">318</span>            <span class="n">acc</span> <span class="o">+=</span> <span class="n">piece</span>
+<span class="linenos">319</span>            <span class="k">if</span> <span class="s2">"。"</span> <span class="ow">in</span> <span class="n">acc</span><span class="p">:</span>                       <span class="c1"># 在**文本**上判断，不是在 token 上</span>
+<span class="linenos">320</span>                <span class="n">why</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"stop string '。' @ step </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">321</span>                <span class="n">acc</span> <span class="o">=</span> <span class="n">acc</span><span class="p">[:</span><span class="n">acc</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="s2">"。"</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>   <span class="c1"># 截到停止串为止</span>
+<span class="linenos">322</span>                <span class="k">break</span>
+<span class="linenos">323</span>            <span class="n">cur3</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">cur3</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="n">nxt3</span><span class="p">]],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">324</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    停止原因：</span><span class="si">{</span><span class="n">why</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">325</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    输出：</span><span class="si">{</span><span class="n">acc</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">326</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">327</span>
+<span class="linenos">328</span>    <span class="c1"># ---------------------------------------------------------------- [7]</span>
+<span class="linenos">329</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[7] 与引擎对齐：自己实现的 top-p 对不对"</span><span class="p">)</span>
+<span class="linenos">330</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    用同一组 logits，比较自己的实现与 torch 官方写法："</span><span class="p">)</span>
+<span class="linenos">331</span>    <span class="k">for</span> <span class="n">pp</span> <span class="ow">in</span> <span class="p">(</span><span class="mf">0.5</span><span class="p">,</span> <span class="mf">0.9</span><span class="p">,</span> <span class="mf">0.95</span><span class="p">):</span>
+<span class="linenos">332</span>        <span class="n">mine</span> <span class="o">=</span> <span class="n">top_p_filter</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">pp</span><span class="p">)</span>
+<span class="linenos">333</span>        <span class="c1"># 参照实现：排序 -&gt; 累加 -&gt; 右移一位 -&gt; 丢弃</span>
+<span class="linenos">334</span>        <span class="n">sp</span><span class="p">,</span> <span class="n">si</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">),</span> <span class="n">descending</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">335</span>        <span class="n">cum</span> <span class="o">=</span> <span class="n">sp</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">336</span>        <span class="n">mask</span> <span class="o">=</span> <span class="n">cum</span> <span class="o">-</span> <span class="n">sp</span> <span class="o">&gt;</span> <span class="n">pp</span>           <span class="c1"># 另一种等价写法：用「不含自己的累计」</span>
+<span class="linenos">337</span>        <span class="n">ref</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos">338</span>        <span class="n">ref</span><span class="p">[</span><span class="n">si</span><span class="p">[</span><span class="n">mask</span><span class="p">]]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">)</span>
+<span class="linenos">339</span>        <span class="n">same</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">mine</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">ref</span><span class="p">))</span>
+<span class="linenos">340</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      top_p=</span><span class="si">{</span><span class="n">pp</span><span class="si">}</span><span class="s2">: 候选集相同 = </span><span class="si">{</span><span class="n">same</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos">341</span>              <span class="sa">f</span><span class="s2">"(我的 </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">mine</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="si">}</span><span class="s2"> 个 / 参照 </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="si">}</span><span class="s2"> 个)"</span><span class="p">)</span>
+<span class="linenos">342</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    两种写法在边界上的差别：一个用「含自己的累计 &gt; p」再右移，"</span><span class="p">)</span>
+<span class="linenos">343</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    一个用「不含自己的累计 &gt; p」。数学上等价，实现上容易写错一个位置——"</span><span class="p">)</span>
+<span class="linenos">344</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    差一个 token 在温度低时会显著改变输出。"</span><span class="p">)</span>
+<span class="linenos">345</span>
+<span class="linenos">346</span>
+<span class="linenos">347</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">348</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/sampling_walk.py 全文（348 行）</code><a href="../code/labs/L0/sampling_walk.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L0/sampling_walk.py<span class="w"> </span>--model<span class="w"> </span>Qwen/Qwen3-1.7B
+</code></pre></div>
+
+<p>需要一张能放下 1.7B bf16 模型的卡（约 4 GB）。输出 130 行。</p>
+<h3 id="_9">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>先预测，再验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>prompt 换成 <code>'1 + 1 ='</code></td>
+<td>最高概率是多少？模型确定还是犹豫？</td>
+</tr>
+<tr>
+<td>prompt 换成 <code>'今天天气'</code></td>
+<td>对比上一条，<code>exp(熵)</code> 差多少？</td>
+</tr>
+<tr>
+<td><code>top_k_filter</code> 里 <code>logits &lt; kth</code> 改成用 <code>topk</code> 的下标直接 mask</td>
+<td><code>top_k=5</code> 会精确留下 5 个。哪种更合理？</td>
+</tr>
+<tr>
+<td>固定种子跑两次</td>
+<td>结果相同吗？再改成不固定种子</td>
+</tr>
+<tr>
+<td><code>top_p=0.9</code> 与 <code>top_k=50</code> 单独用 vs 一起用</td>
+<td>候选数各是多少？</td>
+</tr>
+<tr>
+<td>把 <code>IncrementalDetokenizer</code> 换成逐 token <code>decode</code></td>
+<td>生成含罕见字的文本，观察乱码</td>
+</tr>
+<tr>
+<td>停止串设成 <code>'\n\n'</code></td>
+<td>它会横跨 token 吗？打印每个 token 的文本确认</td>
+</tr>
+</tbody>
+</table>
+<p>第三行值得想清楚：并列时保留全部还是截断到恰好 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 个，
+是一个真实的引擎间差异。</p>
+<hr />
+<h2 id="_10">原始现场</h2>
+<details>
+<summary>① 一次真实前向的完整 top-8</summary>
+<div class="highlight"><pre><span></span><code>[0] 一次真实前向的 logits
+    prompt '中国的首都是' -&gt; 3 个 token [105538, 59975, 100132]
+    logits 形状 (1, 3, 151936)，取最后一个位置 -&gt; (151936,)
+    量级：min -4.44  max 22.12  mean 3.50  std 2.35
+
+      排名       id token              logit      prob   logprob
+       0    68990 '北京'             22.1250  0.554616   -0.5895
+       1   101314 '哪里'             20.1250  0.075059   -2.5895
+       2     2130 '____'           19.6250  0.045526   -3.0895
+       3    99245 '什么'             19.1250  0.027613   -3.5895
+       4   104673 '哪个'             19.0000  0.024368   -3.7145
+       5    99459 '哪'              19.0000  0.024368   -3.7145
+       6     9909 '（'              18.8750  0.021505   -3.8395
+       7    58695 '中国'             18.2500  0.011511   -4.4645
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：</p>
+<ul>
+<li>所有 logit 都是 <code>.xx250</code> / <code>.xx500</code> / <code>.0000</code> 这种形式——
+  <strong>bf16 的可表示值间隔</strong>。19–22 区间内 bf16 的间隔是 0.125。</li>
+<li>排名 4 和 5 的 logit <strong>完全相同</strong>，概率也完全相同。这不是巧合，
+  是两个不同的实数被 bf16 舍入到了同一个值。它直接导致了 top-k 的并列问题。</li>
+<li><code>'____'</code> 排在第 3 位：模型把这句话理解成了填空题。
+  这类「格式性」的候选在真实分布里很常见。</li>
+</ul>
+<p><strong>下一步观察</strong>：把 prompt 改成 <code>'中国的首都是北京'</code>，
+看下一个 token 的分布（应该是标点或句子结束）。</p>
+<p>采集命令：<code>python labs/L0/sampling_walk.py</code>
+完整输出：<code>results/crater/raw04/01_sampling_walk.txt</code></p>
+</details>
+<details>
+<summary>② temperature 与截断的完整表格</summary>
+<div class="highlight"><pre><span></span><code>[2] temperature
+         T       最大概率        熵       有效候选数 exp(熵) top-3
+       0.0     1.0000  -0.0000                1.0   ['北京', '"', '!']
+       0.2     1.0000   0.0006                1.0   ['北京', '哪里', '____']
+       0.5     0.9659   0.2063                1.2   ['北京', '哪里', '____']
+       1.0     0.5546   2.6288               13.9   ['北京', '哪里', '____']
+       1.5     0.1283   7.3256             1518.6   ['北京', '哪里', '____']
+       3.0     0.0022  11.3643            86190.6   ['北京', '哪里', '____']
+
+[3] top-k 与 top-p 的截断
+    策略                    候选数       覆盖概率 候选
+    原始                 151936     1.0000   ['北京', '哪里', '____', '什么']
+    top_k=1                 1     0.5546   ['北京']
+    top_k=5                 6     0.7515   ['北京', '哪里', '____', '什么']
+    top_k=50               52     0.9075   ['北京', '哪里', '____', '什么']
+    top_p=0.5               1     0.5546   ['北京']
+    top_p=0.9              46     0.9008   ['北京', '哪里', '____', '什么']
+    top_p=0.99            146     0.9900   ['北京', '哪里', '____', '什么']
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：</p>
+<ul>
+<li><code>T=0.0</code> 那一行的 top-3 是 <code>['北京', '"', '!']</code>——后两个是<strong>显示假象</strong>。
+  <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span> 时其余全部被置成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span>，<code>topk</code> 在一堆相同的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span> 里
+  按索引顺序返回，所以第 2、3 名没有意义。<strong>只有第 1 名是真的。</strong></li>
+<li><code>top_k=5</code> 留下 6 个、<code>top_k=50</code> 留下 52 个，都是并列所致。</li>
+<li><code>top_p=0.9</code> 留 46 个，覆盖概率 0.9008——<strong>刚好越过 0.9</strong>，
+  说明右移一位的边界处理是对的（第一个越界的那个被保留了）。</li>
+</ul>
+<p><strong>下一步观察</strong>：把 <code>top_p</code> 设成 0.5546（恰好等于最大概率），
+看留下 1 个还是 2 个。这能检验你对边界的理解。</p>
+</details>
+<details>
+<summary>③ 增量 detokenize：错误做法与正确做法的完整对照</summary>
+<div class="highlight"><pre><span></span><code>[5] 增量 detokenize：流式输出的坑
+    '风吹过山谷' -&gt; 3 个 token
+      i       id      单独 decode 字节
+      0   109520           '风吹' e9 a3 8e e5 90 b9
+      1    38182            '过' e8 bf 87
+      2   113599           '山谷' e5 b1 b1 e8 b0 b7
+
+    这三个 token 各自都是完整字符，所以逐个 decode 恰好没问题。
+    但这只是运气好。换一个词表里没有的罕见字：
+    '𩸽' (4 字节) -&gt; 3 个 token
+      i       id token         单独 decode
+      0   103914 'ð©'                '�'
+      1      116 '¸'                 '�'
+      2      121 '½'                 '�'
+
+      逐 token decode 再拼接 -&gt; '���'   ← 三个替换符
+      整体 decode            -&gt; '𩸽'
+      两者相同：False
+
+    用字节缓冲的正确做法：
+      推入 id=103914   字节 f0 a9        -&gt; 吐出 ''  缓冲剩 2 字节
+      推入 id=116      字节 b8           -&gt; 吐出 ''  缓冲剩 3 字节
+      推入 id=121      字节 bd           -&gt; 吐出 '𩸽'  缓冲剩 0 字节
+      拼接结果 '𩸽'
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：</p>
+<ul>
+<li>token 那一列 <code>'ð©'</code> <code>'¸'</code> <code>'½'</code> 是字节经 GPT-2 映射后的样子（<a class="xref" href="../L0/0.4-text-to-tensor.html" title="文本闭环（上）：从 Unicode 字节到模型输入张量">L0.4</a>）。
+  <code>ð©</code> 对应字节 <code>f0 a9</code>，<code>¸</code> 对应 <code>b8</code>，<code>½</code> 对应 <code>bd</code>。</li>
+<li>「吐出」那一列前两次是空字符串。这就是流式接口在这两步应该发送空内容
+  （或者干脆不发送）的原因。</li>
+<li>缓冲字节数 2 → 3 → 0：第三个 token 到达时凑齐 4 字节，一次性吐出。</li>
+</ul>
+<p><strong>下一步观察</strong>：找一个 emoji 组合（比如 <code>'👨‍👩‍👧‍👦'</code>，含零宽连接符），
+看它被切成几个 token、缓冲怎么变化。</p>
+</details>
+<details>
+<summary>④ 两种 top-p 实现的对拍</summary>
+<div class="highlight"><pre><span></span><code>[7] 与引擎对齐：自己实现的 top-p 对不对
+    用同一组 logits，比较自己的实现与 torch 官方写法：
+      top_p=0.5: 候选集相同 = True  (我的 1 个 / 参照 1 个)
+      top_p=0.9: 候选集相同 = True  (我的 46 个 / 参照 46 个)
+      top_p=0.95: 候选集相同 = True  (我的 146 个 / 参照 146 个)
+</code></pre></div>
+
+<p>两种写法：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 写法一（本站实现）：含自己的累计 &gt; p，然后右移一位</span>
+<span class="n">remove</span> <span class="o">=</span> <span class="n">cum</span> <span class="o">&gt;</span> <span class="n">p</span>
+<span class="n">remove</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">=</span> <span class="n">remove</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="n">remove</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span>
+
+<span class="c1"># 写法二（常见参照实现）：不含自己的累计 &gt; p</span>
+<span class="n">mask</span> <span class="o">=</span> <span class="n">cum</span> <span class="o">-</span> <span class="n">sorted_probs</span> <span class="o">&gt;</span> <span class="n">p</span>
+</code></pre></div>
+
+<p>数学上等价：<code>cum[i] - p[i]</code> 就是「前 i-1 个的累计」，
+所以「不含自己的累计 &gt; p」等价于「前一个位置的含自己累计 &gt; p」，
+正是右移一位。</p>
+<p><strong>为什么要写两遍再对拍</strong>：这个边界差一位在温度低时会显著改变输出。
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi><mo>&#x0003D;</mo><mn>0.5</mn></mrow></math></span>、最大概率 0.5546 的情况下，
+错误实现会留下 0 个候选（然后 softmax 全是 nan）。</p>
+<p><strong>这是本章唯一一处「自己实现 + 参照实现对拍」的验证</strong>，
+其余各节都只有观测，没有交叉验证。</p>
+</details>
+<hr />
+<h2 id="_11">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>改变了什么</th>
+<th>代价</th>
+<th>章节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>min-p</strong></td>
+<td>截断阈值取「最大概率 × 系数」，比 top-p 更贴合模型的确定程度</td>
+<td>又一个超参</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>重复惩罚 / presence penalty</strong></td>
+<td>对已出现的 token 减分，抑制复读</td>
+<td>可能伤害正常的重复（代码、列表）</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>约束解码</strong></td>
+<td>用语法/正则把不合法的 token 直接置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span>，保证输出可解析</td>
+<td>每步要算合法集合，且要处理同一字符串的多种 token 化</td>
+<td><a class="xref" href="../L5/5.6-structured-output.html" title="结构化输出与约束解码">L5.6</a></td>
+</tr>
+<tr>
+<td><strong>投机解码</strong></td>
+<td>用小模型先猜几个 token，大模型一次验证。验证时要比较两个分布</td>
+<td>接受率不高时反而更慢</td>
+<td><a class="xref" href="../L5/5.5-speculative-decoding.html" title="投机解码">L5.5</a></td>
+</tr>
+<tr>
+<td><strong>beam search</strong></td>
+<td>保留多条候选序列，按累计 logprob 排序</td>
+<td>显存与计算翻 beam 倍；对开放生成效果一般</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>GPU 上的采样 kernel</strong></td>
+<td>避免每步拷 39 MB logits 回 CPU</td>
+<td>top-p 需要排序，是 GPU 上的非平凡 kernel</td>
+<td><a class="xref" href="../L5/5.3-scheduling.html" title="调度：continuous batching 与 chunked prefill">L5.3</a></td>
+</tr>
+<tr>
+<td><strong>logprob 的返回</strong></td>
+<td>API 返回 top-n logprob 供下游打分</td>
+<td>要把额外数据拷回 CPU，影响吞吐</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_12">陷阱</h2>
+<p><strong>1. <code>assert probs.sum() == 1.0</code>。</strong> 本站实测是 1.000024。
+词表越大误差越大，要用容差判断。</p>
+<p><strong>2. 以为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span> 就是 <code>logits / 0</code>。</strong> 必须特判成 argmax，否则得到 <code>inf</code>/<code>nan</code>。</p>
+<p><strong>3. top-k 并列的处理方式不一致。</strong> 本站 <code>top_k=5</code> 留下 6 个。
+不同引擎行为不同，跨引擎复现时要排查。</p>
+<p><strong>4. 流式输出逐 token decode。</strong> 遇到被拆开的多字节字符会吐出 <code>�</code>。
+必须维护字节缓冲。</p>
+<p><strong>5. 取 token 字节时用了有损的路径。</strong> 本站第一版就栽在这里：
+<code>convert_tokens_to_string(...).encode()</code> 拿到的是替换符的字节。
+必须反查字节级映射表。</p>
+<p><strong>6. stop string 在 token 上判断。</strong> 停止串可能横跨两个 token，
+必须在 detokenize 之后的文本上判断。</p>
+<p><strong>7. 只设 stop string 不设 max_tokens。</strong> stop string 可能永远不出现。
+<code>max_tokens</code> 是唯一保证终止的条件。</p>
+<p><strong>8. 在热路径里 <code>.item()</code> 判断 eos。</strong> 会强制 CPU-GPU 同步（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 实测 4.76 µs）。
+引擎的做法是在 GPU 上算 mask、异步回传、下一步再检查。</p>
+<hr />
+<h2 id="_13">自测题</h2>
+<details>
+<summary>1. <code>temperature=0.7</code> 和 <code>top_p=0.9</code> 一起用，先做哪个？顺序重要吗？</summary>
+<p><strong>先 temperature，再 top-p。顺序重要。</strong></p>
+<p>逐步推。设原始 logits 为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>z</mi></mrow></math></span>。</p>
+<p><strong>正确顺序</strong>（先温度）：
+1. <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>z</mi><mi>&#x02032;</mi></msup><mo>&#x0003D;</mo><mi>z</mi><mo>&#x0002F;</mo><mn>0.7</mn></mrow></math></span> —— 差距被拉大
+2. <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>p</mi><mi>&#x02032;</mi></msup><mo>&#x0003D;</mo><mo>softmax</mo><mo stretchy="false">&#x00028;</mo><msup><mi>z</mi><mi>&#x02032;</mi></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> —— 分布更尖
+3. 按 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>p</mi><mi>&#x02032;</mi></msup></mrow></math></span> 做 top-p 截断</p>
+<p><strong>错误顺序</strong>（先 top-p）：
+1. <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi><mo>&#x0003D;</mo><mo>softmax</mo><mo stretchy="false">&#x00028;</mo><mi>z</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>
+2. 按 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 截断
+3. 再对剩下的除以 0.7</p>
+<p>差别在于<strong>截断用的是哪个分布</strong>。</p>
+<p>用本站的实测数据算：原始分布最大概率 0.5546。
+- 先温度（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x0003D;</mo><mn>0.7</mn></mrow></math></span>）：最大概率涨到约 0.72，<code>top_p=0.9</code> 大约留下 10 多个候选。
+- 先 top-p：按原始分布截断，<code>top_p=0.9</code> 留下 <strong>46</strong> 个，然后再降温。</p>
+<p><strong>候选集差了 3 倍多。</strong> 温度越低差别越大：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x02192;</mo><mn>0</mn></mrow></math></span> 时正确顺序只留 1 个，
+错误顺序仍然留 46 个再降温（虽然最终概率集中，但候选集里有 46 个非零项）。</p>
+<p><strong>约定是先温度。</strong> HuggingFace 的 <code>LogitsProcessorList</code>、vLLM 的 sampler
+都是这个顺序。写自己的采样器时要对齐，否则同样的参数会得到不同的行为。</p>
+</details>
+<details>
+<summary>2. 我用同样的 prompt、同样的 seed，在 transformers 和 vLLM 上跑，结果不一样。可能是哪些原因？</summary>
+<p><strong>至少五个可能的来源，按排查顺序：</strong></p>
+<p><strong>(1) 采样顺序或边界实现不同。</strong> 上一题讲的 temperature/top-p 顺序，
+以及本章讲的 top-k 并列处理（本站 <code>top_k=5</code> 留下 6 个）。
+<strong>排查方法</strong>：把 temperature 设成 0（贪心），如果这时结果一致，
+问题就在采样阶段。</p>
+<p><strong>(2) 随机数生成器不同。</strong> vLLM 在 GPU 上采样，用的是 CUDA 的
+Philox 生成器；transformers 默认在 CPU 上采样。
+即使种子相同，产生的随机数序列也完全不同。
+<strong>这一项无法对齐</strong>，只能用贪心解码来绕开。</p>
+<p><strong>(3) 数值差异。</strong> 两个框架的 kernel 不同：
+transformers 用 PyTorch 的 SDPA，vLLM 用 FlashAttention 或自己的 paged kernel。
+bf16 下累加顺序不同会带来最后几位的差异（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 讨论过）。
+本章实测的 logits 间隔是 0.125，<strong>一个 ULP 的差异就足以让排名 4 和 5 互换</strong>。</p>
+<p><strong>(4) batch 构成影响结果。</strong> 这一条最反直觉：
+vLLM 把多个请求拼成一个 batch，GEMM 的形状随 batch 变化，
+不同形状可能走不同的 kernel 或不同的分块策略，累加顺序因此不同。
+<strong>同一个请求在不同的 batch 里可能得到略微不同的 logits。</strong></p>
+<p><strong>(5) 模板与特殊 token。</strong> 两边的 chat template 应用方式可能不同
+（<a class="xref" href="../L0/0.4-text-to-tensor.html" title="文本闭环（上）：从 Unicode 字节到模型输入张量">L0.4</a>）。<code>add_generation_prompt</code>、是否加 BOS，都会改变输入。
+<strong>排查方法</strong>：打印两边最终的 token id 序列做逐位对比。</p>
+<p><strong>实践上的建议</strong>：跨引擎对比只在 <code>temperature=0</code> 下做，
+而且要先确认 token id 序列完全一致。即便如此，
+数值差异仍可能在长生成中放大成完全不同的文本。</p>
+</details>
+<details>
+<summary>3. 流式接口每步都要把新 token 转成文本发给客户端。为什么这件事不能放在 GPU 上做？</summary>
+<p><strong>因为 detokenize 是字符串处理，不是数值计算。</strong></p>
+<p>具体来说它需要：</p>
+<ol>
+<li>按 token id 查词表（一个 15 万条目的哈希表）；</li>
+<li>反查字节映射；</li>
+<li>维护一个跨步骤的字节缓冲；</li>
+<li>UTF-8 解码（变长、带状态机）。</li>
+</ol>
+<p>这些全是<strong>不规则的控制流与内存访问</strong>，正是 GPU 最不擅长的。
+而且它的数据量极小：每步每个请求只有 1 个 token id。</p>
+<p><strong>所以引擎的做法是分层</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>在哪</th>
+<th>处理什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模型前向 + 采样</td>
+<td>GPU</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">[</mo><mi>B</mi><mo>&#x0002C;</mo><mi>V</mi><mo stretchy="false">]</mo></mrow></math></span> 的 logits → <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 个 token id</td>
+</tr>
+<tr>
+<td>token id 回传</td>
+<td>PCIe</td>
+<td>几百字节，可忽略</td>
+</tr>
+<tr>
+<td>detokenize</td>
+<td>CPU（甚至独立进程）</td>
+<td>id → 文本</td>
+</tr>
+</tbody>
+</table>
+<p>vLLM 把 detokenizer 放在<strong>与 EngineCore 不同的进程</strong>里（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 走读过）。
+好处是 detokenize 的 Python 开销完全不占用 GPU 调度线程；
+代价是多一次进程间通信。</p>
+<p><strong>一个推论</strong>：<code>max_tokens=1</code> 的请求和 <code>max_tokens=1000</code> 的请求，
+detokenize 的开销差 1000 倍，但这个开销不在 GPU 上，
+所以它影响的是<strong>吞吐上限</strong>（CPU 成为瓶颈）而不是单步延迟。
+高并发场景下 detokenize 确实会变成瓶颈，这时要么加进程，
+要么让客户端自己 detokenize（只回传 token id）。</p>
+</details>
+<details>
+<summary>4. 我想让模型输出严格的 JSON。设 <code>temperature=0</code> 够吗？</summary>
+<p><strong>不够。贪心解码只是「每步选概率最高的」，不保证结果合法。</strong></p>
+<p>反例很容易构造：模型在某一步的最高概率 token 是 <code>"</code> 而不是 <code>}</code>，
+于是生成了一个未闭合的字符串；或者在数组里多写了一个逗号。
+概率最高不等于语法正确。</p>
+<p><strong>正确做法是约束解码（constrained decoding）</strong>：
+每一步先算出「在当前语法状态下哪些 token 是合法的」，
+把非法 token 的 logit 置为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mo>&#x0221E;</mo></mrow></math></span>，再采样。</p>
+<p>实现上有几个真实困难：</p>
+<ol>
+<li><strong>合法集合要按语法状态维护。</strong> JSON 的语法是上下文无关的，
+   需要一个下推自动机（或者编译成有限状态机）。</li>
+<li><strong>token 与语法符号不对齐。</strong> 语法说的是「下一个字符必须是 <code>}</code>」，
+   但 token 可能是 <code>"}"</code>、<code>"} "</code>、<code>"}\n"</code>、<code>"}}"</code>……
+   要把语法状态映射到 token 集合，这是预计算量很大的一步。</li>
+<li><strong>同一个字符串有多种 token 化。</strong> <a class="xref" href="../L0/0.4-text-to-tensor.html" title="文本闭环（上）：从 Unicode 字节到模型输入张量">L0.4</a> 讲过 <code>the</code> 在句首句中切法不同。
+   约束解码必须接受所有合法的切分方式，否则会排除掉模型本来想走的路径。</li>
+<li><strong>性能。</strong> 每步都要算合法 token 集合。
+   现在的做法是把语法编译成 DFA，预计算每个状态的 token mask（bitmap），
+   运行时只做一次位运算。</li>
+</ol>
+<p><strong>这是 <a class="xref" href="../L5/5.6-structured-output.html" title="结构化输出与约束解码">L5.6</a> 一整章的内容。</strong> 相关实现：Outlines、XGrammar、
+以及 vLLM/SGLang 内置的 guided decoding。</p>
+<p><strong>顺带</strong>：约束解码和 <code>temperature</code> 是正交的。
+约束保证合法，温度控制在合法候选里的多样性。
+两者可以一起用。</p>
+</details>
+<details>
+<summary>5. 一次请求生成 500 个 token。从系统角度看，这 500 步里 CPU 和 GPU 各做了什么？瓶颈在哪？</summary>
+<p><strong>先分层列出每一步做的事：</strong></p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>在哪</th>
+<th>数据量</th>
+<th>性质</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模型前向</td>
+<td>GPU</td>
+<td>读整个模型权重（1.7B bf16 ≈ 3.4 GB）</td>
+<td><strong>带宽瓶颈</strong></td>
+</tr>
+<tr>
+<td>采样（温度/top-p/multinomial）</td>
+<td>GPU</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">[</mo><mi>B</mi><mo>&#x0002C;</mo><mn>151936</mn><mo stretchy="false">]</mo></mrow></math></span></td>
+<td>需要排序，非平凡</td>
+</tr>
+<tr>
+<td>token id 回传</td>
+<td>PCIe</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 个 int32</td>
+<td>可忽略</td>
+</tr>
+<tr>
+<td>eos 检查</td>
+<td>CPU 或 GPU</td>
+<td>1 个比较</td>
+<td>若用 <code>.item()</code> 会强制同步</td>
+</tr>
+<tr>
+<td>detokenize</td>
+<td>CPU</td>
+<td>1 个 token</td>
+<td>字符串处理</td>
+</tr>
+<tr>
+<td>发送给客户端</td>
+<td>网络</td>
+<td>几十字节</td>
+<td>有 syscall 开销</td>
+</tr>
+</tbody>
+</table>
+<p><strong>瓶颈在模型前向的显存带宽。</strong> 理由（<a class="xref" href="../L0/0.0b-minimal-model-backward.html" title="最小完整模型（下）：链式法则与一次参数更新">L0.0b</a> 自测题 5 推过）：
+生成一个 token 要把整个模型权重读一遍，
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>3.4</mn><mtext>&#x000A0;</mtext><mtext>GB</mtext><mo>&#x0002F;</mo><mn>1674</mn><mtext>&#x000A0;</mtext><mtext>GB/s</mtext><mo>&#x02248;</mo><mn>2.0</mn></mrow></math></span> ms（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测带宽）。
+而这一步只做了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>1.7</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mn>9</mn></msup><mo>&#x02248;</mo><mn>3.4</mn></mrow></math></span> GFLOP，
+在 232 TFLOPS 的卡上只需 0.015 ms。<strong>算力用了不到 1%。</strong></p>
+<p><strong>这直接推出三件事：</strong></p>
+<ol>
+<li><strong>batch 越大越划算。</strong> 权重只读一次，可以同时服务 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 个请求。
+   <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 从 1 涨到 64，延迟几乎不变，吞吐涨 64 倍——
+   这就是 continuous batching 的全部动机（<a class="xref" href="../L5/5.3-scheduling.html" title="调度：continuous batching 与 chunked prefill">L5.3</a>）。</li>
+<li><strong>500 步的总时间约 500 × 2 ms = 1 秒</strong>，与 prompt 长度基本无关
+   （KV cache 的读取随长度增长，但相对权重小得多）。</li>
+<li><strong>CPU 侧的每一项都必须避免同步。</strong> 单步只有 2 ms 的预算，
+   一次 <code>.item()</code> 是 4.76 µs（0.24%），看起来不多，
+   但它打断的是 CPU 提前提交下一步的流水——
+   实际影响远大于 4.76 µs（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a>、<a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a>）。</li>
+</ol>
+<p><strong>什么时候瓶颈会转移</strong>：
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 很大时（几百），采样的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">[</mo><mi>B</mi><mo>&#x0002C;</mo><mi>V</mi><mo stretchy="false">]</mo></mrow></math></span> 排序和 detokenize 的 CPU 开销
+会开始显现。这时的对策是 GPU 上的 top-p kernel 优化和 detokenize 多进程。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L0/0.4-text-to-tensor.html">&#8592; 0.4 文本闭环（上）：从 Unicode 字节到模型输入张量</a><a class="nav-next" href="../L1/1.1-gpu-microarch.html">1.1 GPU 微架构与内存层次 &#8594;</a></nav>
+</main>
+</body>
+</html>

@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.1 GPU 微架构与内存层次</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">1.1</div>
+  <div class="sidebar-title">GPU 微架构与内存层次</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一座延迟递增、带宽递减的金字塔</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#simtwarp">SIMT：warp 是真正的调度单位</a></li>
+<li><a href="#_4">延迟：三段平台，拐点精确落在容量边界</a></li>
+<li><a href="#_5">带宽：随工作集掉三级</a></li>
+<li><a href="#bank-conflict">共享内存与 bank conflict</a></li>
+<li><a href="#-">带宽-延迟积：需要多少并发才能喂饱</a></li>
+</ul>
+</li>
+<li><a href="#tile">工程实现 · 源码走读：硬件容量如何约束 tile</a><ul>
+<li><a href="#sharedmemperblockoptin-optin">另一处：sharedMemPerBlockOptin 为什么是 "Optin"</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_8">原始现场</a></li>
+<li><a href="#_9">前沿</a></li>
+<li><a href="#_10">陷阱</a></li>
+<li><a href="#_11">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L1 · 硬件与操作系统底座</div>
+  <div class="mod-id">1.1</div>
+  <h1>GPU 微架构与内存层次</h1>
+  <p class="lede">认识 SM、warp 与内存层次，区分延迟和带宽；通过访问模式理解并发与 bank conflict，再用容量约束分析 tile 的可行范围。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) + worldvln (L40S, sm_89)</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L0.2（roofline 与账本）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>从寄存器到显存，每一级的<strong>延迟</strong>和<strong>带宽</strong>各是多少？拐点在哪里？这些数字规格表上没有。</li>
+<li>要把显存带宽打满，需要多少并发？为什么"线程开得越多越快"是错的？</li>
+<li>FlashAttention 的 tile 尺寸为什么是 <code>&lt;128, 64, 128, 4&gt;</code> 而不是别的数？</li>
+</ol>
+<p>先区分两个概念：延迟是一次访问需要等多久，带宽是单位时间能搬多少数据。
+GPU 可以让许多访问同时进行，因此带宽高不代表单次访问延迟低。
+本章先认识 SM（执行线程块的计算单元）及其寄存器、共享内存和缓存，
+再用测量结果理解分块计算。硬件容量能排除放不下的 tile，
+但不能单独决定哪组 tile 参数最快。</p>
+<hr />
+<h2 id="_2">心智模型：一座延迟递增、带宽递减的金字塔</h2>
+<figure>
+<svg viewBox="0 0 740 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GPU 内存层次金字塔">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">RTX 5090 D（sm_120）· 全部为本机实测</text>
+
+    <!-- registers -->
+    <rect x="250" y="34" width="200" height="34" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <text x="350" y="55" text-anchor="middle" font-size="12">寄存器</text>
+    <text x="465" y="49" font-size="10.5" opacity="0.8">~1 周期 · 每 SM 256 KB</text>
+    <text x="465" y="63" font-size="10" opacity="0.6">编译器分配，spill 就掉到 local memory</text>
+
+    <!-- smem / L1 -->
+    <rect x="215" y="78" width="270" height="44" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <text x="350" y="97" text-anchor="middle" font-size="12">共享内存 / L1（每 SM 128 KiB 统一）</text>
+    <text x="350" y="114" text-anchor="middle" font-size="10.5" opacity="0.85">smem 6.5 周期 · L1 命中 44 周期 (15.2 ns)</text>
+    <text x="500" y="97" font-size="10.5" opacity="0.8">聚合带宽 27 TB/s</text>
+    <text x="500" y="112" font-size="10" opacity="0.6">单 block 最多可申请 99 KB</text>
+
+    <!-- L2 -->
+    <rect x="165" y="132" width="370" height="52" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <text x="350" y="152" text-anchor="middle" font-size="12">L2（全卡共享，96 MiB）</text>
+    <text x="350" y="170" text-anchor="middle" font-size="10.5" opacity="0.85">360 周期 (124 ns) · 带宽 5.5 TB/s</text>
+    <text x="548" y="158" font-size="10" opacity="0.65">Blackwell 的 L2 大到</text>
+    <text x="548" y="172" font-size="10" opacity="0.65">能装下不少真实工作集</text>
+
+    <!-- DRAM -->
+    <rect x="100" y="194" width="500" height="58" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <text x="350" y="215" text-anchor="middle" font-size="12">显存 GDDR7（32 GB）</text>
+    <text x="350" y="233" text-anchor="middle" font-size="10.5" opacity="0.85">929 周期 (320 ns) · 带宽 1674 GB/s</text>
+    <text x="350" y="248" text-anchor="middle" font-size="10" opacity="0.7">decode 每步要从这里搬 3.44 GB 权重</text>
+
+    <!-- host -->
+    <rect x="60" y="262" width="580" height="40" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="4 3"/>
+    <text x="350" y="287" text-anchor="middle" font-size="11.5" opacity="0.8">主机内存（经 PCIe 5.0，实测 47.5 GB/s）—— 比显存慢 35 倍，见 L1.3</text>
+
+    <!-- key insight -->
+    <line x1="12" y1="320" x2="728" y2="320" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="344" font-size="12" font-weight="600">带宽-延迟积：要打满 1674 GB/s，必须始终有 <tspan font-size="13">524 KB</tspan> 的访存在途</text>
+    <text x="12" y="364" font-size="11" opacity="0.85">= 1674 GB/s × 320 ns。这就是「为什么要开很多 warp」的定量答案。</text>
+    <text x="12" y="386" font-size="11" opacity="0.85">L40S 只需要 169 KB（681 GB/s × 253 ns）—— <tspan font-weight="600">带宽越高的卡，越难喂饱</tspan>。</text>
+  </g>
+</svg>
+<figcaption>每一级的数字都来自 <code>labs/L1/mem_hierarchy.cu</code> 的实测，不是厂商标称。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="simtwarp">SIMT：warp 是真正的调度单位</h3>
+<p>GPU 的最小调度单位不是线程，是 <strong>warp = 32 个线程</strong>。一条指令被整个 warp 同时执行
+（Single Instruction, Multiple Threads）。三个直接后果：</p>
+<ol>
+<li><strong>分支发散（divergence）</strong>：warp 内如果 <code>if</code> 两侧都有线程走，硬件会<strong>两条路径都执行一遍</strong>，
+   用掩码屏蔽不该生效的线程。实际代价取决于分支长度、活跃线程和编译结果，
+   不能只看到 <code>if (tid % 2)</code> 就认定性能减半。</li>
+<li><strong>访存合并（coalescing）</strong>：warp 的 32 个线程如果访问连续地址，硬件合并成少数几个
+   128 字节事务；如果地址散开，最坏要发 32 个事务。这是 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的主题。</li>
+<li><strong>延迟靠切换掩盖</strong>：一个 warp 卡在等访存时，SM 立刻切到另一个就绪的 warp。
+   <strong>GPU 不像 CPU 那样靠乱序执行和大缓存掩盖延迟，它靠"手上有足够多的活"。</strong></li>
+</ol>
+<p>本机实测：每 SM 最多常驻 <strong>1536 个线程 = 48 个 warp</strong>，共 <strong>170 个 SM</strong>。</p>
+<h3 id="_4">延迟：三段平台，拐点精确落在容量边界</h3>
+<p>指针追逐（每次访存依赖上一次结果，硬件无法并行发射）测出的<strong>纯延迟</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>工作集</th>
+<th>5090 周期</th>
+<th>5090 ns</th>
+<th>L40S 周期</th>
+<th>L40S ns</th>
+<th>命中层级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4–64 KiB</td>
+<td><strong>44.1</strong></td>
+<td>15.22</td>
+<td><strong>40.0</strong></td>
+<td>15.91</td>
+<td>L1</td>
+</tr>
+<tr>
+<td>128 KiB</td>
+<td>285.0</td>
+<td>98.24</td>
+<td>222.1</td>
+<td>88.38</td>
+<td>L1 边界（部分被 smem 占走）</td>
+</tr>
+<tr>
+<td>256 KiB – 64 MiB</td>
+<td><strong>360</strong></td>
+<td>124.1</td>
+<td><strong>279</strong></td>
+<td>111.0</td>
+<td>L2</td>
+</tr>
+<tr>
+<td>96 MiB</td>
+<td>575.6</td>
+<td>198.4</td>
+<td>354.2</td>
+<td>141.0</td>
+<td>L2 已到容量边界</td>
+</tr>
+<tr>
+<td>128–512 MiB</td>
+<td><strong>929</strong></td>
+<td>320.3</td>
+<td><strong>636</strong></td>
+<td>253.4</td>
+<td>显存</td>
+</tr>
+</tbody>
+</table>
+<p>三段平台干净到令人愉快：<strong>44 / 360 / 929</strong>（5090），<strong>40 / 279 / 636</strong>（L40S）。
+中间的两个跳变分别发生在 128 KiB 和 96 MiB —— 正好是 L1 与 L2 的容量。</p>
+<p><strong>跨架构的观察很反直觉</strong>：5090 在<strong>每一级</strong>的延迟都比 L40S 高
+（L2 360 vs 279 周期，显存 929 vs 636 周期），但它的带宽高 2.5 倍。</p>
+<p>这是 GDDR7 的典型形态：靠更多的 bank 与更深的流水换带宽，代价是单次访问的往返更长。
+<strong>「更快的显存」在延迟意义上可能更慢。</strong> 对 decode 这种高并发访存的负载无所谓；
+对访存链很长又并发不足的 kernel 则是实打实的损失。</p>
+<h3 id="_5">带宽：随工作集掉三级</h3>
+<table>
+<thead>
+<tr>
+<th>工作集</th>
+<th>5090 GB/s</th>
+<th>L40S GB/s</th>
+<th>主要命中</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 MiB</td>
+<td>10 427</td>
+<td>9 511</td>
+<td>L1（各 SM 私有）</td>
+</tr>
+<tr>
+<td>4 MiB</td>
+<td>24 071</td>
+<td>17 476</td>
+<td>L1</td>
+</tr>
+<tr>
+<td><strong>16 MiB</strong></td>
+<td><strong>27 017</strong></td>
+<td><strong>19 396</strong></td>
+<td>L1（接近聚合上限）</td>
+</tr>
+<tr>
+<td>32 MiB</td>
+<td>12 866</td>
+<td>9 362</td>
+<td>开始溢出 L1</td>
+</tr>
+<tr>
+<td>64–96 MiB</td>
+<td>~5 400</td>
+<td>~4 270</td>
+<td><strong>L2</strong></td>
+</tr>
+<tr>
+<td>128 MiB</td>
+<td>3 006</td>
+<td>1 644</td>
+<td>过渡</td>
+</tr>
+<tr>
+<td>512 MiB – 1 GiB</td>
+<td><strong>1 674</strong></td>
+<td><strong>681</strong></td>
+<td><strong>显存</strong></td>
+</tr>
+</tbody>
+</table>
+<p>两个边界都能被解释：</p>
+<ul>
+<li><strong>第一个悬崖在 16 → 32 MiB</strong>：全卡 L1 聚合容量 = 170 SM × 128 KiB = <strong>21.25 MiB</strong>。
+  工作集超过它就掉进 L2。</li>
+<li><strong>第二个悬崖在 96 → 128 MiB</strong>：正好是 L2 的 96 MiB。</li>
+</ul>
+<p><strong>层级之间的带宽比：L1 : L2 : 显存 ≈ 16 : 3.3 : 1。</strong>
+这说明把可复用数据保留在片上值得考虑。tiling 是把大问题分成小块，
+在一块数据被移出之前尽量重复使用它。带宽比不等于程序加速比，
+因为搬入、同步、计算和写回也需要时间。<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 会逐步讨论这些成本。</p>
+<div class="admonition note">
+<p class="admonition-title">这解释了 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 里一个悬而未决的数字</p>
+<p><a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 用 <code>probe_hw.py</code> 测出 copy 带宽 1519 GB/s、只读 1608 GB/s。
+本章用完全不同的 kernel（float4 grid-stride 读）测出 1674 GB/s。
+三个数字都在 1.5–1.7 TB/s 区间，互相印证。
+而厂商标称是 1792 GB/s —— 实测能到 <strong>93%</strong>，已经相当接近上限。</p>
+</div>
+<h3 id="bank-conflict">共享内存与 bank conflict</h3>
+<p>共享内存分成 <strong>32 个 bank</strong>，每 bank 4 字节宽。一个 warp 的 32 个线程如果落在
+32 个不同 bank，一拍完成；如果全撞同一个 bank，就要串行。</p>
+<p>实测（每线程连发 8 个互不依赖的 load）：</p>
+<table>
+<thead>
+<tr>
+<th>访问模式</th>
+<th>5090</th>
+<th>L40S</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>stride=1（分散在 32 个 bank）</td>
+<td><strong>6.51</strong> 周期/次</td>
+<td>6.65</td>
+</tr>
+<tr>
+<td>stride=32（全撞同一个 bank）</td>
+<td><strong>65.79</strong> 周期/次</td>
+<td>65.55</td>
+</tr>
+<tr>
+<td>冲突倍数</td>
+<td><strong>10.1×</strong></td>
+<td>9.9×</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition warning">
+<p class="admonition-title">这个实验第一版是错的，值得记住为什么</p>
+<p>第一版用了依赖链（<code>idx = s[idx]</code>），测出 stride=1 与 stride=32 都是 44 周期，
+<strong>冲突倍数 1.0×——什么都没测到</strong>。</p>
+<p>原因：bank conflict 损失的是<strong>吞吐</strong>，而依赖链一次只有一个在途请求，吞吐根本不是瓶颈。
+必须让每个线程同时发出多个<strong>互不依赖</strong>的访存，冲突才会显现。</p>
+<p>一般规律：<strong>测延迟用依赖链，测吞吐用独立操作。</strong> 用错了就会测出「没有效应」的假结论。</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">这里的 10.1× 只是时间差，机制在 <a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 被直接读了出来</p>
+<p>本节测到的是<strong>时间比</strong>，「这是 bank conflict」是一个解释，不是观测。
+时间变慢有很多可能的原因。</p>
+<p><a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 在 spark 上用硬件计数器直接读了同一件事（那台机器能读性能计数器）：
+同样的三元对照（stride 1 / 32 / 33），<code>wavefront / request</code> 分别是
+<strong>1.00 / 32.00 / 1.00</strong>，冲突计数 <code>0 / 6,094,848 / 0</code>，
+而 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>6</mn><mrow><mo>&#x0002C;</mo></mrow><mn>094</mn><mrow><mo>&#x0002C;</mo></mrow><mn>848</mn><mo>&#x0003D;</mo><mn>196</mn><mrow><mo>&#x0002C;</mo></mrow><mn>608</mn><mo>&#x000D7;</mo><mn>31</mn></mrow></math></span> 与请求数吻合。</p>
+<p><strong>判据是 <code>wavefront/request</code> 这个比值，不是时间。</strong> 它直接给出冲突路数。
+时间比在那台机器上是 9.83×，与这里的 10.1× 同量级——
+但要注意这是两台不同的 GPU，能对上的是机制，不是绝对数值。</p>
+</div>
+<p>理论上界是 32×（一次广播变成 32 次串行事务），实测 10× 是因为循环本身的加法、
+索引计算等开销稀释了。10 倍已经足够说明问题：
+<strong>一个 stride 写错，kernel 的访存部分慢一个数量级。</strong> 这正是 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 里 swizzle 布局要消灭的东西。</p>
+<h3 id="-">带宽-延迟积：需要多少并发才能喂饱</h3>
+<p>Little's Law：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>达到的带宽</mtext><mo>&#x0003D;</mo><mfrac><mrow><mtext>在途字节数</mtext></mrow><mrow><mtext>延迟</mtext></mrow></mfrac><mspace width="1em" /><mi>&#x027F9;</mi><mspace width="1em" /><mtext>在途字节数</mtext><mo>&#x0003D;</mo><mtext>带宽</mtext><mo>&#x000D7;</mo><mtext>延迟</mtext></mrow></math></div></p>
+<p>代入实测值：</p>
+<ul>
+<li><strong>5090</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1674</mn><mtext>&#x000A0;</mtext><mtext>GB/s</mtext><mo>&#x000D7;</mo><mn>320.3</mn><mtext>&#x000A0;</mtext><mtext>ns</mtext><mo>&#x0003D;</mo></mrow></math></span> <strong>536 KB</strong> 必须始终在途</li>
+<li><strong>L40S</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>681</mn><mtext>&#x000A0;</mtext><mtext>GB/s</mtext><mo>&#x000D7;</mo><mn>253.4</mn><mtext>&#x000A0;</mtext><mtext>ns</mtext><mo>&#x0003D;</mo></mrow></math></span> <strong>173 KB</strong></li>
+</ul>
+<p><strong>带宽越高的卡，需要的访存并行度越大。</strong> 这是个容易被忽略的结论：
+5090 的带宽是 L40S 的 2.5 倍，但要喂饱它需要 3.1 倍的在途请求。</p>
+<p>实测并发扫描印证了这一点：</p>
+<table>
+<thead>
+<tr>
+<th>blocks/SM</th>
+<th>5090 GB/s</th>
+<th>占峰值</th>
+<th>L40S GB/s</th>
+<th>占峰值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>1550</td>
+<td>93%</td>
+<td>651</td>
+<td>96%</td>
+</tr>
+<tr>
+<td>2</td>
+<td>1680</td>
+<td>100%</td>
+<td>669</td>
+<td>98%</td>
+</tr>
+<tr>
+<td>4</td>
+<td>1690</td>
+<td>101%</td>
+<td>680</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>8</td>
+<td>1695</td>
+<td>101%</td>
+<td>681</td>
+<td>100%</td>
+</tr>
+</tbody>
+</table>
+<p>好消息是：<strong>2 个 block/SM（16 warp）就已经饱和</strong>。因为每个 warp 的一次 <code>float4</code> load
+就是 32 × 16 B = 512 B 在途，2720 个 warp × 512 B = 1.39 MB ≫ 536 KB。</p>
+<p><strong>但这有个前提：访存是"宽"的（float4）且合并良好。</strong>
+在“每个 warp 只有一个这类在途 load”的简化模型中，
+改为每线程读取一个 <code>float</code> 后，每 warp 从 512 B 降到 128 B，
+维持相同在途字节数需要 4 倍的 warp 数。真实执行还受发射率和队列容量约束。
+如果访存不合并，情况还要更糟。这就是 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的核心。</p>
+<hr />
+<h2 id="tile">工程实现 · 源码走读：硬件容量如何约束 tile</h2>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 kernel trace 里，prefill 阶段跑的 attention kernel 全名是：</p>
+<div class="highlight"><pre><span></span><code>void flash::flash_fwd_splitkv_kernel&lt;
+    Flash_fwd_kernel_traits&lt;128, 64, 128, 4, false, false, cutlass::bfloat16_t,
+                            Flash_kernel_traits&lt;128, 64, 128, 4, cutlass::bfloat16_t&gt; &gt;,
+    true, false, false, false, ...&gt;
+</code></pre></div>
+
+<p>按 FlashAttention-2 的 traits 约定，前四个参数是
+<code>&lt;kHeadDim, kBlockM, kBlockN, kNWarps&gt;</code>，即 <strong>head_dim=128、Q tile 64 行、KV tile 128 行、4 个 warp</strong>。</p>
+<p>第一个参数有个硬交叉验证：Qwen3-1.7B 的 <code>config.json</code> 里 <code>"head_dim": 128</code>（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 原始现场 ①）。
+对上了。</p>
+<p><strong>现在用本章测出的硬件常数解释后三个数字。</strong></p>
+<p>一个 tile 要在共享内存里放下 Q、K、V 三块（bf16，2 字节）：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><munder><munder><mrow><mn>64</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>Q</mi><mtext>&#x000A0;</mtext><mo>&#x0003D;</mo><mtext>&#x000A0;</mtext><mn>16</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>128</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>K</mi><mtext>&#x000A0;</mtext><mo>&#x0003D;</mo><mtext>&#x000A0;</mtext><mn>32</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>128</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>V</mi><mtext>&#x000A0;</mtext><mo>&#x0003D;</mo><mtext>&#x000A0;</mtext><mn>32</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></munder><mo>&#x0003D;</mo><mn>80</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></math></div></p>
+<p>而本机实测 <code>sharedMemPerBlockOptin = 99 KB</code>。<strong>80 &lt; 99，刚好放得下。</strong></p>
+<p>如果把 <code>kBlockN</code> 从 128 提到 256：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>16</mn><mo>&#x0002B;</mo><mn>64</mn><mo>&#x0002B;</mo><mn>64</mn><mo>&#x0003D;</mo><mn>144</mn></mrow></math></span> KB &gt; 99 KB，<strong>编译期就会失败</strong>。
+如果降到 64：smem 只用 48 KB，但每个 Q tile 要多循环一倍次数，K/V 的重复加载翻倍。</p>
+<p>在上面的 Q/K/V 同时驻留假设下，容量可以排除较大的候选配置。
+但这不是对源码最优 tile 的证明：缓冲复用、流水级数、寄存器布局与调度都会改变选择。
+应先核对实际 kernel 的共享内存布局，再用容量计算和实测共同判断。</p>
+<p><code>kNWarps=4</code> 呢？4 warp = 128 线程。回到带宽-延迟积：
+一个 block 要能持续供上访存，同时寄存器又不能爆（每 SM 只有 256 KB 寄存器文件）。
+warp 太少喂不饱访存，太多则每线程可用寄存器变少、accumulator 放不下要 spill。</p>
+<div class="admonition note">
+<p class="admonition-title">这是本层存在的意义</p>
+<p>「FlashAttention 用 64×128 的 tile」这句话，背下来没有用。
+更有用的是知道哪些条件限制候选参数：共享内存容量、寄存器预算和访存并行度。
+换硬件、dtype 或 head_dim 时，先重新算可行范围，再比较候选实现。
+<a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a> 会把 FA1→FA4 每一代的 tile 变化都对应到硬件参数的变化上。</p>
+</div>
+<h3 id="sharedmemperblockoptin-optin">另一处：<code>sharedMemPerBlockOptin</code> 为什么是 "Optin"</h3>
+<p>本机实测每 block 最多 99 KB，但<strong>默认只给 48 KB</strong>。超过 48 KB 必须显式申请：</p>
+<div class="highlight"><pre><span></span><code><span class="n">cudaFuncSetAttribute</span><span class="p">(</span><span class="n">kernel</span><span class="p">,</span><span class="w"> </span><span class="n">cudaFuncAttributeMaxDynamicSharedMemorySize</span><span class="p">,</span><span class="w"> </span><span class="mi">99</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">);</span>
+</code></pre></div>
+
+<p>历史原因：48 KB 是 Kepler/Maxwell 时代的上限，为了向后兼容，
+超出部分要求 kernel 主动"opt in"。<strong>所有现代 attention/GEMM kernel 都会调这个 API</strong>，
+忘了调就会在启动时报 <code>invalid argument</code> —— 一个很常见又很难查的错误。</p>
+<p>而且 L1 与共享内存是<strong>同一块 128 KiB 物理 SRAM 分割出来的</strong>。
+申请 99 KB 共享内存，L1 就只剩 29 KB。这解释了实测里的一个现象：
+<strong>128 KiB 工作集的指针追逐已经掉到 285 周期</strong>，而不是 L1 的 44 周期——
+因为可用的 L1 数据缓存并没有整整 128 KiB。</p>
+<hr />
+<h2 id="_6">工程实现 · 自己写一遍</h2>
+<p><code>labs/L1/mem_hierarchy.cu</code>。四个实验，每个都有一个方法学要点：</p>
+<p><strong>A. 测延迟 → 必须用依赖链 + 随机顺序 + 走遍工作集</strong></p>
+<div class="highlight"><pre><span></span><code><span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">chase_kernel</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">uint32_t</span><span class="o">*</span><span class="w"> </span><span class="n">__restrict__</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">steps</span><span class="p">,</span>
+<span class="w">                             </span><span class="kt">uint32_t</span><span class="o">*</span><span class="w"> </span><span class="n">out</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="o">*</span><span class="w"> </span><span class="n">cycles</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">steps</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="n">idx</span><span class="p">];</span><span class="w">   </span><span class="c1">// 预热</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">t0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">clock64</span><span class="p">();</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">steps</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="n">idx</span><span class="p">];</span><span class="w">   </span><span class="c1">// ← 每次都依赖上一次</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">t1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">clock64</span><span class="p">();</span>
+<span class="w">    </span><span class="o">*</span><span class="n">out</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">idx</span><span class="p">;</span><span class="w">                                       </span><span class="c1">// 防止整个循环被优化掉</span>
+<span class="w">    </span><span class="o">*</span><span class="n">cycles</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">t1</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">t0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>三个必须做对的地方，缺一个结论就是假的：</p>
+<div class="highlight"><pre><span></span><code><span class="k">const</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">LINE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">128</span><span class="p">;</span><span class="w">                    </span><span class="c1">// ① 每个链节点占一整条 cache line</span>
+<span class="kt">size_t</span><span class="w"> </span><span class="n">n_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">LINE</span><span class="p">;</span>
+<span class="n">std</span><span class="o">::</span><span class="n">shuffle</span><span class="p">(</span><span class="n">order</span><span class="p">.</span><span class="n">begin</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">order</span><span class="p">.</span><span class="n">end</span><span class="p">(),</span><span class="w"> </span><span class="n">rng</span><span class="p">);</span><span class="w">   </span><span class="c1">// ② 随机，打掉硬件预取器</span>
+<span class="kt">size_t</span><span class="w"> </span><span class="n">steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">max</span><span class="p">((</span><span class="kt">size_t</span><span class="p">)</span><span class="n">min_steps</span><span class="p">,</span><span class="w"> </span><span class="n">n_lines</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="p">);</span><span class="w">  </span><span class="c1">// ③ 走遍整个工作集 3 遍</span>
+</code></pre></div>
+
+<div class="admonition warning">
+<p class="admonition-title">第 ③ 条是踩出来的</p>
+<p>第一版对所有 buffer 都固定走 4096 步。对 1 GiB 的 buffer，
+4096 次随机访问只碰到 4096 条 cache line ≈ 512 KB —— <strong>整个"工作集"一直待在 L2 里</strong>。
+结果 1 MiB 到 1 GiB 全测出 360 周期，L2 与显存的差别凭空消失。</p>
+<p>改成 <code>steps = n_lines × 3</code> 之后，三段平台立刻显现。
+<strong>"曲线是平的"往往不是硬件没差别，而是你的实验没触碰到那个差别。</strong></p>
+</div>
+<p><strong>B. 时钟自校准 → 不要相信 <code>cudaDevAttrClockRate</code></strong></p>
+<p><code>clock64()</code> 数的是真实 SM 周期，但要换算成纳秒就得知道频率。
+<code>cudaDevAttrClockRate</code> 报的是<strong>基频</strong>（5090 是 2.41 GHz），而 GPU 会 boost。
+自校准的做法是同时用两种计时器：</p>
+<div class="highlight"><pre><span></span><code><span class="n">CHECK</span><span class="p">(</span><span class="n">cudaEventRecord</span><span class="p">(</span><span class="n">ea</span><span class="p">));</span>
+<span class="n">chase_kernel</span><span class="o">&lt;&lt;&lt;</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="o">&gt;&gt;&gt;</span><span class="p">(...);</span>
+<span class="n">CHECK</span><span class="p">(</span><span class="n">cudaEventRecord</span><span class="p">(</span><span class="n">eb</span><span class="p">));</span>
+<span class="n">CHECK</span><span class="p">(</span><span class="n">cudaEventElapsedTime</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ms</span><span class="p">,</span><span class="w"> </span><span class="n">ea</span><span class="p">,</span><span class="w"> </span><span class="n">eb</span><span class="p">));</span><span class="w">      </span><span class="c1">// 墙钟</span>
+<span class="n">CHECK</span><span class="p">(</span><span class="n">cudaMemcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cyc</span><span class="p">,</span><span class="w"> </span><span class="n">d_cyc</span><span class="p">,</span><span class="w"> </span><span class="p">...));</span><span class="w">           </span><span class="c1">// 周期</span>
+<span class="kt">double</span><span class="w"> </span><span class="n">ghz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">double</span><span class="p">)(</span><span class="n">cyc</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">ms</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e6</span><span class="p">);</span><span class="w">   </span><span class="c1">// 两者相除 = 本次运行的实际频率</span>
+</code></pre></div>
+
+<p>标定实测：5090 得 <strong>2.90 GHz</strong>（基频 2.41，最大 boost 3.09 —— 落在区间内，合理）；
+L40S 得 2.51 GHz（基频 2.52）。</p>
+<p>这里也有个坑：<strong>标定 kernel 必须够长</strong>。第一版用 4096 步（约 0.1 ms），
+kernel launch 的几微秒被算进 event 时间，把频率压到 1.45 GHz —— 低了整整一倍。
+改成 200 万步（约 0.1 秒）后才稳定。</p>
+<p><strong>C / D 的要点</strong>已在上面机制部分讲过：测吞吐要用独立操作；
+测饱和带宽要用远超 L2 的工作集且只扫一遍。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-o<span class="w"> </span>mem_hierarchy<span class="w"> </span>labs/L1/mem_hierarchy.cu
+./mem_hierarchy
+</code></pre></div>
+
+<p><code>-arch</code> 必须匹配你的卡（5090 是 <code>sm_120</code>，L40S 是 <code>sm_89</code>）。
+架构不匹配时 nvcc 不会报错，驱动会 JIT PTX，性能特征可能变化（<a class="xref" href="../L2/2.2-toolchain-ptx-sass.html" title="编译工具链：nvcc → PTX → SASS">L2.2</a> 详解）。</p>
+<h3 id="_7">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>把 <code>LINE</code> 从 128 改成 32</td>
+<td>每条 cache line 上放 4 个链节点 → 实际触碰的字节数只有 1/4，<strong>三段平台会退化</strong>。这能让你亲手复现我踩的那个坑</td>
+</tr>
+<tr>
+<td>把 <code>std::shuffle</code> 去掉（顺序链）</td>
+<td>硬件预取器生效，显存延迟会大幅"变快"——测出的是预取后的假延迟</td>
+</tr>
+<tr>
+<td><code>smem_kernel</code> 里 stride 试 2/4/8/16</td>
+<td>冲突倍数应该大致按 2/4/8/16 递增（部分冲突）</td>
+</tr>
+<tr>
+<td><code>bw_read_kernel</code> 里把 <code>float4</code> 换成 <code>float</code></td>
+<td>每 warp 在途字节从 512 B 掉到 128 B，<strong>饱和需要的 blocks/SM 应该涨约 4 倍</strong></td>
+</tr>
+<tr>
+<td>在 worldvln 上改 <code>CUDA_VISIBLE_DEVICES</code> 到 3</td>
+<td>GPU3 在另一个 NUMA 节点，观察是否影响（应该不影响显存延迟，只影响 H2D —— 见 <a class="xref" href="../L1/1.3-host-pcie-numa.html" title="主机侧：NUMA、PCIe 与 DMA">L1.3</a>）</td>
+</tr>
+</tbody>
+</table>
+<p>倒数第二行是本章最值得做的一个实验：它把「访存宽度」和「所需并发」这两个概念绑在一起。</p>
+<hr />
+<h2 id="_8">原始现场</h2>
+<details>
+<summary>① 5090 的完整输出</summary>
+<div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D  sm_120  SM=170  L2=96.0 MiB  显存=33.7 GB  SM时钟=2.41 GHz
+    每 SM 最大线程 1536，每 block 最大共享内存 99 KB，warp 大小 32
+    标定：基频 2.41 GHz，本次运行有效 2.90 GHz（clock64 与 event 交叉反推）
+
+[A] 指针追逐延迟（随机环，单线程，无法并行 ⇒ 纯延迟）
+    工作集    周期/次   纳秒/次   推测命中层级
+    4 KiB        44.1         15.22        L1
+    16 KiB       44.1         15.22        L1
+    32 KiB       44.1         15.22        L1
+    64 KiB       44.1         15.21        L1
+    128 KiB      285.0        98.24        L1
+    256 KiB      360.2        124.16       L2
+    512 KiB      360.0        124.08       L2
+    1 MiB        360.0        124.10       L2
+    4 MiB        359.9        124.06       L2
+    16 MiB       359.9        124.05       L2
+    32 MiB       359.9        124.05       L2
+    64 MiB       359.8        124.04       L2
+    96 MiB       575.6        198.43       L2（已到容量边界）
+    128 MiB      929.2        320.31       显存
+    256 MiB      929.0        320.25       显存
+    512 MiB      934.2        322.03       显存
+
+[B] 只读带宽 vs 工作集
+    参考边界：L1 聚合约 21 MiB（170 SM × 128 KiB），L2 = 96 MiB
+    1 MiB        10427.1        L1（各 SM 私有）
+    4 MiB        24070.6        L1（各 SM 私有）
+    16 MiB       27016.5        L1（各 SM 私有）
+    32 MiB       12866.0        L2
+    64 MiB       5513.4         L2
+    80 MiB       5412.5         L2
+    96 MiB       5271.0         L2
+    128 MiB      3005.6         显存
+    192 MiB      2091.2         显存
+    256 MiB      1976.6         显存
+    512 MiB      1677.9         显存
+    1024 MiB     1674.0         显存
+
+[C] 共享内存延迟与 bank conflict
+    stride=1  （32 线程分散在 32 个 bank）：6.51 周期/次访存
+    stride=32 （32 线程全撞同一个 bank）  ：65.79 周期/次访存
+    冲突倍数 10.1×
+
+[D] 并发度 vs 带宽（1 GB 工作集，单遍扫描，block=256）
+    blocks/SM   常驻 warp  带宽 GB/s  占已测峰值
+    1           1360         1550.3       93%   已饱和
+    2           2720         1680.2       100%  已饱和
+    4           5440         1689.5       101%  已饱和
+    8           8160         1695.4       101%  已饱和
+    16          8160         1690.2       101%  已饱和
+    参照：实验 B 在 1 GB 工作集下测得 1673 GB/s
+</code></pre></div>
+
+<p>原始文件：<code>results/crater/mem_hierarchy_5090.txt</code></p>
+</details>
+<details>
+<summary>② L40S 的对照输出（同一份 .cu，只换 -arch）</summary>
+<div class="highlight"><pre><span></span><code>=== NVIDIA L40S  sm_89  SM=142  L2=96.0 MiB  显存=47.7 GB  SM时钟=2.52 GHz
+    标定：基频 2.52 GHz，本次运行有效 2.51 GHz
+
+[A]  4–64 KiB   40.0 周期 / 15.91 ns    L1
+     128 KiB    222.1     / 88.38       L1 边界
+     256K–32M   279.0     / 111.03      L2
+     64 MiB     284.0     / 113.02      L2
+     96 MiB     354.2     / 140.96      L2 容量边界
+     128–512M   ~636      / ~253        显存
+
+[B]  16 MiB     19395.6 GB/s   L1
+     64–96 MiB  ~4270          L2
+     1024 MiB   681.4          显存
+
+[C]  stride=1  6.65 周期 · stride=32  65.55 周期 · 冲突 9.9×
+
+[D]  1 blk/SM 651 GB/s (96%) → 4 blk/SM 680 GB/s (100%)
+</code></pre></div>
+
+<p>两张卡的 L2 都是 96 MiB、每 SM smem 上限都是 99 KB、bank 冲突倍数都是 ~10×——
+<strong>这些是跨两代架构不变的量</strong>。变的是延迟（5090 各级都更高）和带宽（5090 各级都更高）。</p>
+<p>原始文件：<code>results/worldvln/mem_hierarchy_l40s.txt</code></p>
+</details>
+<details>
+<summary>③ 设备属性原文（哪些数字可以直接读，哪些必须测）</summary>
+<div class="highlight"><pre><span></span><code>name                          NVIDIA GeForce RTX 5090 D
+compute capability            12.0            ← 决定能用哪些指令（L1.2）
+multiProcessorCount           170
+l2CacheSize                   100663296       ← 96 MiB，可直接读
+maxThreadsPerMultiProcessor   1536            ← 48 warp
+sharedMemPerBlockOptin        101376          ← 99 KB，决定 tile 上界
+warpSize                      32
+clockRate                     2410000 kHz     ← 基频，不是运行频率
+totalGlobalMem                33.7 GB
+</code></pre></div>
+
+<p><strong>可以直接读的</strong>：SM 数、L2 容量、smem 上限、每 SM 线程上限、warp 大小。
+<strong>必须测的</strong>：各级延迟、各级带宽、实际运行频率、bank 冲突代价、饱和所需并发。</p>
+<p>第二组里没有一个能从 API 或规格表拿到，而它们恰恰是决定 kernel 写法的那些数。</p>
+</details>
+<details>
+<summary>④ 那个真实的 attention kernel 全名</summary>
+<div class="highlight"><pre><span></span><code>void flash::flash_fwd_splitkv_kernel&lt;
+    Flash_fwd_kernel_traits&lt;128, 64, 128, 4, false, false, cutlass::bfloat16_t,
+                            Flash_kernel_traits&lt;128, 64, 128, 4, cutlass::bfloat16_t&gt; &gt;,
+    true, false, false, false, false, true, false, false&gt;(
+        Flash_fwd_params)
+</code></pre></div>
+
+<p>C++ 模板实例化的名字是<strong>信息量最大的调试线索之一</strong>：不用读源码，
+就能从名字里读出 head_dim、tile 尺寸、warp 数、数据类型、以及一串编译期开关。
+<code>splitkv</code> 说明这是 split-K 变体（把 KV 序列切成多段并行，最后再 combine —— <a class="xref" href="../L3/3.3-decode-attention.html" title="Decode 侧 attention">L3.3</a>）。</p>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 trace 里还看到配套的 <code>flash_fwd_splitkv_combine_kernel</code>，
+就是那个 combine 步骤，占 decode GPU 时间的 2.5%。</p>
+</details>
+<hr />
+<h2 id="_9">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>与本章的关系</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>异步拷贝与 TMA</strong></td>
+<td>Ampere 的 <code>cp.async</code> 让"搬数据到 smem"不占寄存器、不阻塞计算；Hopper 的 TMA 进一步把整块搬运交给专用硬件。本质都是在提高"在途字节数"以逼近带宽-延迟积（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a>、<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）</td>
+</tr>
+<tr>
+<td><strong>分布式共享内存（DSMEM）</strong></td>
+<td>Hopper 起，同一 cluster 内的 block 可以互相访问 smem，等于把有效 smem 容量放大到 cluster 级。这直接放宽了本章算出的 99 KB 上界</td>
+</tr>
+<tr>
+<td><strong>Tensor Memory（TMEM）</strong></td>
+<td>sm_100 独有的、tensor core 专用的片上存储，把累加器从寄存器文件里搬出去。<strong>sm_120 没有</strong>（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a>）</td>
+</tr>
+<tr>
+<td><strong>L2 驻留控制</strong></td>
+<td><code>cudaStreamSetAttribute</code> 的 access policy window 可以把某段显存"钉"在 L2 里。对 KV cache 的热前缀理论上有用，但目前主流引擎都没用（<a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a> 的一个开放方向）</td>
+</tr>
+<tr>
+<td><strong>FlashAttention-4 的软件仿真 exp()</strong></td>
+<td>因为 <code>MUFU</code>（超越函数单元）的吞吐跟不上 Blackwell 的 tensor core，FA4 改用多项式近似在 FMA 单元上算 exp。这是"某一级硬件资源成为瓶颈后，算法绕过它"的典型（<a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a>）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>除本站实测外的内容来自各自文档与论文，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+</blockquote>
+<hr />
+<h2 id="_10">陷阱</h2>
+<p><strong>1. 用顺序访问测延迟。</strong> 硬件预取器会把顺序访问的延迟完全掩盖，测出的显存延迟可能只有真实值的 1/5。必须随机。</p>
+<p><strong>2. 工作集没走遍。</strong> 本章踩过：固定步数的指针追逐，对大 buffer 而言只触碰了很小一部分，三段平台会消失。</p>
+<p><strong>3. 用依赖链测吞吐 / 用独立操作测延迟。</strong> 两者测的是不同的东西，用反了会得到"没有效应"的假结论。本章的 bank conflict 实验就是这么翻车的。</p>
+<p><strong>4. 相信 <code>cudaDevAttrClockRate</code>。</strong> 那是基频。要么自校准，要么只报周期数不报纳秒。</p>
+<p><strong>5. 标定 kernel 太短。</strong> launch 开销几微秒，对 0.1 ms 的 kernel 是 5% 误差，对更短的就是数倍误差。</p>
+<p><strong>6. 忘了 smem 和 L1 是同一块 SRAM。</strong> 申请 99 KB smem 后 L1 只剩 29 KB。这解释了为什么 128 KiB 工作集的延迟已经不是 L1 的 44 周期。</p>
+<p><strong>7. 把"占用率高"当成"性能好"。</strong> 实测 2 个 block/SM 就饱和了带宽，再往上加没有收益。占用率只是掩盖延迟的<strong>手段</strong>，不是目标（<a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 会展开 occupancy vs ILP 的取舍）。</p>
+<hr />
+<h2 id="_11">自测题</h2>
+<details>
+<summary>1. 我的 kernel 每个线程只 load 一个 <code>float</code>（4 字节），访存完全合并。要打满 5090 的显存带宽，需要多少个 warp 同时在跑？</summary>
+<p>带宽-延迟积 = 1674 GB/s × 320.3 ns ≈ <strong>536 KB</strong> 必须在途。</p>
+<p>每个 warp 的一次合并 <code>float</code> load = 32 线程 × 4 B = <strong>128 B</strong>。</p>
+<p>假设每个 warp 同时只有 1 个未完成的 load：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>536</mn><mspace width="0.167em" /><mtext>KB</mtext><mo>&#x0002F;</mo><mn>128</mn><mspace width="0.167em" /><mtext>B</mtext><mo>&#x0003D;</mo><mn>4288</mn><mtext>&#x000A0;</mtext><mtext>个&#x000A0;warp</mtext></mrow></math></div></p>
+<p>而全卡最多常驻 170 SM × 48 warp = <strong>8160 个 warp</strong>。所以需要 <strong>52% 的占用率</strong>。</p>
+<p>如果换成 <code>float4</code>（每 warp 512 B），只要 1072 个 warp = 13% 占用率就够了——
+这就是为什么向量化访存（<code>float4</code>/<code>LDG.128</code>）几乎是所有 memory-bound kernel 的第一步优化。</p>
+<p><strong>注意这个估算的假设</strong>：每 warp 只有 1 个在途 load。真实情况下编译器会展开循环、
+同时发多个独立 load，所需 warp 数会更少。实测（[D]）显示 2 blocks/SM 即饱和，
+正是因为编译器为 <code>float4</code> 循环做了展开。</p>
+</details>
+<details>
+<summary>2. 为什么 5090 的延迟每一级都比 L40S 高，带宽却高 2.5 倍？这对 LLM 推理意味着什么？</summary>
+<p>GDDR7 用<strong>更多的 bank、更深的流水、更高的信号速率</strong>换带宽，代价是单次访问的往返路径更长。
+L2 变大（同为 96 MiB 但 Blackwell 的分片更多、跨片距离更远）也会增加延迟。
+<strong>这是带宽与延迟的经典取舍，不是"5090 更差"。</strong></p>
+<p>对 LLM 推理的影响：</p>
+<ul>
+<li><strong>decode</strong>：几乎不受影响。decode 是大规模并行访存（几千个 warp 同时读权重和 KV），
+  延迟被并发完全掩盖，只有带宽重要。所以 5090 在 decode 上快 2.48×（<a class="xref" href="../L0/0.3-heterogeneous-baseline.html" title="异构对照：同一模型在两种 GPU 上">L0.3</a> 实测）。</li>
+<li><strong>有长依赖链的小 kernel</strong>：受影响。比如采样里的某些串行归约、
+  block table 的指针追逐、以及 CPU-GPU 同步点附近的小操作。</li>
+<li><strong>一般规律</strong>：现代 GPU 的设计假设就是"你有足够多的并行度"。
+  如果你的负载没有，你拿不到它标称的任何好处。</li>
+</ul>
+</details>
+<details>
+<summary>3. FlashAttention 的 tile 是 <code>&lt;head_dim=128, BlockM=64, BlockN=128, 4 warps&gt;</code>。如果我用一个 head_dim=256 的模型，tile 会怎么变？为什么？</summary>
+<p>smem 需求变成：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><munder><munder><mrow><mn>64</mn><mo>&#x000D7;</mo><mn>256</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>Q</mi><mo>&#x0003D;</mo><mn>32</mn><mspace width="0.167em" /><mtext>KB</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>128</mn><mo>&#x000D7;</mo><mn>256</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>K</mi><mo>&#x0003D;</mo><mn>64</mn><mspace width="0.167em" /><mtext>KB</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>128</mn><mo>&#x000D7;</mo><mn>256</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>V</mi><mo>&#x0003D;</mo><mn>64</mn><mspace width="0.167em" /><mtext>KB</mtext></mrow></munder><mo>&#x0003D;</mo><mn>160</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></math></div></p>
+<p><strong>远超 99 KB 上限</strong>，编译不过。必须缩小 tile，通常是把 <code>kBlockN</code> 砍到 64：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>32</mn><mo>&#x0002B;</mo><mn>32</mn><mo>&#x0002B;</mo><mn>32</mn><mo>&#x0003D;</mo><mn>96</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext><mo>&#x0003C;</mo><mn>99</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext><mspace width="1em" /><mi>&#x02713;</mi></mrow></math></div></p>
+<p><strong>代价</strong>：KV tile 减半意味着每个 Q tile 要循环两倍次数，K/V 从 L2/显存重复加载的量翻倍。
+所以 <strong>head_dim 越大，attention 的实际效率越低</strong>——这是一个纯粹由 smem 容量决定的硬约束。</p>
+<p>（这也解释了为什么大部分模型的 head_dim 停在 128：再大就打不满 tensor core 又装不下 tile。
+DeepSeek 的 MLA 之所以能用 576 维的压缩 KV，是因为它的 kernel 是专门重写的，
+不是通用 FlashAttention —— <a class="xref" href="../L3/3.3-decode-attention.html" title="Decode 侧 attention">L3.3</a>。）</p>
+</details>
+<details>
+<summary>4. 我把 GEMM 的 tile 从 128×128 改成 64×64，smem 用量降到 1/4，占用率翻倍。性能会变好吗？</summary>
+<p><strong>大概率变差。</strong> 因为 tile 变小会让<strong>数据复用率</strong>下降。</p>
+<p>对 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>M</mi><mo>&#x000D7;</mo><mi>K</mi></mrow></math></span> 乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>K</mi><mo>&#x000D7;</mo><mi>N</mi></mrow></math></span> 的 tile GEMM，一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x000D7;</mo><mi>T</mi></mrow></math></span> 的输出 tile 需要读入 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>T</mi><mi>K</mi></mrow></math></span> 个元素，
+产出 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>T</mi><mn>2</mn></msup></mrow></math></span> 个结果，算术强度 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0221D;</mo><mi>T</mi></mrow></math></span>。tile 边长减半 → 算术强度减半 → 访存量翻倍。</p>
+<p>用本章的数字：L1 与显存的带宽比是 16:1。tiling 的全部价值就是把复用留在 smem 里。
+tile 变小 = 少复用 = 更多流量掉回 L2/显存。</p>
+<p>而占用率翻倍带来的收益是有限的——[D] 实测显示 2 blocks/SM 就已经饱和带宽，
+<strong>更高的占用率买不到更多带宽</strong>。</p>
+<p><strong>这就是 occupancy 的经典误区</strong>：占用率是掩盖延迟的手段，一旦延迟已经被掩盖住，
+再提高它只会挤占寄存器和 smem，反而伤害每线程的工作效率（ILP）。<a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 会用 <code>ncu</code> 量化这个取舍。</p>
+</details>
+<details>
+<summary>5. 用本章的数字估算：Qwen3-1.7B 在 batch=1、ctx=1024 时 decode 一步，理论上要多少纳秒？和 <a class="xref" href="../L0/0.3-heterogeneous-baseline.html" title="异构对照：同一模型在两种 GPU 上">L0.3</a> 实测的 4.48 ms 差多少？</summary>
+<p><a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 算过：这一步要搬 3.441 GB 权重 + 0.117 GB KV = <strong>3.558 GB</strong>。</p>
+<p>按本章实测的显存带宽 1674 GB/s：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>3.558</mn><mtext>&#x000A0;</mtext><mtext>GB</mtext><mo>&#x0002F;</mo><mn>1674</mn><mtext>&#x000A0;</mtext><mtext>GB/s</mtext><mo>&#x0003D;</mo><mn>2.126</mn><mtext>&#x000A0;</mtext><mtext>ms</mtext></mrow></math></div></p>
+<p>（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 用的是 <code>probe_hw.py</code> 的 copy 带宽 1519 GB/s，得 2.34 ms。两个分母都合理，
+差别在于 copy 计入读+写、本章只读。<strong>只读带宽是更贴切的分母</strong>，因为 decode 主要是读权重。）</p>
+<p>实测 GPU 忙时 3.085 ms，墙钟 4.48 ms。</p>
+<p>拆解差距：
+- 2.126 ms → 3.085 ms（GPU 忙时）：<strong>效率 69%</strong>。差的部分是 kernel 效率、
+  非 GEMM 小算子、以及 attention 那部分不是纯顺序读。
+- 3.085 ms → 4.48 ms（墙钟）：<strong>1.4 ms 的 CPU launch 开销</strong>（444 次 × 2.68 µs ≈ 1.19 ms）。</p>
+<p><strong>能把 4.48 ms 拆成 2.13 + 0.96 + 1.40 三段，才算真的懂了这一步在干什么。</strong>
+每一段对应一层优化：带宽（换卡/量化）、kernel 效率（L2）、launch 开销（CUDA Graph，<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a>）。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L0/0.5-tensor-to-text.html">&#8592; 0.5 文本闭环（下）：从 logits 到你看到的那段文字</a><a class="nav-next" href="../L1/1.2-tensor-core-lineage.html">1.2 Tensor Core 世代史与 sm_120 的岔路 &#8594;</a></nav>
+</main>
+</body>
+</html>

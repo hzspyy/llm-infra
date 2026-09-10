@@ -1,0 +1,1680 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.6 Profiling 工程学</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">2.6</div>
+  <div class="sidebar-title">Profiling 工程学</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：四层尺子，四种分辨率</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#err_nvgpuctrperm">一、ERR_NVGPUCTRPERM：完整诊断</a></li>
+<li><a href="#profiler">二、profiler 怎么工作：两条完全不同的路径</a></li>
+<li><a href="#_4">三、观测者效应：量化</a></li>
+<li><a href="#_5">四、静态分析能回答什么、不能回答什么</a></li>
+</ul>
+</li>
+<li><a href="#_6">用计数器检查候选解释</a><ul>
+<li><a href="#bank-conflict-10-6094848">推断一：bank conflict —— 从「慢 10 倍」到「冲突了 6,094,848 次」</a></li>
+<li><a href="#4-sector-16">推断二：向量化改善访存合并 —— 从 4 sector/请求 到 16</a></li>
+<li><a href="#_7">推断三：动态指令数 —— 静态表看不见的那一列</a></li>
+<li><a href="#l24tensor-core-bank-conflict">推断四（L2.4）：tensor core 与 bank conflict</a></li>
+</ul>
+</li>
+<li><a href="#chrome-trace">工程实现 · 源码走读：chrome trace 里到底有什么</a><ul>
+<li><a href="#profile">引擎侧怎么 profile</a></li>
+</ul>
+</li>
+<li><a href="#ncu">工程实现 · 自己写一遍：造一把尺子，然后拿 ncu 校准它</a><ul>
+<li><a href="#ncu_1">用 ncu 校准这把自制的尺子</a></li>
+<li><a href="#block">尾效应：多一个 block 的代价</a></li>
+<li><a href="#_8">一个负面结果：块级负载倾斜，硬件自己扛住了</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_9">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="mod-id">2.6</div>
+  <h1>Profiling 工程学</h1>
+  <p class="lede">ncu / nsys 指标体系、roofline、从「慢 kernel」定位到根因的完整案例。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) + spark (GB10, sm_121) · torch 2.13.0+cu130 · nsys 2026.3.2 · ncu 2025.3.1</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L2.3（memory-bound 阶梯）· L2.4（GEMM 阶梯）· L1.1（存储层次）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>「这个 kernel 慢」——这句话要<strong>翻译成哪个具体计数器</strong>才算一个可回答的问题？</li>
+<li>为什么 <code>nsys</code> 能跑而 <code>ncu</code> 报 <code>ERR_NVGPUCTRPERM</code>？这两个工具读的是<strong>不同性质的东西</strong>，
+   而那个差别是一条安全边界。</li>
+<li>profiler 会带来多少额外开销？怎样避免把工具造成的延迟当成原程序的延迟？</li>
+</ol>
+<p>前两章（<a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> / <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）和 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 里，好几个结论我是<strong>靠计时推断</strong>的：</p>
+<ul>
+<li><a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a>：跨步 32 比跨步 33 慢 10.1×，「<strong>这就是 bank conflict</strong>」——但我没看见冲突</li>
+<li><a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a>：<code>float4</code> 让「访存合并变好」——但我没看见"合并"</li>
+<li><a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>：v5/v6「用上了 tensor core」——但我只看见 TFLOPS 变高</li>
+</ul>
+<p>本章把这些推断逐条换成<strong>观测</strong>。四台机器里三台是容器，读不了硬件计数器；
+第四台（spark，裸机）放开之后可以。<strong>所以本章有两条线</strong>：
+拿不到计数器时怎么办（自制尺子 + 静态分析 + 时间轴），
+以及拿到之后那些推断到底对不对。</p>
+<p>先分清三类材料：时间线告诉你什么时候执行，计数器记录执行期间发生了多少事件，
+反汇编展示程序里有哪些指令。它们回答的问题不同，需要结合使用。
+本章会用计数器补充前面的计时解释，并保留哪些判断仍需要进一步验证。</p>
+<hr />
+<h2 id="_2">心智模型：四层尺子，四种分辨率</h2>
+<figure>
+<svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="profiling 的四层尺子">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">「慢」必须先被翻译成一个有具体量纲的问题，才谈得上选工具</text>
+
+    <g font-size="10.5">
+      <line x1="12" y1="30" x2="748" y2="30" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+      <text x="12"  y="48" font-weight="600">问题</text>
+      <text x="250" y="48" font-weight="600">工具</text>
+      <text x="440" y="48" font-weight="600">分辨率</text>
+      <text x="560" y="48" font-weight="600">本机可用？</text>
+
+      <line x1="12" y1="56" x2="748" y2="56" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+
+      <text x="12"  y="76">整条请求慢在哪个阶段？</text>
+      <text x="250" y="76">自己埋点 / 引擎 metrics</text>
+      <text x="440" y="76">ms</text>
+      <text x="560" y="76">✓</text>
+
+      <text x="12"  y="98">CPU 在等 GPU，还是反过来？</text>
+      <text x="250" y="98">nsys / chrome trace</text>
+      <text x="440" y="98">µs</text>
+      <text x="560" y="98">✓</text>
+
+      <text x="12"  y="120">哪个 kernel 占了时间？</text>
+      <text x="250" y="120">torch.profiler / nsys</text>
+      <text x="440" y="120">µs · 单次 launch</text>
+      <text x="560" y="120">✓</text>
+
+      <text x="12"  y="142" font-weight="600">这个 kernel 为什么慢？</text>
+      <text x="250" y="142" font-weight="600">ncu（硬件计数器）</text>
+      <text x="440" y="142">指令 / 周期 / sector</text>
+      <text x="560" y="142" font-weight="600">仅裸机 spark</text>
+
+      <text x="12"  y="164">它执行了哪些指令？</text>
+      <text x="250" y="164">cuobjdump / nvdisasm</text>
+      <text x="440" y="164">静态，无动态次数</text>
+      <text x="560" y="164">✓</text>
+
+      <text x="12"  y="186">占用率 / 尾效应？</text>
+      <text x="250" y="186">自制（%smid+%globaltimer）</text>
+      <text x="440" y="186">block 级</text>
+      <text x="560" y="186">✓</text>
+
+      <text x="12"  y="208">显存去哪了？</text>
+      <text x="250" y="208">memory snapshot</text>
+      <text x="440" y="208">每次 alloc</text>
+      <text x="560" y="208">✓</text>
+
+      <text x="12"  y="230">结果为什么不对？</text>
+      <text x="250" y="230">compute-sanitizer</text>
+      <text x="440" y="230">指令 · 源码行</text>
+      <text x="560" y="230">✓</text>
+      <line x1="12" y1="240" x2="748" y2="240" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    </g>
+
+    <text x="12" y="266" font-size="12" font-weight="600">为什么只有 ncu 需要特权：两类工具读的是两种东西</text>
+    <g font-size="10.5">
+      <rect x="12" y="278" width="352" height="86" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+      <text x="24" y="296" font-weight="600">CUPTI Activity（nsys、torch.profiler）</text>
+      <text x="24" y="314">驱动在每个 kernel 开始/结束时打一条时间戳记录，</text>
+      <text x="24" y="330">事后批量回传。只涉及你自己进程的事件。</text>
+      <text x="24" y="352" font-weight="600">→ 不需要任何特权</text>
+
+      <rect x="384" y="278" width="364" height="86" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="396" y="296" font-weight="600">SM 性能计数器（ncu）</text>
+      <text x="396" y="314">直接读 SM 里的硬件计数器。这些计数器是**全芯片共享**的，</text>
+      <text x="396" y="330">能间接观测到同时在跑的**别人的** kernel 行为。</text>
+      <text x="396" y="352" font-weight="600">→ CVE-2018-6260 之后默认锁死</text>
+    </g>
+
+    <line x1="12" y1="380" x2="748" y2="380" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="402" font-size="12" font-weight="600">观测者效应（本机实测，同一个 profiler，两种负载）</text>
+    <g font-size="10.5">
+      <text x="12"  y="424">GEMM 主导（10 次迭代 30 个 kernel）</text>
+      <text x="330" y="424">1.37 ms → 1.38 ms</text>
+      <text x="470" y="424" font-weight="600">1.01×  几乎免费</text>
+      <text x="12"  y="446">小 kernel 洪流（120 个微秒级 kernel）</text>
+      <text x="330" y="446">0.39 ms → 0.66 ms</text>
+      <text x="470" y="446" font-weight="600">1.68×  实打实的税</text>
+      <text x="12"  y="464" font-size="10">开销按 kernel 计。所以越是 launch-bound 的负载，profiler 越会加重它自己要诊断的病。</text>
+    </g>
+  </g>
+</svg>
+<figcaption>四层尺子及其分辨率；两类 profiler 的权限差异来自它们读的东西不同；观测开销随 kernel 密度上升。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="err_nvgpuctrperm">一、<code>ERR_NVGPUCTRPERM</code>：完整诊断</h3>
+<p>这是 GPU profiling 最常撞的一堵墙。本机上 ncu 的原文：</p>
+<div class="highlight"><pre><span></span><code>==PROF== Connected to process 2355858 (/scratch/learn/results/prof/_smoke)
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access
+          NVIDIA GPU Performance Counters on the target device 0.
+==PROF== Disconnected from process 2355858
+</code></pre></div>
+
+<p><strong>能不能读性能计数器，由两件事决定，任一满足即可</strong>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>允许</mtext><mi>&#x027FA;</mi><mtext mathvariant="monospace">RmProfilingAdminOnly</mtext><mo>&#x0003D;</mo><mn>0</mn><mspace width="0.278em" /><mo>&#x02228;</mo><mspace width="0.278em" /><mo stretchy="false">&#x00028;</mo><mtext>有&#x000A0;CAP\_SYS\_ADMIN</mtext><mo>&#x02227;</mo><mtext>在宿主&#x000A0;user&#x000A0;namespace</mtext><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
+<p>所以要查三条证据。本机实测：</p>
+<table>
+<thead>
+<tr>
+<th>证据</th>
+<th>crater（容器）</th>
+<th>worldvln（容器）</th>
+<th>spark（裸机，改前）</th>
+<th>spark（改后）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RmProfilingAdminOnly</code></td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td><strong>0</strong></td>
+</tr>
+<tr>
+<td><code>CapEff</code> 里的 <code>CAP_SYS_ADMIN</code></td>
+<td><strong>✗ 没有</strong></td>
+<td>✓ 有</td>
+<td>✗（普通用户）</td>
+<td>✗</td>
+</tr>
+<tr>
+<td><code>/proc/self/uid_map</code></td>
+<td><code>0 0 4294967295</code>（未移位）</td>
+<td><strong><code>0 1000000 1000000000</code>（移位）</strong></td>
+<td>未移位</td>
+<td>未移位</td>
+</tr>
+<tr>
+<td>结果</td>
+<td>拒绝</td>
+<td>拒绝</td>
+<td>拒绝</td>
+<td><strong>✓ 通过</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>三台机器，同一个错误，三个不同的原因</strong>：</p>
+<ul>
+<li><strong>crater</strong>：就在宿主 namespace 里，但容器没给 <code>CAP_SYS_ADMIN</code>。</li>
+<li><strong>worldvln</strong>：有 <code>CAP_SYS_ADMIN</code>，但处在 <strong>UID 移位的 user namespace</strong>
+  （<code>uid_map</code> 第二列是 1000000）。容器里的 root 在宿主看来是 uid 1000000，
+  这个 capability 只在容器自己的 namespace 里成立，<strong>驱动按宿主 namespace 判定</strong>，
+  所以不算数。旁证：<code>/dev/nvidiactl</code> 的属主显示成 <code>nobody</code>。</li>
+<li><strong>spark</strong>：裸机、未移位，但当前是普通用户 <code>smc</code>，<code>CapEff</code> 全 0。</li>
+</ul>
+<div class="admonition warning">
+<p class="admonition-title">为什么驱动要锁这个</p>
+<p>NVIDIA 从 2019 年起默认 <code>RmProfilingAdminOnly=1</code>，起因是 <strong>CVE-2018-6260</strong>：
+SM 性能计数器是<strong>全芯片共享</strong>的资源，一个进程读它们能间接推断出<strong>同时在跑的
+其他进程</strong>的访存模式——在多租户 GPU 上这是侧信道。
+所以这不是"NVIDIA 懒得配"，是一个有意的安全边界。</p>
+<p><strong>这也解释了为什么 nsys 不受影响</strong>：CUPTI activity 只记录<strong>你自己进程</strong>的
+kernel 起止时间戳，不读共享计数器。两个工具的权限差异，直接来自它们读的东西不同。</p>
+</div>
+<p><strong>裸机上的标准解法</strong>（spark 用的就是这个，本站实际执行过）：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">echo</span><span class="w"> </span><span class="s1">'options nvidia NVreg_RestrictProfilingToAdminUsers=0'</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>sudo<span class="w"> </span>tee<span class="w"> </span>/etc/modprobe.d/nvidia-profiling.conf
+sudo<span class="w"> </span>update-initramfs<span class="w"> </span>-u<span class="w">        </span><span class="c1"># Ubuntu 上 nvidia 模块在 initramfs 里，不更新就不生效</span>
+sudo<span class="w"> </span>reboot
+</code></pre></div>
+
+<p>重启后 <code>awk '/RmProfilingAdminOnly/{print $2}' /proc/driver/nvidia/params</code> 应该是 <code>0</code>。
+<strong>这条 <code>update-initramfs</code> 很容易漏</strong>——只写 modprobe.d 然后重启，会发现值还是 1。</p>
+<p><strong>容器里没有对应解法</strong>：<code>--privileged</code> 只解决 capability，
+如果同时开了 user namespace 重映射（worldvln 那种），还得加 <code>--userns=host</code>。
+两者都是宿主管理员的事。</p>
+<h3 id="profiler">二、profiler 怎么工作：两条完全不同的路径</h3>
+<p><strong>CUPTI Activity API</strong>（nsys、torch.profiler 都走这条）：</p>
+<p>驱动内部在每个 kernel 的 launch / begin / end 处写一条 activity record 到一个环形缓冲区，
+应用退出或缓冲区满时批量回传。所以：</p>
+<ul>
+<li>开销是<strong>每条记录</strong>的，不是每周期的 → kernel 越小越密，相对开销越大</li>
+<li>GPU 时间戳描述被观测运行中的执行区间，但采集也可能改变调度、重叠和运行状态</li>
+<li>会拉长 launch 路径 → <strong>CPU 侧和间隙会被放大</strong></li>
+</ul>
+<p>这两条性质合起来就是本章最重要的方法论：
+用 profiler 定位执行区间，再用不带 profiler 的运行测整体耗时。
+不要默认两次运行的 GPU 忙时相同，也不要把两者相减直接视作真实空闲率。</p>
+<p><strong>硬件性能计数器</strong>（ncu）：</p>
+<p>ncu 会把 kernel <strong>重放多次</strong>（replay），每次配置一组不同的计数器，
+因为 SM 上能同时激活的计数器数量有限。所以 ncu 报告里的一次「kernel 执行」
+其实是十几次真实执行的拼接。这带来两个后果：</p>
+<ul>
+<li><strong>很慢</strong>（<code>--set full</code> 一个 kernel 要几秒）</li>
+<li>默认每次 replay 前<strong>刷 cache</strong>（<code>--cache-control all</code>），所以它测的是<strong>冷缓存</strong>性能，
+  和你在稳态循环里量到的数字<strong>不是一回事</strong></li>
+</ul>
+<h3 id="_4">三、观测者效应：量化</h3>
+<p>同一个 profiler，两种负载，本机实测：</p>
+<table>
+<thead>
+<tr>
+<th>profiler 配置</th>
+<th>GEMM 主导</th>
+<th>小 kernel 洪流</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无</td>
+<td>1.3729 ms</td>
+<td>0.3932 ms</td>
+</tr>
+<tr>
+<td><code>CUDA only</code></td>
+<td>1.3774 ms  (1.00×)</td>
+<td>0.5517 ms  (<strong>1.40×</strong>)</td>
+</tr>
+<tr>
+<td><code>CPU+CUDA</code></td>
+<td>1.3808 ms  (1.01×)</td>
+<td>0.6126 ms  (<strong>1.56×</strong>)</td>
+</tr>
+<tr>
+<td><code>+record_shapes</code></td>
+<td>1.3809 ms  (1.01×)</td>
+<td>0.6256 ms  (1.59×)</td>
+</tr>
+<tr>
+<td><code>+with_stack +profile_memory</code></td>
+<td>1.3832 ms  (1.01×)</td>
+<td>0.6592 ms  (<strong>1.68×</strong>)</td>
+</tr>
+</tbody>
+</table>
+<p>GEMM 负载 10 次迭代只有 30 个 kernel，每个几百微秒——profiler 的开销淹没在噪声里。
+小 kernel 洪流是 120 个各几微秒的 kernel，<strong>开销涨到 68%</strong>。</p>
+<p><strong>LLM decode 正是后者</strong>：<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 实测 vLLM 一步 444 个 kernel。
+所以在 decode 路径上用 profiler 读绝对延迟，会系统性地高估。</p>
+<p><strong>自指的修正。</strong> 我用 trace 算 GPU 空闲率：</p>
+<div class="highlight"><pre><span></span><code>[GEMM 主导]     40 个 GPU 事件, 跨度 13.708 ms, 忙 13.646 ms, 空闲  0.5%
+[小 kernel 洪流] 360 个 GPU 事件, 跨度  1.924 ms, 忙  0.308 ms, 空闲 84.0%
+</code></pre></div>
+
+<p>但这 84.0% 来自带 profiler 的运行。下面保留原稿的换算，
+它额外假设“有无 profiler 时 GPU 忙时不变”，该假设尚未被独立验证：</p>
+<div class="highlight"><pre><span></span><code>修正：GPU 忙 0.103 ms/次（这个数不受 profiler 影响）
+      干净墙钟 0.394 ms/次  -&gt;  真实空闲 74.0%
+</code></pre></div>
+
+<p>在这个假设下，估计值由 84.0% 变为 74.0%。
+它不是对原程序空闲率的直接测量，也不能把差出的 10 个百分点全部认定为观测工具造成。
+更稳妥的做法是分别报告两个运行的结果，并检查时间线和开销来源。</p>
+<h3 id="_5">四、静态分析能回答什么、不能回答什么</h3>
+<p><code>cuobjdump -sass</code> 不用跑、不用特权，直接数指令。对 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的归约阶梯：</p>
+<table>
+<thead>
+<tr>
+<th>kernel</th>
+<th>总指令</th>
+<th>LDG</th>
+<th>LDS</th>
+<th>STS</th>
+<th>RED</th>
+<th>SHFL</th>
+<th>BAR</th>
+<th>NOP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>red_v0</code></td>
+<td>32</td>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+<td>14</td>
+</tr>
+<tr>
+<td><code>red_v1</code></td>
+<td>56</td>
+<td>1</td>
+<td>3</td>
+<td>2</td>
+<td>1</td>
+<td>0</td>
+<td>2</td>
+<td>13</td>
+</tr>
+<tr>
+<td><code>red_v2</code></td>
+<td>64</td>
+<td>1</td>
+<td>4</td>
+<td>2</td>
+<td>1</td>
+<td><strong>5</strong></td>
+<td>2</td>
+<td>10</td>
+</tr>
+<tr>
+<td><code>red_v3</code></td>
+<td>72</td>
+<td>1</td>
+<td><strong>1</strong></td>
+<td><strong>1</strong></td>
+<td>1</td>
+<td><strong>10</strong></td>
+<td>1</td>
+<td>13</td>
+</tr>
+<tr>
+<td><code>red_v4</code></td>
+<td>72</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>10</td>
+<td>1</td>
+<td>10</td>
+</tr>
+<tr>
+<td><code>red_v5</code></td>
+<td>88</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>10</td>
+<td>1</td>
+<td>11</td>
+</tr>
+<tr>
+<td><code>red_v6</code></td>
+<td>136</td>
+<td><strong>5</strong></td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>10</td>
+<td>1</td>
+<td>14</td>
+</tr>
+</tbody>
+</table>
+<p><strong>阶梯的故事全在这张表里</strong>：</p>
+<ul>
+<li>v1 引入共享内存树形归约 → <code>LDS</code> 3 / <code>STS</code> 2 / <code>BAR</code> 2</li>
+<li>v2 最后一个 warp 换 shuffle → <code>SHFL</code> 出现 5 条</li>
+<li>v3 全程 shuffle → <code>SHFL</code> 涨到 10，<strong><code>LDS</code> 从 4 掉到 1</strong>（共享内存几乎不用了）</li>
+<li>v6 四个独立累加器 → <strong><code>LDG</code> 从 1 变成 5</strong>（四路独立取数 + 一路）</li>
+</ul>
+<p><strong>但这张表也标出了静态分析的边界。</strong>
+注意每一级都恰好只有 <strong>1 条 <code>RED</code></strong>（全局原子加，SASS 里叫 <code>REDG.E.ADD.F32.FTZ.RN</code>）。
+可是 v0 是<strong>每个线程各执行一次</strong>（6700 万次），
+v1 及以后是<strong>每个 block 只有 0 号线程执行一次</strong>（26 万次）——差 256 倍。</p>
+<p><strong>静态指令数是"这段代码里有几条指令"，不是"这次运行执行了几条指令"。</strong>
+后者只有动态 profiler（ncu 的 <code>smsp__inst_executed</code>）能给。</p>
+<p>这条边界是本章的核心：<strong>知道每把尺子量不到什么，和知道它能量什么一样重要。</strong></p>
+<p>（顺带：v0 的 32 条指令里有 <strong>14 条 <code>NOP</code></strong>。这是 SASS 的指令对齐填充，
+Blackwell 的取指要求特定边界。所以「总指令数」这个量本身就要打折看。）</p>
+<hr />
+<h2 id="_6">用计数器检查候选解释</h2>
+<p>以下全部在 <strong>spark（GB10, sm_121, 裸机）</strong> 上用 ncu 实测。
+注意换了机器——GB10 是 Grace-Blackwell 的<strong>统一内存</strong>架构，绝对时间和 crater 不可比，
+但<strong>机制层面的计数器是可比的</strong>，而机制正是要验的东西。</p>
+<div class="admonition warning">
+<p class="admonition-title">GB10 上没有 `dram__*` 计数器</p>
+<p><code>ncu --query-metrics | grep -c '^dram__'</code> 返回 <strong>0</strong>。</p>
+<p>因为 GB10 的 GPU 和 CPU 共用一片 LPDDR5X，<strong>没有独立的 GPU 显存分区</strong>，
+也就没有对应的显存控制器计数器。访存流量只能在 <strong>L2（<code>lts__</code>）</strong> 这一层看，
+或者用综合指标 <code>gpu__compute_memory_throughput</code>。</p>
+<p><strong>在讨论"显存带宽利用率"之前，先确认这块卡上存不存在"显存"这个东西。</strong></p>
+</div>
+<h3 id="bank-conflict-10-6094848">推断一：bank conflict —— 从「慢 10 倍」到「冲突了 6,094,848 次」</h3>
+<p><a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 里我写两个 kernel（跨步 32 vs 跨步 33），测出 10.1× 的时间差，
+然后断言这是 bank conflict。<strong>时间变慢有一万种解释</strong>，那只是推断。</p>
+<p>现在做一个只有下标算式不同的三元对照，读硬件计数器：</p>
+<div class="highlight"><pre><span></span><code><span class="kr">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">probe_stride1</span><span class="w"> </span><span class="p">(</span><span class="kt">float</span><span class="o">*</span><span class="w"> </span><span class="n">o</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">probe_body</span><span class="o">&lt;</span><span class="mi">1</span><span class="o">&gt;</span><span class="w"> </span><span class="p">(</span><span class="n">o</span><span class="p">);</span><span class="w"> </span><span class="p">}</span><span class="w">   </span><span class="c1">// 相邻线程相邻 bank</span>
+<span class="kr">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">probe_stride32</span><span class="p">(</span><span class="kt">float</span><span class="o">*</span><span class="w"> </span><span class="n">o</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">probe_body</span><span class="o">&lt;</span><span class="mi">32</span><span class="o">&gt;</span><span class="p">(</span><span class="n">o</span><span class="p">);</span><span class="w"> </span><span class="p">}</span><span class="w">   </span><span class="c1">// 32 个线程全撞 bank 0</span>
+<span class="kr">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">probe_stride33</span><span class="p">(</span><span class="kt">float</span><span class="o">*</span><span class="w"> </span><span class="n">o</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">probe_body</span><span class="o">&lt;</span><span class="mi">33</span><span class="o">&gt;</span><span class="p">(</span><span class="n">o</span><span class="p">);</span><span class="w"> </span><span class="p">}</span><span class="w">   </span><span class="c1">// 错开一位</span>
+</code></pre></div>
+
+<p>每个 kernel：48 block × 256 线程 × 64 轮 × 8 次共享内存读 = <strong>6,291,456 次读</strong>，
+即 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>6291456</mn><mo>&#x0002F;</mo><mn>32</mn><mo>&#x0003D;</mo><mn>196</mn><mrow><mo>&#x0002C;</mo></mrow><mn>608</mn></mrow></math></span> 次 warp 级请求。</p>
+<table>
+<thead>
+<tr>
+<th>kernel</th>
+<th>耗时 ns</th>
+<th><strong>bank 冲突</strong></th>
+<th>smem 读 wavefront</th>
+<th><strong>wavefront/请求</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>probe_stride1</code></td>
+<td>7,392</td>
+<td><strong>0</strong></td>
+<td>196,608</td>
+<td><strong>1.00</strong></td>
+</tr>
+<tr>
+<td><code>probe_stride32</code></td>
+<td>72,640</td>
+<td><strong>6,094,848</strong></td>
+<td>6,291,456</td>
+<td><strong>32.00</strong></td>
+</tr>
+<tr>
+<td><code>probe_stride33</code></td>
+<td>9,280</td>
+<td><strong>0</strong></td>
+<td>196,608</td>
+<td><strong>1.00</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>判据不是时间，是 <code>wavefront/请求</code> 这个比值。</strong>
+共享内存一次请求如果没有冲突，硬件用<strong>一个 wavefront</strong> 就能服务完；
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 路冲突就要拆成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 个 wavefront 串行发。</p>
+<ul>
+<li><code>stride32</code> 测出 <strong>32.00</strong>——教科书上的 32 路冲突，精确到小数点后两位</li>
+<li>冲突次数 6,094,848 = <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>196</mn><mrow><mo>&#x0002C;</mo></mrow><mn>608</mn><mo>&#x000D7;</mo><mn>31</mn></mrow></math></span>（每个请求多出 31 个 wavefront）——<strong>分毫不差</strong></li>
+<li>跨步改成 33 之后回到 <strong>1.00</strong>，冲突归零</li>
+</ul>
+<p>时间比 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>72640</mn><mo>&#x0002F;</mo><mn>7392</mn><mo>&#x0003D;</mo><mrow><mn mathvariant="bold">9.83</mn><mo mathvariant="bold">&#x000D7;</mo></mrow></mrow></math></span>，和 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 纯靠计时得到的 10.1× 吻合。</p>
+<p><strong>推断一：成立。</strong> 而且现在它不再是推断——是一个能用算术核对的观测量。</p>
+<h3 id="4-sector-16">推断二：向量化改善访存合并 —— 从 4 sector/请求 到 16</h3>
+<p><a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的归约阶梯，全部七级的计数器：</p>
+<table>
+<thead>
+<tr>
+<th>kernel</th>
+<th>耗时 ns</th>
+<th><strong>全局读请求</strong></th>
+<th><strong>sector/请求</strong></th>
+<th>L2 sector</th>
+<th>占用率%</th>
+<th><strong>动态指令(warp)</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>red_v0</code></td>
+<td>104,313,248</td>
+<td>2,097,152</td>
+<td>4</td>
+<td><strong>75,685,621</strong></td>
+<td>78.88</td>
+<td>35,651,584</td>
+</tr>
+<tr>
+<td><code>red_v1</code></td>
+<td>1,682,464</td>
+<td>2,097,152</td>
+<td>4</td>
+<td>8,655,091</td>
+<td>86.91</td>
+<td><strong>236,716,032</strong></td>
+</tr>
+<tr>
+<td><code>red_v2</code></td>
+<td>1,704,416</td>
+<td>2,097,152</td>
+<td>4</td>
+<td>8,655,011</td>
+<td>80.63</td>
+<td>101,187,584</td>
+</tr>
+<tr>
+<td><code>red_v3</code></td>
+<td>1,406,208</td>
+<td>2,097,152</td>
+<td>4</td>
+<td>8,654,967</td>
+<td>75.22</td>
+<td>81,264,640</td>
+</tr>
+<tr>
+<td><code>red_v4</code></td>
+<td>1,319,936</td>
+<td><strong>524,288</strong></td>
+<td><strong>16</strong></td>
+<td>8,458,439</td>
+<td>93.96</td>
+<td>21,889,024</td>
+</tr>
+<tr>
+<td><code>red_v5</code></td>
+<td>1,154,528</td>
+<td>524,288</td>
+<td>16</td>
+<td>8,393,115</td>
+<td>98.52</td>
+<td>6,394,560</td>
+</tr>
+<tr>
+<td><code>red_v6</code></td>
+<td><strong>1,102,816</strong></td>
+<td>524,288</td>
+<td>16</td>
+<td>8,391,856</td>
+<td><strong>100.00</strong></td>
+<td><strong>4,466,112</strong></td>
+</tr>
+</tbody>
+</table>
+<p>从 v3 改为 v4 的 <code>float4</code> 访问后，两列计数发生变化：</p>
+<ul>
+<li>全局读请求 2,097,152 → <strong>524,288</strong>（正好 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x000F7;</mo><mn>4</mn></mrow></math></span>）</li>
+<li>每次请求覆盖的 sector 数 4 → <strong>16</strong>（一个 warp 一次拿 32×16B = 512 B = 16 个 32 B sector）</li>
+</ul>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2097152</mn><mo>&#x0003D;</mo><mn>67108864</mn><mo>&#x0002F;</mo><mn>32</mn></mrow></math></span>，即<strong>每个 warp 一次请求</strong>；改成 <code>float4</code> 后
+每个 warp 一次请求就取回四倍的数据。这就是「向量化」在硬件上的确切含义。</p>
+<p><strong>注意 v0–v3 的 sector/请求 也是 4，不是更差的值。</strong> 也就是说这几级<strong>访存本来就是完美合并的</strong>
+（一个 warp 的 32 个连续 float = 128 B = 4 个 sector，一个都不浪费）。
+所以 v0 慢，<strong>根本不是合并的问题</strong>——</p>
+<p><strong>看 <code>L2 sector</code> 那一列</strong>：v0 是 75,685,621，其余六级都是 ~8.4M。<strong>9 倍的 L2 流量。</strong>
+那多出来的就是 6700 万次全局 <code>atomicAdd</code> 打在同一个地址上的读-改-写。</p>
+<p><strong>推断二成立。</strong> 而且计数器还<strong>排除了一个竞争解释</strong>：</p>
+<p><a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 把 v0 的慢归因于「所有线程争抢同一个地址导致串行化」。
+这个说法本身是对的，但当时无法排除另一种可能——v0 的访存模式是不是也有问题？
+<code>sector/请求 = 4</code> 回答了这个问题：<strong>v0 的读取是完美合并的，一个 sector 都没浪费。</strong></p>
+<p>剩下的观察是 v0 有 9 倍的额外 L2 流量，与「大量原子操作打在同一地址」的解释一致。
+需要说明的是，这几个计数器<strong>支持</strong>这个解释，但没有把全部运行时间量化地归到这一项上；
+要做到那一步，需要 <code>--set full</code> 的 warp stall 分解（见原始现场 ⑦，
+red_v0 的 <code>Issue Slots Busy</code> 只有 0.08%，说明 warp 几乎发不出指令）。</p>
+<h3 id="_7">推断三：动态指令数 —— 静态表看不见的那一列</h3>
+<p>同一张表最右边一列，回答了上一节留下的问题：</p>
+<div class="highlight"><pre><span></span><code>red_v1  236,716,032        ← 共享内存树形归约，指令最多
+red_v2  101,187,584
+red_v3   81,264,640        ← 换成 shuffle
+red_v4   21,889,024        ← float4
+red_v5    6,394,560        ← grid-stride
+red_v6    4,466,112        ← 独立累加器
+</code></pre></div>
+
+<p><strong>v1 → v6 少了 53 倍的指令。</strong> 而静态 SASS 表里 v1 是 56 条、v6 是 136 条——
+<strong>静态看 v6 是 v1 的 2.4 倍，动态看 v6 是 v1 的 1/53。</strong></p>
+<p>这是本章那条边界的最直接证据。静态指令数完全无法预测这个方向。</p>
+<p>（<code>red_v0</code> 的 35,651,584 = <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>67108864</mn><mo>&#x0002F;</mo><mn>32</mn><mo>&#x000D7;</mo><mn>17</mn></mrow></math></span>：每个 warp 执行 17 条有效指令，
+32 条静态指令里减掉 NOP 和被谓词关掉的部分。<code>smsp__inst_executed</code> 数的是
+<strong>warp 级</strong>指令，不是线程级。）</p>
+<h3 id="l24tensor-core-bank-conflict">推断四（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）：tensor core 与 bank conflict</h3>
+<p>GEMM 阶梯的计数器：</p>
+<table>
+<thead>
+<tr>
+<th>kernel</th>
+<th>耗时 ns</th>
+<th><strong>HMMA 指令</strong></th>
+<th><strong>bank 冲突</strong></th>
+<th>寄存器</th>
+<th>smem/blk</th>
+<th>SM吞吐%</th>
+<th>占用率%</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gemm_v0</code></td>
+<td>120,429,408</td>
+<td>0</td>
+<td>0</td>
+<td>40</td>
+<td>0</td>
+<td>69.52</td>
+<td><strong>99.84</strong></td>
+</tr>
+<tr>
+<td><code>gemm_v1</code></td>
+<td>83,651,136</td>
+<td>0</td>
+<td>0</td>
+<td>38</td>
+<td>8,192</td>
+<td>68.96</td>
+<td>66.66</td>
+</tr>
+<tr>
+<td><code>gemm_v2</code></td>
+<td>12,265,536</td>
+<td>0</td>
+<td><strong>268,435,469</strong></td>
+<td>122</td>
+<td>8,192</td>
+<td>52.33</td>
+<td>32.61</td>
+</tr>
+<tr>
+<td><code>gemm_v3</code></td>
+<td>10,752,064</td>
+<td>0</td>
+<td><strong>269,766,172</strong></td>
+<td>109</td>
+<td>8,192</td>
+<td>57.19</td>
+<td>32.81</td>
+</tr>
+<tr>
+<td><code>gemm_v5</code></td>
+<td>8,048,192</td>
+<td><strong>33,554,432</strong></td>
+<td><strong>218,263,980</strong></td>
+<td>128</td>
+<td>16,384</td>
+<td>33.07</td>
+<td>32.38</td>
+</tr>
+<tr>
+<td><code>gemm_v6</code></td>
+<td><strong>4,884,832</strong></td>
+<td>33,554,432</td>
+<td><strong>10,515</strong></td>
+<td>128</td>
+<td>18,944</td>
+<td>32.46</td>
+<td>32.50</td>
+</tr>
+</tbody>
+</table>
+<p><strong>三个结论，全部是观测而非推断：</strong></p>
+<p><strong>(1) tensor core 确实只在 v5/v6 用上了。</strong> <code>HMMA 指令</code> 从 0 跳到 33,554,432。
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>4096</mn><mn>3</mn></msup><mo>&#x0002F;</mo><mo stretchy="false">&#x00028;</mo><mn>16</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>16</mn><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mn>33</mn><mrow><mo>&#x0002C;</mo></mrow><mn>554</mn><mrow><mo>&#x0002C;</mo></mrow><mn>432</mn></mrow></math></span>——<strong>正好是 <code>mma.m16n8k16</code> 所需的指令数</strong>，
+一条不多一条不少。<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 说"用上了 tensor core"，现在这句话有了确切的量。</p>
+<p><strong>(2) v6 相对 v5 的 1.65× 加速，确实来自 padding 消除 bank conflict。</strong>
+bank 冲突 218,263,980 → <strong>10,515</strong>，降了 <strong>两万倍</strong>。
+v6 与 v5 的唯一差别就是 <code>constexpr int LDA = BK + PAD</code>（<code>PAD=8</code>）。
+<strong>单变量，效果直接可见。</strong></p>
+<p><strong>(3) v2/v3 有 2.7 亿次 bank 冲突，而且 v3 比 v2 还多一点。</strong>
+这是 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 里<strong>没说清楚</strong>的地方：v3 做的是<strong>全局访存</strong>的 <code>float4</code> 向量化，
+它压根没动共享内存的布局——所以共享内存冲突原封不动地留着。
+如果当时就有计数器，v3 之后立刻加 padding 会是更好的下一步。</p>
+<p><strong>(4) 占用率和性能反着走。</strong> <code>gemm_v0</code> 占用率 <strong>99.84%</strong>，是全场最高，
+也是全场最慢（比 v6 慢 <strong>24.7 倍</strong>）；<code>gemm_v6</code> 占用率只有 32.50%，最快。
+<code>SM吞吐%</code> 也一样：v0 是 69.52%，v6 只有 32.46%。</p>
+<p><strong>因为 v0 的 SM 忙着做无用功。</strong> 占用率衡量的是"有多少 warp 在飞"，
+不是"这些 warp 在干有价值的事"。v0 每个输出元素要重复读 4096 次 A 和 B，
+SM 一直很忙，忙的全是重复访存。</p>
+<div class="admonition warning">
+<p class="admonition-title">占用率不是优化目标</p>
+<p>这张表是最干净的反例：<strong>最高占用率 = 最慢</strong>。</p>
+<p>占用率只是<strong>掩盖延迟的手段之一</strong>。另一条路是提高每个线程的指令级并行
+（ILP）——v6 的每线程 8×8 寄存器分块正是这么做的，代价是寄存器涨到 128、
+占用率掉到 32%，但<strong>总吞吐赢了 24.7 倍</strong>。</p>
+<p>要优化的是 <code>gpu__time_duration</code>，不是占用率。</p>
+</div>
+<hr />
+<h2 id="chrome-trace">工程实现 · 源码走读：chrome trace 里到底有什么</h2>
+<p><code>prof.export_chrome_trace()</code> 出来的 JSON，大多数人只是拖进 <code>chrome://tracing</code> 看看。
+<strong>打开它。</strong> 顶层结构：</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"schemaVersion"</span><span class="p">:</span><span class="w"> </span><span class="err">...</span><span class="p">,</span><span class="w"> </span><span class="nt">"deviceProperties"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">...</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"cuda_driver_version"</span><span class="p">:</span><span class="w"> </span><span class="err">...</span><span class="p">,</span><span class="w"> </span><span class="nt">"cuda_runtime_version"</span><span class="p">:</span><span class="w"> </span><span class="err">...</span><span class="p">,</span><span class="w"> </span><span class="nt">"cupti_version"</span><span class="p">:</span><span class="w"> </span><span class="err">...</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"baseTimeNanoseconds"</span><span class="p">:</span><span class="w"> </span><span class="err">...</span><span class="p">,</span><span class="w"> </span><span class="nt">"traceEvents"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="err">...</span><span class="w"> </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>326 个事件按 <code>cat</code> 分类：</p>
+<div class="highlight"><pre><span></span><code>ac2g            102     ← async CPU-to-GPU 流程箭头（把 launch 连到 kernel）
+&lt;无 cat&gt;         60
+cpu_op           60     ← aten 算子
+cuda_runtime     42     ← cudaLaunchKernel 等 runtime 调用
+kernel           40     ← 真正的 GPU kernel
+cuda_driver      20     ← cuLaunchKernel
+overhead          1     ← profiler 自己的开销，它诚实地记了一条
+Trace             1
+</code></pre></div>
+
+<p><strong>单条 kernel 事件的 <code>args</code> 是个宝库</strong>——这是一条原文：</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"ph"</span><span class="p">:</span><span class="w"> </span><span class="s2">"X"</span><span class="p">,</span><span class="w"> </span><span class="nt">"cat"</span><span class="p">:</span><span class="w"> </span><span class="s2">"kernel"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"void cutlass::Kernel2&lt;cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8&gt;(...)"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ts"</span><span class="p">:</span><span class="w"> </span><span class="mf">6043715623156.92</span><span class="p">,</span><span class="w"> </span><span class="nt">"dur"</span><span class="p">:</span><span class="w"> </span><span class="mf">633.534</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"args"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"registers per thread"</span><span class="p">:</span><span class="w"> </span><span class="mi">154</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"shared memory"</span><span class="p">:</span><span class="w"> </span><span class="mi">73728</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"grid"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">512</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">],</span><span class="w"> </span><span class="nt">"block"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">128</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">],</span>
+<span class="w">    </span><span class="nt">"occupancy"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">"limitingFactors"</span><span class="p">:</span><span class="w"> </span><span class="s2">"SMEM"</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"blockLimitRegs"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="nt">"blockLimitSharedMem"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"blockLimitWarps"</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span><span class="w"> </span><span class="nt">"blockLimitBlocks"</span><span class="p">:</span><span class="w"> </span><span class="mi">24</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"allocatedRegistersPerBlock"</span><span class="p">:</span><span class="w"> </span><span class="mi">20480</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"allocatedSharedMemPerBlock"</span><span class="p">:</span><span class="w"> </span><span class="mi">74752</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>三件事值得单独说：</p>
+<p><strong>(1) <code>limitingFactors: "SMEM"</code></strong> —— torch.profiler <strong>已经免费告诉你占用率被谁卡住了</strong>。
+不需要 ncu。大多数人从来没打开过这个字段。</p>
+<p><strong>(2) kernel 名字本身是完整的规格说明</strong>：
+<code>cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8</code></p>
+<table>
+<thead>
+<tr>
+<th>片段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cutlass_80</code></td>
+<td>为 <strong>sm_80（Ampere）</strong> 编译的 CUTLASS kernel</td>
+</tr>
+<tr>
+<td><code>tensorop</code></td>
+<td>走 tensor core</td>
+</tr>
+<tr>
+<td><code>s16816</code></td>
+<td>用的是 <code>mma.m16n8k16</code>（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 讲的 Ampere 那代指令）</td>
+</tr>
+<tr>
+<td><code>128x64_64x3</code></td>
+<td>threadblock tile 128×64，K-tile 64，<strong>3 级流水</strong>（<code>cp.async</code> 双/三缓冲）</td>
+</tr>
+<tr>
+<td><code>nn_align8</code></td>
+<td>两个矩阵都不转置，8 元素对齐</td>
+</tr>
+</tbody>
+</table>
+<p><strong>这个 kernel 是给 Ampere 编的，跑在 Blackwell（sm_120）上。</strong>
+它当然能跑（PTX 向前兼容），但它不会用 sm_120 的新指令。
+这正是 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 里「cuBLAS 218 TFLOPS 而纯发射上限 251」的一部分来源——
+你用的往往不是为你这代卡专门调过的 kernel。</p>
+<p><strong>(3) <code>"est. achieved occupancy %": 0</code> 与 <code>activeBlocksPerMultiprocessor: 0</code>
+是错的</strong>（<code>blockLimitSharedMem: 0</code> 也是）。PyTorch 的占用率模型里没有 sm_120 的
+表项（100 KiB smem/SM），算出了 0。<strong>原始字段（寄存器数、smem 字节、grid/block）是准的，
+派生字段在全新架构上不可信。</strong> 又一条：新卡上要分清哪些是测的、哪些是算的。</p>
+<p>还有一个经典陷阱在 <code>key_averages()</code> 的表里：</p>
+<div class="highlight"><pre><span></span><code>                       Name    Self CPU %      Self CPU   ...
+      cudaDeviceSynchronize        92.70%      13.407ms   ...
+</code></pre></div>
+
+<p><strong>排第一的「CPU 开销」是 <code>cudaDeviceSynchronize</code>，占 92.7%。</strong>
+它不是开销，它是<strong>在等 GPU</strong>。按 Self CPU 排序几乎总会把它排到第一，
+然后你就会去优化一个根本不存在的问题。</p>
+<h3 id="profile">引擎侧怎么 profile</h3>
+<p><strong>vLLM</strong> 内置了 profiler 支持（<code>VLLM_TORCH_PROFILER_DIR</code> 环境变量），
+因为 EngineCore 在<strong>独立进程</strong>里（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 陷阱 5：在父进程开 profiler 抓不到任何 GPU 工作）。
+设了这个变量之后，可以通过 <code>/start_profile</code>、<code>/stop_profile</code> 两个 HTTP 端点控制。</p>
+<p><strong>SGLang</strong> 同理，<code>SGLANG_TORCH_PROFILER_DIR</code> + <code>/start_profile</code>。</p>
+<p>nsys 侧对应的开关是 <code>--target-processes all</code>——否则它只跟踪你直接启动的那个进程。
+再配合 <code>--capture-range=cudaProfilerApi</code>，可以只抓 <code>torch.cuda.profiler.start()</code>
+到 <code>stop()</code> 之间那一段，避开模型加载和 warm-up。</p>
+<hr />
+<h2 id="ncu">工程实现 · 自己写一遍：造一把尺子，然后拿 ncu 校准它</h2>
+<p>ncu 报告最核心的三个数字，不用任何特权都能自己算出来。
+更重要的是：<strong>造完之后要验它</strong>——而 spark 上正好有 ncu 可以当标准件。</p>
+<p>关键是两个特殊寄存器：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">__device__</span><span class="w"> </span><span class="kr">__forceinline__</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="n">sm_id</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="n">r</span><span class="p">;</span><span class="w"> </span><span class="k">asm</span><span class="w"> </span><span class="k">volatile</span><span class="p">(</span><span class="s">"mov.u32 %0, %%smid;"</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="s">"=r"</span><span class="p">(</span><span class="n">r</span><span class="p">));</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="kt">__device__</span><span class="w"> </span><span class="kr">__forceinline__</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">gtimer</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="p">;</span><span class="w"> </span><span class="k">asm</span><span class="w"> </span><span class="k">volatile</span><span class="p">(</span><span class="s">"mov.u64 %0, %%globaltimer;"</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="s">"=l"</span><span class="p">(</span><span class="n">r</span><span class="p">));</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">r</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="admonition warning">
+<p class="admonition-title">必须用 `%globaltimer`，不能用 `clock64()`</p>
+<p><code>clock64()</code> 是<strong>每个 SM 自己的</strong>周期计数器。不同 SM 的计数器起点不同、
+频率还会各自变。跨 SM 比较 <code>clock64()</code> 的值没有意义。</p>
+<p><code>%globaltimer</code> 是全芯片统一的<strong>纳秒</strong>计时器，正是为这种用途准备的。
+（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 里我用 <code>clock64()</code> 测延迟是对的——那是同一个 SM 内的差值。）</p>
+</div>
+<p>探针只让 0 号线程记录，代价是两条指令加一次 16 字节写：</p>
+<div class="highlight"><pre><span></span><code><span class="cp">#define PROBE_BEGIN() \</span>
+<span class="cp">    unsigned long long _t0 = gtimer(); unsigned _sm = sm_id();</span>
+<span class="cp">#define PROBE_END(rec) \</span>
+<span class="cp">    if (threadIdx.x == 0) { \</span>
+<span class="cp">        BlockRec r; r.smid = _sm; r.block = blockIdx.x; \</span>
+<span class="cp">        r.t_begin = _t0; r.t_end = gtimer(); (rec)[blockIdx.x] = r; }</span>
+</code></pre></div>
+
+<p>拿到每个 block 的 <code>(SM, 起, 止)</code> 之后，<strong>achieved occupancy 就是定义式本身</strong>：
+把每个 block 拆成 <code>(时刻, ±1)</code> 事件，按 SM 分组扫描，求时间加权的平均并发数。</p>
+<div class="highlight"><pre><span></span><code><span class="kt">double</span><span class="w"> </span><span class="n">area</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w">                 </span><span class="c1">// ∫ 并发数 dt</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">每个</span><span class="w"> </span><span class="n">SM</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">sort</span><span class="p">(</span><span class="n">ev</span><span class="p">[</span><span class="n">s</span><span class="p">]);</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">cur</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">prev</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ev</span><span class="p">[</span><span class="n">s</span><span class="p">][</span><span class="mi">0</span><span class="p">].</span><span class="n">first</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="k">auto</span><span class="o">&amp;</span><span class="w"> </span><span class="n">e</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">ev</span><span class="p">[</span><span class="n">s</span><span class="p">])</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">area</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="kt">double</span><span class="p">(</span><span class="n">cur</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="kt">double</span><span class="p">(</span><span class="n">e</span><span class="p">.</span><span class="n">first</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">prev</span><span class="p">);</span><span class="w">   </span><span class="c1">// 上一段区间的贡献</span>
+<span class="w">        </span><span class="n">prev</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">first</span><span class="p">;</span>
+<span class="w">        </span><span class="n">cur</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">second</span><span class="p">;</span><span class="w">                                 </span><span class="c1">// ±1</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+<span class="n">achieved_blocks_per_sm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">area</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">总跨度</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">用到的</span><span class="w"> </span><span class="n">SM</span><span class="w"> </span><span class="n">数</span><span class="p">;</span>
+</code></pre></div>
+
+<p>理论值这边直接问驱动，也不需要特权：</p>
+<div class="highlight"><pre><span></span><code><span class="n">cudaOccupancyMaxActiveBlocksPerMultiprocessor</span><span class="p">(</span><span class="o">&amp;</span><span class="n">max_blocks</span><span class="p">,</span><span class="w"> </span><span class="n">kernel</span><span class="p">,</span><span class="w"> </span><span class="n">block_size</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+</code></pre></div>
+
+<p><strong>实测结果（crater, 170 SM, 每 SM 48 warp, 100 KiB smem）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>理论 blocks/SM</th>
+<th>实测(时间加权)</th>
+<th>峰值观测</th>
+<th>耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>balanced (grid=1360)</td>
+<td>6 (100%)</td>
+<td>4.18 (70%)</td>
+<td><strong>6</strong></td>
+<td>0.149 ms</td>
+</tr>
+<tr>
+<td>skewed (1/8 的 block 干 8 倍活)</td>
+<td>6 (100%)</td>
+<td>3.87 (65%)</td>
+<td>6</td>
+<td>0.282 ms</td>
+</tr>
+<tr>
+<td>smem_heavy (32 KiB/block)</td>
+<td><strong>3 (50%)</strong></td>
+<td>2.65 (44%)</td>
+<td><strong>3</strong></td>
+<td>0.144 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>峰值观测精确等于理论值</strong>（6 / 6 / 3）——自制的尺子和驱动的模型对上了。
+而时间加权平均低于理论，差的就是启动爬坡和收尾的长尾。</p>
+<p><code>smem_heavy</code> 这一行是最干净的因果：唯一的变量是每个 block 申请 32 KiB 共享内存，
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x0230A;</mi><mn>100</mn><mo>&#x0002F;</mo><mn>32</mn><mi>&#x0230B;</mi><mo>&#x0003D;</mo><mn>3</mn></mrow></math></span>，占用率被砍到 50%——<strong>和 <a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 用 smem 调占用率的实验完全一致</strong>。</p>
+<h3 id="ncu_1">用 ncu 校准这把自制的尺子</h3>
+<p>同样三个 kernel，在 spark 上分别用<strong>我的方法</strong>和 <strong>ncu 的硬件计数器</strong>测 achieved occupancy：</p>
+<table>
+<thead>
+<tr>
+<th>kernel</th>
+<th>自制（<code>%smid</code>+<code>%globaltimer</code> 积分）</th>
+<th><strong>ncu</strong>（<code>sm__warps_active</code>）</th>
+<th>差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>k_balanced</code></td>
+<td>70%</td>
+<td><strong>72.08%</strong></td>
+<td>2.1 pt</td>
+</tr>
+<tr>
+<td><code>k_skewed</code></td>
+<td>65%</td>
+<td><strong>65.99%</strong></td>
+<td>1.0 pt</td>
+</tr>
+<tr>
+<td><code>k_smem_heavy</code></td>
+<td>44%</td>
+<td><strong>44.11%</strong></td>
+<td><strong>0.1 pt</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>两种完全独立的方法，差不到 2 个百分点。</strong></p>
+<ul>
+<li>我的方法：每个 block 记下 <code>(SM, 起, 止)</code>，在<strong>软件里</strong>把并发曲线积出来</li>
+<li>ncu 的方法：读 SM 里的 <code>sm__warps_active</code> <strong>硬件累加器</strong></li>
+</ul>
+<p>它们唯一的共同点是被测对象。<strong>这就是仪器校准。</strong>
+差的那 1–2 个点来自我的探针只在 block 首尾采样，
+block 内部 warp 的退出先后（尾部有些 warp 已经结束但 block 还没释放）看不见。</p>
+<p>ncu 还顺手给出了占用率<strong>被谁卡住</strong>：</p>
+<div class="highlight"><pre><span></span><code>k_balanced     限制: smem 16 / reg 16 / warp 6
+k_smem_heavy   限制: smem  3 / reg 16 / warp 6      ← smem 成为瓶颈
+</code></pre></div>
+
+<p><code>launch__occupancy_limit_warps = 6</code> 是因为每 SM 48 warp ÷ 每 block 8 warp = 6；
+<code>k_smem_heavy</code> 的 <code>limit_shared_mem</code> 掉到 3，<strong>smem 取代 warp 数成了绑定约束</strong>。
+和自制尺子测到的"理论 3 / 实测峰值 3"完全一致。</p>
+<h3 id="block">尾效应：多一个 block 的代价</h3>
+<p>用同一把尺子做一个单变量实验。一个满波 = 6 blocks/SM × 170 SM = <strong>1020 blocks</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>grid</th>
+<th>耗时</th>
+<th>SM 忙碌时间 最大/最小</th>
+<th>末 10% 的并发度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1020（整波）</td>
+<td>0.109 ms</td>
+<td>1.01</td>
+<td>25%</td>
+</tr>
+<tr>
+<td><strong>1021（多一个）</strong></td>
+<td><strong>0.126 ms</strong></td>
+<td><strong>1.21</strong></td>
+<td><strong>0%</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>多一个 block，慢 16%。</strong></p>
+<p>因为第 1021 个 block 必须等某个 SM 空出槽位才能开始，
+而它一个人跑的时候，另外 169 个 SM <strong>全在空转</strong>——
+所以末 10% 的并发度直接掉到 0，SM 之间的忙碌时间也从均衡（1.01）裂成 1.21。</p>
+<p>这就是 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 提到的 wave quantization，现在它被自制的 profiler 直接量出来了。</p>
+<h3 id="_8">一个负面结果：块级负载倾斜，硬件自己扛住了</h3>
+<p><code>skewed</code> 那一行让 1/8 的 block 干 8 倍的活，总工作量变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mfrac><mrow><mn>1</mn></mrow><mrow><mn>8</mn></mrow></mfrac><mo>&#x000D7;</mo><mn>8</mn><mo>&#x0002B;</mo><mfrac><mrow><mn>7</mn></mrow><mrow><mn>8</mn></mrow></mfrac><mo>&#x0003D;</mo><mn>1.875</mn></mrow></math></span> 倍。
+实测耗时 0.149 → 0.282 ms，正好 <strong>1.89 倍</strong>。而 SM 忙碌时间的最大/最小只有 <strong>1.02</strong>。</p>
+<p><strong>GPU 的块调度器把重块摊得几乎完美。</strong> 只要 block 数远多于槽位数，
+块级的负载倾斜基本不需要你操心——这和 CPU 上的静态分区完全不同。
+（真正会出问题的是 <strong>warp 内</strong>的分支发散，那是 <a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 的话题；
+以及 block 数少于槽位数时——那就退化成上面的尾效应。）</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>labs/L2/profile_ladder.sh<span class="w"> </span>results/prof<span class="w">     </span><span class="c1"># 权限诊断 + 自制 profiler + nsys + SASS + sanitizer</span>
+python<span class="w"> </span>labs/L2/profiling_tour.py<span class="w"> </span>--out-dir<span class="w"> </span>results/prof<span class="w">   </span><span class="c1"># torch.profiler + trace 解析 + 显存</span>
+</code></pre></div>
+
+<p>有 ncu 权限的机器上再跑这个（会对上面每一条推断做对质）：</p>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>labs/L2/ncu_ladder.sh<span class="w"> </span>results/ncu
+</code></pre></div>
+
+<p>不想装任何东西的话，这三个环境变量就够走很远：</p>
+<div class="highlight"><pre><span></span><code><span class="nv">TORCH_LOGS</span><span class="o">=</span><span class="s2">"output_code"</span><span class="w"> </span>python<span class="w"> </span>x.py<span class="w">          </span><span class="c1"># 看 Inductor 生成了什么（L2.6b）</span>
+<span class="nv">TORCH_TRACE</span><span class="o">=</span>/tmp/tt<span class="w"> </span>python<span class="w"> </span>x.py<span class="w">               </span><span class="c1"># 编译过程的结构化日志</span>
+<span class="nv">CUDA_LAUNCH_BLOCKING</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>x.py<span class="w">            </span><span class="c1"># 让异步错误报在出错的那一行</span>
+</code></pre></div>
+
+<h3 id="_9">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mini_profiler.cu</code> 里把 <code>%globaltimer</code> 换成 <code>clock64()</code></td>
+<td>跨 SM 的时间戳对不齐，算出来的并发数变成垃圾。<strong>亲手踩一次这个坑</strong></td>
+</tr>
+<tr>
+<td>把 <code>k_smem_heavy</code> 的 <code>__shared__ float buf[8192]</code> 改成 4096</td>
+<td>理论 blocks/SM 从 3 变 6，实测峰值跟着变</td>
+</tr>
+<tr>
+<td>把 wave 实验的 grid 扫成 1020 / 1021 / 1530 / 2040</td>
+<td>阶梯状的耗时曲线，每跨一个波跳一级</td>
+</tr>
+<tr>
+<td>给 <code>tiny_workload</code> 套 CUDA Graph</td>
+<td>GPU 空闲率应从 74% 掉到个位数（<a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a>）</td>
+</tr>
+<tr>
+<td>把 <code>run_tiny</code> 的张量从 256×256 改成 4096×4096</td>
+<td>kernel 变大，profiler 开销从 1.68× 掉回 1.0×</td>
+</tr>
+<tr>
+<td>在 <code>key_averages()</code> 里按 <code>Self CUDA</code> 而不是 <code>Self CPU</code> 排序</td>
+<td><code>cudaDeviceSynchronize</code> 消失，真正的热点浮上来</td>
+</tr>
+<tr>
+<td>打开 <code>51_trace.json</code>，grep <code>limitingFactors</code></td>
+<td>你自己模型里每个 kernel 的占用率瓶颈，免费的</td>
+</tr>
+<tr>
+<td>把 <code>bank_conflict_probe.cu</code> 的跨步扫成 1/2/4/8/16/32/33</td>
+<td><code>wavefront/请求</code> 应该是 1,2,4,8,16,32,1——<strong>2 的幂才撞</strong></td>
+</tr>
+<tr>
+<td>给 <code>gemm_v3</code> 加上 <code>PAD=8</code>（照 v6 的做法）</td>
+<td>bank 冲突应该从 2.7 亿掉到几万，这是 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 漏掉的一步</td>
+</tr>
+</tbody>
+</table>
+<p>第一行最值得做——<strong>测量工具用错了，得到的是理直气壮的错误答案</strong>，比没有测量更危险。</p>
+<hr />
+<h2 id="_10">原始现场</h2>
+<details>
+<summary>① 权限诊断全文（crater）</summary>
+<div class="highlight"><pre><span></span><code>=== [0] 环境与 profiling 权限诊断 ===
+NVIDIA GeForce RTX 5090 D, 580.95.05, 12.0
+编译目标           sm_120
+
+--- 证据 1：驱动是否限制性能计数器（2019 年起默认限制，CVE-2018-6260）---
+RmProfilingAdminOnly: 1
+
+--- 证据 2：本进程有没有 CAP_SYS_ADMIN ---
+CapEff = 00000000a80465fb
+  CAP_SYS_ADMIN(bit 21) = False
+  CAP_PERFMON  (bit 38) = False
+
+--- 证据 3：capability 在哪个 user namespace 里有效 ---
+uid_map:          0          0 4294967295
+crw-rw-rw- 1 root root 195, 255 Jun 24 07:11 /dev/nvidiactl
+
+--- 结论 ---
+  能读性能计数器 = RmProfilingAdminOnly=0  或  (有 CAP_SYS_ADMIN 且在宿主 namespace)
+</code></pre></div>
+
+<p>对照 worldvln（同样被拒，但原因不同）：</p>
+<div class="highlight"><pre><span></span><code>CapEff: 000001ffffffffff        ← CAP_SYS_ADMIN 有
+uid_map:  0    1000000 1000000000   ← 但 UID 被移位了
+crw-rw-rw- 1 nobody nogroup 195, 255   ← 旁证：属主显示成 nobody
+</code></pre></div>
+
+<p>原始文件：<code>results/crater/prof/00_perm_diag.txt</code>、<code>10_ncu_attempt.txt</code></p>
+</details>
+<details>
+<summary>② 自制 profiler 的完整输出</summary>
+<div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D  sm_120  170 SM  每SM最多 1536 线程(48 warp)  smem/SM 100 KiB
+
+[1] 负载均衡：实测占用率应当贴近理论值
+  balanced       grid=1360  block=256  寄存器/线程=12  smem/block=0B
+    理论 blocks/SM           6  (occupancy 100%)
+    实测 blocks/SM(时间加权) 4.18  (occupancy 70%)   峰值观测 6
+    用到的 SM               170 / 170
+    耗时                     0.149 ms (event) / 0.142 ms (globaltimer 跨度)
+    SM 忙碌时间 最大/最小 1.01
+    末 10% 时间的并发度 23%  ← 长尾，SM 大半空转
+
+[2] 负载倾斜：1/8 的 block 干 8 倍的活
+  skewed         grid=1360  block=256  寄存器/线程=12  smem/block=0B
+    理论 blocks/SM           6  (occupancy 100%)
+    实测 blocks/SM(时间加权) 3.87  (occupancy 65%)   峰值观测 6
+    耗时                     0.282 ms (event) / 0.279 ms (globaltimer 跨度)
+    SM 忙碌时间 最大/最小 1.02
+
+[3] 共享内存吃满：32 KiB/block 把 blocks/SM 压下去
+  smem_heavy     grid=1360  block=256  寄存器/线程=12  smem/block=32768B
+    理论 blocks/SM           3  (occupancy 50%)
+    实测 blocks/SM(时间加权) 2.65  (occupancy 44%)   峰值观测 3
+    耗时                     0.144 ms (event) / 0.142 ms (globaltimer 跨度)
+
+[4] 尾效应：grid 刚好比一个整波多一个 block
+    一个满波 = 6 blocks/SM × 170 SM = 1020 blocks
+  wave           grid=1020   耗时 0.109 ms   SM 忙碌 最大/最小 1.01   末10%并发 25%
+  wave+1         grid=1021   耗时 0.126 ms   SM 忙碌 最大/最小 1.21   末10%并发  0%
+</code></pre></div>
+
+<p>注意 <code>event</code> 计时与 <code>globaltimer 跨度</code> 两列一致（0.149 / 0.142），
+说明探针本身的开销可以忽略——<strong>尺子先自证。</strong></p>
+<p>原始文件：<code>results/crater/prof/20_mini_profiler.txt</code></p>
+</details>
+<details>
+<summary>③ nsys 的 SQLite：58 张表，直接用 SQL 查</summary>
+<p><code>.nsys-rep</code> 可以导出成 SQLite，然后完全不经过任何 GUI：</p>
+<div class="highlight"><pre><span></span><code>nsys sqlite 里有 58 张表，和 GPU 执行直接相关的几张：
+  CUPTI_ACTIVITY_KIND_KERNEL                    131 行
+  CUPTI_ACTIVITY_KIND_MEMCPY                      9 行
+  CUPTI_ACTIVITY_KIND_RUNTIME                   356 行
+  ENUM_CUDA_KERNEL_LAUNCH_TYPE                    4 行
+</code></pre></div>
+
+<p><code>CUPTI_ACTIVITY_KIND_KERNEL</code> 每行记录的字段（这就是 CUPTI 给你的全部）：</p>
+<div class="highlight"><pre><span></span><code>start, end, deviceId, contextId, greenContextId, streamId, correlationId,
+globalPid, demangledName, shortName, mangledName, launchType, cacheConfig,
+registersPerThread, gridX, gridY, gridZ, blockX, blockY, blockZ,
+staticSharedMemory, dynamicSharedMemory, localMemoryPerThread, localMemoryTotal,
+gridId, sharedMemoryExecuted, graphNodeId, sharedMemoryLimitConfig,
+qmdBulkReleaseDone, qmdPreexitDone, qmdLastCtaDone, graphId,
+clusterX, clusterY, clusterZ, clusterSchedulingPolicy,
+maxPotentialClusterSize, maxActiveClusters, sharedMemoryRequestedPercentage,
+tensorSizeMinusOneElements
+</code></pre></div>
+
+<p>（<code>cluster*</code> 是 Hopper 的 thread block cluster；<code>graphId/graphNodeId</code> 让你能把
+CUDA Graph 里的节点对回源码——<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a> 会用到。）</p>
+<p>自己写 SQL 聚合，直接复现 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的阶梯：</p>
+<div class="highlight"><pre><span></span><code><span class="k">select</span><span class="w"> </span><span class="n">s</span><span class="p">.</span><span class="n">value</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="k">count</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="n">n</span><span class="p">,</span>
+<span class="w">       </span><span class="k">sum</span><span class="p">(</span><span class="n">k</span><span class="p">.</span><span class="k">end</span><span class="o">-</span><span class="n">k</span><span class="p">.</span><span class="k">start</span><span class="p">)</span><span class="o">/</span><span class="mi">1</span><span class="n">e6</span><span class="w"> </span><span class="n">tot_ms</span><span class="p">,</span><span class="w"> </span><span class="k">avg</span><span class="p">(</span><span class="n">k</span><span class="p">.</span><span class="k">end</span><span class="o">-</span><span class="n">k</span><span class="p">.</span><span class="k">start</span><span class="p">)</span><span class="o">/</span><span class="mi">1</span><span class="n">e3</span><span class="w"> </span><span class="n">avg_us</span>
+<span class="k">from</span><span class="w"> </span><span class="n">CUPTI_ACTIVITY_KIND_KERNEL</span><span class="w"> </span><span class="n">k</span>
+<span class="k">join</span><span class="w"> </span><span class="n">StringIds</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="k">on</span><span class="w"> </span><span class="n">s</span><span class="p">.</span><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">k</span><span class="p">.</span><span class="n">demangledName</span>
+<span class="k">group</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="n">s</span><span class="p">.</span><span class="n">value</span><span class="w"> </span><span class="k">order</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="n">tot_ms</span><span class="w"> </span><span class="k">desc</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code>  kernel                                      次数       总ms       均us
+  red_v0(const float *, float *, unsigned      4   331.576   82894.0
+  red_v1(const float *, float *, unsigned     21     6.843     325.8
+  red_v3(const float *, float *, unsigned     21     6.837     325.5
+  red_v2(const float *, float *, unsigned     21     6.832     325.3
+  red_v6(const float4 *, float *, unsigned    22     3.498     159.0
+  red_v4(const float4 *, float *, unsigned    21     3.463     164.9
+  red_v5(const float4 *, float *, unsigned    21     3.336     158.9
+</code></pre></div>
+
+<p><code>red_v0</code> 82894 µs → <code>red_v5</code> 158.9 µs = <strong>521×</strong>，
+和 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 用 CUDA event 量到的一致。<strong>两把独立的尺子对上了。</strong></p>
+<p><code>nsys stats --report cuda_gpu_kern_sum --format csv</code> 的原文还给了标准差：</p>
+<div class="highlight"><pre><span></span><code>Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+91.5,331575905,4,82893976.3,82895688.5,82886072,82898456,5429.9,"red_v0(const float *, float *, unsigned long)"
+1.9,6842502,21,325833.4,325915.0,324795,327004,664.7,"red_v1(const float *, float *, unsigned long)"
+0.9,3336276,21,158870.3,158974.0,158270,159326,317.4,"red_v5(const float4 *, float *, unsigned long)"
+</code></pre></div>
+
+<p><code>red_v0</code> 四次执行的极差只有 12 µs / 82894 µs = <strong>0.015%</strong>——非常稳。</p>
+<p>原始文件：<code>results/crater/prof/33_sqlite_tour.txt</code>、<code>31_cuda_gpu_kern_sum_*.csv</code></p>
+</details>
+<details>
+<summary>④ chrome trace 里一条 kernel 事件的原文</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"ph"</span><span class="p">:</span><span class="w"> </span><span class="s2">"X"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"cat"</span><span class="p">:</span><span class="w"> </span><span class="s2">"kernel"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"void cutlass::Kernel2&lt;cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8&gt;(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8::Params)"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"pid"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"tid"</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ts"</span><span class="p">:</span><span class="w"> </span><span class="mf">6043715623156.92</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"dur"</span><span class="p">:</span><span class="w"> </span><span class="mf">633.534</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"args"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"External id"</span><span class="p">:</span><span class="w"> </span><span class="mi">21506</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"queued"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"device"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"context"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"stream"</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"correlation"</span><span class="p">:</span><span class="w"> </span><span class="mi">249745</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"registers per thread"</span><span class="p">:</span><span class="w"> </span><span class="mi">154</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"shared memory"</span><span class="p">:</span><span class="w"> </span><span class="mi">73728</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"blocks per SM"</span><span class="p">:</span><span class="w"> </span><span class="mf">24.094118</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"warps per SM"</span><span class="p">:</span><span class="w"> </span><span class="mf">96.376472</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"grid"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">512</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">],</span>
+<span class="w">    </span><span class="nt">"block"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">128</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">],</span>
+<span class="w">    </span><span class="nt">"est. achieved occupancy %"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"occupancy"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">"activeBlocksPerMultiprocessor"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"limitingFactors"</span><span class="p">:</span><span class="w"> </span><span class="s2">"SMEM"</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"blockLimitRegs"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"blockLimitSharedMem"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"blockLimitWarps"</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"blockLimitBlocks"</span><span class="p">:</span><span class="w"> </span><span class="mi">24</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"allocatedRegistersPerBlock"</span><span class="p">:</span><span class="w"> </span><span class="mi">20480</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"allocatedSharedMemPerBlock"</span><span class="p">:</span><span class="w"> </span><span class="mi">74752</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"graph id"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"graph node id"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"channel"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"channel_type"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>"blocks per SM": 24.09</code> 这个名字<strong>具有误导性</strong>：它是
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mtext>grid</mtext><mo>&#x0002F;</mo><mtext>SM&#x000A0;数</mtext><mo>&#x0003D;</mo><mn>512</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x0002F;</mo><mn>170</mn><mo>&#x0003D;</mo><mn>24.09</mn></mrow></math></span>，
+即整个 launch 里平均每个 SM 要<strong>先后</strong>处理多少 block，
+<strong>不是同时驻留多少个</strong>。同时驻留的那个数是 <code>activeBlocksPerMultiprocessor</code>（这里算错成 0）。</p>
+<p>原始文件：<code>results/crater/prof/52_trace_sample_events.json</code></p>
+</details>
+<details>
+<summary>⑤ compute-sanitizer 抓到静默的竞态</summary>
+<p>故意在共享内存归约里漏掉一次 <code>__syncthreads()</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">128</span><span class="p">;</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nb">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">k</span><span class="p">)</span><span class="w"> </span><span class="n">s</span><span class="p">[</span><span class="nb">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="p">]</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">s</span><span class="p">[</span><span class="nb">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">k</span><span class="p">];</span>
+<span class="w">    </span><span class="c1">// ← 这里少了 __syncthreads()</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>直接跑：什么都不报。</strong></p>
+<div class="highlight"><pre><span></span><code>kernel 跑完了，没报任何错
+</code></pre></div>
+
+<p><code>compute-sanitizer --tool racecheck</code>：</p>
+<div class="highlight"><pre><span></span><code>========= Error: Race reported between Write access at racy(const float *, float *)+0x140 in _racy.cu:8
+=========     and Read access at racy(const float *, float *)+0x120 in _racy.cu:8 [11776 hazards]
+=========     and Read access at racy(const float *, float *)+0x170 in _racy.cu:8 [3712 hazards]
+=========
+========= Error: Race reported between Write access at racy(const float *, float *)+0x190 in _racy.cu:8
+=========     and Read access at racy(const float *, float *)+0x170 in _racy.cu:8 [4992 hazards]
+=========
+========= RACECHECK SUMMARY: 4 hazards displayed (2 errors, 5 warnings)
+</code></pre></div>
+
+<p>精确到源码行、给出 hazard 次数。<strong>代价是零特权。</strong></p>
+<div class="admonition warning">
+<p class="admonition-title">装 compute-sanitizer 的坑</p>
+<p>CUDA wheel（<code>nvidia-cu13</code>）里那个 <code>compute-sanitizer</code> 缺少注入库的目录布局，运行时报：</p>
+<div class="highlight"><pre><span></span><code>========= Error: Target application terminated before first instrumented API call
+========= Error: couldn't find exit code.
+</code></pre></div>
+
+<p>要用 redist 的 <code>cuda_sanitizer_api</code> 包（11 MB），或系统 CUDA toolkit 里那份：</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-fsSL<span class="w"> </span>-O<span class="w"> </span>https://developer.download.nvidia.com/compute/cuda/redist/cuda_sanitizer_api/linux-x86_64/cuda_sanitizer_api-linux-x86_64-13.0.85-archive.tar.xz
+</code></pre></div>
+
+</div>
+<p>原始文件：<code>results/crater/prof/50_racecheck.txt</code></p>
+</details>
+<details>
+<summary>⑥ 显存 allocator 的计数器</summary>
+<div class="highlight"><pre><span></span><code>当前已分配                         156.1 MiB
+分配峰值                          268.1 MiB
+当前已保留(向驱动要的)                  306.0 MiB
+保留峰值                          306.0 MiB
+碎片(保留但不可用)                     21.9 MiB
+分配重试次数                            0
+OOM 次数                            0
+保留 - 已分配                      149.9 MiB  ← 这部分显存你占着但用不上
+</code></pre></div>
+
+<ul>
+<li><strong><code>reserved</code> 是向驱动要的，<code>allocated</code> 是你在用的。</strong> 差值就是 caching allocator
+  攥在手里的空闲块。<code>nvidia-smi</code> 看到的是 <code>reserved</code>，所以它永远比你以为的大。</li>
+<li><strong><code>inactive_split_bytes</code>（碎片）</strong>：被切开过、剩下的那半块太小没人要。</li>
+<li><strong><code>num_alloc_retries</code> &gt; 0</strong> 是危险信号：allocator 已经在被迫 <code>empty_cache()</code> 重试了，
+  离 OOM 不远。生产环境应该盯这个数。</li>
+</ul>
+<p><code>_dump_snapshot()</code> 出来的 pickle 拖进 <a href="https://docs.pytorch.org/memory_viz">https://docs.pytorch.org/memory_viz</a>
+（纯前端，不上传）能看到每一块显存的分配调用栈。</p>
+<p>原始文件：<code>results/crater/prof/61_memory_stats.json</code>、<code>60_memory_snapshot.pickle</code></p>
+</details>
+<details>
+<summary>⑦ ncu <code>--set full</code> 对 red_v0 的完整判词（spark）</summary>
+<p><code>--set full</code> 会抓上百个计数器，分成十来个 section，并<strong>直接给出优化建议</strong>：</p>
+<div class="highlight"><pre><span></span><code>    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- --------------
+    Elapsed Cycles                cycle    222,516,137
+    Memory Throughput                 %           2.98
+    Duration                         ms         104.30
+    L1/TEX Cache Throughput           %           1.29
+    L2 Cache Throughput               %           2.98
+    Compute (SM) Throughput           %           0.63
+    ----------------------- ----------- --------------
+
+    Section: Compute Workload Analysis
+    -------------------- ----------- ------------
+    Executed Ipc Active   inst/cycle         0.00
+    Issue Slots Busy               %         0.08
+    SM Busy                        %         0.09
+    -------------------- ----------- ------------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        78.86
+    Achieved Active Warps Per SM           warp        37.85
+    ------------------------------- ----------- ------------
+</code></pre></div>
+
+<p>以及 ncu 自己的建议（原文）：</p>
+<div class="highlight"><pre><span></span><code>    OPT   This workload exhibits low compute throughput and memory bandwidth
+          utilization relative to the peak
+    OPT   Est. Local Speedup: 99.98%
+    OPT   Est. Local Speedup: 97.02%
+    OPT   Est. Speedup: 47.06%
+    INF   Check the Warp Stall Sampling (All Samples) table for the top stall
+          locations in your source based on ...
+</code></pre></div>
+
+<p><strong><code>Est. Local Speedup: 99.98%</code></strong> —— ncu 直接告诉你这个 kernel 有 99.98% 的空间。</p>
+<p>注意 <code>Issue Slots Busy 0.08%</code> 与 <code>Achieved Occupancy 78.86%</code> 并存：
+<strong>warp 都在飞，但几乎没有一条指令发得出去</strong>——全卡在等原子操作。
+这两个数字并排放，比任何一个单独看都有信息量。</p>
+<p>原始文件：<code>results/spark/ncu/41_full_details.txt</code>（401 行）、
+<code>43_full_raw.txt</code>（4105 行，全部原始计数器）</p>
+</details>
+<details>
+<summary>⑧ 一个负面结果：<code>--cache-control</code> 在流式 kernel 上没有区别</summary>
+<p>ncu 默认 <code>--cache-control all</code>（每次 replay 前刷 cache），
+所以常被提醒"它测的是冷缓存"。实测：</p>
+<div class="highlight"><pre><span></span><code>    --cache-control=all   red_v6 耗时    1,062,528 ns   L2 sector      8,395,076
+    --cache-control=none  red_v6 耗时    1,071,136 ns   L2 sector      8,394,661
+</code></pre></div>
+
+<p><strong>差 0.8%，在噪声里。</strong></p>
+<p>因为 <code>red_v6</code> 要读 256 MB，远超任何一级 cache——刷不刷都一样，
+每个 sector 反正都得从内存来一次（L2 sector 数几乎完全相同，佐证了这一点）。</p>
+<p><strong>所以这条"陷阱"是有条件的</strong>：它只在<strong>工作集能装进 cache</strong> 的 kernel 上才咬人
+（比如小矩阵 GEMM、attention 的单个 tile、embedding 查表）。
+流式的 memory-bound kernel 不受影响。</p>
+<p><strong>把一条听来的注意事项在自己的负载上验一遍，才知道它对你适不适用。</strong></p>
+<p>原始文件：<code>results/spark/ncu/50_cc_all.csv</code>、<code>50_cc_none.csv</code></p>
+</details>
+<hr />
+<h2 id="_11">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>PyTorch 内置 roofline</strong></td>
+<td><code>torch.utils.flop_counter.FlopCounterMode</code> 能数出 FLOP，配合 profiler 的时间直接算 MFU，不需要外部工具</td>
+</tr>
+<tr>
+<td><strong>Kineto / CUPTI 之外</strong></td>
+<td>AMD 侧是 rocprof + roctracer，接口形状几乎一一对应；Intel 侧是 oneAPI 的 unitrace</td>
+</tr>
+<tr>
+<td><strong>持续 profiling</strong></td>
+<td>生产环境不能一直开 profiler。做法是采样式：按概率对少量请求开 <code>torch.profiler</code> 的 <code>schedule</code>（<code>wait/warmup/active/repeat</code>）</td>
+</tr>
+<tr>
+<td><strong><code>torch.profiler</code> 的 <code>schedule</code></strong></td>
+<td>训练循环里只抓第 N 步的 M 个 iteration，避开 warm-up 和编译，这是最实用的一个参数</td>
+</tr>
+<tr>
+<td><strong>PyTorch 2.x 的 <code>TORCH_TRACE</code></strong></td>
+<td>结构化的编译日志，配合 <code>tlparse</code> 生成 HTML 报告，是排查 recompilation 的主力（<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）</td>
+</tr>
+<tr>
+<td><strong>HTA (Holistic Trace Analysis)</strong></td>
+<td>Meta 开源，对多卡 trace 做自动分析：通信/计算重叠率、掉队 rank、kernel 分布（L6 会用）</td>
+</tr>
+<tr>
+<td><strong>GPU 侧的火焰图</strong></td>
+<td>ncu 的 <code>--set full --import-source yes</code> 能把计数器归因到 SASS 与源码行；没有 ncu 时只能靠 <code>-lineinfo</code> + 手工二分</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_12">陷阱</h2>
+<p><strong>1. 按 <code>Self CPU</code> 排序读 <code>key_averages()</code>。</strong>
+<code>cudaDeviceSynchronize</code> 会稳居第一（本机 92.7%），但它是在等 GPU，不是开销。
+<strong>按 <code>Self CUDA</code> 排。</strong></p>
+<p><strong>2. 拿 profiler 里的 wall-clock 当性能结论。</strong>
+小 kernel 密集的负载上，profiler 本身就是 1.4–1.68× 的税（本机实测）。
+<strong>GPU busy 时间可信，墙钟和空闲率要用干净计时校正。</strong></p>
+<p><strong>3. 在父进程开 profiler 去抓 vLLM。</strong>
+EngineCore 在独立进程里，抓到 0 个 kernel（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 陷阱 5）。
+要么 <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code>，要么用 <code>VLLM_TORCH_PROFILER_DIR</code> +
+<code>nsys --target-processes all</code>。</p>
+<p><strong>4. 相信新架构上的派生字段。</strong>
+本机 <code>est. achieved occupancy % = 0</code>、<code>blockLimitSharedMem = 0</code> 都是错的，
+因为 PyTorch 的占用率模型没有 sm_120 的表项。<strong>原始字段准，派生字段要交叉验证。</strong></p>
+<p><strong>5. 把 ncu 的数字直接和稳态循环里的数字比。</strong>
+ncu 默认 <code>--cache-control all</code>，每次 replay 前刷 cache，测的是<strong>冷缓存</strong>。
+要比就加 <code>--cache-control none</code>，并且用 <code>--clock-control base</code> 锁频
+（否则 boost 频率漂移会污染跨 kernel 的比较——<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 踩过）。
+<strong>但先验一下这条对你的负载成不成立</strong>：本站实测流式 kernel 上两者只差 0.8%（见原始现场 ⑧）。</p>
+<p><strong>5b. 把占用率当优化目标。</strong>
+本站 GEMM 阶梯里<strong>占用率最高的 v0 是最慢的</strong>（99.84%，比 32.5% 的 v6 慢 24.7 倍）。
+占用率只是掩盖延迟的手段之一，另一条路是提高 ILP，而它和占用率此消彼长。
+<strong>要优化的是耗时。</strong></p>
+<p><strong>6. 用 <code>clock64()</code> 做跨 SM 的时间比较。</strong>
+它是每个 SM 自己的计数器。要跨 SM 就用 <code>%globaltimer</code>。</p>
+<p><strong>7. 把静态指令数当动态执行次数。</strong>
+本章的 SASS 表里每一级都只有 1 条 <code>RED</code>，但 v0 执行了 6700 万次、v1 执行了 26 万次。
+<strong>静态分析回答「有什么」，不回答「跑了多少次」。</strong></p>
+<p><strong>8. 忘了先查正确性。</strong>
+很多「性能问题」其实是越界写或竞态导致的重算/重试。
+<code>compute-sanitizer</code> 零特权、几秒钟，<strong>应该排在 profiler 前面。</strong></p>
+<p><strong>9. 假设每块卡都有 <code>dram__*</code> 计数器。</strong>
+GB10（Grace-Blackwell 统一内存）上 <code>ncu --query-metrics | grep -c '^dram__'</code> 返回 <strong>0</strong>——
+它根本没有独立的 GPU 显存分区。<strong>先查 metric 存不存在，再写脚本</strong>，
+否则 ncu 会安静地返回 <code>n/a</code>，你还以为是 0。</p>
+<p><strong>10. 用 <code>--launch-count N</code> 想抓齐所有 kernel。</strong>
+它按 <strong>launch 顺序</strong>抓前 N 次，而不是每种 kernel 各一次。
+一个跑七级阶梯的程序，<code>-c 7</code> 抓到的可能全是第一级的七次重复。
+要按 kernel 抓就 <code>-k "regex:^名字$" -c 1</code> 逐个来（<code>ncu_ladder.sh</code> 的 <code>collect()</code> 就是这么写的）。
+顺带：模板实例在 <code>--kernel-name-base function</code> 下都显示成 <code>probe&lt;...&gt;</code>，
+正则分不开，<strong>得给它们不同的函数名</strong>。</p>
+<hr />
+<h2 id="_13">自测题</h2>
+<details>
+<summary>1. 同事说「我在容器里跑 ncu 报 ERR_NVGPUCTRPERM，加 --privileged 就好了吧？」——对吗？</summary>
+<p><strong>不一定，要看是哪个原因。</strong> 判据是：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>允许</mtext><mi>&#x027FA;</mi><mtext mathvariant="monospace">RmProfilingAdminOnly</mtext><mo>&#x0003D;</mo><mn>0</mn><mspace width="0.278em" /><mo>&#x02228;</mo><mspace width="0.278em" /><mo stretchy="false">&#x00028;</mo><mtext>CAP\_SYS\_ADMIN</mtext><mo>&#x02227;</mo><mtext>宿主&#x000A0;user&#x000A0;namespace</mtext><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
+<p><code>--privileged</code> 给的是 <strong>capability</strong>，解决的是第二项的前半。
+但如果容器同时启用了 <strong>user namespace 重映射</strong>（<code>/proc/self/uid_map</code>
+第二列非 0），那么这个 capability 只在容器内部成立，驱动按宿主 namespace 判定，
+<strong>加了 <code>--privileged</code> 依然被拒</strong>。</p>
+<p>本站的两台机器恰好是两种情况：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>crater</th>
+<th>worldvln</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CAP_SYS_ADMIN</code></td>
+<td>✗</td>
+<td><strong>✓</strong></td>
+</tr>
+<tr>
+<td><code>uid_map</code> 移位</td>
+<td>✗</td>
+<td><strong>✓</strong></td>
+</tr>
+<tr>
+<td>加 <code>--privileged</code> 能解决吗</td>
+<td><strong>能</strong></td>
+<td><strong>不能</strong>，还要 <code>--userns=host</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>三条都要查</strong>：<code>grep RmProfilingAdminOnly /proc/driver/nvidia/params</code>、
+<code>grep CapEff /proc/self/status</code>、<code>cat /proc/self/uid_map</code>。</p>
+</details>
+<details>
+<summary>2. 我的 trace 显示 GPU 空闲 84%。可以直接汇报「这是 launch-bound」吗？</summary>
+<p><strong>结论方向对，但那个数字不能直接汇报。</strong></p>
+<p>这个 84% 是<strong>在 profiler 底下</strong>测的，而 profiler 对小 kernel 洪流有 1.4–1.68× 的开销
+（本机实测）。开销全部落在 CPU 侧的 launch 路径上——<strong>恰好就是产生这些缝的地方</strong>。</p>
+<p>正确的做法是用一个不受 profiler 影响的量做校正：<strong>GPU busy 时间</strong>。
+kernel 在 GPU 上跑多久不因为被观测而改变。</p>
+<div class="highlight"><pre><span></span><code>profiler 下：跨度 1.924 ms, GPU 忙 0.308 ms  →  空闲 84.0%
+干净墙钟：  0.394 ms/次, GPU 忙 0.103 ms/次 →  空闲 74.0%
+</code></pre></div>
+
+<p><strong>汇报 74%。</strong> 结论不变（重度 launch-bound，该上 CUDA Graph），
+但你没有把自己的观测开销算进被观测对象的账上。</p>
+<p><strong>推广</strong>：任何用 profiler 时间轴算出来的「比例」，
+都要问一句这个比例的分母有没有被 profiler 撑大。</p>
+</details>
+<details>
+<summary>3. 我只能拿到 <code>cuobjdump -sass</code>，能判断两个 kernel 谁更快吗？</summary>
+<p><strong>基本不能。</strong> 静态指令数回答「代码里有什么」，不回答「执行了多少次」。</p>
+<p>本章的表就是反例：<code>red_v0</code> 只有 32 条指令，<code>red_v6</code> 有 136 条——
+但 v0 慢 <strong>521 倍</strong>。因为：</p>
+<ul>
+<li>v0 的那 1 条 <code>REDG</code>（全局原子加）被 <strong>6700 万个线程各执行一次</strong></li>
+<li>v6 的 136 条指令被每个线程执行一次，但只有 26 万个 block 各做一次原子加</li>
+</ul>
+<p><strong>静态分析能可靠回答的是「有没有」类的问题</strong>：</p>
+<ul>
+<li>有没有用上 tensor core（找 <code>HMMA</code> / <code>IMMA</code>）</li>
+<li>有没有向量化访存（<code>LDG.E.128</code> vs <code>LDG.E</code>）</li>
+<li>有没有寄存器溢出（找 <code>LDL</code> / <code>STL</code>，local memory 的读写）</li>
+<li>用了共享内存还是 shuffle（<code>LDS</code>/<code>STS</code> vs <code>SHFL</code>）</li>
+<li>谓词化了还是真分支（<code>@P0</code> 前缀 vs <code>BRA</code>）</li>
+</ul>
+<p><strong>要比快慢，还是得跑。</strong> 而且要注意 SASS 里的 <code>NOP</code>——
+本例 v0 的 32 条里有 14 条是对齐填充，占 44%。</p>
+<p>本章的 ncu 实测给了这条边界最直接的证据：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>静态指令数</th>
+<th><strong>动态执行指令数</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>red_v1</code></td>
+<td>56</td>
+<td><strong>236,716,032</strong></td>
+</tr>
+<tr>
+<td><code>red_v6</code></td>
+<td>136</td>
+<td><strong>4,466,112</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>静态看 v6 是 v1 的 2.4 倍，动态看 v6 是 v1 的 1/53。方向完全相反。</strong></p>
+</details>
+<details>
+<summary>3b. 怎么判断共享内存的访问模式有几路 bank conflict？看哪个指标？</summary>
+<p><strong>看 <code>wavefront / request</code> 的比值</strong>，不是看时间。</p>
+<div class="highlight"><pre><span></span><code>l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum   ÷  请求数
+</code></pre></div>
+
+<p>共享内存一次 warp 级请求，如果 32 个 lane 落在 32 个不同 bank 上，
+硬件用<strong>一个 wavefront</strong> 就能服务完。有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 路冲突就要拆成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 个 wavefront 串行发。
+<strong>所以这个比值直接就是冲突路数。</strong></p>
+<p>本站实测（6,291,456 次读 = 196,608 次请求）：</p>
+<table>
+<thead>
+<tr>
+<th>跨步</th>
+<th>wavefront</th>
+<th><strong>比值</strong></th>
+<th><code>bank_conflicts</code> 计数器</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>196,608</td>
+<td><strong>1.00</strong></td>
+<td>0</td>
+</tr>
+<tr>
+<td>32</td>
+<td>6,291,456</td>
+<td><strong>32.00</strong></td>
+<td>6,094,848</td>
+</tr>
+<tr>
+<td>33</td>
+<td>196,608</td>
+<td><strong>1.00</strong></td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>两个指标是自洽的：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>6</mn><mrow><mo>&#x0002C;</mo></mrow><mn>094</mn><mrow><mo>&#x0002C;</mo></mrow><mn>848</mn><mo>&#x0003D;</mo><mn>196</mn><mrow><mo>&#x0002C;</mo></mrow><mn>608</mn><mo>&#x000D7;</mo><mn>31</mn></mrow></math></span>
+（冲突计数器数的是<strong>额外</strong>的 wavefront 数，所以是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 倍）。</p>
+<p><strong>为什么跨步 33 就没事</strong>：共享内存有 32 个 bank，
+地址 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>a</mi></mrow></math></span> 落在 bank <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo>&#x0002F;</mo><mn>4</mn><mo stretchy="false">&#x00029;</mo><mo>mod</mo><mn>32</mn></mrow></math></span>。跨步 32 时线程 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi></mrow></math></span> 访问
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>32</mn><mi>i</mi></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mtext>bank</mtext><mo>&#x0003D;</mo><mn>32</mn><mi>i</mi><mo>mod</mo><mn>32</mn><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span>——<strong>全撞在 bank 0</strong>。
+跨步 33 时 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mtext>bank</mtext><mo>&#x0003D;</mo><mn>33</mn><mi>i</mi><mo>mod</mo><mn>32</mn><mo>&#x0003D;</mo><mi>i</mi><mo>mod</mo><mn>32</mn></mrow></math></span>——<strong>正好每个 bank 一个</strong>。</p>
+<p><strong>判据：跨步只要是 32 的倍数就全冲突；只要与 32 互质就完全无冲突。</strong>
+所以 padding 加 1 就够，加 8（如 <code>gemm_v6</code>）是为了同时照顾 128 位向量访问的对齐。</p>
+</details>
+<details>
+<summary>4. 我要给一个 4096 tokens 的 prefill 做 profiling，从哪一步开始？</summary>
+<p><strong>按分辨率从粗到细，每一层先排除掉再往下走。</strong></p>
+<p><strong>第 0 步：先查正确性。</strong> <code>compute-sanitizer --tool memcheck</code>，几秒钟。
+越界写会导致重算和奇怪的性能表现。</p>
+<p><strong>第 1 步：分相位。</strong> prefill 和 decode 的瓶颈完全不同（<a class="xref" href="../L5/5.1-prefill-decode.html" title="prefill 与 decode 的系统性质">L5.1</a>）。
+先用自己的埋点确认时间花在哪个相位，别一上来就 profile 整个请求。</p>
+<p><strong>第 2 步：算 roofline 下界。</strong> 用 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的账本算出这个 prefill 的
+FLOP 和访存量，得到理论下界。<strong>如果实测已经在下界的 80%，profiling 到此为止</strong>——
+剩下的空间要靠换算法（量化、稀疏），不是靠调 kernel。</p>
+<p><strong>第 3 步：kernel 成分表。</strong> <code>torch.profiler</code>，按 <code>Self CUDA</code> 排序。
+prefill 应该是 GEMM 主导（本机 MLP 实测 94.9% 在 GEMM 上）。
+如果不是，说明有非预期的开销。</p>
+<p><strong>第 4 步：看时间轴的缝。</strong> 算 GPU 空闲率（记得做第 2 题的校正）。
+prefill 的 kernel 都很大，空闲率应该在个位数。
+高了就是 launch-bound，上 CUDA Graph。</p>
+<p><strong>第 5 步（要 ncu）：单 kernel 深挖。</strong> 只有走到这一步才需要特权。
+而且到这时候你已经知道该挖哪一个 kernel 了——
+<strong>这正是前四步的价值：把「慢」收敛成一个具体到能用计数器回答的问题。</strong></p>
+<p>顺带：<code>args.occupancy.limitingFactors</code> 在第 3 步就能免费拿到，
+很多占用率问题不用等到第 5 步。</p>
+</details>
+<details>
+<summary>5. 为什么 nsys 能跑而 ncu 不能？这个差异说明了什么更一般的事？</summary>
+<p><strong>因为它们读的是两种不同性质的东西。</strong></p>
+<ul>
+<li><strong>nsys / torch.profiler</strong> 走 CUPTI Activity：驱动在你自己进程的每个 kernel
+  起止处打时间戳，事后批量回传。<strong>只涉及你自己的事件</strong>，所以不需要特权。</li>
+<li><strong>ncu</strong> 直接读 SM 上的硬件性能计数器。这些计数器是<strong>全芯片共享</strong>的，
+  一个进程读它们能间接推断出<strong>同时在跑的其他进程</strong>的访存模式。
+  这是 CVE-2018-6260 报告的侧信道，所以 2019 年起驱动默认锁死。</li>
+</ul>
+<p><strong>更一般的事</strong>：观测能力的边界往往不是技术限制，而是<strong>安全边界</strong>。</p>
+<p>同样的模式在别处反复出现：</p>
+<ul>
+<li>Linux 的 <code>perf_event_paranoid</code>：读 CPU PMU 计数器同样是侧信道，同样默认限制</li>
+<li>浏览器把 <code>performance.now()</code> 的精度从纳秒降到 100 µs：Spectre 之后的缓解</li>
+<li>云上的 GPU 实例通常不开性能计数器：多租户</li>
+</ul>
+<p><strong>所以在多租户/容器环境里，「能测到多细」是一个需要提前确认的前提，
+而不是一个可以事后再说的细节。</strong> 设计实验之前先跑一遍权限诊断——
+本站的 <code>profile_ladder.sh</code> 第 0 节就是干这个的。</p>
+</details>
+<details>
+<summary>6. 我的 kernel 占用率只有 32%，同事说太低了要调。该听吗？</summary>
+<p><strong>先问：耗时是多少？占用率不是优化目标。</strong></p>
+<p>本站 GEMM 阶梯是最干净的反例：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>占用率</th>
+<th>SM 吞吐</th>
+<th><strong>耗时</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gemm_v0</code>（naive）</td>
+<td><strong>99.84%</strong></td>
+<td>69.52%</td>
+<td>120.4 ms</td>
+</tr>
+<tr>
+<td><code>gemm_v6</code>（最优）</td>
+<td><strong>32.50%</strong></td>
+<td>32.46%</td>
+<td><strong>4.88 ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>占用率最高的那个慢 24.7 倍</strong>，而且 <code>SM 吞吐</code> 也是它更高——
+因为它的 SM 忙着做无用功（每个输出元素重复读 4096 次 A 和 B）。</p>
+<p><strong>占用率的作用是掩盖延迟</strong>：一个 warp 卡在等访存时，
+换另一个 warp 上来发指令。但这不是唯一的办法——
+<strong>提高单线程的指令级并行（ILP）同样能掩盖延迟</strong>，而且更便宜。</p>
+<p><code>gemm_v6</code> 走的就是 ILP 路线：每线程算 8×8 个输出，
+手里同时有 64 个独立的累加，一条访存指令的延迟被 64 条乘加盖住了。
+代价是寄存器涨到 128、每 SM 装不下那么多 block、占用率掉到 32%。
+<strong>这是有意的取舍，不是缺陷。</strong></p>
+<p><strong>该调占用率的信号</strong>是：ncu 的 <code>Warp State Statistics</code> 显示大量
+<code>stalled_long_scoreboard</code>（等访存）<strong>并且</strong>每个 warp 的 ILP 已经榨干了。
+光看占用率数字本身，什么都说明不了。</p>
+<p>（<code>gemm_v0</code> 还给了另一个警示：<code>SM 吞吐 69.52%</code> 看起来很健康。
+<strong>吞吐率高只说明流水线在动，不说明它在做有用的事。</strong>）</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.5-kernel-dsl-shootout.html">&#8592; 2.5 现代 kernel 编写栈横评</a><a class="nav-next" href="../L2/2.6b-graph-anatomy.html">2.6b 算子图的样子：Dynamo FX 图、Inductor 输出与真实文本 &#8594;</a></nav>
+</main>
+</body>
+</html>

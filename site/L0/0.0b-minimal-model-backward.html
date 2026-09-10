@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.0b 最小完整模型（下）：链式法则与一次参数更新</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">0.0b</div>
+  <div class="sidebar-title">最小完整模型（下）：链式法则与一次参数更新</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一个标量回到每个参数</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#_4">一、训练样本：标签就是输入右移一位</a></li>
+<li><a href="#logits">二、从 logits 到一个标量</a></li>
+<li><a href="#_5">三、梯度：一个标量怎么变成每个参数一个数</a></li>
+<li><a href="#_6">四、反向需要前向的哪些中间值</a></li>
+<li><a href="#_7">五、一次参数更新改了什么</a></li>
+<li><a href="#loss">六、loss 真的会降</a></li>
+</ul>
+</li>
+<li><a href="#_8">工程实现 · 源码走读</a></li>
+<li><a href="#_9">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_10">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L0 · 坐标系</div>
+  <div class="mod-id">0.0b</div>
+  <h1>最小完整模型（下）：链式法则与一次参数更新</h1>
+  <p class="lede">同一个玩具模型，加一条训练样本：labels 怎么来、loss 怎么算、梯度怎么回、参数怎么变。手算一次梯度并与 autograd 对拍。这是 L7 训练层的先修件。</p>
+  <div class="chips"><span class="chip">实测机器 本机 CPU（macOS, torch 2.14.0）</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L0.0（同一个模型）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>loss 是<strong>一个标量</strong>，它怎么变成<strong>每个参数各一个数</strong>？</li>
+<li>「更新一次参数」具体改了内存里的哪些字节？</li>
+<li>为什么反向要保存前向算出的中间值？</li>
+</ol>
+<p><a class="xref" href="../L0/0.0-minimal-model-forward.html" title="最小完整模型（上）：张量、矩阵乘与一次生成">L0.0</a> 走完了一次生成。这一章用同一个模型走完一次训练：
+样本怎么拼、loss 怎么算、梯度怎么回、参数怎么变。
+L7 会把这套流程放大到真实规模，本章先在能手算的尺度上做一遍。</p>
+<p>两个新词：</p>
+<ul>
+<li><strong>梯度（gradient）</strong>：loss 对某个参数的偏导数。它和参数<strong>形状完全相同</strong>——
+  每个参数一个数，表示「把这个参数调大一点，loss 会变大还是变小、变多少」。</li>
+<li><strong>反向传播（backpropagation）</strong>：从 loss 出发，按链式法则逐层往回算梯度的过程。
+  它不是什么特殊算法，就是链式法则加上「把重复用到的中间结果存下来」。</li>
+</ul>
+<hr />
+<h2 id="_2">心智模型：一个标量回到每个参数</h2>
+<figure>
+<svg viewBox="0 0 740 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="一次训练步">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">一个训练步的五段（本机实测的真实数字）</text>
+
+    <g stroke="currentColor" stroke-width="1.2" fill="none" opacity="0.6">
+      <line x1="128" y1="60" x2="150" y2="60"/><line x1="278" y1="60" x2="300" y2="60"/>
+      <line x1="428" y1="60" x2="450" y2="60"/><line x1="578" y1="60" x2="600" y2="60"/>
+    </g>
+    <g>
+      <rect x="12" y="38" width="116" height="44" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+      <text x="70" y="56" text-anchor="middle" font-size="10.5">样本 + 标签</text>
+      <text x="70" y="73" text-anchor="middle" font-size="9.5" opacity="0.75">x[1,10] y[1,10]</text>
+
+      <rect x="150" y="38" width="128" height="44" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+      <text x="214" y="56" text-anchor="middle" font-size="10.5">前向 → logits</text>
+      <text x="214" y="73" text-anchor="middle" font-size="9.5" opacity="0.75">[1, 10, 18]</text>
+
+      <rect x="300" y="38" width="128" height="44" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="364" y="56" text-anchor="middle" font-size="10.5" font-weight="600">loss（一个数）</text>
+      <text x="364" y="73" text-anchor="middle" font-size="9.5" opacity="0.8">2.9957</text>
+
+      <rect x="450" y="38" width="128" height="44" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="514" y="56" text-anchor="middle" font-size="10.5" font-weight="600">反向 → 梯度</text>
+      <text x="514" y="73" text-anchor="middle" font-size="9.5" opacity="0.8">每个参数一个数</text>
+
+      <rect x="600" y="38" width="128" height="44" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+      <text x="664" y="56" text-anchor="middle" font-size="10.5">优化器更新</text>
+      <text x="664" y="73" text-anchor="middle" font-size="9.5" opacity="0.75">改写 26,560 个数</text>
+    </g>
+
+    <line x1="12" y1="102" x2="728" y2="102" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="124" font-size="12" font-weight="600">标签就是输入右移一位</text>
+    <g font-size="10.5" font-family="ui-monospace, monospace">
+      <text x="24" y="146">位置    0    1    2    3    4    5    6    7    8    9</text>
+      <text x="24" y="164">x      风   吹   过   山   谷   ，   云   落   在   水</text>
+      <text x="24" y="182">y      吹   过   山   谷   ，   云   落   在   水   面</text>
+    </g>
+    <text x="24" y="204" font-size="10.5">一条长度 10 的样本同时提供 10 个训练信号，因为因果掩码保证位置 t 看不到 t 之后。</text>
+
+    <line x1="12" y1="222" x2="728" y2="222" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="244" font-size="12" font-weight="600">显存账本：一个参数要占几份空间</text>
+    <g font-size="10.5">
+      <rect x="24" y="256" width="120" height="16" fill="currentColor" opacity="0.75"/>
+      <text x="152" y="269">权重 4 B/参数</text>
+      <rect x="24" y="278" width="120" height="16" fill="currentColor" opacity="0.5"/>
+      <text x="152" y="291">梯度 4 B/参数（与权重同形）</text>
+      <rect x="24" y="300" width="240" height="16" fill="currentColor" opacity="0.3"/>
+      <text x="272" y="313">AdamW 状态 8 B/参数（exp_avg + exp_avg_sq）</text>
+    </g>
+    <text x="24" y="336" font-size="10.5" font-weight="600">合计 16 B/参数 = 权重的 4 倍。再加上前向保存的中间值（activation）。</text>
+
+    <line x1="12" y1="354" x2="728" y2="354" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="376" font-size="12" font-weight="600">一个不会被 loss 曲线暴露的错误</text>
+    <g font-size="10.5">
+      <text x="24" y="396">标签忘了移位（用 x 预测 x）时，loss 曲线与正确版本几乎重合：3.10→0.021 vs 2.996→0.019。</text>
+      <text x="24" y="414">但生成结果是 <tspan font-family="ui-monospace,monospace">'风吹吹过过过过过过过'</tspan> —— 它只学会了复读输入。</text>
+    </g>
+  </g>
+</svg>
+<figcaption>一次训练步的五段、标签的对齐方式、显存账本，以及一个 loss 曲线看不出来的错误。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="_4">一、训练样本：标签就是输入右移一位</h3>
+<p>语言模型的训练目标是「预测下一个 token」。所以标签不需要人工标注，
+把输入整体右移一位就是标签：</p>
+<div class="highlight"><pre><span></span><code>原文  '风吹过山谷，云落在水面'  (11 个字符)
+  位置     输入 x     标签 y   含义
+   0        风        吹   看到 '风' 之后应当预测 '吹'
+   1        吹        过   看到 '风吹' 之后应当预测 '过'
+   2        过        山   看到 '风吹过' 之后应当预测 '山'
+   …
+   9        水        面   看到 '风吹过山谷，云落在水' 之后应当预测 '面'
+</code></pre></div>
+
+<p>一条长度 10 的样本<strong>同时提供了 10 个训练信号</strong>。这一点依赖 <a class="xref" href="../L0/0.0-minimal-model-forward.html" title="最小完整模型（上）：张量、矩阵乘与一次生成">L0.0</a> 讲的因果掩码：
+位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 只能看到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02264;</mo><mi>t</mi></mrow></math></span>，所以它预测 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span> 时不算作弊。
+掩码没写对，模型就能看到答案——<a class="xref" href="../L0/0.0-minimal-model-forward.html" title="最小完整模型（上）：张量、矩阵乘与一次生成">L0.0</a> 自测题 4 讨论过这个问题。</p>
+<p>训练时每一步喂进去的都是<strong>真实的前缀</strong>，而不是模型自己上一步生成的字符。
+这叫 <strong>teacher forcing</strong>（教师强制）。它让训练可以并行——
+10 个位置一次算完，而不是像生成时那样必须一个一个来。</p>
+<p>代价是训练与推理的分布不一致：训练时模型看到的前缀总是对的，
+推理时前缀是它自己生成的，可能已经错了。这个差距叫 exposure bias，
+是 RL 后训练要处理的问题之一（<span class="xref pending" title="RL infra：rollout、policy 版本与权重同步（尚未写）">L7.6</span>）。</p>
+<h3 id="logits">二、从 logits 到一个标量</h3>
+<p>一次前向得到 <code>logits: [1, 10, 18]</code>——10 个位置，每个位置 18 个分数。
+把它和标签对上，逐位置算交叉熵：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>&#x02113;</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mo>&#x02212;</mo><mi>log</mi><msub><mi>p</mi><mi>t</mi></msub><mo stretchy="false">[</mo><msub><mi>y</mi><mi>t</mi></msub><mo stretchy="false">]</mo><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>p</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mo>softmax</mo><mo stretchy="false">&#x00028;</mo><msub><mtext>logits</mtext><mi>t</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x02113;</mi><mi>t</mi></msub></mrow></math></span> 的含义是：模型给正确答案分配的概率越低，惩罚越大。
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span> 时 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x02113;</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi><mo>&#x02192;</mo><mn>0</mn></mrow></math></span> 时 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x02113;</mi><mo>&#x02192;</mo><mo>&#x0221E;</mo></mrow></math></span>。</p>
+<p>实测：</p>
+<div class="highlight"><pre><span></span><code>per_token_loss   (10,)   前6个: [+2.8736, +3.0997, +3.3885, +2.9945, +2.6051, +2.1830]
+loss = per_token_loss.mean() = 2.995676
+
+验证位置 0：正确字符 '吹'，p=0.056493，-log p=2.873633（脚本算出 2.873632）
+未训练时模型接近均匀分布，预期 loss ≈ ln(V) = ln(18) = 2.8904，实测 2.9957
+</code></pre></div>
+
+<p><strong><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>ln</mi><mi>V</mi></mrow></math></span> 是一个有用的基准线。</strong> 完全随机的模型给每个字符 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><mi>V</mi></mrow></math></span> 的概率，
+loss 就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mi>log</mi><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x0002F;</mo><mi>V</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>ln</mi><mi>V</mi></mrow></math></span>。训练开始时 loss 应该在这个值附近；
+明显更高说明初始化有问题，明显更低说明有信息泄漏。</p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mtext>loss</mtext></mrow></msup></mrow></math></span> 叫<strong>困惑度（perplexity）</strong>，可以理解成「模型在多少个选项之间犹豫」。
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>ln</mi><mi>V</mi></mrow></math></span> 对应的困惑度正好是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi></mrow></math></span>。</p>
+<p>最后一步是把 10 个数平均成 1 个：</p>
+<div class="highlight"><pre><span></span><code><span class="n">loss</span> <span class="o">=</span> <span class="n">per_token_loss</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+</code></pre></div>
+
+<p><code>mean()</code> 的分母是 10，即<strong>有效 token 数</strong>。真实训练里一个 batch 内各条样本长度不同，
+要 padding 对齐；padding 位置不能参与 loss，分母也只能数有效 token。
+这件事写错的后果是 loss 被稀释、不同 batch 之间不可比。<span class="xref pending" title="一个 batch 走完训练步：labels、loss、梯度、更新与恢复（尚未写）">L7.0b</span> 会展开。</p>
+<h3 id="_5">三、梯度：一个标量怎么变成每个参数一个数</h3>
+<p>先在一个能手算的例子上把链式法则写清楚。取</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>f</mi><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo>&#x0002C;</mo><mi>b</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mo stretchy="false">&#x00028;</mo><mi>a</mi><mi>b</mi><mo>&#x0002B;</mo><mi>a</mi><msup><mo stretchy="false">&#x00029;</mo><mn>2</mn></msup><mo>&#x0002C;</mo><mspace width="2em" /><mi>a</mi><mo>&#x0003D;</mo><mn>2</mn><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mi>b</mi><mo>&#x0003D;</mo><mn>3</mn></mrow></math></div></p>
+<p>设 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>u</mi><mo>&#x0003D;</mo><mi>a</mi><mi>b</mi><mo>&#x0002B;</mo><mi>a</mi><mo>&#x0003D;</mo><mi>a</mi><mo stretchy="false">&#x00028;</mo><mi>b</mi><mo>&#x0002B;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo></mrow></math></span>，则 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>f</mi><mo>&#x0003D;</mo><msup><mi>u</mi><mn>2</mn></msup></mrow></math></span>。链式法则说：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><mo>&#x02202;</mo><mi>f</mi></mrow><mrow><mo>&#x02202;</mo><mi>a</mi></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><mo>&#x02202;</mo><mi>f</mi></mrow><mrow><mo>&#x02202;</mo><mi>u</mi></mrow></mfrac><mo>&#x000B7;</mo><mfrac><mrow><mo>&#x02202;</mo><mi>u</mi></mrow><mrow><mo>&#x02202;</mo><mi>a</mi></mrow></mfrac><mo>&#x0003D;</mo><mn>2</mn><mi>u</mi><mo>&#x000B7;</mo><mo stretchy="false">&#x00028;</mo><mi>b</mi><mo>&#x0002B;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="2em" /><mfrac><mrow><mo>&#x02202;</mo><mi>f</mi></mrow><mrow><mo>&#x02202;</mo><mi>b</mi></mrow></mfrac><mo>&#x0003D;</mo><mn>2</mn><mi>u</mi><mo>&#x000B7;</mo><mi>a</mi></mrow></math></div></p>
+<p>代入 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>u</mi><mo>&#x0003D;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>3</mn><mo>&#x0002B;</mo><mn>2</mn><mo>&#x0003D;</mo><mn>8</mn></mrow></math></span>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02202;</mo><mi>f</mi><mo>&#x0002F;</mo><mo>&#x02202;</mo><mi>a</mi><mo>&#x0003D;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>4</mn><mo>&#x0003D;</mo><mn>64</mn></mrow></math></span>，
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02202;</mo><mi>f</mi><mo>&#x0002F;</mo><mo>&#x02202;</mo><mi>b</mi><mo>&#x0003D;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>2</mn><mo>&#x0003D;</mo><mn>32</mn></mrow></math></span>。</p>
+<div class="highlight"><pre><span></span><code>代入 u = 8.0:  手算 df/da = 64.0, df/db = 32.0
+autograd:      df/da = 64.0, df/db = 32.0
+一致：True
+</code></pre></div>
+
+<p><strong>反向传播就是把这个过程自动化。</strong> 每个算子知道自己的局部导数，
+框架按图的逆序把它们连乘起来。<a class="xref" href="../L2/2.6b-graph-anatomy.html" title="算子图的样子：Dynamo FX 图、Inductor 输出与真实文本">L2.6b</a> 打印过完整的反向图。</p>
+<p>回到模型。最靠近 loss 的是 logits，它的梯度有一个简洁形式：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><mo>&#x02202;</mo><mi>L</mi></mrow><mrow><mo>&#x02202;</mo><msub><mtext>logits</mtext><mi>t</mi></msub></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><msub><mi>p</mi><mi>t</mi></msub><mo>&#x02212;</mo><mtext>onehot</mtext><mo stretchy="false">&#x00028;</mo><msub><mi>y</mi><mi>t</mi></msub><mo stretchy="false">&#x00029;</mo></mrow><mrow><mi>N</mi></mrow></mfrac></mrow></math></div></p>
+<p>其中 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 是参与平均的 token 数。实测对拍：</p>
+<div class="highlight"><pre><span></span><code>手算与 autograd 的最大绝对差 = 7.451e-09
+位置 0 的梯度前 6 个：手算   [+0.006362, +0.008880, +0.004424, +0.005823, +0.003122, +0.004670]
+                    autograd [+0.006362, +0.008880, +0.004424, +0.005823, +0.003122, +0.004670]
+</code></pre></div>
+
+<p>这个式子值得读懂：</p>
+<ul>
+<li>对<strong>正确</strong>的那个字符，梯度是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>p</mi><mo>&#x02212;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo><mo>&#x0002F;</mo><mi>N</mi><mo>&#x0003C;</mo><mn>0</mn></mrow></math></span>。
+  梯度为负意味着「增大这个 logit 会让 loss 变小」，所以更新时它会被推高。</li>
+<li>对<strong>其余</strong>字符，梯度是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi><mo>&#x0002F;</mo><mi>N</mi><mo>&#x0003E;</mo><mn>0</mn></mrow></math></span>，会被压低。</li>
+<li><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 越接近 1，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>p</mi><mo>&#x02212;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo></mrow></math></span> 越接近 0，梯度越小——<strong>已经答对的地方不再推动</strong>。</li>
+</ul>
+<p>这也解释了 <a class="xref" href="../L0/0.0-minimal-model-forward.html" title="最小完整模型（上）：张量、矩阵乘与一次生成">L0.0</a> 讲的缩放问题：softmax 塌成 one-hot 之后，
+所有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 不是 0 就是 1，梯度全部趋近 0，模型学不动。</p>
+<h3 id="_6">四、反向需要前向的哪些中间值</h3>
+<p>反向不是「再跑一遍前向」。它需要前向算出来的一些张量。
+以上面的式子为例：算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02202;</mo><mi>L</mi><mo>&#x0002F;</mo><mo>&#x02202;</mo><mtext>logits</mtext></mrow></math></span> 要用到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span>，
+而 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 是前向 softmax 的输出。</p>
+<p>PyTorch 把这些值挂在计算图的节点上。从 loss 出发可以直接走这条链：</p>
+<div class="highlight"><pre><span></span><code>loss.grad_fn 链（前 6 跳）：
+  NllLossBackward0 -&gt; LogSoftmaxBackward0 -&gt; ViewBackward0
+  -&gt; UnsafeViewBackward0 -&gt; MmBackward0 -&gt; ViewBackward0
+</code></pre></div>
+
+<p>每个 <code>*Backward0</code> 是一个反向节点，<code>next_functions</code> 指向它的上游。
+这就是「计算图」在内存里的样子——<a class="xref" href="../L2/2.6b-graph-anatomy.html" title="算子图的样子：Dynamo FX 图、Inductor 输出与真实文本">L2.6b</a> 把整张图打印过。</p>
+<p><strong>工程后果</strong>：这些中间值必须从前向一直活到反向结束。
+本例里 logits 只有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>10</mn><mo>&#x000D7;</mo><mn>18</mn></mrow></math></span> 个 fp32 = 720 字节，无所谓；
+真实模型里这一项（activation memory）是训练显存的大头，
+而且随 batch 和序列长度线性增长。<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span> 会算这笔账，
+并介绍用重算换显存的做法（activation checkpointing）。</p>
+<h3 id="_7">五、一次参数更新改了什么</h3>
+<p>梯度和参数<strong>形状完全相同</strong>：</p>
+<div class="highlight"><pre><span></span><code>lm_head.weight   (18, 32)   前4个: [-0.1212, -0.0809, +0.0522, -0.1445]
+  .grad          (18, 32)   前4个: [+0.0017, -0.0146, +0.0118, -0.0236]
+梯度范数 |g| = 1.765255
+</code></pre></div>
+
+<p><strong>最朴素的 SGD</strong> 就是一行：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>w</mi><mo>&#x02190;</mo><mi>w</mi><mo>&#x02212;</mo><mi>&#x003B7;</mi><mspace width="0.167em" /><mi>g</mi></mrow></math></div></p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi></mrow></math></span> 是学习率（learning rate）。实测（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi><mo>&#x0003D;</mo><mn>0.1</mn></mrow></math></span>）：</p>
+<div class="highlight"><pre><span></span><code>手算与 optimizer 的最大差 = 1.490e-08
+w[0,0]: -0.121226 -&gt; -0.121391  (变化 -0.000165 = -0.1 × +0.001655)
+</code></pre></div>
+
+<p><strong>AdamW</strong> 是现在训练大模型的默认选择，它多维护两个和参数等大的状态：</p>
+<div class="highlight"><pre><span></span><code>状态键：['exp_avg', 'exp_avg_sq', 'step']
+exp_avg          (18, 32)   前4个: [+0.0002, -0.0015, +0.0012, -0.0024]
+exp_avg_sq       (18, 32)   前4个: [+0.0000, +0.0000, +0.0000, +0.0000]
+w[0,0]: -0.121226 -&gt; -0.221225
+</code></pre></div>
+
+<ul>
+<li><code>exp_avg</code>（记作 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi></mrow></math></span>）是梯度的指数滑动平均，起平滑作用。
+  第一步时 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi><mo>&#x0003D;</mo><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><msub><mi>&#x003B2;</mi><mn>1</mn></msub><mo stretchy="false">&#x00029;</mo><mi>g</mi><mo>&#x0003D;</mo><mn>0.1</mn><mi>g</mi></mrow></math></span>，所以前 4 个数正好是梯度的 1/10。</li>
+<li><code>exp_avg_sq</code>（记作 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>v</mi></mrow></math></span>）是梯度<strong>平方</strong>的滑动平均。第一步 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>v</mi><mo>&#x0003D;</mo><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><msub><mi>&#x003B2;</mi><mn>2</mn></msub><mo stretchy="false">&#x00029;</mo><msup><mi>g</mi><mn>2</mn></msup><mo>&#x0003D;</mo><mn>0.001</mn><msup><mi>g</mi><mn>2</mn></msup></mrow></math></span>，
+  数量级是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>6</mn></mrow></msup></mrow></math></span>，所以按 4 位小数打印显示成 <code>+0.0000</code>——它不是零。</li>
+</ul>
+<p>更新式（省略权重衰减）：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>w</mi><mo>&#x02190;</mo><mi>w</mi><mo>&#x02212;</mo><mi>&#x003B7;</mi><mspace width="0.167em" /><mfrac><mrow><mover accent="true"><mi>m</mi><mo>&#x0005E;</mo></mover></mrow><mrow><msqrt><mrow><mover accent="true"><mi>v</mi><mo>&#x0005E;</mo></mover></mrow></msqrt><mo>&#x0002B;</mo><mi>&#x003F5;</mi></mrow></mfrac><mo>&#x0002C;</mo><mspace width="2em" /><mover accent="true"><mi>m</mi><mo>&#x0005E;</mo></mover><mo>&#x0003D;</mo><mfrac><mrow><mi>m</mi></mrow><mrow><mn>1</mn><mo>&#x02212;</mo><msubsup><mi>&#x003B2;</mi><mn>1</mn><mi>t</mi></msubsup></mrow></mfrac><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mover accent="true"><mi>v</mi><mo>&#x0005E;</mo></mover><mo>&#x0003D;</mo><mfrac><mrow><mi>v</mi></mrow><mrow><mn>1</mn><mo>&#x02212;</mo><msubsup><mi>&#x003B2;</mi><mn>2</mn><mi>t</mi></msubsup></mrow></mfrac></mrow></math></div></p>
+<p>第一步时偏差修正后 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mover accent="true"><mi>m</mi><mo>&#x0005E;</mo></mover><mo>&#x02248;</mo><mi>g</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><mover accent="true"><mi>v</mi><mo>&#x0005E;</mo></mover></mrow></msqrt><mo>&#x02248;</mo><mo stretchy="false">&#x0007C;</mo><mi>g</mi><mo stretchy="false">&#x0007C;</mo></mrow></math></span>，
+所以整个分式约等于 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>sign</mo><mo stretchy="false">&#x00028;</mo><mi>g</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>。
+实测 <code>w[0,0]</code> 变化正好是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mn>0.1</mn><mo>&#x0003D;</mo><mo>&#x02212;</mo><mi>&#x003B7;</mi></mrow></math></span>，与梯度大小无关——这与实测吻合。</p>
+<p><strong>这带来一笔明确的显存账</strong>：</p>
+<div class="highlight"><pre><span></span><code>参数 576 个 -&gt; 权重 2304 B + 状态 4608 B = 6912 B
+</code></pre></div>
+
+<p>每个 fp32 参数占 4 B 权重 + 4 B 梯度 + 8 B 优化器状态 = <strong>16 B</strong>，是权重的 4 倍。
+一个 7B 模型光这三项就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>7</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mn>9</mn></msup><mo>&#x000D7;</mo><mn>16</mn><mtext>&#x000A0;</mtext><mtext>B</mtext><mo>&#x0003D;</mo><mn>112</mn></mrow></math></span> GB，
+单卡放不下——这是 ZeRO / FSDP 存在的直接原因（<span class="xref pending" title="训练并行：ZeRO 到 zero-bubble（尚未写）">L7.2</span>）。</p>
+<h3 id="loss">六、loss 真的会降</h3>
+<p>把上面这一步重复 200 次：</p>
+<div class="highlight"><pre><span></span><code>  step       loss      困惑度 exp(loss)
+     0     2.9957             19.999
+    40     0.0668              1.069
+    80     0.0191              1.019
+   120     0.0105              1.011
+   160     0.0068              1.007
+   200     0.0048              1.005
+
+训练后从 '风吹' 续写：'风吹过山谷，云落在水'
+</code></pre></div>
+
+<p>困惑度从 20（约等于随机猜 18 个字符）降到 1.005（几乎确定）。
+模型把这条语料背下来了。</p>
+<p>只有一条训练数据时这叫<strong>过拟合</strong>，不能说明模型有泛化能力。
+但它确实证明了梯度在起作用——这是训练代码的第一个可用性检查：
+<strong>先让模型在一条数据上过拟合。</strong> 如果连这都做不到，说明梯度链路有 bug。</p>
+<hr />
+<h2 id="_8">工程实现 · 源码走读</h2>
+<p>本章的训练循环就是四行，真实训练脚本的骨架与它相同：</p>
+<div class="highlight"><pre><span></span><code><span class="n">loss</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">y</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+<span class="n">opt</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>      <span class="c1"># 清掉上一步的梯度（PyTorch 的梯度是累加的）</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>      <span class="c1"># 反向：填充每个参数的 .grad</span>
+<span class="n">opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>           <span class="c1"># 用 .grad 更新参数</span>
+</code></pre></div>
+
+<p><code>zero_grad()</code> 容易被忽略但不能省：PyTorch 的 <code>.grad</code> 是<strong>累加</strong>的，
+不清零就会把上一步的梯度加进来。这个设计是为了支持梯度累积——
+把一个大 batch 拆成几个小 batch，各自 <code>backward()</code> 之后再一次 <code>step()</code>。
+<span class="xref pending" title="一个 batch 走完训练步：labels、loss、梯度、更新与恢复（尚未写）">L7.0b</span> 会讲它与直接用大 batch 的区别（不完全等价，因为 BatchNorm 之类的算子会受影响）。</p>
+<p>真实训练脚本在这四行之外还有：梯度裁剪、学习率调度、混合精度的 scaler、
+分布式的梯度同步、checkpoint 保存。<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span> 逐项展开。</p>
+<hr />
+<h2 id="_9">工程实现 · 自己写一遍</h2>
+<p>完整的实验脚本在这里。它比正文多打印很多中间量：</p>
+<details class="fold srcfold"><summary>labs/L0/walk_train.py 全文（248 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos">  2</span><span class="sd">"""L0.0b lab · 把一次参数更新的每一步打印出来。</span>
+<span class="linenos">  3</span>
+<span class="linenos">  4</span><span class="sd">问题：loss 是一个标量，它怎么变成每个参数的一个数？「更新一次参数」到底改了什么？</span>
+<span class="linenos">  5</span>
+<span class="linenos">  6</span><span class="sd">本脚本按顺序打印：</span>
+<span class="linenos">  7</span><span class="sd">    [0] 训练样本            —— 输入与 labels 的对齐关系</span>
+<span class="linenos">  8</span><span class="sd">    [1] 逐 token loss       —— 一个标量是怎么从 T 个数平均出来的</span>
+<span class="linenos">  9</span><span class="sd">    [2] 手算梯度 vs autograd —— 先在一个两参数的函数上对拍，再回到模型</span>
+<span class="linenos"> 10</span><span class="sd">    [3] 反向保存了什么      —— 前向的哪些中间值必须活到反向</span>
+<span class="linenos"> 11</span><span class="sd">    [4] 一次参数更新        —— SGD 与 AdamW 各改了哪些字节</span>
+<span class="linenos"> 12</span><span class="sd">    [5] 训练几十步          —— loss 真的会降</span>
+<span class="linenos"> 13</span><span class="sd">    [A] 失败案例：标签没移位 —— loss 迅速趋零，模型无用</span>
+<span class="linenos"> 14</span><span class="sd">    [B] 失败案例：detach     —— 梯度在哪里断掉</span>
+<span class="linenos"> 15</span>
+<span class="linenos"> 16</span><span class="sd">用法：python walk_train.py</span>
+<span class="linenos"> 17</span><span class="sd">"""</span>
+<span class="linenos"> 18</span>
+<span class="linenos"> 19</span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos"> 20</span>
+<span class="linenos"> 21</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+<span class="linenos"> 23</span>
+<span class="linenos"> 24</span><span class="kn">from</span><span class="w"> </span><span class="nn">tiny_lm</span><span class="w"> </span><span class="kn">import</span> <span class="n">CORPUS</span><span class="p">,</span> <span class="n">CharVocab</span><span class="p">,</span> <span class="n">TinyLM</span><span class="p">,</span> <span class="n">show</span>
+<span class="linenos"> 25</span>
+<span class="linenos"> 26</span><span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos"> 27</span><span class="n">SEP</span> <span class="o">=</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="mi">78</span>
+<span class="linenos"> 28</span>
+<span class="linenos"> 29</span>
+<span class="linenos"> 30</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos"> 31</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  device=cpu</span><span class="se">\n</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 32</span>    <span class="n">vocab</span> <span class="o">=</span> <span class="n">CharVocab</span><span class="p">(</span><span class="n">CORPUS</span><span class="p">)</span>
+<span class="linenos"> 33</span>    <span class="n">D</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">L</span><span class="p">,</span> <span class="n">BS</span> <span class="o">=</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">16</span>
+<span class="linenos"> 34</span>    <span class="n">model</span> <span class="o">=</span> <span class="n">TinyLM</span><span class="p">(</span><span class="n">vocab</span><span class="o">.</span><span class="n">size</span><span class="p">,</span> <span class="n">d_model</span><span class="o">=</span><span class="n">D</span><span class="p">,</span> <span class="n">n_head</span><span class="o">=</span><span class="n">H</span><span class="p">,</span> <span class="n">n_layer</span><span class="o">=</span><span class="n">L</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="n">BS</span><span class="p">)</span>
+<span class="linenos"> 35</span>
+<span class="linenos"> 36</span>    <span class="c1"># ---------------------------------------------------------------- [0]</span>
+<span class="linenos"> 37</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[0] 训练样本：输入与 labels"</span><span class="p">)</span>
+<span class="linenos"> 38</span>    <span class="n">text</span> <span class="o">=</span> <span class="s2">"风吹过山谷，云落在水面"</span>
+<span class="linenos"> 39</span>    <span class="n">ids</span> <span class="o">=</span> <span class="n">vocab</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">text</span><span class="p">)</span>
+<span class="linenos"> 40</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]])</span>          <span class="c1"># 输入：去掉最后一个</span>
+<span class="linenos"> 41</span>    <span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids</span><span class="p">[</span><span class="mi">1</span><span class="p">:]])</span>           <span class="c1"># 标签：去掉第一个 —— 整体左移一位</span>
+<span class="linenos"> 42</span>    <span class="n">T</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos"> 43</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    原文  </span><span class="si">{</span><span class="n">text</span><span class="si">!r}</span><span class="s2">  (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个字符)"</span><span class="p">)</span>
+<span class="linenos"> 44</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">'位置'</span><span class="si">:</span><span class="s2">&gt;4s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'输入 x'</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'标签 y'</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2">   含义"</span><span class="p">)</span>
+<span class="linenos"> 45</span>    <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span>
+<span class="linenos"> 46</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;4d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">vocab</span><span class="o">.</span><span class="n">itos</span><span class="p">[</span><span class="n">x</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="n">t</span><span class="p">]]</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">vocab</span><span class="o">.</span><span class="n">itos</span><span class="p">[</span><span class="n">y</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="n">t</span><span class="p">]]</span><span class="si">:</span><span class="s2">&gt;8s</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos"> 47</span>              <span class="sa">f</span><span class="s2">"   看到 </span><span class="si">{</span><span class="n">vocab</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">ids</span><span class="p">[:</span><span class="n">t</span><span class="o">+</span><span class="mi">1</span><span class="p">])</span><span class="si">!r}</span><span class="s2"> 之后应当预测 </span><span class="si">{</span><span class="n">vocab</span><span class="o">.</span><span class="n">itos</span><span class="p">[</span><span class="n">y</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="n">t</span><span class="p">]]</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 48</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    labels 就是输入右移一位。一条长度 </span><span class="si">{</span><span class="n">T</span><span class="si">}</span><span class="s2"> 的样本同时提供了 </span><span class="si">{</span><span class="n">T</span><span class="si">}</span><span class="s2"> 个训练信号，"</span><span class="p">)</span>
+<span class="linenos"> 49</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    因为因果掩码保证位置 t 看不到 t 之后的内容——这叫 teacher forcing："</span><span class="p">)</span>
+<span class="linenos"> 50</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    训练时每一步喂的都是真实的前缀，而不是模型自己上一步生成的字符。"</span><span class="p">)</span>
+<span class="linenos"> 51</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos"> 52</span>
+<span class="linenos"> 53</span>    <span class="c1"># ---------------------------------------------------------------- [1]</span>
+<span class="linenos"> 54</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[1] 从 logits 到一个标量 loss"</span><span class="p">)</span>
+<span class="linenos"> 55</span>    <span class="n">logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>                                   <span class="c1"># [1, T, V]</span>
+<span class="linenos"> 56</span>    <span class="n">V</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos"> 57</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">show</span><span class="p">(</span><span class="s1">'logits'</span><span class="p">,</span><span class="w"> </span><span class="n">logits</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 58</span>    <span class="n">flat_logits</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">)</span>                    <span class="c1"># [T, V]</span>
+<span class="linenos"> 59</span>    <span class="n">flat_y</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>                                 <span class="c1"># [T]</span>
+<span class="linenos"> 60</span>    <span class="n">per_tok</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">flat_logits</span><span class="p">,</span> <span class="n">flat_y</span><span class="p">,</span> <span class="n">reduction</span><span class="o">=</span><span class="s2">"none"</span><span class="p">)</span>
+<span class="linenos"> 61</span>    <span class="n">loss</span> <span class="o">=</span> <span class="n">per_tok</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+<span class="linenos"> 62</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">show</span><span class="p">(</span><span class="s1">'per_token_loss'</span><span class="p">,</span><span class="w"> </span><span class="n">per_tok</span><span class="p">,</span><span class="w"> </span><span class="n">k</span><span class="o">=</span><span class="mi">6</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 63</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    loss = per_token_loss.mean() = </span><span class="si">{</span><span class="n">loss</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 64</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    交叉熵：位置 t 的 loss = -log p(正确字符)，p 来自 softmax(logits[t])。"</span><span class="p">)</span>
+<span class="linenos"> 65</span>    <span class="n">t0</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos"> 66</span>    <span class="n">p0</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="n">t0</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos"> 67</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    验证位置 </span><span class="si">{</span><span class="n">t0</span><span class="si">}</span><span class="s2">：正确字符 </span><span class="si">{</span><span class="n">vocab</span><span class="o">.</span><span class="n">itos</span><span class="p">[</span><span class="n">y</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="n">t0</span><span class="p">]]</span><span class="si">!r}</span><span class="s2">，"</span>
+<span class="linenos"> 68</span>          <span class="sa">f</span><span class="s2">"p=</span><span class="si">{</span><span class="n">p0</span><span class="p">[</span><span class="n">y</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="n">t0</span><span class="p">]]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">，-log p=</span><span class="si">{</span><span class="o">-</span><span class="n">p0</span><span class="p">[</span><span class="n">y</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="n">t0</span><span class="p">]]</span><span class="o">.</span><span class="n">log</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos"> 69</span>          <span class="sa">f</span><span class="s2">"（脚本算出 </span><span class="si">{</span><span class="n">per_tok</span><span class="p">[</span><span class="n">t0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos"> 70</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos"> 71</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    未训练时模型接近均匀分布，预期 loss ≈ ln(V) = ln(</span><span class="si">{</span><span class="n">V</span><span class="si">}</span><span class="s2">) = </span><span class="si">{</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">V</span><span class="p">)</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos"> 72</span>          <span class="sa">f</span><span class="s2">"实测 </span><span class="si">{</span><span class="n">loss</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 73</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    mean() 的分母是 </span><span class="si">{</span><span class="n">T</span><span class="si">}</span><span class="s2">（有效 token 数）。真实训练里有 padding，"</span><span class="p">)</span>
+<span class="linenos"> 74</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    那时必须用 mask 把 padding 位置排除，分母也只数有效 token（见 L7.0b）。"</span><span class="p">)</span>
+<span class="linenos"> 75</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos"> 76</span>
+<span class="linenos"> 77</span>    <span class="c1"># ---------------------------------------------------------------- [2]</span>
+<span class="linenos"> 78</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[2] 手算梯度 vs autograd"</span><span class="p">)</span>
+<span class="linenos"> 79</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    先在一个两参数的函数上对拍，把链式法则写出来："</span><span class="p">)</span>
+<span class="linenos"> 80</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      f(a, b) = (a * b + a)^2，  取 a=2, b=3"</span><span class="p">)</span>
+<span class="linenos"> 81</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      设 u = a*b + a = a(b+1)，f = u^2"</span><span class="p">)</span>
+<span class="linenos"> 82</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      df/du = 2u"</span><span class="p">)</span>
+<span class="linenos"> 83</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      du/da = b + 1,   du/db = a"</span><span class="p">)</span>
+<span class="linenos"> 84</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"      df/da = 2u(b+1), df/db = 2u·a"</span><span class="p">)</span>
+<span class="linenos"> 85</span>    <span class="n">a</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">2.0</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 86</span>    <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mf">3.0</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos"> 87</span>    <span class="n">f</span> <span class="o">=</span> <span class="p">(</span><span class="n">a</span> <span class="o">*</span> <span class="n">b</span> <span class="o">+</span> <span class="n">a</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span>
+<span class="linenos"> 88</span>    <span class="n">f</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos"> 89</span>    <span class="n">u</span> <span class="o">=</span> <span class="mf">2.0</span> <span class="o">*</span> <span class="mf">3.0</span> <span class="o">+</span> <span class="mf">2.0</span>
+<span class="linenos"> 90</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      代入 u = </span><span class="si">{</span><span class="n">u</span><span class="si">}</span><span class="s2">:  手算 df/da = </span><span class="si">{</span><span class="mi">2</span><span class="o">*</span><span class="n">u</span><span class="o">*</span><span class="p">(</span><span class="mi">3</span><span class="o">+</span><span class="mi">1</span><span class="p">)</span><span class="si">}</span><span class="s2">, df/db = </span><span class="si">{</span><span class="mi">2</span><span class="o">*</span><span class="n">u</span><span class="o">*</span><span class="mf">2.0</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 91</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      autograd:      df/da = </span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">}</span><span class="s2">, df/db = </span><span class="si">{</span><span class="n">b</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 92</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      一致：</span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">2</span><span class="o">*</span><span class="n">u</span><span class="o">*</span><span class="p">(</span><span class="mi">3</span><span class="o">+</span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="n">b</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">2</span><span class="o">*</span><span class="n">u</span><span class="o">*</span><span class="mf">2.0</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos"> 93</span>
+<span class="linenos"> 94</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    再看模型里最靠近 loss 的那一层：lm_head。"</span><span class="p">)</span>
+<span class="linenos"> 95</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    交叉熵 + softmax 的梯度有一个简洁形式：dL/dlogits = (p - onehot(y)) / N"</span><span class="p">)</span>
+<span class="linenos"> 96</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    其中 p 是 softmax 输出，N 是参与平均的 token 数（这里 N=</span><span class="si">{</span><span class="n">T</span><span class="si">}</span><span class="s2">）。"</span><span class="p">)</span>
+<span class="linenos"> 97</span>    <span class="n">model</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+<span class="linenos"> 98</span>    <span class="n">logits2</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos"> 99</span>    <span class="n">logits2</span><span class="o">.</span><span class="n">retain_grad</span><span class="p">()</span>
+<span class="linenos">100</span>    <span class="n">loss2</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">logits2</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">flat_y</span><span class="p">)</span>
+<span class="linenos">101</span>    <span class="n">loss2</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos">102</span>    <span class="n">p_all</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits2</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos">103</span>    <span class="n">onehot</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">one_hot</span><span class="p">(</span><span class="n">flat_y</span><span class="p">,</span> <span class="n">V</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="linenos">104</span>    <span class="n">manual</span> <span class="o">=</span> <span class="p">(</span><span class="n">p_all</span> <span class="o">-</span> <span class="n">onehot</span><span class="p">)</span> <span class="o">/</span> <span class="n">T</span>
+<span class="linenos">105</span>    <span class="n">got</span> <span class="o">=</span> <span class="n">logits2</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">)</span>
+<span class="linenos">106</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    手算与 autograd 的最大绝对差 = </span><span class="si">{</span><span class="p">(</span><span class="n">manual</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">got</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">107</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    位置 0 的梯度前 6 个：手算 "</span>
+<span class="linenos">108</span>          <span class="sa">f</span><span class="s2">"[</span><span class="si">{</span><span class="s1">', '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s1">'</span><span class="si">{</span><span class="n">v</span><span class="si">:</span><span class="s1">+.6f</span><span class="si">}</span><span class="s1">'</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">manual</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="p">:</span><span class="mi">6</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span><span class="si">}</span><span class="s2">]"</span><span class="p">)</span>
+<span class="linenos">109</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">''</span><span class="si">:</span><span class="s2">&gt;26s</span><span class="si">}</span><span class="s2">autograd "</span>
+<span class="linenos">110</span>          <span class="sa">f</span><span class="s2">"[</span><span class="si">{</span><span class="s1">', '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s1">'</span><span class="si">{</span><span class="n">v</span><span class="si">:</span><span class="s1">+.6f</span><span class="si">}</span><span class="s1">'</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">got</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="p">:</span><span class="mi">6</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span><span class="si">}</span><span class="s2">]"</span><span class="p">)</span>
+<span class="linenos">111</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    正确字符那一项的梯度是 (p-1)/N &lt; 0，其余是 p/N &gt; 0："</span><span class="p">)</span>
+<span class="linenos">112</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      降低正确字符的 logit 会让 loss 变大，所以梯度为负、更新时朝增大方向走。"</span><span class="p">)</span>
+<span class="linenos">113</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">114</span>
+<span class="linenos">115</span>    <span class="c1"># ---------------------------------------------------------------- [3]</span>
+<span class="linenos">116</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[3] 反向需要前向的哪些中间值"</span><span class="p">)</span>
+<span class="linenos">117</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    反向不是「再跑一遍前向」，它需要前向算出来的一些张量。"</span><span class="p">)</span>
+<span class="linenos">118</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    PyTorch 把它们挂在计算图的节点上："</span><span class="p">)</span>
+<span class="linenos">119</span>    <span class="n">node</span> <span class="o">=</span> <span class="n">loss2</span><span class="o">.</span><span class="n">grad_fn</span>
+<span class="linenos">120</span>    <span class="n">chain</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">121</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">6</span><span class="p">):</span>
+<span class="linenos">122</span>        <span class="n">chain</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">node</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span>
+<span class="linenos">123</span>        <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">next_functions</span> <span class="ow">or</span> <span class="n">node</span><span class="o">.</span><span class="n">next_functions</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos">124</span>            <span class="k">break</span>
+<span class="linenos">125</span>        <span class="n">node</span> <span class="o">=</span> <span class="n">node</span><span class="o">.</span><span class="n">next_functions</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos">126</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      loss.grad_fn 链（前 6 跳）：</span><span class="si">{</span><span class="s1">' -&gt; '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">chain</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">127</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    以 softmax+交叉熵为例：反向要用到前向算出的 p。"</span><span class="p">)</span>
+<span class="linenos">128</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    所以 p 必须一直留在显存里，直到反向用完。这就是 activation memory。"</span><span class="p">)</span>
+<span class="linenos">129</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    本例中 logits 本身就是 </span><span class="si">{</span><span class="n">logits2</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span><span class="si">}</span><span class="s2"> 个 fp32 = "</span>
+<span class="linenos">130</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">logits2</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span><span class="o">*</span><span class="mi">4</span><span class="si">}</span><span class="s2"> 字节；真实模型里这一项是显存大头（L7.0/L7.1）。"</span><span class="p">)</span>
+<span class="linenos">131</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    L2.6b 打印过完整的反向图：前向 11 个节点，反向 25 个。"</span><span class="p">)</span>
+<span class="linenos">132</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">133</span>
+<span class="linenos">134</span>    <span class="c1"># ---------------------------------------------------------------- [4]</span>
+<span class="linenos">135</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[4] 一次参数更新改了什么"</span><span class="p">)</span>
+<span class="linenos">136</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span>
+<span class="linenos">137</span>    <span class="n">before</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos">138</span>    <span class="n">g</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos">139</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">show</span><span class="p">(</span><span class="s1">'lm_head.weight'</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">140</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">show</span><span class="p">(</span><span class="s1">'  .grad'</span><span class="p">,</span><span class="w"> </span><span class="n">g</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">141</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    梯度和参数**形状完全相同**：每个参数一个数。"</span><span class="p">)</span>
+<span class="linenos">142</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    梯度范数 |g| = </span><span class="si">{</span><span class="n">g</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">143</span>
+<span class="linenos">144</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    (a) 最朴素的 SGD：w &lt;- w - lr * g"</span><span class="p">)</span>
+<span class="linenos">145</span>    <span class="n">lr</span> <span class="o">=</span> <span class="mf">0.1</span>
+<span class="linenos">146</span>    <span class="n">manual_sgd</span> <span class="o">=</span> <span class="n">before</span> <span class="o">-</span> <span class="n">lr</span> <span class="o">*</span> <span class="n">g</span>
+<span class="linenos">147</span>    <span class="n">opt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">SGD</span><span class="p">([</span><span class="n">w</span><span class="p">],</span> <span class="n">lr</span><span class="o">=</span><span class="n">lr</span><span class="p">)</span>
+<span class="linenos">148</span>    <span class="n">opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">149</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      手算与 optimizer 的最大差 = </span><span class="si">{</span><span class="p">(</span><span class="n">manual_sgd</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">w</span><span class="o">.</span><span class="n">detach</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">150</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      w[0,0]: </span><span class="si">{</span><span class="n">before</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="n">w</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos">151</span>          <span class="sa">f</span><span class="s2">"(变化 </span><span class="si">{</span><span class="p">(</span><span class="n">w</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">]</span><span class="o">-</span><span class="n">before</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">])</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2"> = -</span><span class="si">{</span><span class="n">lr</span><span class="si">}</span><span class="s2"> × </span><span class="si">{</span><span class="n">g</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos">152</span>
+<span class="linenos">153</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    (b) AdamW：多了两个和参数等大的状态张量"</span><span class="p">)</span>
+<span class="linenos">154</span>    <span class="n">w</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">before</span><span class="p">)</span>                      <span class="c1"># 还原</span>
+<span class="linenos">155</span>    <span class="n">w</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">g</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos">156</span>    <span class="n">opt2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">([</span><span class="n">w</span><span class="p">],</span> <span class="n">lr</span><span class="o">=</span><span class="n">lr</span><span class="p">,</span> <span class="n">betas</span><span class="o">=</span><span class="p">(</span><span class="mf">0.9</span><span class="p">,</span> <span class="mf">0.999</span><span class="p">),</span> <span class="n">eps</span><span class="o">=</span><span class="mf">1e-8</span><span class="p">,</span> <span class="n">weight_decay</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos">157</span>    <span class="n">opt2</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">158</span>    <span class="n">st</span> <span class="o">=</span> <span class="n">opt2</span><span class="o">.</span><span class="n">state</span><span class="p">[</span><span class="n">w</span><span class="p">]</span>
+<span class="linenos">159</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      状态键：</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">k</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">st</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">160</span>    <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"exp_avg"</span><span class="p">,</span> <span class="s2">"exp_avg_sq"</span><span class="p">):</span>
+<span class="linenos">161</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      </span><span class="si">{</span><span class="n">show</span><span class="p">(</span><span class="n">k</span><span class="p">,</span><span class="w"> </span><span class="n">st</span><span class="p">[</span><span class="n">k</span><span class="p">])</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">162</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      w[0,0]: </span><span class="si">{</span><span class="n">before</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="n">w</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">163</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">      第一步时 m/(sqrt(v)+eps) 经偏差修正后接近 sign(g)，"</span><span class="p">)</span>
+<span class="linenos">164</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      所以每个参数的变化幅度都接近 lr=</span><span class="si">{</span><span class="n">lr</span><span class="si">}</span><span class="s2">，与梯度大小基本无关。"</span><span class="p">)</span>
+<span class="linenos">165</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      代价：每个参数要多存 2 个 fp32 状态。参数 </span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span><span class="si">}</span><span class="s2"> 个 -&gt; "</span>
+<span class="linenos">166</span>          <span class="sa">f</span><span class="s2">"权重 </span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span><span class="o">*</span><span class="mi">4</span><span class="si">}</span><span class="s2"> B + 状态 </span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span><span class="o">*</span><span class="mi">8</span><span class="si">}</span><span class="s2"> B = </span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span><span class="o">*</span><span class="mi">12</span><span class="si">}</span><span class="s2"> B。"</span><span class="p">)</span>
+<span class="linenos">167</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      **优化器状态是权重的 2 倍**，这是训练显存账本的关键一项（L7.0b/L7.1）。"</span><span class="p">)</span>
+<span class="linenos">168</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">169</span>
+<span class="linenos">170</span>    <span class="c1"># ---------------------------------------------------------------- [5]</span>
+<span class="linenos">171</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[5] 训练 200 步，看 loss 下降"</span><span class="p">)</span>
+<span class="linenos">172</span>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">173</span>    <span class="n">m</span> <span class="o">=</span> <span class="n">TinyLM</span><span class="p">(</span><span class="n">vocab</span><span class="o">.</span><span class="n">size</span><span class="p">,</span> <span class="n">d_model</span><span class="o">=</span><span class="n">D</span><span class="p">,</span> <span class="n">n_head</span><span class="o">=</span><span class="n">H</span><span class="p">,</span> <span class="n">n_layer</span><span class="o">=</span><span class="n">L</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="n">BS</span><span class="p">)</span>
+<span class="linenos">174</span>    <span class="n">xs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]])</span>
+<span class="linenos">175</span>    <span class="n">ys</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids</span><span class="p">[</span><span class="mi">1</span><span class="p">:]])</span>
+<span class="linenos">176</span>    <span class="n">opt3</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">3e-3</span><span class="p">)</span>
+<span class="linenos">177</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">'step'</span><span class="si">:</span><span class="s2">&gt;6s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'loss'</span><span class="si">:</span><span class="s2">&gt;10s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'困惑度 exp(loss)'</span><span class="si">:</span><span class="s2">&gt;18s</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">178</span>    <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">201</span><span class="p">):</span>
+<span class="linenos">179</span>        <span class="n">lg</span> <span class="o">=</span> <span class="n">m</span><span class="p">(</span><span class="n">xs</span><span class="p">)</span>
+<span class="linenos">180</span>        <span class="n">ls</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">lg</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">ys</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+<span class="linenos">181</span>        <span class="n">opt3</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+<span class="linenos">182</span>        <span class="n">ls</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos">183</span>        <span class="n">opt3</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">184</span>        <span class="k">if</span> <span class="n">step</span> <span class="o">%</span> <span class="mi">40</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos">185</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">step</span><span class="si">:</span><span class="s2">&gt;6d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ls</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;10.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ls</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;18.3f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">186</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    起点 ln(V)=</span><span class="si">{</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">V</span><span class="p">)</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2"> 对应困惑度 </span><span class="si">{</span><span class="n">V</span><span class="si">}</span><span class="s2">（等于随机猜）。"</span><span class="p">)</span>
+<span class="linenos">187</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    这条样本被记住了——只有一条训练数据时这叫过拟合，但它证明梯度确实在起作用。"</span><span class="p">)</span>
+<span class="linenos">188</span>    <span class="n">g2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">()</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">7</span><span class="p">)</span>
+<span class="linenos">189</span>    <span class="n">out</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">vocab</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"风吹"</span><span class="p">)]),</span> <span class="mi">8</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g2</span><span class="p">)</span>
+<span class="linenos">190</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    训练后从 '风吹' 续写：</span><span class="si">{</span><span class="n">vocab</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">191</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">192</span>
+<span class="linenos">193</span>    <span class="c1"># ---------------------------------------------------------------- [A]</span>
+<span class="linenos">194</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[A] 失败案例：labels 没有移位"</span><span class="p">)</span>
+<span class="linenos">195</span>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">196</span>    <span class="n">m_bad</span> <span class="o">=</span> <span class="n">TinyLM</span><span class="p">(</span><span class="n">vocab</span><span class="o">.</span><span class="n">size</span><span class="p">,</span> <span class="n">d_model</span><span class="o">=</span><span class="n">D</span><span class="p">,</span> <span class="n">n_head</span><span class="o">=</span><span class="n">H</span><span class="p">,</span> <span class="n">n_layer</span><span class="o">=</span><span class="n">L</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="n">BS</span><span class="p">)</span>
+<span class="linenos">197</span>    <span class="n">xb</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]])</span>
+<span class="linenos">198</span>    <span class="n">yb</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">ids</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]])</span>            <span class="c1"># 错误：用 x 预测 x</span>
+<span class="linenos">199</span>    <span class="n">opt4</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">m_bad</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">3e-3</span><span class="p">)</span>
+<span class="linenos">200</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="s1">'step'</span><span class="si">:</span><span class="s2">&gt;6s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'错误 loss'</span><span class="si">:</span><span class="s2">&gt;12s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'正确 loss'</span><span class="si">:</span><span class="s2">&gt;12s</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">201</span>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos">202</span>    <span class="n">m_ok</span> <span class="o">=</span> <span class="n">TinyLM</span><span class="p">(</span><span class="n">vocab</span><span class="o">.</span><span class="n">size</span><span class="p">,</span> <span class="n">d_model</span><span class="o">=</span><span class="n">D</span><span class="p">,</span> <span class="n">n_head</span><span class="o">=</span><span class="n">H</span><span class="p">,</span> <span class="n">n_layer</span><span class="o">=</span><span class="n">L</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="n">BS</span><span class="p">)</span>
+<span class="linenos">203</span>    <span class="n">opt5</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">m_ok</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">3e-3</span><span class="p">)</span>
+<span class="linenos">204</span>    <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">81</span><span class="p">):</span>
+<span class="linenos">205</span>        <span class="n">lb</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">m_bad</span><span class="p">(</span><span class="n">xb</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">yb</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+<span class="linenos">206</span>        <span class="n">opt4</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">();</span> <span class="n">lb</span><span class="o">.</span><span class="n">backward</span><span class="p">();</span> <span class="n">opt4</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">207</span>        <span class="n">lo</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">m_ok</span><span class="p">(</span><span class="n">xs</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">ys</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+<span class="linenos">208</span>        <span class="n">opt5</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">();</span> <span class="n">lo</span><span class="o">.</span><span class="n">backward</span><span class="p">();</span> <span class="n">opt5</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos">209</span>        <span class="k">if</span> <span class="n">step</span> <span class="o">%</span> <span class="mi">20</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos">210</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">step</span><span class="si">:</span><span class="s2">&gt;6d</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">lb</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;12.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">lo</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">&gt;12.4f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">211</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    两条 loss 曲线几乎一模一样，错误版本没有任何异常表现。"</span><span class="p">)</span>
+<span class="linenos">212</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    因为它学的是恒等映射：位置 t 的输入就是位置 t 的答案，"</span><span class="p">)</span>
+<span class="linenos">213</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    模型只要把 embedding 抄到输出即可——这同样能把 loss 压到很低。"</span><span class="p">)</span>
+<span class="linenos">214</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    **光看 loss 曲线分辨不出这个错误。** 分辨它要看生成结果："</span><span class="p">)</span>
+<span class="linenos">215</span>    <span class="n">g3</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">()</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">7</span><span class="p">)</span>
+<span class="linenos">216</span>    <span class="n">ob</span> <span class="o">=</span> <span class="n">m_bad</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">vocab</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"风吹"</span><span class="p">)]),</span> <span class="mi">8</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g3</span><span class="p">)</span>
+<span class="linenos">217</span>    <span class="n">g4</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">()</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">7</span><span class="p">)</span>
+<span class="linenos">218</span>    <span class="n">oo</span> <span class="o">=</span> <span class="n">m_ok</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">vocab</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"风吹"</span><span class="p">)]),</span> <span class="mi">8</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">g4</span><span class="p">)</span>
+<span class="linenos">219</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      正确模型：</span><span class="si">{</span><span class="n">vocab</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">oo</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">220</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      错误模型：</span><span class="si">{</span><span class="n">vocab</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">ob</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span><span class="si">!r}</span><span class="s2">   ← 在复读输入"</span><span class="p">)</span>
+<span class="linenos">221</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    训练脚本至少要有一个不依赖 loss 的检查：定期生成一小段看，"</span><span class="p">)</span>
+<span class="linenos">222</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    或者在留出集上算指标（本例只有一条数据，无法留出）。"</span><span class="p">)</span>
+<span class="linenos">223</span>    <span class="nb">print</span><span class="p">(</span><span class="n">SEP</span><span class="p">)</span>
+<span class="linenos">224</span>
+<span class="linenos">225</span>    <span class="c1"># ---------------------------------------------------------------- [B]</span>
+<span class="linenos">226</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"[B] 失败案例：detach 把梯度断在哪里"</span><span class="p">)</span>
+<span class="linenos">227</span>    <span class="n">m2</span> <span class="o">=</span> <span class="n">TinyLM</span><span class="p">(</span><span class="n">vocab</span><span class="o">.</span><span class="n">size</span><span class="p">,</span> <span class="n">d_model</span><span class="o">=</span><span class="n">D</span><span class="p">,</span> <span class="n">n_head</span><span class="o">=</span><span class="n">H</span><span class="p">,</span> <span class="n">n_layer</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="n">BS</span><span class="p">)</span>
+<span class="linenos">228</span>    <span class="k">for</span> <span class="n">tag</span><span class="p">,</span> <span class="n">use_detach</span> <span class="ow">in</span> <span class="p">((</span><span class="s2">"正常"</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span> <span class="p">(</span><span class="s2">"对 embedding 输出 detach"</span><span class="p">,</span> <span class="kc">True</span><span class="p">)):</span>
+<span class="linenos">229</span>        <span class="n">m2</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+<span class="linenos">230</span>        <span class="n">emb</span> <span class="o">=</span> <span class="n">m2</span><span class="o">.</span><span class="n">tok_emb</span><span class="p">(</span><span class="n">xs</span><span class="p">)</span>
+<span class="linenos">231</span>        <span class="k">if</span> <span class="n">use_detach</span><span class="p">:</span>
+<span class="linenos">232</span>            <span class="n">emb</span> <span class="o">=</span> <span class="n">emb</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+<span class="linenos">233</span>        <span class="n">h</span> <span class="o">=</span> <span class="n">emb</span> <span class="o">+</span> <span class="n">m2</span><span class="o">.</span><span class="n">pos_emb</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">xs</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]))</span>
+<span class="linenos">234</span>        <span class="k">for</span> <span class="n">blk</span> <span class="ow">in</span> <span class="n">m2</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span>
+<span class="linenos">235</span>            <span class="n">h</span> <span class="o">=</span> <span class="n">blk</span><span class="p">(</span><span class="n">h</span><span class="p">)</span>
+<span class="linenos">236</span>        <span class="n">lg2</span> <span class="o">=</span> <span class="n">m2</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">m2</span><span class="o">.</span><span class="n">ln_f</span><span class="p">(</span><span class="n">h</span><span class="p">))</span>
+<span class="linenos">237</span>        <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">lg2</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">ys</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos">238</span>        <span class="n">ge</span> <span class="o">=</span> <span class="n">m2</span><span class="o">.</span><span class="n">tok_emb</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">grad</span>
+<span class="linenos">239</span>        <span class="n">gh</span> <span class="o">=</span> <span class="n">m2</span><span class="o">.</span><span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">grad</span>
+<span class="linenos">240</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">tag</span><span class="si">:</span><span class="s2">&lt;24s</span><span class="si">}</span><span class="s2"> tok_emb.grad = "</span>
+<span class="linenos">241</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'None'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">ge</span><span class="w"> </span><span class="ow">is</span><span class="w"> </span><span class="kc">None</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="sa">f</span><span class="s1">'范数 </span><span class="si">{</span><span class="n">ge</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s1">.6f</span><span class="si">}</span><span class="s1">'</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos">242</span>              <span class="sa">f</span><span class="s2">" | lm_head.grad 范数 = </span><span class="si">{</span><span class="n">gh</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos">243</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">    detach 切断的是**这一条路径**上的梯度回传，它下游的参数照常拿到梯度。"</span><span class="p">)</span>
+<span class="linenos">244</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    这正是冻结部分模块的做法（VLM 冻结 ViT、LoRA 冻结主干），见 L4.6 / L7.5。"</span><span class="p">)</span>
+<span class="linenos">245</span>
+<span class="linenos">246</span>
+<span class="linenos">247</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos">248</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L0/walk_train.py 全文（248 行）</code><a href="../code/labs/L0/walk_train.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L0/walk_train.py
+</code></pre></div>
+
+<p>CPU，十几秒跑完，输出 121 行。</p>
+<h3 id="_10">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>先预测，再验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>把学习率从 <code>3e-3</code> 改成 <code>3e-1</code></td>
+<td>loss 会怎样？（提示：不是「降得更快」）</td>
+</tr>
+<tr>
+<td>把 AdamW 换成 <code>SGD(lr=3e-3)</code></td>
+<td>200 步之后 loss 大约是多少？为什么差这么多？</td>
+</tr>
+<tr>
+<td>删掉 <code>opt.zero_grad()</code></td>
+<td>梯度累加，等效学习率越来越大。第几步开始发散？</td>
+</tr>
+<tr>
+<td>在 <code>loss.backward()</code> 之后打印 <code>model.tok_emb.weight.grad.norm()</code></td>
+<td>它和 <code>lm_head</code> 的梯度范数差多少？为什么？</td>
+</tr>
+<tr>
+<td>把 <code>TinyBlock</code> 的残差去掉（<code>x = self.attn(...)</code>）</td>
+<td>训练 200 步后 loss 停在哪？梯度范数怎么变？</td>
+</tr>
+<tr>
+<td>把模型改成 <code>n_layer=8</code></td>
+<td>无残差时更难训练——这就是残差连接的意义</td>
+</tr>
+<tr>
+<td>手写 <code>cross_entropy</code>（<code>-log_softmax</code> 取标签项再平均）</td>
+<td>与框架实现逐位对比</td>
+</tr>
+</tbody>
+</table>
+<p>倒数第三行值得做完：残差连接对<strong>深</strong>模型才关键，两层看不出差别。</p>
+<hr />
+<h2 id="_11">原始现场</h2>
+<details>
+<summary>① 输入与标签的完整对齐表</summary>
+<div class="highlight"><pre><span></span><code>[0] 训练样本：输入与 labels
+    原文  '风吹过山谷，云落在水面'  (11 个字符)
+      位置     输入 x     标签 y   含义
+       0        风        吹   看到 '风' 之后应当预测 '吹'
+       1        吹        过   看到 '风吹' 之后应当预测 '过'
+       2        过        山   看到 '风吹过' 之后应当预测 '山'
+       3        山        谷   看到 '风吹过山' 之后应当预测 '谷'
+       4        谷        ，   看到 '风吹过山谷' 之后应当预测 '，'
+       5        ，        云   看到 '风吹过山谷，' 之后应当预测 '云'
+       6        云        落   看到 '风吹过山谷，云' 之后应当预测 '落'
+       7        落        在   看到 '风吹过山谷，云落' 之后应当预测 '在'
+       8        在        水   看到 '风吹过山谷，云落在' 之后应当预测 '水'
+       9        水        面   看到 '风吹过山谷，云落在水' 之后应当预测 '面'
+</code></pre></div>
+
+<p><strong>该看哪个字段</strong>：11 个字符只产生了 10 个训练位置。
+因为最后一个字符没有「下一个」可预测，它只能作为标签出现。
+所以长度为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>n</mi></mrow></math></span> 的文本给出 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>n</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 个训练信号。</p>
+<p><strong>下一步观察</strong>：把 <code>text</code> 换成一个 20 字的句子，确认位置数是 19。</p>
+<p>采集命令：<code>python labs/L0/walk_train.py</code>
+完整输出：<code>results/local/00b_walk_train.txt</code></p>
+</details>
+<details>
+<summary>② 手算梯度与 autograd 的逐元素对比</summary>
+<div class="highlight"><pre><span></span><code>[2] 手算梯度 vs autograd
+    先在一个两参数的函数上对拍，把链式法则写出来：
+      f(a, b) = (a * b + a)^2，  取 a=2, b=3
+      设 u = a*b + a = a(b+1)，f = u^2
+      df/du = 2u
+      du/da = b + 1,   du/db = a
+      df/da = 2u(b+1), df/db = 2u·a
+      代入 u = 8.0:  手算 df/da = 64.0, df/db = 32.0
+      autograd:      df/da = 64.0, df/db = 32.0
+      一致：True
+
+    再看模型里最靠近 loss 的那一层：lm_head。
+    交叉熵 + softmax 的梯度有一个简洁形式：dL/dlogits = (p - onehot(y)) / N
+    其中 p 是 softmax 输出，N 是参与平均的 token 数（这里 N=10）。
+    手算与 autograd 的最大绝对差 = 7.451e-09
+    位置 0 的梯度前 6 个：手算 [+0.006362, +0.008880, +0.004424, +0.005823, +0.003122, +0.004670]
+                              autograd [+0.006362, +0.008880, +0.004424, +0.005823, +0.003122, +0.004670]
+</code></pre></div>
+
+<p><strong>该看哪个字段</strong>：<code>7.451e-09</code> 是 fp32 的舍入误差量级，不是 0。
+两条路径做的浮点运算顺序不同，得到逐位相同才是意外。</p>
+<p><strong>注意这只验证了一个输入下的一致性</strong>，不能推广成「实现一定正确」。
+真正的验证工具是 <code>torch.autograd.gradcheck</code>：它用有限差分逐元素比对，
+并且会在多个随机输入上做。<a class="xref" href="../L2/2.8-custom-op-integration.html" title="把一个算子接进 PyTorch：注册、分发、backward 与 compile">L2.8</a> 用它验证自定义算子。</p>
+<p><strong>下一步观察</strong>：把 <code>f</code> 换成 <code>torch.sin(a*b)</code>，手写它的导数再对拍。</p>
+</details>
+<details>
+<summary>③ AdamW 的状态与显存账</summary>
+<div class="highlight"><pre><span></span><code>[4] 一次参数更新改了什么
+    lm_head.weight   (18, 32)  float32  前4个: [-0.1212, -0.0809, +0.0522, -0.1445]
+      .grad          (18, 32)  float32  前4个: [+0.0017, -0.0146, +0.0118, -0.0236]
+    梯度范数 |g| = 1.765255
+
+    (a) 最朴素的 SGD：w &lt;- w - lr * g
+      手算与 optimizer 的最大差 = 1.490e-08
+      w[0,0]: -0.121226 -&gt; -0.121391  (变化 -0.000165 = -0.1 × +0.001655)
+
+    (b) AdamW：多了两个和参数等大的状态张量
+      状态键：['exp_avg', 'exp_avg_sq', 'step']
+      exp_avg          (18, 32)  float32  前4个: [+0.0002, -0.0015, +0.0012, -0.0024]
+      exp_avg_sq       (18, 32)  float32  前4个: [+0.0000, +0.0000, +0.0000, +0.0000]
+      w[0,0]: -0.121226 -&gt; -0.221225
+      代价：参数 576 个 -&gt; 权重 2304 B + 状态 4608 B = 6912 B
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：</p>
+<ul>
+<li><code>exp_avg</code> 的前 4 个数正好是 <code>.grad</code> 前 4 个数的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><mn>10</mn></mrow></math></span>：
+  第一步 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi><mo>&#x0003D;</mo><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><msub><mi>&#x003B2;</mi><mn>1</mn></msub><mo stretchy="false">&#x00029;</mo><mi>g</mi><mo>&#x0003D;</mo><mn>0.1</mn><mi>g</mi></mrow></math></span>。可以逐个核对。</li>
+<li><code>exp_avg_sq</code> 显示成 <code>+0.0000</code> 是打印精度的问题，不是零。
+  它的真实量级是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><msub><mi>&#x003B2;</mi><mn>2</mn></msub><mo stretchy="false">&#x00029;</mo><msup><mi>g</mi><mn>2</mn></msup><mo>&#x0003D;</mo><mn>0.001</mn><mo>&#x000D7;</mo><msup><mi>g</mi><mn>2</mn></msup><mo>&#x02248;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>6</mn></mrow></msup></mrow></math></span>。</li>
+<li>SGD 那一步的变化量 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mn>0.000165</mn></mrow></math></span> 可以直接用 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mi>&#x003B7;</mi><mi>g</mi></mrow></math></span> 手算核对；
+  AdamW 那一步的变化量是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mn>0.1</mn></mrow></math></span>，正好等于 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mi>&#x003B7;</mi></mrow></math></span>。</li>
+</ul>
+<p><strong>下一步观察</strong>：把 AdamW 连续 <code>step()</code> 两次（同一个梯度），
+看第二步的变化量是不是仍然接近 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi></mrow></math></span>。（提示：偏差修正的分母在变。）</p>
+</details>
+<details>
+<summary>④ 失败案例：标签没有移位，loss 曲线看不出来</summary>
+<p>把标签写成 <code>y = x</code>（用位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 的输入预测位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 自己），
+与正确版本用相同的随机种子、相同的超参并排训练：</p>
+<div class="highlight"><pre><span></span><code>[A] 失败案例：labels 没有移位
+      step      错误 loss      正确 loss
+         0       3.1022       2.9957
+        20       0.2592       0.2390
+        40       0.0725       0.0668
+        60       0.0332       0.0305
+        80       0.0207       0.0191
+</code></pre></div>
+
+<p><strong>两条曲线几乎重合。</strong> 错误版本没有任何异常表现——
+它学的是恒等映射，模型只要把 embedding 抄到输出即可，
+这同样能把 loss 压得很低。</p>
+<p>分辨它要看生成结果：</p>
+<div class="highlight"><pre><span></span><code>      正确模型：'风吹过山谷，云落在水'
+      错误模型：'风吹吹过过过过过过过'   ← 在复读输入
+</code></pre></div>
+
+<p><strong>这是本章最重要的一条经验</strong>：loss 下降不等于训练正确。
+训练脚本至少要有一个不依赖 loss 的检查——
+定期生成一小段看，或者在留出集上算指标。</p>
+<p><strong>同类问题</strong>：因果掩码写错（<a class="xref" href="../L0/0.0-minimal-model-forward.html" title="最小完整模型（上）：张量、矩阵乘与一次生成">L0.0</a> 自测题 4）、
+数据里混进了答案、评测集泄漏到训练集。它们的共同点都是
+「模型找到了一条比学习更省力的捷径，而 loss 奖励了这条捷径」。</p>
+</details>
+<details>
+<summary>⑤ detach 把梯度断在哪里</summary>
+<div class="highlight"><pre><span></span><code>[B] 失败案例：detach 把梯度断在哪里
+    正常                       tok_emb.grad = 范数 0.126201 | lm_head.grad 范数 = 1.728341
+    对 embedding 输出 detach    tok_emb.grad = None        | lm_head.grad 范数 = 1.728341
+</code></pre></div>
+
+<p><strong>该看哪个字段</strong>：<code>tok_emb.grad</code> 从「范数 0.126」变成 <code>None</code>——
+不是变成 0，是<strong>从未被填充</strong>。而 <code>lm_head.grad</code> 的范数<strong>完全没变</strong>（1.728341）。</p>
+<p><code>detach()</code> 切断的是这条路径上的梯度回传，
+它<strong>下游</strong>（更靠近 loss 的一侧）的参数照常拿到梯度。</p>
+<p>这正是「冻结部分模块」的实现方式：</p>
+<ul>
+<li>VLM 训练第一阶段冻结视觉编码器，只训 connector（<span class="xref pending" title="VLM（二）：视觉编码器与 connector（尚未写）">L4.6</span>）</li>
+<li>LoRA 冻结整个主干，只训低秩旁路（<span class="xref pending" title="RL / 后训练基础设施（尚未写）">L7.5</span>）</li>
+</ul>
+<p>两者都不是「不算梯度」，而是「不更新那部分参数」——
+实现上可以用 <code>detach()</code>、<code>requires_grad_(False)</code>，
+或者干脆不把那些参数交给 optimizer。三种做法在<strong>显存</strong>上的差别不同，
+<span class="xref pending" title="RL / 后训练基础设施（尚未写）">L7.5</span> 会区分。</p>
+</details>
+<hr />
+<h2 id="_12">前沿</h2>
+<p>本章讲的是最基本的一步。它在真实训练里会被下面这些东西包住，各自解决一个具体问题：</p>
+<table>
+<thead>
+<tr>
+<th>加进来的东西</th>
+<th>解决什么</th>
+<th>代价</th>
+<th>章节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>混合精度（bf16 权重 + fp32 主权重）</td>
+<td>显存与带宽减半</td>
+<td>需要处理数值范围</td>
+<td><a class="xref" href="../L4/4.2-numerics.html" title="数值系统与确定性">L4.2</a> / <span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span></td>
+</tr>
+<tr>
+<td>梯度裁剪</td>
+<td>偶发的大梯度会毁掉训练</td>
+<td>多一次全局归约</td>
+<td><span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span></td>
+</tr>
+<tr>
+<td>学习率调度（warmup + 衰减）</td>
+<td>开始时参数还没「对齐」，大步长会发散</td>
+<td>多一个超参</td>
+<td><span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span></td>
+</tr>
+<tr>
+<td>梯度累积</td>
+<td>用小显存模拟大 batch</td>
+<td>更新频率降低</td>
+<td><span class="xref pending" title="一个 batch 走完训练步：labels、loss、梯度、更新与恢复（尚未写）">L7.0b</span></td>
+</tr>
+<tr>
+<td>activation checkpointing</td>
+<td>不保存中间值，反向时重算</td>
+<td>约 +33% 计算</td>
+<td><span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span></td>
+</tr>
+<tr>
+<td>ZeRO / FSDP</td>
+<td>把权重、梯度、优化器状态切到多卡</td>
+<td>通信</td>
+<td><span class="xref pending" title="训练并行：ZeRO 到 zero-bubble（尚未写）">L7.2</span></td>
+</tr>
+<tr>
+<td>8-bit / paged 优化器</td>
+<td>优化器状态从 8 B 降到 2 B</td>
+<td>数值精度</td>
+<td><span class="xref pending" title="RL / 后训练基础设施（尚未写）">L7.5</span></td>
+</tr>
+</tbody>
+</table>
+<p>最后一行值得注意：本章算出「优化器状态是权重的 2 倍」，
+这个比例正是那些优化器要攻击的目标。</p>
+<hr />
+<h2 id="_13">陷阱</h2>
+<p><strong>1. 忘记 <code>zero_grad()</code>。</strong> PyTorch 的 <code>.grad</code> 是累加的。
+不清零时等效学习率会逐步变大，训练往往不是立刻崩，而是过一阵才发散——很难查。</p>
+<p><strong>2. 用 loss 曲线判断训练是否正确。</strong> 本章的失败案例 [A] 里，
+错误版本的 loss 曲线和正确版本几乎重合。
+<strong>必须有一个不依赖 loss 的检查。</strong></p>
+<p><strong>3. 以为 <code>detach()</code> 等于「不算梯度」。</strong> 它只切断这一条路径，
+下游参数照常有梯度，前向的中间值也照常被保存。
+要省显存得用 <code>torch.no_grad()</code> 或不注册参数。</p>
+<p><strong>4. 忽略 padding 位置的 loss。</strong> 分母数错会让 loss 被稀释，
+不同长度的 batch 之间不可比。<span class="xref pending" title="一个 batch 走完训练步：labels、loss、梯度、更新与恢复（尚未写）">L7.0b</span> 展开。</p>
+<p><strong>5. 把 <code>exp_avg_sq</code> 打印出的 <code>0.0000</code> 当成零。</strong>
+它的量级是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>6</mn></mrow></msup></mrow></math></span>，只是打印精度不够。
+调试数值问题时永远用科学计数法看。</p>
+<p><strong>6. 只在一条数据上验证训练代码就上大规模。</strong>
+「能过拟合一条数据」是必要条件，不是充分条件。
+它能排除梯度链路的 bug，排除不了数据管线、学习率、并行策略的问题。</p>
+<hr />
+<h2 id="_14">自测题</h2>
+<details>
+<summary>1. 一个 7B 模型用 AdamW 训练，纯 fp32，光「权重 + 梯度 + 优化器状态」要多少显存？</summary>
+<p><strong>逐项算。</strong> 设参数量 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi><mo>&#x0003D;</mo><mn>7</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mn>9</mn></msup></mrow></math></span>。</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>每参数字节</th>
+<th>合计</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>权重</td>
+<td>4</td>
+<td>28 GB</td>
+</tr>
+<tr>
+<td>梯度</td>
+<td>4</td>
+<td>28 GB</td>
+</tr>
+<tr>
+<td>AdamW <code>exp_avg</code></td>
+<td>4</td>
+<td>28 GB</td>
+</tr>
+<tr>
+<td>AdamW <code>exp_avg_sq</code></td>
+<td>4</td>
+<td>28 GB</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>16</strong></td>
+<td><strong>112 GB</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>112 GB</strong>，而 H100 是 80 GB。单卡放不下——<strong>而且这还没算 activation。</strong></p>
+<p><strong>混合精度不会让它降到 1/4。</strong> 常见的 bf16 混合精度配方是：
+bf16 权重副本（2 B）+ bf16 梯度（2 B）+ fp32 主权重（4 B）+ fp32 优化器状态（8 B）
+= 16 B，<strong>和纯 fp32 一样</strong>。省下来的是激活值和通信量，不是这三项。</p>
+<p>（有些实现把主权重与 <code>exp_avg</code> 合并或用 8-bit 优化器，那是另一回事，见 <span class="xref pending" title="RL / 后训练基础设施（尚未写）">L7.5</span>。）</p>
+<p><strong>这就是 ZeRO 的出发点</strong>：这三项在数据并行时每张卡都存了一份完全相同的副本，
+纯属浪费。ZeRO-1/2/3 依次把优化器状态、梯度、权重切开分到各卡。<span class="xref pending" title="训练并行：ZeRO 到 zero-bubble（尚未写）">L7.2</span> 展开。</p>
+</details>
+<details>
+<summary>2. 我把学习率从 3e-3 改成 3e-1，loss 会「降得更快」吗？</summary>
+<p><strong>不会，多半会发散。</strong></p>
+<p>先想清楚 AdamW 的更新量。前面推过，第一步时</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mrow><mo stretchy="true" fence="true" form="prefix">&#x0007C;</mo><mi>&#x00394;</mi><mi>w</mi><mo stretchy="true" fence="true" form="postfix">&#x0007C;</mo></mrow><mo>&#x0003D;</mo><mi>&#x003B7;</mi><mrow><mo stretchy="true" fence="true" form="prefix">&#x0007C;</mo><mfrac><mrow><mover accent="true"><mi>m</mi><mo>&#x0005E;</mo></mover></mrow><mrow><msqrt><mrow><mover accent="true"><mi>v</mi><mo>&#x0005E;</mo></mover></mrow></msqrt><mo>&#x0002B;</mo><mi>&#x003F5;</mi></mrow></mfrac><mo stretchy="true" fence="true" form="postfix">&#x0007C;</mo></mrow><mo>&#x02248;</mo><mi>&#x003B7;</mi></mrow></math></div></p>
+<p>也就是说，<strong>每个参数每一步的变化量大约就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi></mrow></math></span></strong>，与梯度大小基本无关。</p>
+<p>本章参数的初始值量级是多少？<code>lm_head.weight</code> 的前几个数是
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mn>0.12</mn><mo>&#x0002C;</mo><mo>&#x02212;</mo><mn>0.08</mn><mo>&#x0002C;</mo><mo>&#x0002B;</mo><mn>0.05</mn><mo>&#x0002C;</mo><mo>&#x02212;</mo><mn>0.14</mn></mrow></math></span>，量级约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>0.1</mn></mrow></math></span>。</p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi><mo>&#x0003D;</mo><mn>3</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>3</mn></mrow></msup></mrow></math></span> 时，一步改动 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>0.003</mn></mrow></math></span>，是参数量级的 3%——合理。
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi><mo>&#x0003D;</mo><mn>0.3</mn></mrow></math></span> 时，一步改动 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>0.3</mn></mrow></math></span>，<strong>比参数本身还大 3 倍</strong>。
+参数每一步都被推到一个和上一步几乎无关的位置，这不是优化，是随机游走。</p>
+<p><strong>实际会观察到</strong>：loss 先剧烈震荡，然后可能变成 <code>nan</code>
+（logits 爆炸 → softmax 溢出 → loss 为 inf → 梯度为 nan → 参数全部变 nan）。</p>
+<p><strong>判断学习率是否合理的一个经验法则</strong>：
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi></mrow></math></span> 应当比参数的典型量级小 1–2 个数量级。
+真实模型里 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi></mrow></math></span> 越大初始化越小（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x0007E;</mi><mn>1</mn><mo>&#x0002F;</mo><msqrt><mrow><mi>d</mi></mrow></msqrt></mrow></math></span>），所以大模型的学习率也更小。</p>
+<p><strong>warmup 的作用</strong>也在这里：训练最开始参数还是随机的，梯度方向不可靠，
+先用很小的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi></mrow></math></span> 走几百步，等 <code>exp_avg_sq</code> 积累出合理的尺度估计再放大。</p>
+</details>
+<details>
+<summary>3. 我删掉了 <code>opt.zero_grad()</code>，为什么模型不是立刻崩，而是训练一阵才出问题？</summary>
+<p><strong>因为梯度是累加的，等效学习率是逐步变大的。</strong></p>
+<p>设第 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 步的真实梯度是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>g</mi><mi>t</mi></msub></mrow></math></span>。不清零时，<code>.grad</code> 里的内容是</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>G</mi><mi>t</mi></msub><mo>&#x0003D;</mo><msub><mi>g</mi><mn>1</mn></msub><mo>&#x0002B;</mo><msub><mi>g</mi><mn>2</mn></msub><mo>&#x0002B;</mo><mo>&#x02026;</mo><mo>&#x0002B;</mo><msub><mi>g</mi><mi>t</mi></msub></mrow></math></div></p>
+<p><strong>早期</strong>（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 小）：各步梯度方向相近，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>G</mi><mi>t</mi></msub><mo>&#x02248;</mo><mi>t</mi><mo>&#x000B7;</mo><mover><mi>g</mi><mo stretchy="true">&#x000AF;</mo></mover></mrow></math></span>，
+相当于学习率被放大了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 倍。<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x0003D;</mo><mn>2</mn><mo>&#x0002C;</mo><mn>3</mn></mrow></math></span> 时只是走得快一点，loss 甚至可能降得更快。</p>
+<p><strong>中期</strong>：等效学习率线性增长。到第 30 步时相当于 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B7;</mi></mrow></math></span> 放大 30 倍，
+按上一题的分析，参数开始被推到不合理的位置。</p>
+<p><strong>注意 AdamW 会掩盖这个问题一段时间。</strong> 因为它对梯度做了归一化：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>&#x00394;</mi><mi>w</mi><mo>&#x02248;</mo><mi>&#x003B7;</mi><mspace width="0.167em" /><mfrac><mrow><mover accent="true"><mi>m</mi><mo>&#x0005E;</mo></mover></mrow><mrow><msqrt><mrow><mover accent="true"><mi>v</mi><mo>&#x0005E;</mo></mover></mrow></msqrt></mrow></mfrac></mrow></math></div></p>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>G</mi><mi>t</mi></msub></mrow></math></span> 整体放大 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 倍时，分子分母同时放大 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 倍，<strong>约掉了</strong>。
+所以 AdamW 下这个 bug 比 SGD 下更隐蔽——真正出问题的是
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>G</mi><mi>t</mi></msub></mrow></math></span> 里各步方向不一致带来的<strong>噪声累积</strong>，而不是尺度。</p>
+<p><strong>怎么查</strong>：在训练循环里打印 <code>grad.norm()</code>。
+正常训练时它应当大致平稳或缓慢下降；单调线性增长就是没清零。</p>
+<p><strong>这个设计为什么存在</strong>：梯度累加是有意的，它让梯度累积（gradient accumulation）
+成为可能——把一个大 batch 拆成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi></mrow></math></span> 个小 batch，
+各自 <code>backward()</code> 后再一次 <code>step()</code>。<span class="xref pending" title="一个 batch 走完训练步：labels、loss、梯度、更新与恢复（尚未写）">L7.0b</span> 展开。</p>
+</details>
+<details>
+<summary>4. <code>tok_emb</code> 的梯度范数是 0.126，<code>lm_head</code> 是 1.728，差了 13 倍。这正常吗？</summary>
+<p><strong>正常，而且方向可以预期。</strong> 有两个原因。</p>
+<p><strong>原因一：离 loss 的距离不同。</strong> <code>lm_head</code> 直接产生 logits，
+它的梯度就是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02202;</mo><mi>L</mi><mo>&#x0002F;</mo><mo>&#x02202;</mo><mtext>logits</mtext></mrow></math></span> 乘上输入——一步到位。
+<code>tok_emb</code> 在最前面，梯度要穿过两层 attention + MLP + 若干 LayerNorm 才到达，
+中间每一步都乘上一个雅可比矩阵，量级会衰减。</p>
+<p><strong>原因二：更新的稀疏性不同。</strong> <code>lm_head.weight</code> 的<strong>每一行</strong>都参与了每个位置的计算
+（因为要给所有 18 个字符打分），所以每行都有梯度。
+<code>tok_emb.weight</code> 只有本次出现过的那几个 token 对应的行才有非零梯度——
+本例 10 个位置最多涉及 10 行，其余 8 行梯度是 0。</p>
+<p><strong>所以「梯度范数」这个量在跨层比较时要小心。</strong> 更有意义的比较是
+<strong>相对量</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo fence="false" stretchy="false">&#x02016;</mo><mi>g</mi><mo fence="false" stretchy="false">&#x02016;</mo><mo>&#x0002F;</mo><mo fence="false" stretchy="false">&#x02016;</mo><mi>w</mi><mo fence="false" stretchy="false">&#x02016;</mo></mrow></math></span>（梯度与参数的比值），
+它大致对应「这一步会把参数改变百分之多少」。</p>
+<p><strong>什么时候该担心</strong>：如果某一层的梯度范数比相邻层小几个数量级
+（比如 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>8</mn></mrow></msup></mrow></math></span> vs <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>2</mn></mrow></msup></mrow></math></span>），那才是梯度消失。
+判断依据是<strong>层与层之间的比值</strong>，不是绝对值。</p>
+<p><strong>怎么看</strong>：训练时打印每一层的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo fence="false" stretchy="false">&#x02016;</mo><mi>g</mi><mo fence="false" stretchy="false">&#x02016;</mo><mo>&#x0002F;</mo><mo fence="false" stretchy="false">&#x02016;</mo><mi>w</mi><mo fence="false" stretchy="false">&#x02016;</mo></mrow></math></span>，正常时各层应在同一数量级。
+这也是残差连接与归一化层要保证的事情之一（<a class="xref" href="../L4/4.1-transformer-anatomy.html" title="Transformer 层解剖与从零实现">L4.1</a>）。</p>
+</details>
+<details>
+<summary>5. 训练时 10 个位置的预测一次算完，生成时却必须一个一个来。为什么不能反过来？</summary>
+<p><strong>关键在于「下一步的输入是否已知」。</strong></p>
+<p><strong>训练时</strong>，整条序列是已知的真实文本。位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 的输入是真实的第 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 个字符，
+不依赖模型在位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 的输出。所以 10 个位置的计算<strong>互不依赖</strong>，
+可以放进同一个矩阵乘一次算完（teacher forcing）。</p>
+<p><strong>生成时</strong>，位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 的输入是模型在位置 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 采样出来的字符。
+不先算出 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span>，就不知道 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi></mrow></math></span> 该喂什么。这是一条<strong>串行的依赖链</strong>，
+没法并行。</p>
+<p>这个差别决定了两种负载的性质完全不同：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>训练 / prefill</th>
+<th>生成 / decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一次处理的位置数</td>
+<td>整条序列</td>
+<td>1 个</td>
+</tr>
+<tr>
+<td>矩阵乘的形状</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> 乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span></td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span> 乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>d</mi><mo>&#x000D7;</mo><mi>d</mi></mrow></math></span></td>
+</tr>
+<tr>
+<td>瓶颈</td>
+<td>算力</td>
+<td><strong>显存带宽</strong></td>
+</tr>
+<tr>
+<td>原因</td>
+<td>矩阵够大，算术强度高</td>
+<td>每个权重只被用一次就换下一个</td>
+</tr>
+</tbody>
+</table>
+<p>decode 之所以是带宽瓶颈：为了算一个 token，
+要把<strong>整个模型的权重</strong>从显存读一遍，而只做了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>d</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 次乘加。
+读 1.4 GB 权重、算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>1.4</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mn>9</mn></msup></mrow></math></span> 次浮点运算，
+算术强度约 1 FLOP/字节——远低于 GPU 的平衡点（约 200+）。</p>
+<p>这是本书 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a>（资源账本）、<a class="xref" href="../L5/5.1-prefill-decode.html" title="prefill 与 decode 的系统性质">L5.1</a>（prefill/decode 性质）的核心，
+也是投机解码（<a class="xref" href="../L5/5.5-speculative-decoding.html" title="投机解码">L5.5</a>）的动机：<strong>既然带宽已经花了，不如一次多验证几个 token。</strong></p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L0/0.0-minimal-model-forward.html">&#8592; 0.0 最小完整模型（上）：张量、矩阵乘与一次生成</a><a class="nav-next" href="../L0/0.1-request-lifecycle.html">0.1 从 HTTP 到 SASS：一次请求的完整调用栈 &#8594;</a></nav>
+</main>
+</body>
+</html>

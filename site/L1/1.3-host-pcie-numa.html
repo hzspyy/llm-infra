@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.3 主机侧：NUMA、PCIe 与 DMA</title>
+<link rel="stylesheet" href="../assets/style.css?v=60262162">
+<link rel="stylesheet" href="../assets/code.css?v=60262162">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <div class="sidebar-id">1.3</div>
+  <div class="sidebar-title">主机侧：NUMA、PCIe 与 DMA</div>
+  <nav class="toc"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#pcie">心智模型：主机内存、PCIe 与显存的连接</a></li>
+<li><a href="#_2">机制拆解</a><ul>
+<li><a href="#pinned">pinned 内存：为什么快一倍</a></li>
+<li><a href="#_3">传输大小：小块传输几乎全是开销</a></li>
+<li><a href="#numa">NUMA：为什么这组传输测试的差异较小</a></li>
+<li><a href="#p2p-numa">P2P：真正决定带宽的不是 NUMA，是链路宽度</a></li>
+<li><a href="#_4">多流重叠：除了拷贝引擎，还要检查主机内存</a></li>
+</ul>
+</li>
+<li><a href="#_5">工程实现 · 源码走读：引擎在哪里用到这些</a><ul>
+<li><a href="#1-vllm-pinned">1. vLLM 的 pinned 缓冲池</a></li>
+<li><a href="#2-kv">2. KV 卸载：为什么值得</a></li>
+<li><a href="#3-pd-kv">3. PD 分离的 KV 传输：账不一样</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">建议你做的消融</a></li>
+</ul>
+</li>
+<li><a href="#_8">原始现场</a></li>
+<li><a href="#_9">前沿</a></li>
+<li><a href="#_10">陷阱</a></li>
+<li><a href="#_11">自测题</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L1 · 硬件与操作系统底座</div>
+  <div class="mod-id">1.3</div>
+  <h1>主机侧：NUMA、PCIe 与 DMA</h1>
+  <p class="lede">沿主机到显存的路径，比较 pageable 与 pinned 内存、小块传输、NUMA 与 PCIe 拓扑；分析多流重叠还受哪些资源限制。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, PCIe 5.0) + worldvln (5× L40S, PCIe 4.0, 双 NUMA)</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（带宽-延迟积）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><code>pin_memory=True</code> 到底做了什么？为什么它能让传输快一倍？</li>
+<li><strong>NUMA 亲和性对 GPU 传输有多大影响</strong>？（答案可能和你听说的不一样）</li>
+<li>H2D 与 D2H 能同时跑吗？<strong>决定它的不是拷贝引擎数量。</strong></li>
+</ol>
+<p>这一章关注数据如何在主机内存和 GPU 显存之间移动。
+H2D 表示主机到设备，D2H 表示设备到主机；PCIe 是这里的连接通道。
+NUMA 表示不同 CPU 对不同内存区域的访问成本可能不同。
+我们会分别检查内存类型、传输大小和连接拓扑，而不是用一个带宽数字解释所有情况。</p>
+<hr />
+<h2 id="pcie">心智模型：主机内存、PCIe 与显存的连接</h2>
+<figure>
+<svg viewBox="0 0 740 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="主机到 GPU 的数据通路">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">一份权重从磁盘到 tensor core 要过几道关</text>
+
+    <!-- boxes -->
+    <rect x="12" y="36" width="118" height="46" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <text x="71" y="56" text-anchor="middle" font-size="11">NVMe / NFS</text>
+    <text x="71" y="72" text-anchor="middle" font-size="10" opacity="0.75">GB/s 量级</text>
+
+    <rect x="160" y="36" width="150" height="46" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <text x="235" y="53" text-anchor="middle" font-size="11">主机内存（pageable）</text>
+    <text x="235" y="70" text-anchor="middle" font-size="10" opacity="0.75">可被换出，地址会变</text>
+
+    <rect x="340" y="36" width="150" height="46" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <text x="415" y="53" text-anchor="middle" font-size="11">pinned（页锁定）缓冲</text>
+    <text x="415" y="70" text-anchor="middle" font-size="10" opacity="0.75">物理地址固定，可 DMA</text>
+
+    <rect x="560" y="36" width="168" height="46" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <text x="644" y="53" text-anchor="middle" font-size="11">GPU 显存</text>
+    <text x="644" y="70" text-anchor="middle" font-size="10" opacity="0.75">1674 GB/s（L1.1 实测）</text>
+
+    <g stroke="currentColor" stroke-width="1.2" fill="none" opacity="0.7">
+      <line x1="130" y1="59" x2="158" y2="59"/>
+      <line x1="310" y1="59" x2="338" y2="59"/>
+      <line x1="490" y1="59" x2="558" y2="59"/>
+    </g>
+    <text x="524" y="100" text-anchor="middle" font-size="10.5" font-weight="600">PCIe</text>
+    <text x="524" y="115" text-anchor="middle" font-size="10">Gen5 47 GB/s</text>
+    <text x="524" y="129" text-anchor="middle" font-size="10">Gen4 25 GB/s</text>
+
+    <text x="235" y="110" font-size="10.5" opacity="0.85">pageable 的额外一跳：</text>
+    <text x="235" y="125" font-size="10" opacity="0.75">driver 先拷进临时 pinned 缓冲</text>
+    <text x="235" y="139" font-size="10" opacity="0.75">→ 实测慢 <tspan font-weight="600">2.00×</tspan></text>
+
+    <!-- the ratio -->
+    <line x1="12" y1="158" x2="728" y2="158" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="182" font-size="12" font-weight="600">这条管子有多窄</text>
+    <rect x="12" y="196" width="700" height="22" fill="currentColor" opacity="0.72"/>
+    <text x="362" y="211" text-anchor="middle" font-size="11" fill="var(--bg)">显存 1674 GB/s</text>
+    <rect x="12" y="224" width="20" height="22" fill="currentColor" opacity="0.45"/>
+    <text x="42" y="239" font-size="11">PCIe 5.0 47 GB/s —— <tspan font-weight="600">窄 35 倍</tspan></text>
+    <rect x="12" y="252" width="10" height="22" fill="currentColor" opacity="0.3"/>
+    <text x="42" y="267" font-size="11">PCIe 4.0 25 GB/s —— 窄 67 倍</text>
+
+    <text x="12" y="300" font-size="11">凡是要过这根管子的：加载权重、KV 卸载到主机、PD 分离传 KV、</text>
+    <text x="12" y="318" font-size="11">无 NVLink 时的多卡通信 —— 都被它卡着（L6.1、L6.4）。</text>
+
+    <line x1="12" y1="336" x2="728" y2="336" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="360" font-size="11.5" font-weight="600">本章两个反直觉结论</text>
+    <text x="12" y="380" font-size="11">① NUMA 亲和性对 H2D <tspan font-weight="600">毫无影响</tspan>（PCIe 更慢，掩盖了它）</text>
+    <text x="12" y="398" font-size="11">② H2D/D2H 能否重叠，取决于<tspan font-weight="600">主机内存带宽</tspan>，不是拷贝引擎数量</text>
+  </g>
+</svg>
+<figcaption>主机侧的数据通路。所有带宽为本机实测。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_2">机制拆解</h2>
+<h3 id="pinned">pinned 内存：为什么快一倍</h3>
+<p><strong>pageable（普通）内存</strong>可以被操作系统换出到磁盘，物理地址随时可能变。
+而 DMA 引擎只认物理地址、且传输期间地址不能变。所以 driver 必须：</p>
+<ol>
+<li>分配一块临时的 pinned 缓冲</li>
+<li><strong>CPU 把数据从 pageable 拷到 pinned</strong>（一次完整的内存拷贝）</li>
+<li>从 pinned DMA 到 GPU</li>
+</ol>
+<p><strong>pinned（页锁定）内存</strong>由 <code>cudaHostAlloc</code> / <code>pin_memory=True</code> 分配，
+内核保证它不被换出，物理地址固定 → 直接 DMA，省掉第 2 步。</p>
+<p>实测（crater，PCIe 5.0，256 MB）：</p>
+<div class="highlight"><pre><span></span><code>h2d_pinned           47.2 GB/s
+d2h_pinned           42.1 GB/s
+h2d_pageable         23.6 GB/s        ← 恰好一半
+d2h_pageable         15.3 GB/s
+pinned 相对 pageable 的加速：H2D 2.00×，D2H 2.75×
+</code></pre></div>
+
+<p><strong>H2D 正好 2.00×</strong>：因为多出的那次 CPU 拷贝要占用同样多的内存带宽。
+D2H 更差（2.75×），因为写 pageable 内存还要处理页错误。</p>
+<p>代价：pinned 内存<strong>不能被换出</strong>，占满物理内存会让整个系统变慢甚至 OOM。
+所以引擎都用固定大小的 pinned 缓冲池，而不是把所有 host 张量都 pin 住。</p>
+<h3 id="_3">传输大小：小块传输几乎全是开销</h3>
+<div class="highlight"><pre><span></span><code>[B] 传输大小 vs 有效带宽（crater, pinned, H2D）
+        大小      GB/s       耗时us    固定开销占比
+      4 KB       0.8        5.3        100%
+     16 KB       3.1        5.3        101%
+     64 KB      12.3        5.3        101%
+    256 KB      38.6        6.8         79%
+      1 MB      45.0       23.3         23%
+      4 MB      46.0       91.3          6%
+     16 MB      46.8      358.8          1%
+    256 MB      47.3     5675.0          0%
+</code></pre></div>
+
+<p><strong>4 KB 到 64 KB 的耗时完全一样（5.3 µs）</strong> —— 这段全部是固定开销：
+kernel launch、DMA 描述符设置、同步。数据本身的传输时间可以忽略。</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>有效带宽</mtext><mo>&#x0003D;</mo><mfrac><mrow><mi>S</mi></mrow><mrow><msub><mi>t</mi><mrow><mtext>fixed</mtext></mrow></msub><mo>&#x0002B;</mo><mi>S</mi><mo>&#x0002F;</mo><mi>B</mi><msub><mi>W</mi><mrow><mtext>peak</mtext></mrow></msub></mrow></mfrac></mrow></math></div></p>
+<p>要达到峰值的 90%，需要 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x02265;</mo><mn>9</mn><mo>&#x000D7;</mo><msub><mi>t</mi><mrow><mtext>fixed</mtext></mrow></msub><mo>&#x000D7;</mo><mi>B</mi><mi>W</mi></mrow></math></span>：
+crater 上是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>9</mn><mo>&#x000D7;</mo><mn>5.3</mn><mspace width="0.167em" /><mi>&#x003BC;</mi><mi>s</mi><mo>&#x000D7;</mo><mn>47</mn><mspace width="0.167em" /><mtext>GB/s</mtext><mo>&#x02248;</mo><mn>2.2</mn></mrow></math></span> MB。</p>
+<p>worldvln（PCIe 4.0）的固定开销是 <strong>11.3 µs</strong>，是 crater 的两倍多——
+主机 CPU 单核性能差（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 里 kernel launch 也是 5.03 vs 2.68 µs，同一个原因）。</p>
+<p><strong>工程含义</strong>：PD 分离传 KV 时（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>），如果按 16 token 的块逐块传，
+每块只有 1.8 MB（Qwen3-1.7B）—— 勉强够。但如果按更细的粒度传，
+固定开销会吃掉一切。<strong>必须批量聚合。</strong></p>
+<h3 id="numa">NUMA：为什么这组传输测试的差异较小</h3>
+<p>worldvln 是双路 Xeon 8476C，GPU 分属两个 NUMA 节点：</p>
+<div class="highlight"><pre><span></span><code>GPU0  bus=16:00.0  numa_node=0
+GPU1  bus=38:00.0  numa_node=0
+GPU2  bus=4a:00.0  numa_node=0
+GPU3  bus=a8:00.0  numa_node=1
+GPU4  bus=d8:00.0  numa_node=1
+</code></pre></div>
+
+<p>常见建议是"把 pinned 内存分配在 GPU 所在的 NUMA 节点上"。测一下 2×2 矩阵：</p>
+<table>
+<thead>
+<tr>
+<th>内存/CPU 绑定</th>
+<th>目标 GPU</th>
+<th>GPU 的 NUMA</th>
+<th>h2d_pinned</th>
+<th>d2h_pinned</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>node 0</td>
+<td>GPU0</td>
+<td>0（本地）</td>
+<td><strong>25.0</strong></td>
+<td>27.0</td>
+</tr>
+<tr>
+<td>node 0</td>
+<td>GPU3</td>
+<td>1（跨节点）</td>
+<td><strong>25.0</strong></td>
+<td>27.0</td>
+</tr>
+<tr>
+<td>node 1</td>
+<td>GPU0</td>
+<td>0（跨节点）</td>
+<td><strong>25.0</strong></td>
+<td>27.0</td>
+</tr>
+<tr>
+<td>node 1</td>
+<td>GPU3</td>
+<td>1（本地）</td>
+<td><strong>25.1</strong></td>
+<td>27.0</td>
+</tr>
+</tbody>
+</table>
+<p><strong>四种组合完全一样。NUMA 亲和性对 H2D/D2H 没有可测量的影响。</strong></p>
+<p>这个负结果有两种可能的解释，必须用对照实验区分：</p>
+<ul>
+<li><strong>(a)</strong> 这台机器的跨 NUMA 链路根本不慢</li>
+<li><strong>(b)</strong> 跨 NUMA 确实慢，但 PCIe 更慢，瓶颈不在那里</li>
+</ul>
+<p>把 GPU 拿掉，只测 CPU 侧内存带宽（<code>labs/L1/numa_bandwidth.py</code>）：</p>
+<div class="highlight"><pre><span></span><code>node distances:      node   0   1
+                       0:  10  21          ← 跨节点"距离"是本地的 2.1 倍
+                       1:  21  10
+
+CPU 在 node0，内存绑 node0（本地）：  copy 20.5 GB/s   read 8.9 GB/s
+CPU 在 node0，内存绑 node1（跨节点）：copy 16.0 GB/s   read 6.8 GB/s
+                                      ↓ 慢 22%          ↓ 慢 24%
+8 进程聚合（本地）：                   58.2 GB/s
+8 进程聚合（跨节点）：                 61.6 GB/s → 之前测得，同量级
+</code></pre></div>
+
+<p><strong>结论是 (b)</strong>：跨 NUMA 确实有 22–24% 的惩罚，但即使跨节点也能提供
+远超 PCIe 4.0（25 GB/s）的带宽，所以 PCIe 始终是瓶颈，NUMA 的影响被完全掩盖。</p>
+<div class="admonition note">
+<p class="admonition-title">什么时候 NUMA 又会重要起来</p>
+<ol>
+<li><strong>PCIe 5.0 / CXL 上</strong>：管子变宽到接近内存带宽时，NUMA 惩罚就会显现。</li>
+<li><strong>CPU 侧的重活</strong>：分词、detokenize、采样后处理、dataloader（<span class="xref pending" title="数据、checkpoint 与容错（尚未写）">L7.4</span>）——
+   这些是纯 CPU 内存访问，22% 的惩罚直接生效。</li>
+<li><strong>GPUDirect RDMA</strong>：网卡与 GPU 跨 NUMA 时，惩罚会显现（<a class="xref" href="../L1/1.5-network-storage.html" title="网络与存储底座">L1.5</a>、<span class="xref pending" title="集合通信与成本模型（尚未写）">L6.1</span>）。</li>
+<li><strong>统一内存 / Grace-Blackwell</strong>：CPU 与 GPU 共享内存空间时，NUMA 就是一等公民。</li>
+</ol>
+<p>所以「绑 NUMA」的建议不是错的，只是<strong>在这台机器的这个测试上不生效</strong>。
+知道原因，你才知道换台机器要不要重测。</p>
+</div>
+<h3 id="p2p-numa">P2P：真正决定带宽的不是 NUMA，是链路宽度</h3>
+<p>worldvln 五张卡的点对点带宽矩阵（单向，256 MB）：</p>
+<div class="highlight"><pre><span></span><code>             GPU0          GPU1          GPU2          GPU3          GPU4
+GPU0      -            22.6(NODE)    11.3(NODE)    22.6(SYS )    22.6(SYS )
+GPU1     22.6(NODE)     -            11.3(NODE)    22.6(SYS )    22.6(SYS )
+GPU2     13.5(NODE)    13.5(NODE)     -            13.5(SYS )    13.5(SYS )
+GPU3     22.7(SYS )    22.7(SYS )    11.3(SYS )     -            22.7(NODE)
+GPU4     22.6(SYS )    22.7(SYS )    11.3(SYS )    22.7(NODE)     -
+
+按链路类型汇总：
+    NODE   n=8   中位 18.1 GB/s   范围 11.3 – 22.7
+    SYS    n=12  中位 22.6 GB/s   范围 11.3 – 22.7
+</code></pre></div>
+
+<p><strong>第一个反常</strong>：<code>SYS</code>（跨 NUMA）的中位数居然比 <code>NODE</code>（同节点）<strong>高</strong>。</p>
+<p><strong>第二个反常</strong>：所有涉及 <strong>GPU2</strong> 的传输都只有一半带宽（11.3–13.5）。</p>
+<p><code>nvidia-smi topo -m</code> 的链路标注解释不了这个。去查 PCIe 链路本身：</p>
+<div class="highlight"><pre><span></span><code>index, pcie.link.gen.current, gen.max, width.current, width.max
+0,     4,  4,  16, 16
+1,     4,  4,  16, 16
+2,     4,  4,   8, 16      ← ★ GPU2 只跑在 x8
+3,     4,  4,  16, 16
+4,     4,  4,  16, 16
+</code></pre></div>
+
+<p><strong>GPU2 的 PCIe 链路是 x8 而不是 x16</strong>（上限明明是 x16）。带宽正好减半。
+把 GPU2 从统计里剔除，<code>NODE</code> 与 <code>SYS</code> 的中位数都是 22.6–22.7 GB/s，<strong>完全一致</strong>。</p>
+<div class="admonition warning">
+<p class="admonition-title">这对 L6 的分布式实验是硬约束</p>
+<p>GPU2 的较窄链路可能限制包含它的集合通信，但不能据此断言每次 all-reduce 都慢一半。
+影响还取决于算法、消息大小和实际拓扑。实验应单独比较包含与不包含 GPU2 的配置。</p>
+<p>所以后面 <span class="xref pending" title="集合通信与成本模型（尚未写）">L6.1</span> / <span class="xref pending" title="推理并行：TP / PP / EP / CP（尚未写）">L6.2</span> 的实验必须：
+- 要么用 GPU0/1/3/4 四张卡（避开 GPU2）
+- 要么把 GPU2 的影响单独测出来并在结论里说明</p>
+<p><strong>不查这一步就跑分布式实验，会得到一堆无法解释的数字。</strong></p>
+</div>
+<h3 id="_4">多流重叠：除了拷贝引擎，还要检查主机内存</h3>
+<p>H2D 与 D2H 走不同方向，理论上应该能完全重叠。实测：</p>
+<table>
+<thead>
+<tr>
+<th>机器</th>
+<th>串行</th>
+<th>并发</th>
+<th>重叠收益</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>crater（PCIe 5.0）</td>
+<td>12.16 ms</td>
+<td>12.03 ms</td>
+<td><strong>1.01×（几乎没重叠）</strong></td>
+</tr>
+<tr>
+<td>worldvln（PCIe 4.0）</td>
+<td>20.67 ms</td>
+<td>11.86 ms</td>
+<td><strong>1.74×</strong></td>
+</tr>
+</tbody>
+</table>
+<p>第一反应是"crater 的拷贝引擎少"。查一下：</p>
+<div class="highlight"><pre><span></span><code>crater   asyncEngineCount = 2
+worldvln asyncEngineCount = 2
+</code></pre></div>
+
+<p><strong>一样。</strong> 所以不是引擎数量。</p>
+<p>一个与这些数据相容的解释是<strong>主机内存带宽限制</strong>。全双工传输时，主机内存要同时承受
+「被读走 H2D 的量」+「被写入 D2H 的量」：</p>
+<table>
+<thead>
+<tr>
+<th>机器</th>
+<th>H2D</th>
+<th>D2H</th>
+<th>需要的主存流量</th>
+<th><strong>实测主存聚合带宽</strong></th>
+<th>预测重叠比</th>
+<th><strong>实测重叠比</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>crater</td>
+<td>47.2</td>
+<td>42.1</td>
+<td><strong>89.3 GB/s</strong></td>
+<td><strong>48.4 GB/s</strong></td>
+<td>48.4/47.2 = <strong>1.03×</strong></td>
+<td><strong>1.01×</strong></td>
+</tr>
+<tr>
+<td>worldvln</td>
+<td>25.0</td>
+<td>27.0</td>
+<td>52.0 GB/s</td>
+<td>58.2 GB/s（单节点）</td>
+<td>封顶 2×</td>
+<td>1.74×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>crater 的预测 1.03× 与实测 1.01× 几乎重合。</strong></p>
+<p>原因也很直白：crater 是 AMD Ryzen 9 9950X3D，<strong>单路消费级双通道 DDR5</strong>；
+worldvln 是双路 Xeon 8476C，每路 8 通道。
+<strong>PCIe 5.0 太快了，快到主机内存跟不上。</strong></p>
+<p>这是一个很有代表性的现象：<strong>当某一层被大幅加速后，瓶颈会跳到相邻的一层。</strong>
+PCIe 从 Gen4 到 Gen5 翻倍，于是主机内存成了新的墙。</p>
+<hr />
+<h2 id="_5">工程实现 · 源码走读：引擎在哪里用到这些</h2>
+<h3 id="1-vllm-pinned">1. vLLM 的 pinned 缓冲池</h3>
+<p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 第 14 阶段的 <code>_prepare_inputs</code> 每步都要把 CPU 上算好的 token id、
+位置、slot mapping、block table 传到 GPU。这些张量小（几 KB 到几百 KB），
+正好落在上面测出的"固定开销主导区"。</p>
+<p>所以引擎不会每步 <code>cudaHostAlloc</code>，而是维护<strong>复用的 pinned 缓冲</strong>，
+并且尽量把多个小张量<strong>打包成一次传输</strong>。这是"批量聚合"原则的直接体现。</p>
+<h3 id="2-kv">2. KV 卸载：为什么值得</h3>
+<p><a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a> 的自测题算过一笔账：把 3000 token 的前缀 KV（344 MB）卸载到主机，
+命中时再拉回来。用本章的数字：</p>
+<ul>
+<li>crater（PCIe 5.0）：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>344</mn><mspace width="0.167em" /><mtext>MB</mtext><mo>&#x0002F;</mo><mn>47.2</mn><mspace width="0.167em" /><mtext>GB/s</mtext><mo>&#x0003D;</mo><mn>7.3</mn></mrow></math></span> ms</li>
+<li>worldvln（PCIe 4.0）：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>344</mn><mo>&#x0002F;</mo><mn>25.0</mn><mo>&#x0003D;</mo><mn>13.8</mn></mrow></math></span> ms</li>
+<li><strong>重算的成本</strong>：<a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a> 实测 41.5 ms</li>
+</ul>
+<p><strong>即使在 PCIe 4.0 上，拉回来也比重算快 3 倍。</strong> 这就是 Mooncake / LMCache
+那条路线的经济学基础（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>）。</p>
+<p>而且注意 344 MB ≫ 2.2 MB 的"有效传输门槛"，固定开销可以忽略——
+<strong>KV 卸载天然是大块传输，正好落在 PCIe 的舒适区。</strong></p>
+<h3 id="3-pd-kv">3. PD 分离的 KV 传输：账不一样</h3>
+<p><a class="xref" href="../L0/0.3-heterogeneous-baseline.html" title="异构对照：同一模型在两种 GPU 上">L0.3</a> 的自测题问过：prefill 在 L40S、decode 在 5090，KV 怎么传？</p>
+<p>两台机器之间<strong>没有 PCIe 直连</strong>，只有以太网。即使有 100 GbE（12.5 GB/s），
+传 470 MB 也要 38 ms —— 比本机重算（<a class="xref" href="../L0/0.3-heterogeneous-baseline.html" title="异构对照：同一模型在两种 GPU 上">L0.3</a> 实测 prefill 4096 token 约 79 ms）
+省不了多少，还多了一跳延迟。</p>
+<p><strong>所以 PD 分离在没有高速互连的集群上是不划算的</strong>——这正是 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 前沿一节
+提到的「fleet simulation 显示 PD 分离并非总是有利」的具体原因。
+<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span> 会在 worldvln 内部（有 PCIe P2P，22.6 GB/s）真跑一次。</p>
+<hr />
+<h2 id="_6">工程实现 · 自己写一遍</h2>
+<p>三个脚本，每个对应一类实验。要点是<strong>记录上下文</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">numa_context</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""把当前进程实际的 NUMA / CPU 绑定情况记下来。</span>
+
+<span class="sd">    这非常重要：如果你不记录"这次跑在哪个节点上"，</span>
+<span class="sd">    NUMA 实验的结果就无法解释，也无法复现。</span>
+<span class="sd">    """</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"cpu_affinity"</span><span class="p">:</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">sched_getaffinity</span><span class="p">(</span><span class="mi">0</span><span class="p">))[:</span><span class="mi">8</span><span class="p">],</span>
+           <span class="s2">"n_cpus_allowed"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">sched_getaffinity</span><span class="p">(</span><span class="mi">0</span><span class="p">))}</span>
+    <span class="n">r</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">([</span><span class="s2">"numastat"</span><span class="p">,</span> <span class="s2">"-p"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getpid</span><span class="p">())],</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">out</span><span class="p">[</span><span class="s2">"numastat"</span><span class="p">]</span> <span class="o">=</span> <span class="n">r</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[</span><span class="o">-</span><span class="mi">3</span><span class="p">:]</span>
+    <span class="k">return</span> <span class="n">out</span>
+</code></pre></div>
+
+<p>跑 NUMA 实验时，输出里必须能看到 <code>前几个核 [0,1,2,...]</code> 还是 <code>[48,49,50,...]</code>，
+否则你无法证明 <code>numactl</code> 真的生效了。本章的输出里就有这一行。</p>
+<p>从 sysfs 读 GPU 的 NUMA 归属，而不是靠猜：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">gpu_numa_node</span><span class="p">(</span><span class="n">idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="n">bus</span> <span class="o">=</span> <span class="n">nvidia_smi_query</span><span class="p">(</span><span class="s2">"pci.bus_id"</span><span class="p">,</span> <span class="n">idx</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">removeprefix</span><span class="p">(</span><span class="s2">"00000000:"</span><span class="p">)</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/sys/bus/pci/devices/0000:</span><span class="si">{</span><span class="n">bus</span><span class="si">}</span><span class="s2">/numa_node"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">p</span><span class="o">.</span><span class="n">read_text</span><span class="p">()</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">if</span> <span class="n">p</span><span class="o">.</span><span class="n">exists</span><span class="p">()</span> <span class="k">else</span> <span class="s2">"?"</span>
+</code></pre></div>
+
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># A/B/D：pinned、大小扫描、多流重叠</span>
+python<span class="w"> </span>labs/L1/host_transfer.py<span class="w"> </span>--gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span>--mb<span class="w"> </span><span class="m">256</span><span class="w"> </span>--out<span class="w"> </span>results/xfer.json
+
+<span class="c1"># C：NUMA 2×2 矩阵（需要双路机器）</span>
+<span class="k">for</span><span class="w"> </span>NODE<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">do</span><span class="w"> </span><span class="k">for</span><span class="w"> </span>GPU<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="m">3</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span>numactl<span class="w"> </span>--cpunodebind<span class="o">=</span><span class="nv">$NODE</span><span class="w"> </span>--membind<span class="o">=</span><span class="nv">$NODE</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>python<span class="w"> </span>labs/L1/host_transfer.py<span class="w"> </span>--gpu<span class="w"> </span><span class="nv">$GPU</span><span class="w"> </span>--out<span class="w"> </span>results/xfer_n<span class="si">${</span><span class="nv">NODE</span><span class="si">}</span>_g<span class="si">${</span><span class="nv">GPU</span><span class="si">}</span>.json
+<span class="k">done</span><span class="p">;</span><span class="w"> </span><span class="k">done</span>
+
+<span class="c1"># 对照组：CPU 侧本地 vs 跨节点内存带宽</span>
+numactl<span class="w"> </span>--cpunodebind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--membind<span class="o">=</span><span class="m">0</span><span class="w"> </span>python<span class="w"> </span>labs/L1/numa_bandwidth.py
+numactl<span class="w"> </span>--cpunodebind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--membind<span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>labs/L1/numa_bandwidth.py
+
+<span class="c1"># P2P 带宽矩阵</span>
+python<span class="w"> </span>labs/L1/p2p_matrix.py<span class="w"> </span>results/p2p_matrix.json
+
+<span class="c1"># 永远先查链路宽度！</span>
+nvidia-smi<span class="w"> </span>--query-gpu<span class="o">=</span>index,pcie.link.gen.current,pcie.link.gen.max,<span class="se">\</span>
+pcie.link.width.current,pcie.link.width.max<span class="w"> </span>--format<span class="o">=</span>csv
+</code></pre></div>
+
+<h3 id="_7">建议你做的消融</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--mb 1</code>（1 MB 传输）</td>
+<td>有效带宽掉到峰值的 ~50%（固定开销占 23%）</td>
+</tr>
+<tr>
+<td>在 crater 上重复 NUMA 实验</td>
+<td>crater 是<strong>单 NUMA 节点</strong>（<code>numactl --hardware</code> 只有 node0），实验无从做起——这本身是个信息</td>
+</tr>
+<tr>
+<td>把多流实验改成两个 <strong>H2D</strong>（同方向）</td>
+<td>应该完全不重叠：同方向共用一个拷贝引擎且共享 PCIe 上行带宽</td>
+</tr>
+<tr>
+<td>在 worldvln 上只用 GPU0/1/3/4 重跑 P2P</td>
+<td><code>NODE</code> 与 <code>SYS</code> 的差异应该消失（GPU2 是唯一的异常）</td>
+</tr>
+<tr>
+<td>传输时用 <code>nvidia-smi -q -d PCIE</code> 观察链路</td>
+<td>空闲时链路会 downtrain（crater 空闲报 <code>gen.current=1</code>，实际是 Gen5）——<strong>必须在传输中查</strong></td>
+</tr>
+</tbody>
+</table>
+<p>最后一行是个重要陷阱：本章第一次查 crater 的 PCIe 代数时看到 <code>gen.current = 1</code>，
+差点得出"PCIe 1.0"的错误结论。实际是 ASPM 省电降速，一有流量立刻回到 Gen5。</p>
+<hr />
+<h2 id="_8">原始现场</h2>
+<details>
+<summary>① crater 的完整传输测试（PCIe 5.0）</summary>
+<div class="highlight"><pre><span></span><code>=== GPU0 NVIDIA GeForce RTX 5090 D  (PCIe 挂在 NUMA node -1)
+    本进程可用 CPU 数 32，前几个核 [0, 1, 2, 3, 4, 5, 6, 7]
+
+[A] 256 MB 单次传输
+    h2d_pinned           47.2 GB/s
+    d2h_pinned           42.1 GB/s
+    h2d_pageable         23.6 GB/s
+    d2h_pageable         15.3 GB/s
+    pinned 相对 pageable 的加速：H2D 2.00×，D2H 2.75×
+
+[B] 传输大小 vs 有效带宽（pinned, H2D）
+        大小      GB/s       耗时us    固定开销占比
+      4 KB       0.8        5.3        100%
+     16 KB       3.1        5.3        101%
+     64 KB      12.3        5.3        101%
+    256 KB      38.6        6.8         79%
+      1 MB      45.0       23.3         23%
+      4 MB      46.0       91.3          6%
+     16 MB      46.8      358.8          1%
+     64 MB      47.4     1416.7          0%
+    256 MB      47.3     5675.0          0%
+    ⇒ 一次传输的固定开销约 5.3 µs，小于约 246 KB 的传输几乎全是开销
+
+[D] 多流并发（H2D + D2H 能否重叠）
+    同一条流串行：  12.16 ms   两条流并发：  12.03 ms   重叠收益 1.01×
+</code></pre></div>
+
+<p><code>NUMA node -1</code> 是单节点机器的标记（没有 NUMA 划分）。
+crater 是 AMD Ryzen 9 9950X3D，单路 16 核，双通道 DDR5。</p>
+<p>原始文件：<code>results/crater/xfer_crater_gpu0.json</code></p>
+</details>
+<details>
+<summary>② worldvln 的 NUMA 2×2 矩阵（四次运行的关键行）</summary>
+<div class="highlight"><pre><span></span><code>########## 内存/CPU 绑在 NUMA0  →  GPU0 (在 NUMA0)
+=== GPU0 NVIDIA L40S  (PCIe 挂在 NUMA node 0)
+    本进程可用 CPU 数 96，前几个核 [0, 1, 2, 3, 4, 5, 6, 7]
+    h2d_pinned           25.0 GB/s
+    d2h_pinned           27.0 GB/s
+    ⇒ 固定开销约 11.3 µs
+    重叠收益 1.60×
+
+########## 内存/CPU 绑在 NUMA0  →  GPU3 (在 NUMA1)
+    本进程可用 CPU 数 96，前几个核 [0, 1, 2, 3, 4, 5, 6, 7]
+    h2d_pinned           25.0 GB/s
+    d2h_pinned           27.0 GB/s
+    重叠收益 1.74×
+
+########## 内存/CPU 绑在 NUMA1  →  GPU0 (在 NUMA0)
+    本进程可用 CPU 数 96，前几个核 [48, 49, 50, 51, 52, 53, 54, 55]   ← 绑定生效了
+    h2d_pinned           25.0 GB/s
+    d2h_pinned           27.0 GB/s
+    重叠收益 1.74×
+
+########## 内存/CPU 绑在 NUMA1  →  GPU3 (在 NUMA1)
+    本进程可用 CPU 数 96，前几个核 [48, 49, 50, 51, 52, 53, 54, 55]
+    h2d_pinned           25.1 GB/s
+    d2h_pinned           27.0 GB/s
+    重叠收益 1.73×
+</code></pre></div>
+
+<p><strong>注意第三、四次的 <code>前几个核 [48,...]</code></strong> —— 这一行证明 <code>numactl</code> 确实生效了。
+没有这行证据，"NUMA 没影响"这个结论就站不住（可能只是绑定失败了）。</p>
+<p>原始文件：<code>results/worldvln/xfer_node{0,1}_gpu{0,3}.json</code></p>
+</details>
+<details>
+<summary>③ NUMA 距离矩阵与 CPU 侧对照</summary>
+<div class="highlight"><pre><span></span><code>$ lscpu | grep -E "Model name|Socket|NUMA"
+Model name:      Intel(R) Xeon(R) Platinum 8476C
+Core(s) per socket: 48
+Socket(s):       2
+NUMA node(s):    2
+NUMA node0 CPU(s): 0-47,96-143
+NUMA node1 CPU(s): 48-95,144-191
+
+$ numactl --hardware | tail -4
+node 1 size: 96727 MB
+node 1 free: 3990 MB
+node distances:
+node   0   1
+  0:  10  21
+  1:  21  10
+</code></pre></div>
+
+<p><code>node distances</code> 的 10 / 21 是 ACPI SLIT 表里的相对延迟，
+不是带宽比。实测带宽比是 20.5 / 16.0 = 1.28（copy），
+<strong>距离矩阵只能定性，不能定量</strong>。</p>
+<p>CPU 侧对照（单线程 numpy，2.15 GB 缓冲）：</p>
+<div class="highlight"><pre><span></span><code>CPU node0 + 内存 node0（本地）：  copy 20.5 GB/s   read 8.9 GB/s
+CPU node0 + 内存 node1（跨节点）：copy 16.0 GB/s   read 6.8 GB/s
+</code></pre></div>
+
+<p>单线程的绝对值远低于这颗 CPU 的峰值（受单线程访存并行度限制，
+和 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 里 GPU 的 Little's Law 是同一个道理）。<strong>要看的是比值，不是绝对值。</strong></p>
+<p>聚合（8 个并行进程）：crater 48.4 GB/s，worldvln 单节点 58.2 GB/s。</p>
+</details>
+<details>
+<summary>④ P2P 矩阵与 PCIe 链路宽度</summary>
+<div class="highlight"><pre><span></span><code>[P2P 可达性] cudaDeviceCanAccessPeer —— 5 张卡两两全部可达（PCIe P2P）
+
+[单向带宽 GB/s]  括号里是 nvidia-smi 报的链路类型
+             GPU0          GPU1          GPU2          GPU3          GPU4
+GPU0      -            22.6(NODE)    11.3(NODE)    22.6(SYS )    22.6(SYS )
+GPU1     22.6(NODE)     -            11.3(NODE)    22.6(SYS )    22.6(SYS )
+GPU2     13.5(NODE)    13.5(NODE)     -            13.5(SYS )    13.5(SYS )
+GPU3     22.7(SYS )    22.7(SYS )    11.3(SYS )     -            22.7(NODE)
+GPU4     22.6(SYS )    22.7(SYS )    11.3(SYS )    22.7(NODE)     -
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code>$ nvidia-smi --query-gpu=index,pcie.link.gen.current,pcie.link.gen.max,\
+             pcie.link.width.current,pcie.link.width.max --format=csv
+index, gen.current, gen.max, width.current, width.max
+0, 4, 4, 16, 16
+1, 4, 4, 16, 16
+2, 4, 4,  8, 16          ← GPU2 跑在 x8
+3, 4, 4, 16, 16
+4, 4, 4, 16, 16
+</code></pre></div>
+
+<p>而 crater 空闲时查是这样的：</p>
+<div class="highlight"><pre><span></span><code>index, gen.current, gen.max, width.current, width.max
+0, 1, 5, 16, 16          ← gen.current=1 是 ASPM 降速，不是真的 PCIe 1.0
+</code></pre></div>
+
+<p><strong>空闲时 PCIe 会 downtrain 省电。查链路代数必须在有流量的时候查。</strong>
+sysfs 的 <code>current_link_speed</code> 同样会报 <code>2.5 GT/s</code>（Gen1 速率），是同一回事。</p>
+</details>
+<details>
+<summary>⑤ 拷贝引擎数量：一个被证伪的假设</summary>
+<div class="highlight"><pre><span></span><code>crater   asyncEngineCount = 2   gpuOverlap = 1   concurrentKernels = 1
+worldvln asyncEngineCount = 2   gpuOverlap = 1   concurrentKernels = 1
+</code></pre></div>
+
+<p>两台机器的拷贝引擎数量完全一样，但重叠收益是 1.01× vs 1.74×。
+<strong>硬件属性解释不了这个差异</strong>，必须去找别的原因（主机内存带宽）。</p>
+<p>查法（torch 没暴露这个属性，直接问 runtime API）：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
+<span class="n">cudart</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="s1">'libcudart.so.13'</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="n">ctypes</span><span class="o">.</span><span class="n">RTLD_GLOBAL</span><span class="p">)</span>
+<span class="n">val</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span><span class="p">()</span>
+<span class="n">cudart</span><span class="o">.</span><span class="n">cudaDeviceGetAttribute</span><span class="p">(</span><span class="n">ctypes</span><span class="o">.</span><span class="n">byref</span><span class="p">(</span><span class="n">val</span><span class="p">),</span> <span class="mi">40</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>  <span class="c1"># cudaDevAttrAsyncEngineCount</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">val</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+</code></pre></div>
+
+</details>
+<hr />
+<h2 id="_9">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>与本章的关系</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>GPUDirect Storage (GDS)</strong></td>
+<td>让 NVMe 直接 DMA 到显存，绕过主机内存与 CPU。本章测出主机内存已经成为 PCIe 5.0 的瓶颈——GDS 正是绕开它的手段（<a class="xref" href="../L1/1.5-network-storage.html" title="网络与存储底座">L1.5</a>）</td>
+</tr>
+<tr>
+<td><strong>GPUDirect RDMA / IBGDA</strong></td>
+<td>网卡直接读写显存，绕过主机。DeepEP 的 low-latency kernel 依赖它；NVSHMEM 的 IBGDA 更进一步让 GPU 直接驱动网卡（<span class="xref pending" title="MoE 分布式与 all-to-all（尚未写）">L6.3</span>）</td>
+</tr>
+<tr>
+<td><strong>NVLink-C2C / Grace-Hopper / GB10</strong></td>
+<td>CPU 与 GPU 之间 900 GB/s 的一致性互连，本章的"32 倍窄管子"不复存在。<code>spark</code> 上的 GB10 会在 <span class="xref pending" title="成本、能耗与硬件选型（尚未写）">L8.5</span> 做对照</td>
+</tr>
+<tr>
+<td><strong>CXL</strong></td>
+<td>把内存挂到 PCIe 通道上，NUMA 的层级会更多、更复杂。本章的"NUMA 被 PCIe 掩盖"结论在 CXL 上会反转</td>
+</tr>
+<tr>
+<td><strong>KV 卸载与多级存储</strong></td>
+<td>Mooncake 的 HBM/DRAM/SSD 三级；本章的传输大小实验决定了它的块粒度必须足够大（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>除本站实测外的内容来自各自文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+</blockquote>
+<hr />
+<h2 id="_10">陷阱</h2>
+<p><strong>1. 用 pageable 内存做大批量传输。</strong> 白白慢一倍。但也别把所有东西都 pin 住——
+pinned 内存不可换出，会挤压系统。</p>
+<p><strong>2. 小块传输。</strong> 低于约 250 KB 时几乎全是固定开销。<strong>批量聚合。</strong></p>
+<p><strong>3. 空闲时查 PCIe 链路代数。</strong> ASPM 会 downtrain，本章差点因此得出"crater 是 PCIe 1.0"。</p>
+<p><strong>4. 不查链路宽度就跑多卡实验。</strong> worldvln 的 GPU2 跑在 x8，
+带宽减半，会污染所有 5 卡集合通信的结果。</p>
+<p><strong>5. 相信"NUMA 一定要绑"。</strong> 本章实测在 PCIe 4.0 + DMA 的场景下毫无影响。
+<strong>但也别反过来相信"NUMA 不重要"</strong>——CPU 侧确实差 22–24%。
+<strong>结论必须带上场景。</strong></p>
+<p><strong>6. 用硬件属性解释性能差异而不验证。</strong> <code>asyncEngineCount</code> 两台都是 2，
+却有 1.01× vs 1.74× 的差异。<strong>属性只是必要条件。</strong></p>
+<p><strong>7. 忘了记录绑定是否生效。</strong> <code>numactl</code> 可能因为权限或参数问题静默失效。
+输出里必须有 CPU 亲和性列表作为证据。</p>
+<hr />
+<h2 id="_11">自测题</h2>
+<details>
+<summary>1. 我要把 16 GB 的模型权重从主机加载到 GPU。crater 上理论最快多久？实际会更慢吗？</summary>
+<p>理论：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>16</mn><mspace width="0.167em" /><mtext>GB</mtext><mo>&#x0002F;</mo><mn>47.2</mn><mspace width="0.167em" /><mtext>GB/s</mtext><mo>&#x0003D;</mo><mn>339</mn></mrow></math></span> ms（pinned，大块传输）。</p>
+<p>实际会更慢，原因有三：</p>
+<ol>
+<li><strong>权重先要从磁盘/NFS 读到主机内存</strong>。如果没有 page cache 命中，
+   这一步可能比 PCIe 传输还慢（<a class="xref" href="../L1/1.5-network-storage.html" title="网络与存储底座">L1.5</a> 会测）。</li>
+<li><strong>safetensors 是 mmap 的</strong>（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 原始现场 ②），
+   传输时页会按需触发缺页，实际路径是 pageable 而非 pinned →
+   按本章实测可能慢到 2×，即 ~680 ms。</li>
+<li><strong>逐张量传输</strong>：310 个张量（Qwen3-1.7B），
+   其中很多是几 KB 的 norm 权重，落在固定开销区。</li>
+</ol>
+<p>这就是为什么引擎的模型加载都做了专门优化：多线程、pinned 缓冲池、
+大张量分块流水。vLLM 启动日志里的 <code>Loading safetensors checkpoint shards</code> 那几秒，
+主要就花在这里。</p>
+</details>
+<details>
+<summary>2. 我在 worldvln 上跑 4 卡 TP（GPU0-3）。每步 all-reduce 的时间下界是多少？GPU2 会有多大影响？</summary>
+<p>先算通信量。TP 的每层要做两次 all-reduce（attention 后、FFN 后），
+每次的数据量 = batch × seq × hidden × 2 字节。</p>
+<p>以 Qwen3-1.7B、batch=32、decode（seq=1）为例：
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>32</mn><mo>&#x000D7;</mo><mn>1</mn><mo>&#x000D7;</mo><mn>2048</mn><mo>&#x000D7;</mo><mn>2</mn><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span> KB 每次，28 层 × 2 次 = 56 次，共 7 MB。</p>
+<p><strong>但 128 KB 落在"固定开销主导区"</strong>（本章测出 worldvln 的固定开销 11.3 µs）。
+56 次 × 11.3 µs = <strong>0.63 ms 纯开销</strong>，而 decode 每步本来才 11 ms（<a class="xref" href="../L0/0.3-heterogeneous-baseline.html" title="异构对照：同一模型在两种 GPU 上">L0.3</a> 实测）。</p>
+<p><strong>GPU2 的影响</strong>：ring all-reduce 的完成时间由最慢的边决定。
+GPU2 的边只有 11.3 GB/s（其他 22.6），所以整个 ring 降到一半速度。</p>
+<p><strong>结论</strong>：小 batch 的 TP decode 在没有 NVLink 的机器上，
+<strong>通信开销可能吃掉一半以上的时间</strong>，而且 GPU2 会让它雪上加霜。
+<span class="xref pending" title="推理并行：TP / PP / EP / CP（尚未写）">L6.2</span> 会实测这个，本题的估算是那次实验的预测值。</p>
+</details>
+<details>
+<summary>3. 为什么 crater 的 PCIe 更快（47 vs 25 GB/s），多流重叠反而更差（1.01× vs 1.74×）？</summary>
+<p>因为瓶颈跳到了主机内存。</p>
+<p>全双工传输需要主机内存同时承受「H2D 读走的量 + D2H 写入的量」：</p>
+<ul>
+<li>crater：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>47.2</mn><mo>&#x0002B;</mo><mn>42.1</mn><mo>&#x0003D;</mo><mn>89.3</mn></mrow></math></span> GB/s，而实测主存聚合只有 <strong>48.4 GB/s</strong> → 做不到</li>
+<li>worldvln：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>25.0</mn><mo>&#x0002B;</mo><mn>27.0</mn><mo>&#x0003D;</mo><mn>52.0</mn></mrow></math></span> GB/s，主存有 58.2 GB/s（单节点）→ 勉强够</li>
+</ul>
+<p><strong>预测</strong>：crater 的重叠比 ≈ <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>48.4</mn><mo>&#x0002F;</mo><mn>47.2</mn><mo>&#x0003D;</mo><mn>1.03</mn></mrow></math></span>。<strong>实测 1.01×。</strong></p>
+<p>根因是平台差异：crater 是单路消费级（Ryzen 9950X3D，双通道 DDR5），
+worldvln 是双路服务器（Xeon 8476C，每路 8 通道）。</p>
+<p><strong>一般规律：某一层被大幅加速后，瓶颈会跳到相邻的一层。</strong>
+这在整套材料里会反复出现——PCIe→主存、算力→带宽（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a>）、
+tensor core→MUFU（<a class="xref" href="../L3/3.2-flashattention-lineage.html" title="FlashAttention 1 → 2 → 3 → 4">L3.2</a> 的 FA4）。</p>
+</details>
+<details>
+<summary>4. 我读到一篇博客说「pinned memory 能带来 10 倍加速」。可信吗？</summary>
+<p><strong>大概率不可信，或者场景很特殊。</strong></p>
+<p>理论上限很清楚：pageable 多了一次 CPU 内存拷贝。
+如果主机内存带宽远大于 PCIe，这次拷贝的代价约等于一次 PCIe 传输，
+所以上限是 <strong>2×</strong>。本章实测 H2D 恰好 2.00×，D2H 2.75×（写 pageable 还要处理页错误）。</p>
+<p><strong>能超过 3× 的情况</strong>：
+- 传输很小，而 pageable 路径的固定开销大得多
+- 主机内存严重受限或有 swap 活动
+- 测量方法有问题（比如没预热，第一次传输包含缺页）</p>
+<p><strong>判断方法</strong>：任何加速比都要问「上限是多少，为什么」。
+说不出机制的加速比，都要存疑。这也是 <span class="xref pending" title="如何跟前沿（尚未写）">M3</span>（如何跟前沿）的核心检查项。</p>
+</details>
+<details>
+<summary>5. 如果把 worldvln 的 PCIe 从 Gen4 升到 Gen5，H2D 会翻倍吗？多流重叠会怎么变？</summary>
+<p><strong>H2D 大概率会接近翻倍</strong>（25 → ~47 GB/s），因为它当前明显受 PCIe 限制
+（NUMA 实验证明主存不是瓶颈：跨节点也有 58 GB/s）。</p>
+<p><strong>但多流重叠会变差。</strong> 升级后需要的主存流量变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>47</mn><mo>&#x0002B;</mo><mn>47</mn><mo>&#x0003D;</mo><mn>94</mn></mrow></math></span> GB/s，
+而 worldvln 单节点实测 58.2 GB/s → 重叠比会从 1.74× 掉到约 <strong>1.24×</strong>。</p>
+<p><strong>除非</strong>你把两个方向的 pinned 缓冲分别放在两个 NUMA 节点上——
+那样总带宽是两个节点之和（~116 GB/s），重叠可以恢复。</p>
+<p><strong>这时候 NUMA 绑定就重要了。</strong> 呼应本章的核心结论：
+「NUMA 不重要」是这台机器这个配置下的结论，不是普适真理。
+换代硬件必须重测。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L1/1.2-tensor-core-lineage.html">&#8592; 1.2 Tensor Core 世代史与 sm_120 的岔路</a><a class="nav-next" href="../L1/1.4-driver-and-os.html">1.4 驱动与操作系统 &#8594;</a></nav>
+</main>
+</body>
+</html>

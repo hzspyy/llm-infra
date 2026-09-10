@@ -1,0 +1,155 @@
+torch 2.13.0+cu130  device cuda
+gpu   NVIDIA GeForce RTX 5090 D
+==============================================================================
+[A] 守卫：编译结果凭什么可以复用
+==============================================================================
+  图数量        1
+  图断裂次数    0
+  被捕获的算子  1
+--- Dynamo 实际装了哪些守卫（TORCH_LOGS=guards 的内容） ----------------------------------
+  共 15 行守卫，节选：
+    TREE_GUARD_MANAGER:
+    +- RootGuardManager
+    | +- LAMBDA_GUARD: torch._functorch.aot_autograd.utils.top_saved_tensors_hooks ids == None  # _dynamo/output_g
+    | +- GLOBAL_STATE: ___check_global_state() against {"allow_bf16_reduce":0,"allow_fp16_reduce":0,"allow_tf32":f
+    | +- TORCH_FUNCTION_MODE_STACK: ___check_torch_function_mode_stack()
+    | +- DEFAULT_DEVICE: utils_device.CURRENT_DEVICE == None                           # _dynamo/output_graph.py:1
+    | +- GuardManager: source=L['x'], accessed_by=FrameLocalsGuardAccessor(key='x', framelocals_idx=0), type=<clas
+    | | +- TENSOR_MATCH: check_tensor(L['x'], Tensor, DispatchKeySet(CUDA, BackendSelect, ADInplaceOrView, Autogra
+    | | +- DIMENSION_DYNAMIC_MARKING_GUARD: hasattr(L['x'], '_dynamo_dynamic_indices') == False           # return
+    | | +- DIMENSION_DYNAMIC_MARKING_GUARD: hasattr(L['x'], '_dynamo_weak_dynamic_indices') == False      # return
+    | | +- DIMENSION_DYNAMIC_MARKING_GUARD: hasattr(L['x'], '_dynamo_unbacked_indices') == False          # return
+    | | +- DIMENSION_DYNAMIC_MARKING_GUARD: hasattr(L['x'], '_dynamo_strict_unbacked_indices') == False   # return
+    | | +- DIMENSION_DYNAMIC_MARKING_GUARD: hasattr(L['x'], '_dynamo_static_indices') == False            # return
+    | +- GuardManager: source=L['alpha'], accessed_by=FrameLocalsGuardAccessor(key='alpha', framelocals_idx=1), ty
+    | | +- EQUALS_MATCH: L['alpha'] == 2.0                                             # return (x * alpha).relu()
+  守卫是「这份编译结果什么时候还算数」的完整条件。
+  每次调用都要把它跑一遍 —— 所以守卫本身也是运行时开销。
+==============================================================================
+[B] 重编译：什么会让编译结果失效
+==============================================================================
+  调用                                 累计编译次数     本次新增
+  基准 (8,8) f32 cuda                       1        1
+  同形状同 dtype 再来一次                         1        0
+  换形状 (16,16)                             2        1
+  再换形状 (32,32)                            2        0
+  换 dtype bf16                            3        1
+  换维数 (8,8,8)                             4        1
+  换 device cpu                            5        1
+  非连续 (转置)                                6        1
+--- cache_size_limit：编译太多次会发生什么 ---------------------------------------------
+  cache_size_limit = 8   accumulated = 256
+  先看一个**不会**炸的：python int 参数。
+  k = 0..11 时累计编译次数: [1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+  只编译了 2 次。第一次把 k 特化成常量 0，第二次发现 k 变了，
+  于是把 k 转成动态标量，之后所有 k 都复用同一份代码。
+  **这和形状的 automatic dynamic 是同一个机制**，不要以为标量一定会特化。
+  再看一个真的会炸的：维数（rank）。rank 没法做成动态。
+     维数       累计编译  说明
+      1          1  
+      2          2  
+      3          3  
+      4          4  
+      5          5  
+      6          6  
+      7          7  
+      8          8  <- 卡在 cache_size_limit
+      9          8  <- 卡在 cache_size_limit
+     10          8  <- 卡在 cache_size_limit
+     11          8  <- 卡在 cache_size_limit
+     12          8  <- 卡在 cache_size_limit
+  累计编译停在 8，等于 cache_size_limit = 8。
+  之后每个新维数都不再编译，直接退回 eager 执行 —— 不报错，只是变慢。
+--- 撑爆缓存本身贵不贵 ---------------------------------------------------------------
+  撑爆，但 big 那条缓存还在（rank 2..13）                  0.015 ms   编译数=8
+  撑爆，且 big 那条被挤掉（rank 1..12）                  80.116 ms   编译数=8
+  纯 eager 参照                                   0.025 ms
+  第一行说明：**撑爆缓存本身不贵**。只要还有一条守卫能对上，
+  它照样用编译好的代码，Dynamo 也不会重新进编译器（frames 增量为 0）。
+  第二行那 80 ms 不是「退回 eager」造成的 —— eager 只要 0.025 ms。
+  真正的原因是：rank 1 被一个 2 元素的张量顶掉之后触发了 automatic dynamic，
+  而**动态形状的归约 kernel** 在大输入上会塌掉。这是 [C] 节的主题。
+==============================================================================
+[C] 动态形状：让一份代码吃所有长度
+==============================================================================
+--- 1. 默认：先特化，被打脸一次之后自动转动态 --------------------------------------------------
+  shape=(8,)   累计编译 1
+  shape=(16,)   累计编译 2
+  shape=(32,)   累计编译 2
+  shape=(64,)   累计编译 2
+  shape=(128,)   累计编译 2
+  第 1 次特化成 8，第 2 次发现形状变了 -> 重编译成动态，之后不再涨。
+--- 2. 一开始就声明动态 -------------------------------------------------------------
+  shape=(8,)   累计编译 1
+  shape=(16,)   累计编译 1
+  shape=(32,)   累计编译 1
+  shape=(64,)   累计编译 1
+  shape=(128,)   累计编译 1
+--- 3. 动态形状的代价：归约会塌，逐元素不会 ---------------------------------------------------
+  表达式                            eager        静态         动态      动态/静态
+  归约 (t*2).relu().sum()          0.025     0.015     80.155    5421.2×
+                               静态 size_hints ["size_hints={'x': 512, 'r0_': 8192}", "size_hints={'x': 1, 'r0_': 512}"]
+                               动态 size_hints ["size_hints={'x': 1, 'r0_': 2}"]
+  逐元素 (t*2).relu()*1.5           0.025     0.012      0.015       1.3×
+                               静态 size_hints ["size_hints={'x': 4194304}"]
+                               动态 size_hints ["size_hints={'x': 4194304}"]
+  逐元素几乎不受影响：kernel 本来就是一维网格，元素个数当运行时参数传进去就行。
+  归约塌了：静态版拿到 `{'x': 512, 'r0_': 8192}`，是 512 个 block 的两段式归约；
+  动态版只拿到 `{'x': 1}` —— 形状未知时 Inductor 无法决定怎么切分归约维，
+  于是退化成**一个 block 顺序扫完整个张量**。
+  这不是常量折叠少了一点，是并行度从 512 掉到 1。
+==============================================================================
+[D] 融合边界：Inductor 在哪里停下来
+==============================================================================
+  表达式                                 triton kernel 数   eager ms  compiled ms      加速
+  5 个逐元素算子                                          1      0.434        0.117   3.71×
+  逐元素 + 一个归约                                        2      0.293        0.084   3.48×
+  归约之后再逐元素                                          2      0.193        0.084   2.29×
+  两个独立归约                                            4      0.157        0.090   1.74×
+  中间要写出去（两次用到不同形状）                                  2      0.288        0.045   6.38×
+--- 图断裂：.item() 把一张图切成两张 ----------------------------------------------------
+  图数量 2  断裂 1
+  原因: GraphCompileReason(reason='Unsupported Tensor.item() call with capture_scalar_outputs=False\n  Explanation: Dynamo does not support tracing `Tensor.it
+==============================================================================
+[E] autotune：编译时间换运行时间
+==============================================================================
+  autotune 只在「cuBLAS 的启发式选得不好」的形状上才有东西可赢。
+  所以要同时测一个方方正正的 GEMM 和一个 decode 形状的瘦长 GEMM。
+  方阵 4096×4096×4096（prefill 形状）
+  mode                    编译 s      运行 ms   TFLOP/s      GB/s    相对 eager
+  eager (cuBLAS)             -     0.6450     213.1     156.1       1.00×
+  default                  0.0     0.6398     214.8     157.3       1.01×
+  max-autotune             0.0     0.7018     195.8     143.4       0.92×
+  瘦长 8×4096×4096（decode 形状）
+  mode                    编译 s      运行 ms   TFLOP/s      GB/s    相对 eager
+  eager (cuBLAS)             -     0.0229      11.7    1470.2       1.00×
+  default                  0.0     0.0232      11.6    1450.6       0.99×
+  max-autotune             0.0     0.0357       7.5     942.5       0.64×
+  瘦长 1×4096×11008（decode + FFN）
+  mode                    编译 s      运行 ms   TFLOP/s      GB/s    相对 eager
+  eager (cuBLAS)             -     0.0311       2.9    2903.9       1.00×
+  default                  0.0     0.0333       2.7    2708.1       0.93×
+  max-autotune             0.0     0.1515       0.6     595.5       0.21×
+  方阵上 cuBLAS 已经接近实测算力上限（L1.1 测得 232 TFLOP/s），没什么可赢的。
+  瘦长形状是 memory-bound 的，要看 GB/s 而不是 TFLOP/s。
+==============================================================================
+[F] 广度：同一个模块，几条不同的编译路线
+==============================================================================
+  8 层 Block、batch=1 —— 这是 launch 开销占比最高的区间（见 L1.4）。
+  两种计时都报：紧凑循环（CPU 提交可以和 GPU 重叠）
+  与每次同步（服务里逐 token 返回时看到的那种）。
+  路线                              紧凑循环 ms      加速       每次同步 ms      加速
+  eager                            0.2073   1.00×        0.2179   1.00×
+  compile/aot_eager                0.2187   0.95×        0.2391   0.91×
+  compile/inductor                 0.1770   1.17×        0.2063   1.06×
+  compile/reduce-overhead          0.1520   1.36×        0.1908   1.14×
+  compile/max-autotune             0.1725   1.20×        0.2110   1.03×
+--- torch.export：把图固化下来，不带 python -------------------------------------------
+  导出成功：90 个节点，40 个 call_function
+    aten.linear.default                              16
+    aten.layer_norm.default                          8
+    aten.gelu.default                                8
+    aten.add.Tensor                                  8
+  export 的图不含 python 控制流，可以脱离 python 运行时部署。
+  这是与 torch.compile 最大的区别：compile 仍然活在 python 进程里。
+  未装 TensorRT / ONNX Runtime，这两条路线本轮无法对照（见正文「待补」）。
