@@ -4,16 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.6 Profiling 工程学</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">2.6</div>
   <div class="sidebar-title">Profiling 工程学</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">心智模型：四层尺子，四种分辨率</a></li>
@@ -42,7 +42,7 @@
 </ul>
 </li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_9">建议你做的消融</a></li>
+<li><a href="#_9">消融建议</a></li>
 </ul>
 </li>
 <li><a href="#_10">原始现场</a></li>
@@ -52,13 +52,54 @@
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：四层尺子，四种分辨率</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#err_nvgpuctrperm">一、ERR_NVGPUCTRPERM：完整诊断</a></li>
+<li><a href="#profiler">二、profiler 怎么工作：两条完全不同的路径</a></li>
+<li><a href="#_4">三、观测者效应：量化</a></li>
+<li><a href="#_5">四、静态分析能回答什么、不能回答什么</a></li>
+</ul>
+</li>
+<li><a href="#_6">用计数器检查候选解释</a><ul>
+<li><a href="#bank-conflict-10-6094848">推断一：bank conflict —— 从「慢 10 倍」到「冲突了 6,094,848 次」</a></li>
+<li><a href="#4-sector-16">推断二：向量化改善访存合并 —— 从 4 sector/请求 到 16</a></li>
+<li><a href="#_7">推断三：动态指令数 —— 静态表看不见的那一列</a></li>
+<li><a href="#l24tensor-core-bank-conflict">推断四（L2.4）：tensor core 与 bank conflict</a></li>
+</ul>
+</li>
+<li><a href="#chrome-trace">工程实现 · 源码走读：chrome trace 里到底有什么</a><ul>
+<li><a href="#profile">引擎侧怎么 profile</a></li>
+</ul>
+</li>
+<li><a href="#ncu">工程实现 · 自己写一遍：造一把尺子，然后拿 ncu 校准它</a><ul>
+<li><a href="#ncu_1">用 ncu 校准这把自制的尺子</a></li>
+<li><a href="#block">尾效应：多一个 block 的代价</a></li>
+<li><a href="#_8">一个负面结果：块级负载倾斜，硬件自己扛住了</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_9">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
   <div class="mod-id">2.6</div>
   <h1>Profiling 工程学</h1>
-  <p class="lede">ncu / nsys 指标体系、roofline、从「慢 kernel」定位到根因的完整案例。</p>
+  <p class="lede">结合时间线、硬件计数器与自制探针定位开销，区分工具扰动和正常运行。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) + spark (GB10, sm_121) · torch 2.13.0+cu130 · nsys 2026.3.2 · ncu 2025.3.1</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L2.3（memory-bound 阶梯）· L2.4（GEMM 阶梯）· L1.1（存储层次）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
@@ -67,22 +108,16 @@
    而那个差别是一条安全边界。</li>
 <li>profiler 会带来多少额外开销？怎样避免把工具造成的延迟当成原程序的延迟？</li>
 </ol>
-<p>前两章（<a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> / <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）和 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 里，好几个结论我是<strong>靠计时推断</strong>的：</p>
-<ul>
-<li><a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a>：跨步 32 比跨步 33 慢 10.1×，「<strong>这就是 bank conflict</strong>」——但我没看见冲突</li>
-<li><a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a>：<code>float4</code> 让「访存合并变好」——但我没看见"合并"</li>
-<li><a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>：v5/v6「用上了 tensor core」——但我只看见 TFLOPS 变高</li>
-</ul>
-<p>本章把这些推断逐条换成<strong>观测</strong>。四台机器里三台是容器，读不了硬件计数器；
-第四台（spark，裸机）放开之后可以。<strong>所以本章有两条线</strong>：
-拿不到计数器时怎么办（自制尺子 + 静态分析 + 时间轴），
-以及拿到之后那些推断到底对不对。</p>
+<p><a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a>、<a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 和 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 中的时间差提出了几个需要进一步核对的问题：跨步访问是否增加 bank conflict，向量化是否改变内存事务，GEMM 是否执行了 Tensor Core 指令。</p>
+<p>本章结合时间线、反汇编和计数器检查这些问题。记录中的 crater 与 worldvln 缺少硬件计数器权限，spark 可采集 ncu 数据；容器身份本身不是能否采集的判据。没有计数器时可以先检查指令与时间线，但不能把推断当作直接观测；跨机器计数也不能替代原机器的时间归因。</p>
 <p>先分清三类材料：时间线告诉你什么时候执行，计数器记录执行期间发生了多少事件，
 反汇编展示程序里有哪些指令。它们回答的问题不同，需要结合使用。
 本章会用计数器补充前面的计时解释，并保留哪些判断仍需要进一步验证。</p>
 <hr />
 <h2 id="_2">心智模型：四层尺子，四种分辨率</h2>
 <figure>
+
+
 <svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="profiling 的四层尺子">
   <g font-size="11.5" fill="currentColor">
     <text x="12" y="18" font-size="12.5" font-weight="600">「慢」必须先被翻译成一个有具体量纲的问题，才谈得上选工具</text>
@@ -166,6 +201,8 @@
     </g>
   </g>
 </svg>
+
+
 <figcaption>四层尺子及其分辨率；两类 profiler 的权限差异来自它们读的东西不同；观测开销随 kernel 密度上升。</figcaption>
 </figure>
 
@@ -772,7 +809,7 @@ Trace             1
 </code></pre></div>
 
 <p>三件事值得单独说：</p>
-<p><strong>(1) <code>limitingFactors: "SMEM"</code></strong> —— torch.profiler <strong>已经免费告诉你占用率被谁卡住了</strong>。
+<p><strong>(1) <code>limitingFactors: "SMEM"</code></strong> —— torch.profiler 的导出字段提供了该 kernel 的占用率约束估计。
 不需要 ncu。大多数人从来没打开过这个字段。</p>
 <p><strong>(2) kernel 名字本身是完整的规格说明</strong>：
 <code>cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8</code></p>
@@ -1019,7 +1056,7 @@ python<span class="w"> </span>labs/L2/profiling_tour.py<span class="w"> </span>-
 <span class="nv">CUDA_LAUNCH_BLOCKING</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>x.py<span class="w">            </span><span class="c1"># 让异步错误报在出错的那一行</span>
 </code></pre></div>
 
-<h3 id="_9">建议你做的消融</h3>
+<h3 id="_9">消融建议</h3>
 <table>
 <thead>
 <tr>
@@ -1054,7 +1091,7 @@ python<span class="w"> </span>labs/L2/profiling_tour.py<span class="w"> </span>-
 </tr>
 <tr>
 <td>打开 <code>51_trace.json</code>，grep <code>limitingFactors</code></td>
-<td>你自己模型里每个 kernel 的占用率瓶颈，免费的</td>
+<td>检查导出字段中的占用率资源约束；不等同于实测 stall 原因</td>
 </tr>
 <tr>
 <td>把 <code>bank_conflict_probe.cu</code> 的跨步扫成 1/2/4/8/16/32/33</td>
@@ -1288,7 +1325,7 @@ OOM 次数                            0
 
 <ul>
 <li><strong><code>reserved</code> 是向驱动要的，<code>allocated</code> 是你在用的。</strong> 差值就是 caching allocator
-  攥在手里的空闲块。<code>nvidia-smi</code> 看到的是 <code>reserved</code>，所以它永远比你以为的大。</li>
+  攥在手里的空闲块。<code>nvidia-smi</code> 报告的进程显存还可能包含 CUDA context、库分配等非 PyTorch 部分，并不等于 <code>reserved</code>。</li>
 <li><strong><code>inactive_split_bytes</code>（碎片）</strong>：被切开过、剩下的那半块太小没人要。</li>
 <li><strong><code>num_alloc_retries</code> &gt; 0</strong> 是危险信号：allocator 已经在被迫 <code>empty_cache()</code> 重试了，
   离 OOM 不远。生产环境应该盯这个数。</li>
@@ -1387,7 +1424,7 @@ OOM 次数                            0
 </tr>
 <tr>
 <td><strong>PyTorch 2.x 的 <code>TORCH_TRACE</code></strong></td>
-<td>结构化的编译日志，配合 <code>tlparse</code> 生成 HTML 报告，是排查 recompilation 的主力（<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）</td>
+<td>结构化的编译日志，配合 <code>tlparse</code> 生成 HTML 报告，是排查 recompilation 的主力（<a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>）</td>
 </tr>
 <tr>
 <td><strong>HTA (Holistic Trace Analysis)</strong></td>
@@ -1418,7 +1455,7 @@ EngineCore 在独立进程里，抓到 0 个 kernel（<a class="xref" href="../L
 ncu 默认 <code>--cache-control all</code>，每次 replay 前刷 cache，测的是<strong>冷缓存</strong>。
 要比就加 <code>--cache-control none</code>，并且用 <code>--clock-control base</code> 锁频
 （否则 boost 频率漂移会污染跨 kernel 的比较——<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 踩过）。
-<strong>但先验一下这条对你的负载成不成立</strong>：本站实测流式 kernel 上两者只差 0.8%（见原始现场 ⑧）。</p>
+<strong>但先验一下这条对你的负载成不成立</strong>：本章实测流式 kernel 上两者只差 0.8%（见原始现场 ⑧）。</p>
 <p><strong>5b. 把占用率当优化目标。</strong>
 本站 GEMM 阶梯里<strong>占用率最高的 v0 是最慢的</strong>（99.84%，比 32.5% 的 v6 慢 24.7 倍）。
 占用率只是掩盖延迟的手段之一，另一条路是提高 ILP，而它和占用率此消彼长。
@@ -1549,7 +1586,7 @@ kernel 在 GPU 上跑多久不因为被观测而改变。</p>
 <p>共享内存一次 warp 级请求，如果 32 个 lane 落在 32 个不同 bank 上，
 硬件用<strong>一个 wavefront</strong> 就能服务完。有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 路冲突就要拆成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 个 wavefront 串行发。
 <strong>所以这个比值直接就是冲突路数。</strong></p>
-<p>本站实测（6,291,456 次读 = 196,608 次请求）：</p>
+<p>本章实测（6,291,456 次读 = 196,608 次请求）：</p>
 <table>
 <thead>
 <tr>

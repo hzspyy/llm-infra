@@ -30,9 +30,11 @@ SRC = ROOT / "src"
 SITE = ROOT / "site"
 ASSETS_SRC = ROOT / "assets"
 
-STATUS_LABEL = {"done": "有正文", "verified": "已核对", "draft": "有初稿",
-                "evidence": "证据待补", "wip": "编写中", "planned": "待写"}
 
+def ensure_dir(path: Path) -> None:
+    """Skip redundant mkdir calls in filesystem brokers that reject EEXIST."""
+    if not path.is_dir():
+        path.mkdir(parents=True, exist_ok=True)
 
 # --------------------------------------------------------------------------
 # math / code protection
@@ -106,6 +108,11 @@ def render_math(md_text: str, src_store: list[str] | None = None
     md_text = _protect(md_text, FENCE_RE, code_store, "CODE")
     if src_store is not None:
         md_text = expand_src_directives(md_text, src_store)
+        # Multiline SVG is opaque HTML: Markdown must not insert <p> inside it.
+        def stash_svg(match):
+            src_store.append(match.group(0))
+            return f"\n\nzZSRC{len(src_store) - 1}Zz\n\n"
+        md_text = re.sub(r"<svg\b[^>]*>.*?</svg>", stash_svg, md_text, flags=re.S)
     md_text = convert_admonitions(md_text)      # 代码块已保护，不会误伤
     md_text = _protect(md_text, INLINE_CODE_RE, code_store, "CODE")
 
@@ -205,10 +212,13 @@ def build_toc_sidebar(toc_html: str, up: str, mod_id: str, mod_title: str) -> st
     else:
         inner = toc_html
     return f"""<aside class="sidebar">
-  <a class="sidebar-home" href="{up}index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="{up}index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">{html.escape(mod_id)}</div>
   <div class="sidebar-title">{html.escape(mod_title)}</div>
-  <nav class="toc">{inner}</nav>
+  <nav class="toc" aria-label="本章目录">{inner}</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）">{inner}</nav>
+  </details>
 </aside>"""
 
 
@@ -299,12 +309,32 @@ def link_xrefs(html_text: str, *, depth: int) -> str:
         if mod.get("_built"):
             return (f'<a class="xref" href="{up}{module_url(mod)}" '
                     f'title="{title}">{key}</a>')
-        return f'<span class="xref pending" title="{title}（尚未写）">{key}</span>'
+        return f'<span class="xref pending" title="{title}（后续章节）">{key}</span>'
 
     linked = XREF_RE.sub(repl, protected)
     for i, hole in enumerate(holes):
         linked = linked.replace(f"\x00H{i}\x00", hole)
     return linked
+
+
+def bundle_result_links(body_html: str, src_path: Path) -> str:
+    """Bundle explicitly linked raw results so site/ is self-contained."""
+    def repl(match):
+        href = html.unescape(match.group(1))
+        if not href.startswith("../../results/"):
+            return match.group(0)
+        local_path, sep, anchor = href.partition("#")
+        source = (src_path.parent / local_path).resolve()
+        results_root = (ROOT / "results").resolve()
+        if not source.is_relative_to(results_root) or not source.is_file():
+            raise ValueError(f"Invalid result link in {src_path}: {href}")
+        relative = source.relative_to(results_root)
+        target = SITE / "raw" / "results" / relative
+        ensure_dir(target.parent)
+        shutil.copyfile(source, target)
+        url = "../raw/results/" + relative.as_posix() + (sep + anchor if sep else "")
+        return f'href="{html.escape(url, quote=True)}"'
+    return re.sub(r'href="([^"]+)"', repl, body_html)
 
 
 def build_module(mod: dict, prev_mod, next_mod, md: markdown.Markdown) -> bool:
@@ -331,6 +361,7 @@ def build_module(mod: dict, prev_mod, next_mod, md: markdown.Markdown) -> bool:
         toc_html = toc_html.replace(f"zZSRC{i}Zz", "")
 
     body_html = link_xrefs(body_html, depth=1)
+    body_html = bundle_result_links(body_html, src_path)
 
     meta_bits = []
     if meta.get("machine"):
@@ -353,7 +384,7 @@ def build_module(mod: dict, prev_mod, next_mod, md: markdown.Markdown) -> bool:
     nav_html = f'<nav class="pagenav">{"".join(nav)}</nav>'
 
     header = f"""<header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> {html.escape(mod["layer_id"])} · {html.escape(mod["layer_name"])}</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> {html.escape(mod["layer_id"])} · {html.escape(mod["layer_name"])}</div>
   <div class="mod-id">{html.escape(mod["id"])}</div>
   <h1>{html.escape(mod["title"])}</h1>
   <p class="lede">{html.escape(mod.get("brief", ""))}</p>
@@ -366,7 +397,7 @@ def build_module(mod: dict, prev_mod, next_mod, md: markdown.Markdown) -> bool:
                       body=body, sidebar=sidebar)
 
     out = SITE / module_url(mod)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(out.parent)
     out.write_text(page, encoding="utf-8")
     return True
 
@@ -512,13 +543,13 @@ def render_source_page(rel: Path) -> tuple[str, int]:
 <div class="src-body">{code_html}</div>
 """
     sidebar = f"""<aside class="sidebar">
-  <a class="sidebar-home" href="{up}index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="{up}index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">源码</div>
   <div class="sidebar-title">{html.escape(rel.name)}</div>
   <nav class="toc">{outline_html or ''}</nav>
 </aside>"""
     out_path = CODE_DIR / Path(*rel.parts).with_suffix(rel.suffix + ".html")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(out_path.parent)
     out_path.write_text(
         page_shell(title=f"{rel.name} · 源码", depth=depth, body=body,
                    sidebar=sidebar, main_class="page page-wide"),
@@ -552,8 +583,8 @@ def build_source_pages() -> list[tuple[Path, int]]:
   行号是固定链接；正文里的节选都能跳到这里的对应行。</p>
 </header>
 {''.join(secs)}
-<p class="src-foot"><a href="../index.html">&#8592; 回到全景地图</a></p>"""
-    CODE_DIR.mkdir(parents=True, exist_ok=True)
+<p class="src-foot"><a href="../index.html">&#8592; 回到教程目录</a></p>"""
+    ensure_dir(CODE_DIR)
     (CODE_DIR / "index.html").write_text(
         page_shell(title="全部源码", depth=1, body=body,
                    main_class="page page-wide"), encoding="utf-8")
@@ -609,7 +640,12 @@ def expand_src_directives(md_text: str, store: list[str]) -> str:
             lexer = get_lexer_by_name(lang)
         except Exception:                                    # noqa: BLE001
             lexer = get_lexer_by_name("text")
+        # Plain logs are data, not source code: do not prepend fake numeric data.
+        if lang == "text":
+            fmt = HtmlFormatter(cssclass="highlight", linenos=False)
         code = highlight(snippet, lexer, fmt)
+        code = re.sub(r'<span class="linenos">(.*?)</span>',
+                      r'<span class="linenos" aria-hidden="true">\1</span> ', code)
         bar = (f'<div class="srcref"><code>{html.escape(label)}</code>'
                f'<a href="{anchor}">在完整文件中打开 &rarr;</a></div>')
         block = f'<div class="srcblock">{code}{bar}</div>'
@@ -623,83 +659,87 @@ def expand_src_directives(md_text: str, store: list[str]) -> str:
     return SRC_DIRECTIVE.sub(repl, md_text)
 
 def build_index(outline: dict, mods: list[dict]) -> None:
-    written = sum(1 for m in mods if module_path(m).exists())
-    total = len(mods)
-
-    def md_bold(s: str) -> str:
-        return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html.escape(s))
-
-    sections = []
+    """Reader-facing contents; editorial progress belongs in STATUS.md."""
+    available = [m for m in mods if m.get("_built")]
+    descriptions = {
+        "L0": "从最小模型开始，建立张量、请求、计算量与数据量之间的联系。",
+        "L1": "理解 GPU 存储层级、指令、PCIe 和操作系统对执行的约束。",
+        "L2": "从 CUDA 执行模型到算子优化，再到编译器、性能分析与框架接入。",
+        "L3": "推导 attention 的计算与存储成本，比较分块、分页和压缩状态。",
+        "L4": "把配置、权重文件与模型计算对应起来，分析数值、量化和 MoE。",
+        "L5": "串起缓存、调度、执行、采样与失败处理，理解单机推理服务。",
+    }
+    sections, layer_links, roadmap = [], [], []
     for layer in outline["layers"]:
+        built = [m for m in available if m["layer_id"] == layer["id"]]
+        pending = [m for m in mods if m["layer_id"] == layer["id"] and not m.get("_built")]
+        if pending:
+            names = "；".join(html.escape(m["id"] + " " + m["title"]) for m in pending)
+            roadmap.append(f'<li><b>{html.escape(layer["id"] + " · " + layer["name"])}</b><p>{names}</p></li>')
+        if not built:
+            continue
+        lid = html.escape(layer["id"])
+        name = html.escape(layer["name"])
+        layer_links.append(f'<li><a href="#{lid}"><span>{lid}</span>{name}</a></li>')
         rows = []
-        for raw_mod in layer["modules"]:
-            mod = {**raw_mod, "layer_id": layer["id"]}
-            st = mod.get("status", "planned")
-            exists = module_path(mod).exists()
-            if exists:
-                link = f'<a href="{module_url(mod)}">{html.escape(mod["title"])}</a>'
-                badge = '<span class="badge done">有正文</span>'
-            else:
-                link = f'<span class="pending">{html.escape(mod["title"])}</span>'
-                badge = f'<span class="badge {st}">{STATUS_LABEL.get(st, st)}</span>'
+        for mod in built:
+            brief = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html.escape(mod.get("brief", "")))
             rows.append(
                 f'<li><span class="mid">{html.escape(mod["id"])}</span>'
-                f'<div class="mbody"><div class="mtitle">{link} {badge}</div>'
-                f'<div class="mbrief">{md_bold(mod.get("brief", ""))}</div></div></li>'
-            )
-        sections.append(f"""<section class="layer" id="{layer['id']}">
-  <div class="layer-head">
-    <span class="layer-id">{html.escape(layer['id'])}</span>
-    <h2>{html.escape(layer['name'])}<span class="layer-tag">{html.escape(layer['tagline'])}</span></h2>
-  </div>
-  <p class="layer-why">{html.escape(layer['why'])}</p>
-  <ol class="modlist">{''.join(rows)}</ol>
-</section>""")
-
-    def md_bold(s: str) -> str:
-        return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html.escape(s))
-
-    principles = "".join(f"<li>{md_bold(p)}</li>" for p in outline.get("principles", []))
-
-    body = f"""<header class="hero">
-  <h1>{html.escape(outline['title'])}</h1>
-  <p class="lede">{html.escape(outline['subtitle'])}</p>
-  <div class="progress"><span>{written} / {total} 模块有正文（不代表验收完成）</span>
-  <div class="bar"><i style="width:{(written / total * 100):.1f}%"></i></div></div>
-</header>
-
-<section class="intro">
-  <h2>写作与证据要求</h2>
-  <ol class="principles">{principles}</ol>
-</section>
-
-<section class="intro">
-  <h2>怎么读这套材料</h2>
-  <p>顺序不是纯自底向上，也不是纯自顶向下。<b>L0 先建立一本资源账本</b>——一次请求的时间、字节、
-  FLOP 分别去了哪；它是后面每一章的挂载点。然后 <b>L1–L5 自底向上打穿</b>，每一层都在解决下一层
-  暴露出的约束。最后 <b>L6–L8 横向展开</b>，把单机的结论放大到多卡、训练与集群。</p>
-  <p>每个模块固定十段：<b>本章回答的三个问题 &rarr; 心智模型 &rarr; 机制拆解 &rarr;
-  工程实现·源码走读 &rarr; 工程实现·自己写一遍 &rarr; 动手 lab（含实测数字）&rarr;
-  原始现场 &rarr; 前沿 &rarr; 陷阱 &rarr; 自测题</b>。</p>
-  <p class="rule"><b>数字诚实性</b>：站内每个数字都标注机器、日期与产生它的命令，原始输出留在
-  <code>results/</code>。没有实测的数字一律显式标注 <span class="unverified">未实测</span>，
-  不会把别处 blog 的加速比当作已验证事实呈现。</p>
-  <h3>快车道</h3>
-  <p>时间紧时可以只走推理主干：<b>L0 &rarr; L5 &rarr; L6 &rarr; L8</b>，底层（L1–L3）与训练侧（L7）后补。
-  每章开头会标出真正的前置依赖，跳读不会断层。</p>
-</section>
-
-<section class="intro">
-  <h2>实验硬件底座</h2>
-  <p>同一份代码在四种硬件上跑出不同数字，才能讲清楚「瓶颈来自哪个硬件参数」。</p>
-  {HARDWARE_TABLE}
-</section>
-
-{''.join(sections)}
-
-<footer class="site-foot">构建于 {date.today().isoformat()} · 纯静态、无 JavaScript、无外部资源，可离线阅读</footer>
-"""
-    page = page_shell(title=outline["title"], depth=0, body=body)
+                f'<div class="mbody"><a class="mtitle" href="{module_url(mod)}">'
+                f'{html.escape(mod["title"])}</a><p class="mbrief">{brief}</p></div>'
+                '<span class="chapter-arrow" aria-hidden="true">&#8599;</span></li>')
+        sections.append(f'<section class="layer" id="{lid}">'
+                        f'<div class="layer-head"><span class="layer-id">{lid}</span>'
+                        f'<h2>{name}</h2><span class="chapter-count">{len(built)} 章</span></div>'
+                        f'<p class="layer-why">{html.escape(descriptions.get(layer["id"], layer["tagline"]))}</p>'
+                        f'<ol class="modlist">{"".join(rows)}</ol></section>')
+    nav = '<ul class="contents-links">' + "".join(layer_links) + '</ul>'
+    sidebar = f'''<aside class="sidebar home-sidebar">
+      <a class="sidebar-home" href="#top">AI INFRA / 教程</a>
+      <div class="sidebar-title">阅读目录</div>
+      <nav aria-label="全书分层目录">{nav}</nav>
+      <div class="sidebar-extras"><a href="#reading">阅读与复现</a><a href="code/index.html">源码与原始材料</a></div>
+    </aside>'''
+    start = module_url(available[0]) if available else "#contents"
+    body = f'''<header class="hero home-hero" id="top">
+      <p class="eyebrow">原理 / 源码 / 可复现实验</p>
+      <h1>从模型计算<br>理解 AI 基础设施</h1>
+      <p class="lede">沿着一次模型请求，连接张量计算、GPU、算子与推理引擎。<br>
+      用推导解释机制，用代码检查细节，用实验判断代价。</p>
+      <div class="hero-actions"><a class="primary-link" href="{start}">从最小模型开始 &#8594;</a>
+      <a href="#contents">浏览全部 {len(available)} 章</a></div>
+    </header>
+    <section class="reading-paths" aria-labelledby="paths-title">
+      <h2 id="paths-title">选择一条阅读路线</h2>
+      <div class="path-grid">
+        <a class="path-card" href="#L0"><span class="eyebrow">基础路线</span><h3>从计算到系统</h3>
+        <p>L0 → L1 → L2 → L3 → L4 → L5</p><small>逐层理解机制，适合完整学习。</small></a>
+        <a class="path-card" href="#L5"><span class="eyebrow">推理路线</span><h3>从请求到引擎</h3>
+        <p>L0 → L4 → L5，按需回看 L1–L3</p><small>先建立服务全貌，再补齐底层原理。</small></a>
+      </div>
+    </section>
+    <section class="contents-intro" id="contents"><p class="eyebrow">CONTENTS</p>
+      <h2>章节目录</h2><p>按层浏览，或直接选择一个问题开始阅读。</p>
+      <nav class="layer-jumps" aria-label="跳转到章节层">{nav}</nav>
+    </section>
+    {"".join(sections)}
+    <section class="intro reader-guide" id="reading"><h2>阅读与复现</h2>
+      <p><b>只阅读，不需要 GPU。</b> 先看机制与推导，再按需展开源码和原始输出。
+      代码块下方的链接可打开完整文件；行号可用于定位和引用。</p>
+      <p><b>运行实验，从项目根目录开始。</b> 文中的 <code>python labs/…</code> 使用已激活的独立环境；
+      依赖版本、硬件和模型见各章说明。模型实验通常读取本地缓存，先设置自己的
+      <code>HF_HOME</code> 并准备匹配的模型快照。脚本若带有历史默认路径，应先按说明调整，不能直接套用他人的目录。</p>
+      <p><b>比较数字，先确认条件。</b> 公式估计不等于硬件读数；小规模对照不代表所有输入。
+      <code>UNVERIFIED</code> 表示相关路线尚未实测。机器别名仅标识原始记录的来源，不是阅读或复现所需的登录地址。</p>
+      <p>GPU 实验前检查设备占用并核算权重、KV 和临时空间；新结果使用新文件名，不覆盖原始材料。
+      <a href="code/index.html">打开源码与原始材料 &#8594;</a></p>
+    </section>
+    <details class="roadmap"><summary>后续主题</summary><p>以下为课程范围预告，不属于上面的阅读目录。</p>
+      <ul>{"".join(roadmap)}</ul></details>
+    <footer class="site-foot">AI Infra 教程 · {date.today().isoformat()} · 静态页面，可离线阅读</footer>'''
+    page = page_shell(title=outline["title"], depth=0, body=body,
+                      sidebar=sidebar, main_class="page home-page")
     (SITE / "index.html").write_text(page, encoding="utf-8")
 
 
@@ -712,8 +752,8 @@ def main() -> int:
         m["_built"] = module_path(m).exists()
     build_xref_index(mods)
 
-    SITE.mkdir(exist_ok=True)
-    (SITE / "assets").mkdir(exist_ok=True)
+    ensure_dir(SITE)
+    ensure_dir(SITE / "assets")
     shutil.copy2(ASSETS_SRC / "style.css", SITE / "assets" / "style.css")
     global ASSET_VER
     ASSET_VER = hashlib.sha1(

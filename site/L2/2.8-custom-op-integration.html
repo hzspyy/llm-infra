@@ -4,19 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.8 把一个算子接进 PyTorch：注册、分发、backward 与 compile</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">2.8</div>
   <div class="sidebar-title">把一个算子接进 PyTorch：注册、分发、backward 与 compile</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
-<li><a href="#pytorch-kernel">一 · 起点：一个 PyTorch 完全不认识的 kernel</a></li>
+<li><a href="#kernel">一 · 裸 kernel 调用不自动具备框架语义</a></li>
 <li><a href="#_2">二 · 注册成一个真正的算子</a></li>
 <li><a href="#fakemeta">三 · fake（meta）函数：不执行也要知道形状</a></li>
 <li><a href="#gradcheck">四 · 反向：注册 + gradcheck</a><ul>
@@ -24,11 +24,11 @@
 <li><a href="#_3">失败现场：反向写错，前向完全正确</a></li>
 </ul>
 </li>
-<li><a href="#_4">五 · 注册之后能被融合吗</a></li>
+<li><a href="#_4">五 · 不透明算子形成融合边界</a></li>
 <li><a href="#_5">六 · 设计取舍</a><ul>
-<li><a href="#61">6.1 为什么不透明是必须的，而不是偷懒</a></li>
-<li><a href="#62">6.2 什么时候值得写自定义算子</a></li>
-<li><a href="#63">6.3 三次注册的顺序不是随意的</a></li>
+<li><a href="#61">6.1 不透明边界的可组合性与优化限制</a></li>
+<li><a href="#62">6.2 自定义算子的功能与性能目标</a></li>
+<li><a href="#63-schemafake-autograd">6.3 schema、fake 与 autograd 各自负责不同契约</a></li>
 </ul>
 </li>
 <li><a href="#lab">七 · 动手 lab</a></li>
@@ -37,13 +37,39 @@
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#kernel">一 · 裸 kernel 调用不自动具备框架语义</a></li>
+<li><a href="#_2">二 · 注册成一个真正的算子</a></li>
+<li><a href="#fakemeta">三 · fake（meta）函数：不执行也要知道形状</a></li>
+<li><a href="#gradcheck">四 · 反向：注册 + gradcheck</a><ul>
+<li><a href="#gradcheck_1">gradcheck 通过</a></li>
+<li><a href="#_3">失败现场：反向写错，前向完全正确</a></li>
+</ul>
+</li>
+<li><a href="#_4">五 · 不透明算子形成融合边界</a></li>
+<li><a href="#_5">六 · 设计取舍</a><ul>
+<li><a href="#61">6.1 不透明边界的可组合性与优化限制</a></li>
+<li><a href="#62">6.2 自定义算子的功能与性能目标</a></li>
+<li><a href="#63-schemafake-autograd">6.3 schema、fake 与 autograd 各自负责不同契约</a></li>
+</ul>
+</li>
+<li><a href="#lab">七 · 动手 lab</a></li>
+<li><a href="#_6">八 · 陷阱</a></li>
+<li><a href="#_7">九 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
   <div class="mod-id">2.8</div>
   <h1>把一个算子接进 PyTorch：注册、分发、backward 与 compile</h1>
-  <p class="lede">从一个自写 CUDA kernel 出发，走完 Python 绑定 → torch.library 注册 → dispatcher 分发 → 自定义 autograd → 让 torch.compile 认识它（含 meta / fake tensor 与融合边界）。这是 L2 的收口练习。</p>
+  <p class="lede">为自定义 kernel 注册 schema、fake 与 autograd，检查梯度、图捕获及融合边界。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · CUDA 13.0</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 2.0（dispatcher 与 DispatchKeySet）· 2.2（工具链）· 2.6b / 2.7（编译器栈）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>L2 到这里已经会写 kernel（2.1–2.5）、会看编译器（2.6b、2.7）、
@@ -63,7 +89,7 @@
 有两个需要求导的输入、而且反向里有一个<strong>很容易忘掉的 relu 掩码</strong>——
 后面会故意忘一次，看 <code>gradcheck</code> 能不能抓住。</p>
 <hr />
-<h2 id="pytorch-kernel">一 · 起点：一个 PyTorch 完全不认识的 kernel</h2>
+<h2 id="kernel">一 · 裸 kernel 调用不自动具备框架语义</h2>
 <p>先用 <code>load_inline</code> 编出来，确认它是对的：</p>
 <div class="highlight"><pre><span></span><code>前向对不对: max|err| = 5.684e-14
 返回类型: &lt;class 'torch.Tensor'&gt;  shape=(64,)
@@ -96,7 +122,7 @@ aten::add.Tensor             存在
 <p><strong>kernel 调用根本不在图里。</strong> 图的入参 <code>L_stack0_</code> 是"栈上第 0 号槽"——
 也就是<strong>已经算好的结果</strong>。Dynamo 在图外 eager 执行了这次调用，
 只从它的返回值开始捕获，于是图里只剩一个 <code>* 2</code>。</p>
-<p>用 <code>fullgraph=True</code> 才会说实话：</p>
+<p>设置 <code>fullgraph=True</code>，让未完整捕获的情况显式报错：</p>
 <div class="highlight"><pre><span></span><code>Unsupported: Attempted to call function marked as skipped
 </code></pre></div>
 
@@ -261,7 +287,7 @@ gradcheck 抓到了:
 <p><code>gradcheck</code> 是唯一能在写完当场抓住它的工具。<strong>写反向就要写 gradcheck</strong>，
 成本是三行代码。</p>
 <hr />
-<h2 id="_4">五 · 注册之后能被融合吗</h2>
+<h2 id="_4">五 · 不透明算子形成融合边界</h2>
 <p>不能。自定义算子在 Inductor 眼里是不透明的。</p>
 <p>同一个表达式 <code>(op(x, w) * 2).relu() + 1</code>，两种写法：</p>
 <div class="highlight"><pre><span></span><code>自定义算子 + 后续逐元素
@@ -313,7 +339,7 @@ gradcheck 抓到了:
 </ol>
 <hr />
 <h2 id="_5">六 · 设计取舍</h2>
-<h3 id="61">6.1 为什么不透明是必须的，而不是偷懒</h3>
+<h3 id="61">6.1 不透明边界的可组合性与优化限制</h3>
 <p>Inductor 要融合两个算子，前提是它<strong>知道两者在算什么</strong>——
 知道循环结构、访存模式、哪些维度可以合并。对一个只有 schema
 <code>(Tensor x, Tensor w) -&gt; Tensor</code> 的黑盒，这些全都不知道。</p>
@@ -345,10 +371,10 @@ Inductor 自己生成的走 C；<code>torch.library.triton_op</code> 是一条�
 让 Inductor 知道这是个 Triton kernel 从而能做一部分处理。</p>
 <p>判据是<strong>边界划在哪</strong>。A 把边界划在"函数调用"这个最小公约数上，
 换来的是任何东西都能接进来。这是一个有意识的取舍，不是能力不足。</p>
-<h3 id="62">6.2 什么时候值得写自定义算子</h3>
-<p>本章的测量给出了一个直接的判据：<strong>当且仅当你的 kernel 比编译器生成的快，
+<h3 id="62">6.2 自定义算子的功能与性能目标</h3>
+<p>本章的测量给出了一个直接的判据：<strong>若目标是加速，需要你的 kernel 比编译器生成的快，
 而且快出的部分能覆盖不透明边界的代价。</strong></p>
-<p>我这个 kernel 没做到。它慢的原因也清楚：一个 block 归约一行（4096 个元素），
+<p>本章 kernel 未达到这一目标。一个待核对的实现差异是：一个 block 归约一行（4096 个元素），
 grid 只有 4096 个 block，且每行只有一个 block 在做归约——
 2.3 里讲的两段式切分我只做了 block 内那一段。Inductor 生成的版本
 按 <code>size_hints={'x': 512, 'r0_': 8192}</code> 两级切分（2.7 §3），并行度更高。</p>
@@ -357,7 +383,7 @@ grid 只有 4096 个 block，且每行只有一个 block 在做归约——
 <strong>特殊指令</strong>（tcgen05、FP4，<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a>）、
 <strong>融合了编译器不会跨越的边界</strong>（PagedAttention 跨 block table 的 gather）。
 "我觉得手写会更快"通常不是。</p>
-<h3 id="63">6.3 三次注册的顺序不是随意的</h3>
+<h3 id="63-schemafake-autograd">6.3 schema、fake 与 autograd 各自负责不同契约</h3>
 <p><code>custom_op</code> → <code>register_fake</code> → <code>register_autograd</code>，
 对应三个不同的 dispatch key：<code>CompositeExplicitAutograd</code> → <code>Meta</code> → <code>Autograd</code>。
 缺哪个就在哪一层失败，而且失败方式不同：</p>
@@ -387,8 +413,8 @@ grid 只有 4096 个 block，且每行只有一个 block 在做归约——
 </tr>
 <tr>
 <td>autograd 写错</td>
-<td><strong>永远不炸</strong></td>
-<td>只有 gradcheck 能发现</td>
+<td>可能不报错</td>
+<td>用 gradcheck、解析梯度与多输入对照检查</td>
 </tr>
 </tbody>
 </table>
@@ -397,436 +423,437 @@ grid 只有 4096 个 block，且每行只有一个 block 在做归约——
 注册的价值一半在功能，一半在<strong>把静默失败变成显式失败</strong>。</p>
 <hr />
 <h2 id="lab">七 · 动手 lab</h2>
-<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L2 &amp;&amp; /scratch/learn/envs/serve/bin/python custom_op.py'</span>
+<div class="highlight"><pre><span></span><code><span class="c1"># 需要匹配本章版本的 PyTorch、CUDA 编译工具链</span>
+python<span class="w"> </span>labs/L2/custom_op.py
 </code></pre></div>
 
 <p>单节：<code>custom_op.py C D</code>。原始输出
 <code>results/crater/compile/28_custom_op.txt</code>（139 行）。</p>
-<details class="fold srcfold"><summary>labs/L2/custom_op.py 全文（425 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
-<span class="linenos">  2</span><span class="sd">"""L2.8 —— 把一个自写 CUDA kernel 接进 PyTorch。</span>
-<span class="linenos">  3</span>
-<span class="linenos">  4</span><span class="sd">算子：out[i] = sum_j relu(x[i,j] * w[j])</span>
-<span class="linenos">  5</span><span class="sd">反向：dx[i,j] = g[i] * w[j] * 1[x*w&gt;0]</span>
-<span class="linenos">  6</span><span class="sd">      dw[j]   = sum_i g[i] * x[i,j] * 1[x*w&gt;0]</span>
-<span class="linenos">  7</span>
-<span class="linenos">  8</span><span class="sd">一路走完：裸函数 -&gt; torch.library 注册 -&gt; fake（meta）-&gt; autograd -&gt; torch.compile。</span>
-<span class="linenos">  9</span><span class="sd">每一步都打印 dispatch 表 / 图 / gradcheck 结果，看清楚少了哪一步会怎样。</span>
-<span class="linenos"> 10</span>
-<span class="linenos"> 11</span><span class="sd">用法：</span>
-<span class="linenos"> 12</span><span class="sd">    python custom_op.py            # 全跑</span>
-<span class="linenos"> 13</span><span class="sd">    python custom_op.py C E</span>
-<span class="linenos"> 14</span><span class="sd">"""</span>
-<span class="linenos"> 15</span>
-<span class="linenos"> 16</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="linenos"> 17</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
-<span class="linenos"> 18</span>
-<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="linenos"> 20</span>
-<span class="linenos"> 21</span><span class="n">DEV</span> <span class="o">=</span> <span class="s2">"cuda"</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="k">else</span> <span class="s2">"cpu"</span>
-<span class="linenos"> 22</span><span class="n">LIB</span> <span class="o">=</span> <span class="s2">"l28"</span>
-<span class="linenos"> 23</span>
-<span class="linenos"> 24</span>
-<span class="linenos"> 25</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
-<span class="linenos"> 26</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
-<span class="linenos"> 27</span>
-<span class="linenos"> 28</span>
-<span class="linenos"> 29</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
-<span class="linenos"> 30</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
-<span class="linenos"> 31</span>
-<span class="linenos"> 32</span>
-<span class="linenos"> 33</span><span class="c1"># ---------------------------------------------------------------- kernel</span>
-<span class="linenos"> 34</span><span class="n">CUDA_SRC</span> <span class="o">=</span> <span class="sa">r</span><span class="s2">"""</span>
-<span class="linenos"> 35</span><span class="s2">#include &lt;ATen/ATen.h&gt;</span>
-<span class="linenos"> 36</span><span class="s2">#include &lt;ATen/Dispatch.h&gt;</span>
-<span class="linenos"> 37</span>
-<span class="linenos"> 38</span><span class="s2">template &lt;typename scalar_t&gt;</span>
-<span class="linenos"> 39</span><span class="s2">__global__ void fss_fwd(const scalar_t* __restrict__ x,</span>
-<span class="linenos"> 40</span><span class="s2">                        const scalar_t* __restrict__ w,</span>
-<span class="linenos"> 41</span><span class="s2">                        scalar_t* __restrict__ out, int R, int C) {</span>
-<span class="linenos"> 42</span><span class="s2">    int row = blockIdx.x;</span>
-<span class="linenos"> 43</span><span class="s2">    if (row &gt;= R) return;</span>
-<span class="linenos"> 44</span><span class="s2">    // 一个 block 归约一行；这是 L2.3 那个两段式归约的最小版本</span>
-<span class="linenos"> 45</span><span class="s2">    extern __shared__ unsigned char smem_raw[];</span>
-<span class="linenos"> 46</span><span class="s2">    scalar_t* smem = reinterpret_cast&lt;scalar_t*&gt;(smem_raw);</span>
-<span class="linenos"> 47</span><span class="s2">    scalar_t acc = 0;</span>
-<span class="linenos"> 48</span><span class="s2">    for (int j = threadIdx.x; j &lt; C; j += blockDim.x) {</span>
-<span class="linenos"> 49</span><span class="s2">        scalar_t v = x[row * C + j] * w[j];</span>
-<span class="linenos"> 50</span><span class="s2">        acc += v &gt; scalar_t(0) ? v : scalar_t(0);</span>
-<span class="linenos"> 51</span><span class="s2">    }</span>
-<span class="linenos"> 52</span><span class="s2">    smem[threadIdx.x] = acc;</span>
-<span class="linenos"> 53</span><span class="s2">    __syncthreads();</span>
-<span class="linenos"> 54</span><span class="s2">    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {</span>
-<span class="linenos"> 55</span><span class="s2">        if (threadIdx.x &lt; s) smem[threadIdx.x] += smem[threadIdx.x + s];</span>
-<span class="linenos"> 56</span><span class="s2">        __syncthreads();</span>
-<span class="linenos"> 57</span><span class="s2">    }</span>
-<span class="linenos"> 58</span><span class="s2">    if (threadIdx.x == 0) out[row] = smem[0];</span>
-<span class="linenos"> 59</span><span class="s2">}</span>
-<span class="linenos"> 60</span>
-<span class="linenos"> 61</span><span class="s2">template &lt;typename scalar_t&gt;</span>
-<span class="linenos"> 62</span><span class="s2">__global__ void fss_bwd(const scalar_t* __restrict__ g,</span>
-<span class="linenos"> 63</span><span class="s2">                        const scalar_t* __restrict__ x,</span>
-<span class="linenos"> 64</span><span class="s2">                        const scalar_t* __restrict__ w,</span>
-<span class="linenos"> 65</span><span class="s2">                        scalar_t* __restrict__ gx,</span>
-<span class="linenos"> 66</span><span class="s2">                        scalar_t* __restrict__ gw, int R, int C) {</span>
-<span class="linenos"> 67</span><span class="s2">    int idx = blockIdx.x * blockDim.x + threadIdx.x;</span>
-<span class="linenos"> 68</span><span class="s2">    if (idx &gt;= R * C) return;</span>
-<span class="linenos"> 69</span><span class="s2">    int i = idx / C, j = idx % C;</span>
-<span class="linenos"> 70</span><span class="s2">    scalar_t v = x[idx] * w[j];</span>
-<span class="linenos"> 71</span><span class="s2">    scalar_t mask = v &gt; scalar_t(0) ? scalar_t(1) : scalar_t(0);</span>
-<span class="linenos"> 72</span><span class="s2">    gx[idx] = g[i] * w[j] * mask;</span>
-<span class="linenos"> 73</span><span class="s2">    atomicAdd(&amp;gw[j], g[i] * x[idx] * mask);</span>
-<span class="linenos"> 74</span><span class="s2">}</span>
-<span class="linenos"> 75</span>
-<span class="linenos"> 76</span><span class="s2">at::Tensor fss_forward(at::Tensor x, at::Tensor w) {</span>
-<span class="linenos"> 77</span><span class="s2">    TORCH_CHECK(x.is_cuda() &amp;&amp; w.is_cuda(), "需要 CUDA 张量");</span>
-<span class="linenos"> 78</span><span class="s2">    TORCH_CHECK(x.is_contiguous() &amp;&amp; w.is_contiguous(),</span>
-<span class="linenos"> 79</span><span class="s2">                "这个 kernel 假设连续内存 —— 见 L2.0 [E] 节");</span>
-<span class="linenos"> 80</span><span class="s2">    int R = x.size(0), C = x.size(1);</span>
-<span class="linenos"> 81</span><span class="s2">    auto out = at::empty(</span><span class="si">{R}</span><span class="s2">, x.options());</span>
-<span class="linenos"> 82</span><span class="s2">    int threads = 256;</span>
-<span class="linenos"> 83</span><span class="s2">    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fss_fwd", [&amp;] {</span>
-<span class="linenos"> 84</span><span class="s2">        fss_fwd&lt;scalar_t&gt;&lt;&lt;&lt;R, threads, threads * sizeof(scalar_t)&gt;&gt;&gt;(</span>
-<span class="linenos"> 85</span><span class="s2">            x.data_ptr&lt;scalar_t&gt;(), w.data_ptr&lt;scalar_t&gt;(),</span>
-<span class="linenos"> 86</span><span class="s2">            out.data_ptr&lt;scalar_t&gt;(), R, C);</span>
-<span class="linenos"> 87</span><span class="s2">    });</span>
-<span class="linenos"> 88</span><span class="s2">    return out;</span>
-<span class="linenos"> 89</span><span class="s2">}</span>
-<span class="linenos"> 90</span>
-<span class="linenos"> 91</span><span class="s2">std::vector&lt;at::Tensor&gt; fss_backward(at::Tensor g, at::Tensor x, at::Tensor w) {</span>
-<span class="linenos"> 92</span><span class="s2">    int R = x.size(0), C = x.size(1);</span>
-<span class="linenos"> 93</span><span class="s2">    auto gx = at::empty_like(x);</span>
-<span class="linenos"> 94</span><span class="s2">    auto gw = at::zeros_like(w);</span>
-<span class="linenos"> 95</span><span class="s2">    int n = R * C, threads = 256;</span>
-<span class="linenos"> 96</span><span class="s2">    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fss_bwd", [&amp;] {</span>
-<span class="linenos"> 97</span><span class="s2">        fss_bwd&lt;scalar_t&gt;&lt;&lt;&lt;(n + threads - 1) / threads, threads&gt;&gt;&gt;(</span>
-<span class="linenos"> 98</span><span class="s2">            g.contiguous().data_ptr&lt;scalar_t&gt;(), x.data_ptr&lt;scalar_t&gt;(),</span>
-<span class="linenos"> 99</span><span class="s2">            w.data_ptr&lt;scalar_t&gt;(), gx.data_ptr&lt;scalar_t&gt;(),</span>
-<span class="linenos">100</span><span class="s2">            gw.data_ptr&lt;scalar_t&gt;(), R, C);</span>
-<span class="linenos">101</span><span class="s2">    });</span>
-<span class="linenos">102</span><span class="s2">    return {gx, gw};</span>
-<span class="linenos">103</span><span class="s2">}</span>
-<span class="linenos">104</span><span class="s2">"""</span>
-<span class="linenos">105</span>
-<span class="linenos">106</span><span class="n">CPP_SRC</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"at::Tensor fss_forward(at::Tensor x, at::Tensor w);</span><span class="se">\n</span><span class="s2">"</span>
-<span class="linenos">107</span>           <span class="s2">"std::vector&lt;at::Tensor&gt; fss_backward(at::Tensor g, at::Tensor x, at::Tensor w);</span><span class="se">\n</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">108</span>
-<span class="linenos">109</span><span class="n">_mod</span> <span class="o">=</span> <span class="kc">None</span>
-<span class="linenos">110</span>
-<span class="linenos">111</span>
-<span class="linenos">112</span><span class="k">def</span><span class="w"> </span><span class="nf">kernel</span><span class="p">():</span>
-<span class="linenos">113</span>    <span class="k">global</span> <span class="n">_mod</span>
-<span class="linenos">114</span>    <span class="k">if</span> <span class="n">_mod</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-<span class="linenos">115</span>        <span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.cpp_extension</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_inline</span>
-<span class="linenos">116</span>        <span class="n">build</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"LEARN_ROOT"</span><span class="p">,</span> <span class="s2">"/tmp"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/.cache/torchext/l28"</span>
-<span class="linenos">117</span>        <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">build</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">118</span>        <span class="n">_mod</span> <span class="o">=</span> <span class="n">load_inline</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">"l28_fss"</span><span class="p">,</span> <span class="n">cpp_sources</span><span class="o">=</span><span class="n">CPP_SRC</span><span class="p">,</span>
-<span class="linenos">119</span>                           <span class="n">cuda_sources</span><span class="o">=</span><span class="n">CUDA_SRC</span><span class="p">,</span>
-<span class="linenos">120</span>                           <span class="n">functions</span><span class="o">=</span><span class="p">[</span><span class="s2">"fss_forward"</span><span class="p">,</span> <span class="s2">"fss_backward"</span><span class="p">],</span>
-<span class="linenos">121</span>                           <span class="n">build_directory</span><span class="o">=</span><span class="n">build</span><span class="p">,</span> <span class="n">verbose</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos">122</span>    <span class="k">return</span> <span class="n">_mod</span>
-<span class="linenos">123</span>
-<span class="linenos">124</span>
-<span class="linenos">125</span><span class="k">def</span><span class="w"> </span><span class="nf">ref</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
-<span class="linenos">126</span><span class="w">    </span><span class="sd">"""纯 PyTorch 参照实现，用来对答案。"""</span>
-<span class="linenos">127</span>    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="n">w</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-<span class="linenos">128</span>
-<span class="linenos">129</span>
-<span class="linenos">130</span><span class="c1"># ---------------------------------------------------------------- A</span>
-<span class="linenos">131</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
-<span class="linenos">132</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 起点：一个能跑、但 PyTorch 完全不认识的 kernel"</span><span class="p">)</span>
-<span class="linenos">133</span>    <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
-<span class="linenos">134</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
-<span class="linenos">135</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">512</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
-<span class="linenos">136</span>    <span class="n">got</span><span class="p">,</span> <span class="n">want</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">),</span> <span class="n">ref</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">137</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  前向对不对: max|err| = </span><span class="si">{</span><span class="p">(</span><span class="n">got</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">want</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">138</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  返回类型: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">got</span><span class="p">)</span><span class="si">}</span><span class="s2">  shape=</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">got</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">139</span>
-<span class="linenos">140</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"它在 dispatcher 里存在吗"</span><span class="p">)</span>
-<span class="linenos">141</span>    <span class="c1"># 注意：_dispatch_dump 对不存在的算子返回空串，不抛异常</span>
-<span class="linenos">142</span>    <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"l28::fused_scale_sum"</span><span class="p">,</span> <span class="s2">"aten::add.Tensor"</span><span class="p">]:</span>
-<span class="linenos">143</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">144</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'存在'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_dump</span><span class="p">(</span><span class="n">name</span><span class="p">)</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'**不存在**'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">145</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  它只是一个 pybind 出来的 python 可调用对象，dispatcher 里没有它。"</span><span class="p">)</span>
-<span class="linenos">146</span>
-<span class="linenos">147</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"requires_grad 会怎样"</span><span class="p">)</span>
-<span class="linenos">148</span>    <span class="n">xg</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">149</span>    <span class="n">out</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">xg</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">150</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  out.requires_grad = </span><span class="si">{</span><span class="n">out</span><span class="o">.</span><span class="n">requires_grad</span><span class="si">}</span><span class="s2">   grad_fn = </span><span class="si">{</span><span class="n">out</span><span class="o">.</span><span class="n">grad_fn</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">151</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  没有反向。autograd 根本不知道发生过这次计算。"</span><span class="p">)</span>
-<span class="linenos">152</span>
-<span class="linenos">153</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"torch.compile 遇到它会怎样 —— 这里有个陷阱"</span><span class="p">)</span>
-<span class="linenos">154</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">torch._dynamo</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dynamo</span>
-<span class="linenos">155</span>    <span class="k">def</span><span class="w"> </span><span class="nf">f</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">):</span>
-<span class="linenos">156</span>        <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span>
-<span class="linenos">157</span>
-<span class="linenos">158</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
-<span class="linenos">159</span>    <span class="n">exp</span> <span class="o">=</span> <span class="n">dynamo</span><span class="o">.</span><span class="n">explain</span><span class="p">(</span><span class="n">f</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">160</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  explain(): 图数量 </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">   图断裂 </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">graph_break_count</span><span class="si">}</span><span class="s2">"</span>
-<span class="linenos">161</span>          <span class="sa">f</span><span class="s2">"   捕获算子 </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">op_count</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">162</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  看起来一切正常。但把图打印出来："</span><span class="p">)</span>
-<span class="linenos">163</span>
-<span class="linenos">164</span>    <span class="n">gms</span> <span class="o">=</span> <span class="p">[]</span>
-<span class="linenos">165</span>    <span class="k">def</span><span class="w"> </span><span class="nf">cb</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">ex</span><span class="p">):</span>
-<span class="linenos">166</span>        <span class="n">gms</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gm</span><span class="p">);</span> <span class="k">return</span> <span class="n">gm</span><span class="o">.</span><span class="n">forward</span>
-<span class="linenos">167</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
-<span class="linenos">168</span>    <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">cb</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">169</span>    <span class="k">for</span> <span class="n">g</span> <span class="ow">in</span> <span class="n">gms</span><span class="p">:</span>
-<span class="linenos">170</span>        <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">g</span><span class="o">.</span><span class="n">code</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">splitlines</span><span class="p">():</span>
-<span class="linenos">171</span>            <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">line</span><span class="p">)</span>
-<span class="linenos">172</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  **kernel 调用根本不在图里。** 图的入参 L_stack0_ 是"</span>
-<span class="linenos">173</span>          <span class="s2">"已经算好的结果，"</span><span class="p">)</span>
-<span class="linenos">174</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  只有后面那个 `* 2` 被捕获了。Dynamo 在图外 eager 执行了这次调用。"</span><span class="p">)</span>
-<span class="linenos">175</span>
-<span class="linenos">176</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  用 fullgraph=True 才会说实话："</span><span class="p">)</span>
-<span class="linenos">177</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
-<span class="linenos">178</span>    <span class="k">try</span><span class="p">:</span>
-<span class="linenos">179</span>        <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">True</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">180</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  竟然成功了"</span><span class="p">)</span>
-<span class="linenos">181</span>    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
-<span class="linenos">182</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[</span><span class="mi">0</span><span class="p">][:</span><span class="mi">160</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">183</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  教训：explain() 报 0 次断裂**不等于**全部captured。"</span><span class="p">)</span>
-<span class="linenos">184</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  想确认有没有东西被漏在图外，用 fullgraph=True，或者把图打出来看。"</span><span class="p">)</span>
-<span class="linenos">185</span>
-<span class="linenos">186</span>
-<span class="linenos">187</span><span class="c1"># ---------------------------------------------------------------- B</span>
-<span class="linenos">188</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
-<span class="linenos">189</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 注册成一个真正的算子"</span><span class="p">)</span>
-<span class="linenos">190</span>    <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
-<span class="linenos">191</span>
-<span class="linenos">192</span>    <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::fused_scale_sum"</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
-<span class="linenos">193</span>    <span class="k">def</span><span class="w"> </span><span class="nf">fused_scale_sum</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="linenos">194</span>        <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">195</span>
-<span class="linenos">196</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  注册完成。现在它在 dispatcher 里："</span><span class="p">)</span>
-<span class="linenos">197</span>    <span class="n">dump</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_dump</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::fused_scale_sum"</span><span class="p">)</span>
-<span class="linenos">198</span>    <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">dump</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[:</span><span class="mi">12</span><span class="p">]:</span>
-<span class="linenos">199</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">line</span><span class="p">)</span>
-<span class="linenos">200</span>
-<span class="linenos">201</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"它出现在哪些 dispatch key 上"</span><span class="p">)</span>
-<span class="linenos">202</span>    <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"CUDA"</span><span class="p">,</span> <span class="s2">"CPU"</span><span class="p">,</span> <span class="s2">"Meta"</span><span class="p">,</span> <span class="s2">"Autograd"</span><span class="p">,</span> <span class="s2">"CompositeExplicitAutograd"</span><span class="p">]:</span>
-<span class="linenos">203</span>        <span class="n">has</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_has_kernel_for_dispatch_key</span><span class="p">(</span>
-<span class="linenos">204</span>            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::fused_scale_sum"</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span>
-<span class="linenos">205</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">k</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">has</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">206</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  注意 CUDA 和 CPU 都是 False，而 CompositeExplicitAutograd 是 True："</span><span class="p">)</span>
-<span class="linenos">207</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  `torch.library.custom_op` 默认注册的是**与后端无关**的实现，"</span><span class="p">)</span>
-<span class="linenos">208</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  由 CompositeExplicitAutograd 这个别名键覆盖所有后端（2.0 §3.3 那张表）。"</span><span class="p">)</span>
-<span class="linenos">209</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  想按设备分别注册，用 `custom_op(..., device_types='cuda')`"</span>
-<span class="linenos">210</span>          <span class="s2">" 或 `register_kernel`。"</span><span class="p">)</span>
-<span class="linenos">211</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  Meta 和 Autograd 这两行虽然是 True，但注册的是**占位实现**："</span><span class="p">)</span>
-<span class="linenos">212</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  它们会在被调用时报错，提示你还没写 fake / autograd。"</span><span class="p">)</span>
-<span class="linenos">213</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这正是接下来两节要补的两件事。"</span><span class="p">)</span>
-<span class="linenos">214</span>    <span class="k">return</span> <span class="n">fused_scale_sum</span>
-<span class="linenos">215</span>
-<span class="linenos">216</span>
-<span class="linenos">217</span><span class="c1"># ---------------------------------------------------------------- C</span>
-<span class="linenos">218</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
-<span class="linenos">219</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 少了 fake（meta）函数会怎样"</span><span class="p">)</span>
-<span class="linenos">220</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">torch._dynamo</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dynamo</span>
-<span class="linenos">221</span>    <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
-<span class="linenos">222</span>    <span class="n">name</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::no_fake"</span>
-<span class="linenos">223</span>
-<span class="linenos">224</span>    <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
-<span class="linenos">225</span>    <span class="k">def</span><span class="w"> </span><span class="nf">no_fake</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="linenos">226</span>        <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">227</span>
-<span class="linenos">228</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)</span>
-<span class="linenos">229</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">512</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)</span>
-<span class="linenos">230</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  eager 调用没问题:"</span><span class="p">,</span> <span class="n">no_fake</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
-<span class="linenos">231</span>
-<span class="linenos">232</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"但 torch.compile 需要在不真的执行的情况下推出形状"</span><span class="p">)</span>
-<span class="linenos">233</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
-<span class="linenos">234</span>    <span class="k">try</span><span class="p">:</span>
-<span class="linenos">235</span>        <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">no_fake</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">236</span>        <span class="n">cf</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">237</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  竟然成功了"</span><span class="p">)</span>
-<span class="linenos">238</span>    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
-<span class="linenos">239</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  失败:"</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span>
-<span class="linenos">240</span>        <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[:</span><span class="mi">8</span><span class="p">]:</span>
-<span class="linenos">241</span>            <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">line</span><span class="p">[:</span><span class="mi">150</span><span class="p">])</span>
-<span class="linenos">242</span>
-<span class="linenos">243</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"补上 fake 之后"</span><span class="p">)</span>
-<span class="linenos">244</span>    <span class="nd">@no_fake</span><span class="o">.</span><span class="n">register_fake</span>
-<span class="linenos">245</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
-<span class="linenos">246</span>        <span class="c1"># 只描述形状与 dtype，不做任何真实计算 —— 这就是 meta 的全部工作</span>
-<span class="linenos">247</span>        <span class="n">torch</span><span class="o">.</span><span class="n">_check</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="s2">"x 必须是二维"</span><span class="p">)</span>
-<span class="linenos">248</span>        <span class="n">torch</span><span class="o">.</span><span class="n">_check</span><span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="s2">"w 必须是一维"</span><span class="p">)</span>
-<span class="linenos">249</span>        <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-<span class="linenos">250</span>
-<span class="linenos">251</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
-<span class="linenos">252</span>    <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">no_fake</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">253</span>    <span class="n">out</span> <span class="o">=</span> <span class="n">cf</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">254</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  成功，shape=</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">out</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">255</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  Meta key 现在有 kernel 了: "</span>
-<span class="linenos">256</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_has_kernel_for_dispatch_key</span><span class="p">(</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="s1">'Meta'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">257</span>
-<span class="linenos">258</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"编译后的图里，这个算子长什么样"</span><span class="p">)</span>
-<span class="linenos">259</span>    <span class="n">gms</span> <span class="o">=</span> <span class="p">[]</span>
-<span class="linenos">260</span>    <span class="k">def</span><span class="w"> </span><span class="nf">collect</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">ex</span><span class="p">):</span>
-<span class="linenos">261</span>        <span class="n">gms</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
-<span class="linenos">262</span>        <span class="k">return</span> <span class="n">gm</span><span class="o">.</span><span class="n">forward</span>
-<span class="linenos">263</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
-<span class="linenos">264</span>    <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">no_fake</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">collect</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">265</span>    <span class="k">if</span> <span class="n">gms</span><span class="p">:</span>
-<span class="linenos">266</span>        <span class="nb">print</span><span class="p">(</span><span class="n">gms</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">code</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span>
-<span class="linenos">267</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  它是图里的一个**不透明节点**：Inductor 知道它的形状，"</span><span class="p">)</span>
-<span class="linenos">268</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  知道要在这里调用它，但不知道它内部在算什么。"</span><span class="p">)</span>
-<span class="linenos">269</span>
-<span class="linenos">270</span>
-<span class="linenos">271</span><span class="c1"># ---------------------------------------------------------------- D</span>
-<span class="linenos">272</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
-<span class="linenos">273</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 接上反向，并用 gradcheck 验一遍"</span><span class="p">)</span>
-<span class="linenos">274</span>    <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
-<span class="linenos">275</span>    <span class="n">name</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::with_grad"</span>
-<span class="linenos">276</span>
-<span class="linenos">277</span>    <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
-<span class="linenos">278</span>    <span class="k">def</span><span class="w"> </span><span class="nf">with_grad</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="linenos">279</span>        <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">280</span>
-<span class="linenos">281</span>    <span class="nd">@with_grad</span><span class="o">.</span><span class="n">register_fake</span>
-<span class="linenos">282</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
-<span class="linenos">283</span>        <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-<span class="linenos">284</span>
-<span class="linenos">285</span>    <span class="k">def</span><span class="w"> </span><span class="nf">setup_context</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">output</span><span class="p">):</span>
-<span class="linenos">286</span>        <span class="n">x</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">inputs</span>
-<span class="linenos">287</span>        <span class="n">ctx</span><span class="o">.</span><span class="n">save_for_backward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">288</span>
-<span class="linenos">289</span>    <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">grad</span><span class="p">):</span>
-<span class="linenos">290</span>        <span class="n">x</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">saved_tensors</span>
-<span class="linenos">291</span>        <span class="n">gx</span><span class="p">,</span> <span class="n">gw</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_backward</span><span class="p">(</span><span class="n">grad</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">292</span>        <span class="k">return</span> <span class="n">gx</span><span class="p">,</span> <span class="n">gw</span>
-<span class="linenos">293</span>
-<span class="linenos">294</span>    <span class="n">with_grad</span><span class="o">.</span><span class="n">register_autograd</span><span class="p">(</span><span class="n">backward</span><span class="p">,</span> <span class="n">setup_context</span><span class="o">=</span><span class="n">setup_context</span><span class="p">)</span>
-<span class="linenos">295</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  Autograd key 现在有 kernel 了: "</span>
-<span class="linenos">296</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_has_kernel_for_dispatch_key</span><span class="p">(</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="s1">'Autograd'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">297</span>
-<span class="linenos">298</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"gradcheck：用有限差分逐个元素验梯度"</span><span class="p">)</span>
-<span class="linenos">299</span>    <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
-<span class="linenos">300</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">301</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">302</span>    <span class="n">ok</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">gradcheck</span><span class="p">(</span><span class="n">with_grad</span><span class="p">,</span> <span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">),</span> <span class="n">eps</span><span class="o">=</span><span class="mf">1e-6</span><span class="p">,</span>
-<span class="linenos">303</span>                                  <span class="n">atol</span><span class="o">=</span><span class="mf">1e-8</span><span class="p">,</span> <span class="n">rtol</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">)</span>
-<span class="linenos">304</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  gradcheck 通过: </span><span class="si">{</span><span class="n">ok</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">305</span>
-<span class="linenos">306</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"和参照实现对拍"</span><span class="p">)</span>
-<span class="linenos">307</span>    <span class="n">xr</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">308</span>    <span class="n">wr</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">309</span>    <span class="n">with_grad</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
-<span class="linenos">310</span>    <span class="n">ref</span><span class="p">(</span><span class="n">xr</span><span class="p">,</span> <span class="n">wr</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
-<span class="linenos">311</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  dx max|err| = </span><span class="si">{</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">xr</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">312</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  dw max|err| = </span><span class="si">{</span><span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">grad</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">wr</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">313</span>
-<span class="linenos">314</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"失败现场：反向写错但前向是对的"</span><span class="p">)</span>
-<span class="linenos">315</span>    <span class="n">name2</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::bad_grad"</span>
-<span class="linenos">316</span>
-<span class="linenos">317</span>    <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="n">name2</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
-<span class="linenos">318</span>    <span class="k">def</span><span class="w"> </span><span class="nf">bad_grad</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="linenos">319</span>        <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">320</span>
-<span class="linenos">321</span>    <span class="nd">@bad_grad</span><span class="o">.</span><span class="n">register_fake</span>
-<span class="linenos">322</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
-<span class="linenos">323</span>        <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-<span class="linenos">324</span>
-<span class="linenos">325</span>    <span class="k">def</span><span class="w"> </span><span class="nf">bad_backward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">grad</span><span class="p">):</span>
-<span class="linenos">326</span>        <span class="n">x</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">saved_tensors</span>
-<span class="linenos">327</span>        <span class="c1"># 忘了 relu 的掩码 —— 前向完全不受影响</span>
-<span class="linenos">328</span>        <span class="n">gx</span> <span class="o">=</span> <span class="n">grad</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">w</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
-<span class="linenos">329</span>        <span class="n">gw</span> <span class="o">=</span> <span class="p">(</span><span class="n">grad</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
-<span class="linenos">330</span>        <span class="k">return</span> <span class="n">gx</span><span class="p">,</span> <span class="n">gw</span>
-<span class="linenos">331</span>
-<span class="linenos">332</span>    <span class="n">bad_grad</span><span class="o">.</span><span class="n">register_autograd</span><span class="p">(</span><span class="n">bad_backward</span><span class="p">,</span> <span class="n">setup_context</span><span class="o">=</span><span class="n">setup_context</span><span class="p">)</span>
-<span class="linenos">333</span>
-<span class="linenos">334</span>    <span class="n">x2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">335</span>    <span class="n">w2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">336</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  前向仍然正确: max|err| = "</span>
-<span class="linenos">337</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">(</span><span class="n">bad_grad</span><span class="p">(</span><span class="n">x2</span><span class="p">,</span><span class="w"> </span><span class="n">w2</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">ref</span><span class="p">(</span><span class="n">x2</span><span class="p">,</span><span class="w"> </span><span class="n">w2</span><span class="p">))</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">338</span>    <span class="k">try</span><span class="p">:</span>
-<span class="linenos">339</span>        <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">gradcheck</span><span class="p">(</span><span class="n">bad_grad</span><span class="p">,</span> <span class="p">(</span><span class="n">x2</span><span class="p">,</span> <span class="n">w2</span><span class="p">))</span>
-<span class="linenos">340</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  gradcheck 竟然通过了（不应该）"</span><span class="p">)</span>
-<span class="linenos">341</span>    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
-<span class="linenos">342</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  gradcheck 抓到了:"</span><span class="p">)</span>
-<span class="linenos">343</span>        <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[:</span><span class="mi">10</span><span class="p">]:</span>
-<span class="linenos">344</span>            <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">line</span><span class="p">[:</span><span class="mi">130</span><span class="p">])</span>
-<span class="linenos">345</span>
-<span class="linenos">346</span>
-<span class="linenos">347</span><span class="c1"># ---------------------------------------------------------------- E</span>
-<span class="linenos">348</span><span class="k">def</span><span class="w"> </span><span class="nf">section_E</span><span class="p">():</span>
-<span class="linenos">349</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[E] 注册之后它能被融合吗"</span><span class="p">)</span>
-<span class="linenos">350</span>    <span class="k">if</span> <span class="n">DEV</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
-<span class="linenos">351</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"需要 CUDA"</span><span class="p">);</span> <span class="k">return</span>
-<span class="linenos">352</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
-<span class="linenos">353</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<span class="linenos">354</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">torch._dynamo</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dynamo</span>
-<span class="linenos">355</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">torch._inductor.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">run_and_get_code</span>
-<span class="linenos">356</span>
-<span class="linenos">357</span>    <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
-<span class="linenos">358</span>    <span class="n">name</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::fusible_probe"</span>
-<span class="linenos">359</span>
-<span class="linenos">360</span>    <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
-<span class="linenos">361</span>    <span class="k">def</span><span class="w"> </span><span class="nf">op</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="linenos">362</span>        <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">363</span>
-<span class="linenos">364</span>    <span class="nd">@op</span><span class="o">.</span><span class="n">register_fake</span>
-<span class="linenos">365</span>    <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
-<span class="linenos">366</span>        <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-<span class="linenos">367</span>
-<span class="linenos">368</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
-<span class="linenos">369</span>    <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
-<span class="linenos">370</span>
-<span class="linenos">371</span>    <span class="k">def</span><span class="w"> </span><span class="nf">with_custom</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">):</span>
-<span class="linenos">372</span>        <span class="k">return</span> <span class="p">(</span><span class="n">op</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mf">2.0</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span> <span class="o">+</span> <span class="mf">1.0</span>
-<span class="linenos">373</span>
-<span class="linenos">374</span>    <span class="k">def</span><span class="w"> </span><span class="nf">pure_torch</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">):</span>
-<span class="linenos">375</span>        <span class="k">return</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">a</span> <span class="o">*</span> <span class="n">b</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mf">2.0</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span> <span class="o">+</span> <span class="mf">1.0</span>
-<span class="linenos">376</span>
-<span class="linenos">377</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  两者数值一致: "</span>
-<span class="linenos">378</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">with_custom</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">),</span><span class="w"> </span><span class="n">pure_torch</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">),</span><span class="w"> </span><span class="n">atol</span><span class="o">=</span><span class="mf">1e-3</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">379</span>
-<span class="linenos">380</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">fn</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"自定义算子 + 后续逐元素"</span><span class="p">,</span> <span class="n">with_custom</span><span class="p">),</span>
-<span class="linenos">381</span>                      <span class="p">(</span><span class="s2">"等价的纯 torch 写法"</span><span class="p">,</span> <span class="n">pure_torch</span><span class="p">)]:</span>
-<span class="linenos">382</span>        <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
-<span class="linenos">383</span>        <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">fn</span><span class="p">)</span>
-<span class="linenos">384</span>        <span class="n">_</span><span class="p">,</span> <span class="n">code</span> <span class="o">=</span> <span class="n">run_and_get_code</span><span class="p">(</span><span class="n">cf</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">385</span>        <span class="n">src</span> <span class="o">=</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">code</span><span class="p">)</span>
-<span class="linenos">386</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">src</span><span class="o">.</span><span class="n">count</span><span class="p">(</span><span class="s2">"@triton.jit"</span><span class="p">)</span>
-<span class="linenos">387</span>        <span class="n">calls</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">findall</span><span class="p">(</span><span class="sa">r</span><span class="s2">"torch\.ops\.\w+\.\w+"</span><span class="p">,</span> <span class="n">src</span><span class="p">)</span>
-<span class="linenos">388</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">389</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    Inductor 生成 triton kernel: </span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">390</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    图里对外部算子的调用: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">calls</span><span class="p">))</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">391</span>
-<span class="linenos">392</span>    <span class="k">def</span><span class="w"> </span><span class="nf">timeit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">30</span><span class="p">):</span>
-<span class="linenos">393</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
-<span class="linenos">394</span>            <span class="n">fn</span><span class="p">()</span>
-<span class="linenos">395</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-<span class="linenos">396</span>        <span class="n">s</span><span class="p">,</span> <span class="n">e</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">397</span>        <span class="n">s</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
-<span class="linenos">398</span>        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
-<span class="linenos">399</span>            <span class="n">fn</span><span class="p">()</span>
-<span class="linenos">400</span>        <span class="n">e</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
-<span class="linenos">401</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-<span class="linenos">402</span>        <span class="k">return</span> <span class="n">s</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">e</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
-<span class="linenos">403</span>
-<span class="linenos">404</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">();</span> <span class="n">c1</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">with_custom</span><span class="p">);</span> <span class="n">c1</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">405</span>    <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">();</span> <span class="n">c2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">pure_torch</span><span class="p">);</span> <span class="n">c2</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
-<span class="linenos">406</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  自定义算子（编译后）  </span><span class="si">{</span><span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">c1</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">))</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
-<span class="linenos">407</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  纯 torch（编译后）    </span><span class="si">{</span><span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">c2</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">))</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
-<span class="linenos">408</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  我的 kernel（裸调）    </span><span class="si">{</span><span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">))</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
-<span class="linenos">409</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  eager 纯 torch        </span><span class="si">{</span><span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">pure_torch</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">))</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
-<span class="linenos">410</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  自定义算子是一个**不透明的边界**：Inductor 不能把它前后的算子"</span><span class="p">)</span>
-<span class="linenos">411</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  融进它，也不能把它拆开重排。写得比库快，才值得付这个边界的代价。"</span><span class="p">)</span>
-<span class="linenos">412</span>    <span class="k">del</span> <span class="n">x</span><span class="p">,</span> <span class="n">w</span>
-<span class="linenos">413</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos">414</span>
-<span class="linenos">415</span>
-<span class="linenos">416</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span>
-<span class="linenos">417</span>            <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">,</span> <span class="s2">"E"</span><span class="p">:</span> <span class="n">section_E</span><span class="p">}</span>
-<span class="linenos">418</span>
-<span class="linenos">419</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
-<span class="linenos">420</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
-<span class="linenos">421</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  device </span><span class="si">{</span><span class="n">DEV</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">422</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
-<span class="linenos">423</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
-<span class="linenos">424</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
-<span class="linenos">425</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<details class="fold srcfold"><summary>labs/L2/custom_op.py 全文（425 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""L2.8 —— 把一个自写 CUDA kernel 接进 PyTorch。</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">算子：out[i] = sum_j relu(x[i,j] * w[j])</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">反向：dx[i,j] = g[i] * w[j] * 1[x*w&gt;0]</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="sd">      dw[j]   = sum_i g[i] * x[i,j] * 1[x*w&gt;0]</span>
+<span class="linenos" aria-hidden="true">  7</span> 
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">一路走完：裸函数 -&gt; torch.library 注册 -&gt; fake（meta）-&gt; autograd -&gt; torch.compile。</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="sd">每一步都打印 dispatch 表 / 图 / gradcheck 结果，看清楚少了哪一步会怎样。</span>
+<span class="linenos" aria-hidden="true"> 10</span> 
+<span class="linenos" aria-hidden="true"> 11</span> <span class="sd">用法：</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">    python custom_op.py            # 全跑</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="sd">    python custom_op.py C E</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 15</span> 
+<span class="linenos" aria-hidden="true"> 16</span> <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos" aria-hidden="true"> 18</span> 
+<span class="linenos" aria-hidden="true"> 19</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos" aria-hidden="true"> 20</span> 
+<span class="linenos" aria-hidden="true"> 21</span> <span class="n">DEV</span> <span class="o">=</span> <span class="s2">"cuda"</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="k">else</span> <span class="s2">"cpu"</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="n">LIB</span> <span class="o">=</span> <span class="s2">"l28"</span>
+<span class="linenos" aria-hidden="true"> 23</span> 
+<span class="linenos" aria-hidden="true"> 24</span> 
+<span class="linenos" aria-hidden="true"> 25</span> <span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 26</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 27</span> 
+<span class="linenos" aria-hidden="true"> 28</span> 
+<span class="linenos" aria-hidden="true"> 29</span> <span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 30</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true"> 31</span> 
+<span class="linenos" aria-hidden="true"> 32</span> 
+<span class="linenos" aria-hidden="true"> 33</span> <span class="c1"># ---------------------------------------------------------------- kernel</span>
+<span class="linenos" aria-hidden="true"> 34</span> <span class="n">CUDA_SRC</span> <span class="o">=</span> <span class="sa">r</span><span class="s2">"""</span>
+<span class="linenos" aria-hidden="true"> 35</span> <span class="s2">#include &lt;ATen/ATen.h&gt;</span>
+<span class="linenos" aria-hidden="true"> 36</span> <span class="s2">#include &lt;ATen/Dispatch.h&gt;</span>
+<span class="linenos" aria-hidden="true"> 37</span> 
+<span class="linenos" aria-hidden="true"> 38</span> <span class="s2">template &lt;typename scalar_t&gt;</span>
+<span class="linenos" aria-hidden="true"> 39</span> <span class="s2">__global__ void fss_fwd(const scalar_t* __restrict__ x,</span>
+<span class="linenos" aria-hidden="true"> 40</span> <span class="s2">                        const scalar_t* __restrict__ w,</span>
+<span class="linenos" aria-hidden="true"> 41</span> <span class="s2">                        scalar_t* __restrict__ out, int R, int C) {</span>
+<span class="linenos" aria-hidden="true"> 42</span> <span class="s2">    int row = blockIdx.x;</span>
+<span class="linenos" aria-hidden="true"> 43</span> <span class="s2">    if (row &gt;= R) return;</span>
+<span class="linenos" aria-hidden="true"> 44</span> <span class="s2">    // 一个 block 归约一行；这是 L2.3 那个两段式归约的最小版本</span>
+<span class="linenos" aria-hidden="true"> 45</span> <span class="s2">    extern __shared__ unsigned char smem_raw[];</span>
+<span class="linenos" aria-hidden="true"> 46</span> <span class="s2">    scalar_t* smem = reinterpret_cast&lt;scalar_t*&gt;(smem_raw);</span>
+<span class="linenos" aria-hidden="true"> 47</span> <span class="s2">    scalar_t acc = 0;</span>
+<span class="linenos" aria-hidden="true"> 48</span> <span class="s2">    for (int j = threadIdx.x; j &lt; C; j += blockDim.x) {</span>
+<span class="linenos" aria-hidden="true"> 49</span> <span class="s2">        scalar_t v = x[row * C + j] * w[j];</span>
+<span class="linenos" aria-hidden="true"> 50</span> <span class="s2">        acc += v &gt; scalar_t(0) ? v : scalar_t(0);</span>
+<span class="linenos" aria-hidden="true"> 51</span> <span class="s2">    }</span>
+<span class="linenos" aria-hidden="true"> 52</span> <span class="s2">    smem[threadIdx.x] = acc;</span>
+<span class="linenos" aria-hidden="true"> 53</span> <span class="s2">    __syncthreads();</span>
+<span class="linenos" aria-hidden="true"> 54</span> <span class="s2">    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {</span>
+<span class="linenos" aria-hidden="true"> 55</span> <span class="s2">        if (threadIdx.x &lt; s) smem[threadIdx.x] += smem[threadIdx.x + s];</span>
+<span class="linenos" aria-hidden="true"> 56</span> <span class="s2">        __syncthreads();</span>
+<span class="linenos" aria-hidden="true"> 57</span> <span class="s2">    }</span>
+<span class="linenos" aria-hidden="true"> 58</span> <span class="s2">    if (threadIdx.x == 0) out[row] = smem[0];</span>
+<span class="linenos" aria-hidden="true"> 59</span> <span class="s2">}</span>
+<span class="linenos" aria-hidden="true"> 60</span> 
+<span class="linenos" aria-hidden="true"> 61</span> <span class="s2">template &lt;typename scalar_t&gt;</span>
+<span class="linenos" aria-hidden="true"> 62</span> <span class="s2">__global__ void fss_bwd(const scalar_t* __restrict__ g,</span>
+<span class="linenos" aria-hidden="true"> 63</span> <span class="s2">                        const scalar_t* __restrict__ x,</span>
+<span class="linenos" aria-hidden="true"> 64</span> <span class="s2">                        const scalar_t* __restrict__ w,</span>
+<span class="linenos" aria-hidden="true"> 65</span> <span class="s2">                        scalar_t* __restrict__ gx,</span>
+<span class="linenos" aria-hidden="true"> 66</span> <span class="s2">                        scalar_t* __restrict__ gw, int R, int C) {</span>
+<span class="linenos" aria-hidden="true"> 67</span> <span class="s2">    int idx = blockIdx.x * blockDim.x + threadIdx.x;</span>
+<span class="linenos" aria-hidden="true"> 68</span> <span class="s2">    if (idx &gt;= R * C) return;</span>
+<span class="linenos" aria-hidden="true"> 69</span> <span class="s2">    int i = idx / C, j = idx % C;</span>
+<span class="linenos" aria-hidden="true"> 70</span> <span class="s2">    scalar_t v = x[idx] * w[j];</span>
+<span class="linenos" aria-hidden="true"> 71</span> <span class="s2">    scalar_t mask = v &gt; scalar_t(0) ? scalar_t(1) : scalar_t(0);</span>
+<span class="linenos" aria-hidden="true"> 72</span> <span class="s2">    gx[idx] = g[i] * w[j] * mask;</span>
+<span class="linenos" aria-hidden="true"> 73</span> <span class="s2">    atomicAdd(&amp;gw[j], g[i] * x[idx] * mask);</span>
+<span class="linenos" aria-hidden="true"> 74</span> <span class="s2">}</span>
+<span class="linenos" aria-hidden="true"> 75</span> 
+<span class="linenos" aria-hidden="true"> 76</span> <span class="s2">at::Tensor fss_forward(at::Tensor x, at::Tensor w) {</span>
+<span class="linenos" aria-hidden="true"> 77</span> <span class="s2">    TORCH_CHECK(x.is_cuda() &amp;&amp; w.is_cuda(), "需要 CUDA 张量");</span>
+<span class="linenos" aria-hidden="true"> 78</span> <span class="s2">    TORCH_CHECK(x.is_contiguous() &amp;&amp; w.is_contiguous(),</span>
+<span class="linenos" aria-hidden="true"> 79</span> <span class="s2">                "这个 kernel 假设连续内存 —— 见 L2.0 [E] 节");</span>
+<span class="linenos" aria-hidden="true"> 80</span> <span class="s2">    int R = x.size(0), C = x.size(1);</span>
+<span class="linenos" aria-hidden="true"> 81</span> <span class="s2">    auto out = at::empty(</span><span class="si">{R}</span><span class="s2">, x.options());</span>
+<span class="linenos" aria-hidden="true"> 82</span> <span class="s2">    int threads = 256;</span>
+<span class="linenos" aria-hidden="true"> 83</span> <span class="s2">    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fss_fwd", [&amp;] {</span>
+<span class="linenos" aria-hidden="true"> 84</span> <span class="s2">        fss_fwd&lt;scalar_t&gt;&lt;&lt;&lt;R, threads, threads * sizeof(scalar_t)&gt;&gt;&gt;(</span>
+<span class="linenos" aria-hidden="true"> 85</span> <span class="s2">            x.data_ptr&lt;scalar_t&gt;(), w.data_ptr&lt;scalar_t&gt;(),</span>
+<span class="linenos" aria-hidden="true"> 86</span> <span class="s2">            out.data_ptr&lt;scalar_t&gt;(), R, C);</span>
+<span class="linenos" aria-hidden="true"> 87</span> <span class="s2">    });</span>
+<span class="linenos" aria-hidden="true"> 88</span> <span class="s2">    return out;</span>
+<span class="linenos" aria-hidden="true"> 89</span> <span class="s2">}</span>
+<span class="linenos" aria-hidden="true"> 90</span> 
+<span class="linenos" aria-hidden="true"> 91</span> <span class="s2">std::vector&lt;at::Tensor&gt; fss_backward(at::Tensor g, at::Tensor x, at::Tensor w) {</span>
+<span class="linenos" aria-hidden="true"> 92</span> <span class="s2">    int R = x.size(0), C = x.size(1);</span>
+<span class="linenos" aria-hidden="true"> 93</span> <span class="s2">    auto gx = at::empty_like(x);</span>
+<span class="linenos" aria-hidden="true"> 94</span> <span class="s2">    auto gw = at::zeros_like(w);</span>
+<span class="linenos" aria-hidden="true"> 95</span> <span class="s2">    int n = R * C, threads = 256;</span>
+<span class="linenos" aria-hidden="true"> 96</span> <span class="s2">    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fss_bwd", [&amp;] {</span>
+<span class="linenos" aria-hidden="true"> 97</span> <span class="s2">        fss_bwd&lt;scalar_t&gt;&lt;&lt;&lt;(n + threads - 1) / threads, threads&gt;&gt;&gt;(</span>
+<span class="linenos" aria-hidden="true"> 98</span> <span class="s2">            g.contiguous().data_ptr&lt;scalar_t&gt;(), x.data_ptr&lt;scalar_t&gt;(),</span>
+<span class="linenos" aria-hidden="true"> 99</span> <span class="s2">            w.data_ptr&lt;scalar_t&gt;(), gx.data_ptr&lt;scalar_t&gt;(),</span>
+<span class="linenos" aria-hidden="true">100</span> <span class="s2">            gw.data_ptr&lt;scalar_t&gt;(), R, C);</span>
+<span class="linenos" aria-hidden="true">101</span> <span class="s2">    });</span>
+<span class="linenos" aria-hidden="true">102</span> <span class="s2">    return {gx, gw};</span>
+<span class="linenos" aria-hidden="true">103</span> <span class="s2">}</span>
+<span class="linenos" aria-hidden="true">104</span> <span class="s2">"""</span>
+<span class="linenos" aria-hidden="true">105</span> 
+<span class="linenos" aria-hidden="true">106</span> <span class="n">CPP_SRC</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"at::Tensor fss_forward(at::Tensor x, at::Tensor w);</span><span class="se">\n</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">107</span>            <span class="s2">"std::vector&lt;at::Tensor&gt; fss_backward(at::Tensor g, at::Tensor x, at::Tensor w);</span><span class="se">\n</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">108</span> 
+<span class="linenos" aria-hidden="true">109</span> <span class="n">_mod</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">110</span> 
+<span class="linenos" aria-hidden="true">111</span> 
+<span class="linenos" aria-hidden="true">112</span> <span class="k">def</span><span class="w"> </span><span class="nf">kernel</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">113</span>     <span class="k">global</span> <span class="n">_mod</span>
+<span class="linenos" aria-hidden="true">114</span>     <span class="k">if</span> <span class="n">_mod</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">115</span>         <span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.cpp_extension</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_inline</span>
+<span class="linenos" aria-hidden="true">116</span>         <span class="n">build</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"LEARN_ROOT"</span><span class="p">,</span> <span class="s2">"/tmp"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/.cache/torchext/l28"</span>
+<span class="linenos" aria-hidden="true">117</span>         <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">build</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">118</span>         <span class="n">_mod</span> <span class="o">=</span> <span class="n">load_inline</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">"l28_fss"</span><span class="p">,</span> <span class="n">cpp_sources</span><span class="o">=</span><span class="n">CPP_SRC</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">119</span>                            <span class="n">cuda_sources</span><span class="o">=</span><span class="n">CUDA_SRC</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">120</span>                            <span class="n">functions</span><span class="o">=</span><span class="p">[</span><span class="s2">"fss_forward"</span><span class="p">,</span> <span class="s2">"fss_backward"</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">121</span>                            <span class="n">build_directory</span><span class="o">=</span><span class="n">build</span><span class="p">,</span> <span class="n">verbose</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">122</span>     <span class="k">return</span> <span class="n">_mod</span>
+<span class="linenos" aria-hidden="true">123</span> 
+<span class="linenos" aria-hidden="true">124</span> 
+<span class="linenos" aria-hidden="true">125</span> <span class="k">def</span><span class="w"> </span><span class="nf">ref</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">126</span> <span class="w">    </span><span class="sd">"""纯 PyTorch 参照实现，用来对答案。"""</span>
+<span class="linenos" aria-hidden="true">127</span>     <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="n">w</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">128</span> 
+<span class="linenos" aria-hidden="true">129</span> 
+<span class="linenos" aria-hidden="true">130</span> <span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos" aria-hidden="true">131</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">132</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 起点：一个能跑、但 PyTorch 完全不认识的 kernel"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">133</span>     <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">134</span>     <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">135</span>     <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">512</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">136</span>     <span class="n">got</span><span class="p">,</span> <span class="n">want</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">),</span> <span class="n">ref</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">137</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  前向对不对: max|err| = </span><span class="si">{</span><span class="p">(</span><span class="n">got</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">want</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">138</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  返回类型: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">got</span><span class="p">)</span><span class="si">}</span><span class="s2">  shape=</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">got</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">139</span> 
+<span class="linenos" aria-hidden="true">140</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"它在 dispatcher 里存在吗"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">141</span>     <span class="c1"># 注意：_dispatch_dump 对不存在的算子返回空串，不抛异常</span>
+<span class="linenos" aria-hidden="true">142</span>     <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"l28::fused_scale_sum"</span><span class="p">,</span> <span class="s2">"aten::add.Tensor"</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">143</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">144</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'存在'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_dump</span><span class="p">(</span><span class="n">name</span><span class="p">)</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'**不存在**'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">145</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  它只是一个 pybind 出来的 python 可调用对象，dispatcher 里没有它。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">146</span> 
+<span class="linenos" aria-hidden="true">147</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"requires_grad 会怎样"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">148</span>     <span class="n">xg</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">149</span>     <span class="n">out</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">xg</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">150</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  out.requires_grad = </span><span class="si">{</span><span class="n">out</span><span class="o">.</span><span class="n">requires_grad</span><span class="si">}</span><span class="s2">   grad_fn = </span><span class="si">{</span><span class="n">out</span><span class="o">.</span><span class="n">grad_fn</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">151</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  没有反向。autograd 根本不知道发生过这次计算。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">152</span> 
+<span class="linenos" aria-hidden="true">153</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"torch.compile 遇到它会怎样 —— 这里有个陷阱"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">154</span>     <span class="kn">import</span><span class="w"> </span><span class="nn">torch._dynamo</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dynamo</span>
+<span class="linenos" aria-hidden="true">155</span>     <span class="k">def</span><span class="w"> </span><span class="nf">f</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">156</span>         <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos" aria-hidden="true">157</span> 
+<span class="linenos" aria-hidden="true">158</span>     <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">159</span>     <span class="n">exp</span> <span class="o">=</span> <span class="n">dynamo</span><span class="o">.</span><span class="n">explain</span><span class="p">(</span><span class="n">f</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">160</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  explain(): 图数量 </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">   图断裂 </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">graph_break_count</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">161</span>           <span class="sa">f</span><span class="s2">"   捕获算子 </span><span class="si">{</span><span class="n">exp</span><span class="o">.</span><span class="n">op_count</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">162</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  看起来一切正常。但把图打印出来："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">163</span> 
+<span class="linenos" aria-hidden="true">164</span>     <span class="n">gms</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">165</span>     <span class="k">def</span><span class="w"> </span><span class="nf">cb</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">ex</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">166</span>         <span class="n">gms</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gm</span><span class="p">);</span> <span class="k">return</span> <span class="n">gm</span><span class="o">.</span><span class="n">forward</span>
+<span class="linenos" aria-hidden="true">167</span>     <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">168</span>     <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">cb</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">169</span>     <span class="k">for</span> <span class="n">g</span> <span class="ow">in</span> <span class="n">gms</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">170</span>         <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">g</span><span class="o">.</span><span class="n">code</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">splitlines</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">171</span>             <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">line</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">172</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  **kernel 调用根本不在图里。** 图的入参 L_stack0_ 是"</span>
+<span class="linenos" aria-hidden="true">173</span>           <span class="s2">"已经算好的结果，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">174</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  只有后面那个 `* 2` 被捕获了。Dynamo 在图外 eager 执行了这次调用。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">175</span> 
+<span class="linenos" aria-hidden="true">176</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  用 fullgraph=True 才会说实话："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">177</span>     <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">178</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">179</span>         <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">f</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">True</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">180</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  竟然成功了"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">181</span>     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
+<span class="linenos" aria-hidden="true">182</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[</span><span class="mi">0</span><span class="p">][:</span><span class="mi">160</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">183</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  教训：explain() 报 0 次断裂**不等于**全部captured。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">184</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  想确认有没有东西被漏在图外，用 fullgraph=True，或者把图打出来看。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">185</span> 
+<span class="linenos" aria-hidden="true">186</span> 
+<span class="linenos" aria-hidden="true">187</span> <span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos" aria-hidden="true">188</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">189</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 注册成一个真正的算子"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">190</span>     <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">191</span> 
+<span class="linenos" aria-hidden="true">192</span>     <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::fused_scale_sum"</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">193</span>     <span class="k">def</span><span class="w"> </span><span class="nf">fused_scale_sum</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">194</span>         <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">195</span> 
+<span class="linenos" aria-hidden="true">196</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  注册完成。现在它在 dispatcher 里："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">197</span>     <span class="n">dump</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_dump</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::fused_scale_sum"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">198</span>     <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">dump</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[:</span><span class="mi">12</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">199</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">line</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">200</span> 
+<span class="linenos" aria-hidden="true">201</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"它出现在哪些 dispatch key 上"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">202</span>     <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"CUDA"</span><span class="p">,</span> <span class="s2">"CPU"</span><span class="p">,</span> <span class="s2">"Meta"</span><span class="p">,</span> <span class="s2">"Autograd"</span><span class="p">,</span> <span class="s2">"CompositeExplicitAutograd"</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">203</span>         <span class="n">has</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_has_kernel_for_dispatch_key</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">204</span>             <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::fused_scale_sum"</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">205</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">k</span><span class="si">:</span><span class="s2">&lt;28</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">has</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">206</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  注意 CUDA 和 CPU 都是 False，而 CompositeExplicitAutograd 是 True："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">207</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  `torch.library.custom_op` 默认注册的是**与后端无关**的实现，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">208</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  由 CompositeExplicitAutograd 这个别名键覆盖所有后端（2.0 §3.3 那张表）。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">209</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  想按设备分别注册，用 `custom_op(..., device_types='cuda')`"</span>
+<span class="linenos" aria-hidden="true">210</span>           <span class="s2">" 或 `register_kernel`。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">211</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  Meta 和 Autograd 这两行虽然是 True，但注册的是**占位实现**："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">212</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  它们会在被调用时报错，提示你还没写 fake / autograd。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">213</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  这正是接下来两节要补的两件事。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">214</span>     <span class="k">return</span> <span class="n">fused_scale_sum</span>
+<span class="linenos" aria-hidden="true">215</span> 
+<span class="linenos" aria-hidden="true">216</span> 
+<span class="linenos" aria-hidden="true">217</span> <span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos" aria-hidden="true">218</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">219</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 少了 fake（meta）函数会怎样"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">220</span>     <span class="kn">import</span><span class="w"> </span><span class="nn">torch._dynamo</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dynamo</span>
+<span class="linenos" aria-hidden="true">221</span>     <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">222</span>     <span class="n">name</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::no_fake"</span>
+<span class="linenos" aria-hidden="true">223</span> 
+<span class="linenos" aria-hidden="true">224</span>     <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">225</span>     <span class="k">def</span><span class="w"> </span><span class="nf">no_fake</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">226</span>         <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">227</span> 
+<span class="linenos" aria-hidden="true">228</span>     <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">229</span>     <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">512</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">230</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  eager 调用没问题:"</span><span class="p">,</span> <span class="n">no_fake</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">231</span> 
+<span class="linenos" aria-hidden="true">232</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"但 torch.compile 需要在不真的执行的情况下推出形状"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">233</span>     <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">234</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">235</span>         <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">no_fake</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">236</span>         <span class="n">cf</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">237</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  竟然成功了"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">238</span>     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
+<span class="linenos" aria-hidden="true">239</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  失败:"</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">240</span>         <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[:</span><span class="mi">8</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">241</span>             <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">line</span><span class="p">[:</span><span class="mi">150</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">242</span> 
+<span class="linenos" aria-hidden="true">243</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"补上 fake 之后"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">244</span>     <span class="nd">@no_fake</span><span class="o">.</span><span class="n">register_fake</span>
+<span class="linenos" aria-hidden="true">245</span>     <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">246</span>         <span class="c1"># 只描述形状与 dtype，不做任何真实计算 —— 这就是 meta 的全部工作</span>
+<span class="linenos" aria-hidden="true">247</span>         <span class="n">torch</span><span class="o">.</span><span class="n">_check</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="s2">"x 必须是二维"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">248</span>         <span class="n">torch</span><span class="o">.</span><span class="n">_check</span><span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="s2">"w 必须是一维"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">249</span>         <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">250</span> 
+<span class="linenos" aria-hidden="true">251</span>     <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">252</span>     <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">no_fake</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">253</span>     <span class="n">out</span> <span class="o">=</span> <span class="n">cf</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">254</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  成功，shape=</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">out</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">255</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  Meta key 现在有 kernel 了: "</span>
+<span class="linenos" aria-hidden="true">256</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_has_kernel_for_dispatch_key</span><span class="p">(</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="s1">'Meta'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">257</span> 
+<span class="linenos" aria-hidden="true">258</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"编译后的图里，这个算子长什么样"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">259</span>     <span class="n">gms</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">260</span>     <span class="k">def</span><span class="w"> </span><span class="nf">collect</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">ex</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">261</span>         <span class="n">gms</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">262</span>         <span class="k">return</span> <span class="n">gm</span><span class="o">.</span><span class="n">forward</span>
+<span class="linenos" aria-hidden="true">263</span>     <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">264</span>     <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">no_fake</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">collect</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">265</span>     <span class="k">if</span> <span class="n">gms</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">266</span>         <span class="nb">print</span><span class="p">(</span><span class="n">gms</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">code</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">267</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  它是图里的一个**不透明节点**：Inductor 知道它的形状，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">268</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  知道要在这里调用它，但不知道它内部在算什么。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">269</span> 
+<span class="linenos" aria-hidden="true">270</span> 
+<span class="linenos" aria-hidden="true">271</span> <span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos" aria-hidden="true">272</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">273</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 接上反向，并用 gradcheck 验一遍"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">274</span>     <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">275</span>     <span class="n">name</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::with_grad"</span>
+<span class="linenos" aria-hidden="true">276</span> 
+<span class="linenos" aria-hidden="true">277</span>     <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">278</span>     <span class="k">def</span><span class="w"> </span><span class="nf">with_grad</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">279</span>         <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">280</span> 
+<span class="linenos" aria-hidden="true">281</span>     <span class="nd">@with_grad</span><span class="o">.</span><span class="n">register_fake</span>
+<span class="linenos" aria-hidden="true">282</span>     <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">283</span>         <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">284</span> 
+<span class="linenos" aria-hidden="true">285</span>     <span class="k">def</span><span class="w"> </span><span class="nf">setup_context</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">output</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">286</span>         <span class="n">x</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">inputs</span>
+<span class="linenos" aria-hidden="true">287</span>         <span class="n">ctx</span><span class="o">.</span><span class="n">save_for_backward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">288</span> 
+<span class="linenos" aria-hidden="true">289</span>     <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">grad</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">290</span>         <span class="n">x</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">saved_tensors</span>
+<span class="linenos" aria-hidden="true">291</span>         <span class="n">gx</span><span class="p">,</span> <span class="n">gw</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_backward</span><span class="p">(</span><span class="n">grad</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">292</span>         <span class="k">return</span> <span class="n">gx</span><span class="p">,</span> <span class="n">gw</span>
+<span class="linenos" aria-hidden="true">293</span> 
+<span class="linenos" aria-hidden="true">294</span>     <span class="n">with_grad</span><span class="o">.</span><span class="n">register_autograd</span><span class="p">(</span><span class="n">backward</span><span class="p">,</span> <span class="n">setup_context</span><span class="o">=</span><span class="n">setup_context</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">295</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  Autograd key 现在有 kernel 了: "</span>
+<span class="linenos" aria-hidden="true">296</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_dispatch_has_kernel_for_dispatch_key</span><span class="p">(</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="s1">'Autograd'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">297</span> 
+<span class="linenos" aria-hidden="true">298</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"gradcheck：用有限差分逐个元素验梯度"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">299</span>     <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">300</span>     <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">301</span>     <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">302</span>     <span class="n">ok</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">gradcheck</span><span class="p">(</span><span class="n">with_grad</span><span class="p">,</span> <span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">),</span> <span class="n">eps</span><span class="o">=</span><span class="mf">1e-6</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">303</span>                                   <span class="n">atol</span><span class="o">=</span><span class="mf">1e-8</span><span class="p">,</span> <span class="n">rtol</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">304</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  gradcheck 通过: </span><span class="si">{</span><span class="n">ok</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">305</span> 
+<span class="linenos" aria-hidden="true">306</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"和参照实现对拍"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">307</span>     <span class="n">xr</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">308</span>     <span class="n">wr</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">309</span>     <span class="n">with_grad</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">310</span>     <span class="n">ref</span><span class="p">(</span><span class="n">xr</span><span class="p">,</span> <span class="n">wr</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">311</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  dx max|err| = </span><span class="si">{</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">xr</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">312</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  dw max|err| = </span><span class="si">{</span><span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">grad</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">wr</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">313</span> 
+<span class="linenos" aria-hidden="true">314</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"失败现场：反向写错但前向是对的"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">315</span>     <span class="n">name2</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::bad_grad"</span>
+<span class="linenos" aria-hidden="true">316</span> 
+<span class="linenos" aria-hidden="true">317</span>     <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="n">name2</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">318</span>     <span class="k">def</span><span class="w"> </span><span class="nf">bad_grad</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">319</span>         <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">320</span> 
+<span class="linenos" aria-hidden="true">321</span>     <span class="nd">@bad_grad</span><span class="o">.</span><span class="n">register_fake</span>
+<span class="linenos" aria-hidden="true">322</span>     <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">323</span>         <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">324</span> 
+<span class="linenos" aria-hidden="true">325</span>     <span class="k">def</span><span class="w"> </span><span class="nf">bad_backward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">grad</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">326</span>         <span class="n">x</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">saved_tensors</span>
+<span class="linenos" aria-hidden="true">327</span>         <span class="c1"># 忘了 relu 的掩码 —— 前向完全不受影响</span>
+<span class="linenos" aria-hidden="true">328</span>         <span class="n">gx</span> <span class="o">=</span> <span class="n">grad</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">w</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">329</span>         <span class="n">gw</span> <span class="o">=</span> <span class="p">(</span><span class="n">grad</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">330</span>         <span class="k">return</span> <span class="n">gx</span><span class="p">,</span> <span class="n">gw</span>
+<span class="linenos" aria-hidden="true">331</span> 
+<span class="linenos" aria-hidden="true">332</span>     <span class="n">bad_grad</span><span class="o">.</span><span class="n">register_autograd</span><span class="p">(</span><span class="n">bad_backward</span><span class="p">,</span> <span class="n">setup_context</span><span class="o">=</span><span class="n">setup_context</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">333</span> 
+<span class="linenos" aria-hidden="true">334</span>     <span class="n">x2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">335</span>     <span class="n">w2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">DEV</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">336</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  前向仍然正确: max|err| = "</span>
+<span class="linenos" aria-hidden="true">337</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">(</span><span class="n">bad_grad</span><span class="p">(</span><span class="n">x2</span><span class="p">,</span><span class="w"> </span><span class="n">w2</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">ref</span><span class="p">(</span><span class="n">x2</span><span class="p">,</span><span class="w"> </span><span class="n">w2</span><span class="p">))</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">338</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">339</span>         <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">gradcheck</span><span class="p">(</span><span class="n">bad_grad</span><span class="p">,</span> <span class="p">(</span><span class="n">x2</span><span class="p">,</span> <span class="n">w2</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">340</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  gradcheck 竟然通过了（不应该）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">341</span>     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
+<span class="linenos" aria-hidden="true">342</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  gradcheck 抓到了:"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">343</span>         <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[:</span><span class="mi">10</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">344</span>             <span class="nb">print</span><span class="p">(</span><span class="s2">"   "</span><span class="p">,</span> <span class="n">line</span><span class="p">[:</span><span class="mi">130</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">345</span> 
+<span class="linenos" aria-hidden="true">346</span> 
+<span class="linenos" aria-hidden="true">347</span> <span class="c1"># ---------------------------------------------------------------- E</span>
+<span class="linenos" aria-hidden="true">348</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_E</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">349</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[E] 注册之后它能被融合吗"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">350</span>     <span class="k">if</span> <span class="n">DEV</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">351</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"需要 CUDA"</span><span class="p">);</span> <span class="k">return</span>
+<span class="linenos" aria-hidden="true">352</span>     <span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+<span class="linenos" aria-hidden="true">353</span>     <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos" aria-hidden="true">354</span>     <span class="kn">import</span><span class="w"> </span><span class="nn">torch._dynamo</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dynamo</span>
+<span class="linenos" aria-hidden="true">355</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">torch._inductor.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">run_and_get_code</span>
+<span class="linenos" aria-hidden="true">356</span> 
+<span class="linenos" aria-hidden="true">357</span>     <span class="n">m</span> <span class="o">=</span> <span class="n">kernel</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">358</span>     <span class="n">name</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">LIB</span><span class="si">}</span><span class="s2">::fusible_probe"</span>
+<span class="linenos" aria-hidden="true">359</span> 
+<span class="linenos" aria-hidden="true">360</span>     <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">361</span>     <span class="k">def</span><span class="w"> </span><span class="nf">op</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">362</span>         <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">363</span> 
+<span class="linenos" aria-hidden="true">364</span>     <span class="nd">@op</span><span class="o">.</span><span class="n">register_fake</span>
+<span class="linenos" aria-hidden="true">365</span>     <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">366</span>         <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">367</span> 
+<span class="linenos" aria-hidden="true">368</span>     <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">369</span>     <span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">370</span> 
+<span class="linenos" aria-hidden="true">371</span>     <span class="k">def</span><span class="w"> </span><span class="nf">with_custom</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">372</span>         <span class="k">return</span> <span class="p">(</span><span class="n">op</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span> <span class="o">*</span> <span class="mf">2.0</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span> <span class="o">+</span> <span class="mf">1.0</span>
+<span class="linenos" aria-hidden="true">373</span> 
+<span class="linenos" aria-hidden="true">374</span>     <span class="k">def</span><span class="w"> </span><span class="nf">pure_torch</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">375</span>         <span class="k">return</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">a</span> <span class="o">*</span> <span class="n">b</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mf">2.0</span><span class="p">)</span><span class="o">.</span><span class="n">relu</span><span class="p">()</span> <span class="o">+</span> <span class="mf">1.0</span>
+<span class="linenos" aria-hidden="true">376</span> 
+<span class="linenos" aria-hidden="true">377</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  两者数值一致: "</span>
+<span class="linenos" aria-hidden="true">378</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">with_custom</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">),</span><span class="w"> </span><span class="n">pure_torch</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">),</span><span class="w"> </span><span class="n">atol</span><span class="o">=</span><span class="mf">1e-3</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">379</span> 
+<span class="linenos" aria-hidden="true">380</span>     <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">fn</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"自定义算子 + 后续逐元素"</span><span class="p">,</span> <span class="n">with_custom</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">381</span>                       <span class="p">(</span><span class="s2">"等价的纯 torch 写法"</span><span class="p">,</span> <span class="n">pure_torch</span><span class="p">)]:</span>
+<span class="linenos" aria-hidden="true">382</span>         <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">383</span>         <span class="n">cf</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">fn</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">384</span>         <span class="n">_</span><span class="p">,</span> <span class="n">code</span> <span class="o">=</span> <span class="n">run_and_get_code</span><span class="p">(</span><span class="n">cf</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">385</span>         <span class="n">src</span> <span class="o">=</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">code</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">386</span>         <span class="n">k</span> <span class="o">=</span> <span class="n">src</span><span class="o">.</span><span class="n">count</span><span class="p">(</span><span class="s2">"@triton.jit"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">387</span>         <span class="n">calls</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">findall</span><span class="p">(</span><span class="sa">r</span><span class="s2">"torch\.ops\.\w+\.\w+"</span><span class="p">,</span> <span class="n">src</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">388</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">389</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    Inductor 生成 triton kernel: </span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">390</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    图里对外部算子的调用: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">calls</span><span class="p">))</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">391</span> 
+<span class="linenos" aria-hidden="true">392</span>     <span class="k">def</span><span class="w"> </span><span class="nf">timeit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">30</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">393</span>         <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">394</span>             <span class="n">fn</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">395</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">396</span>         <span class="n">s</span><span class="p">,</span> <span class="n">e</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">397</span>         <span class="n">s</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">398</span>         <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">399</span>             <span class="n">fn</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">400</span>         <span class="n">e</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">401</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">402</span>         <span class="k">return</span> <span class="n">s</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">e</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
+<span class="linenos" aria-hidden="true">403</span> 
+<span class="linenos" aria-hidden="true">404</span>     <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">();</span> <span class="n">c1</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">with_custom</span><span class="p">);</span> <span class="n">c1</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">405</span>     <span class="n">dynamo</span><span class="o">.</span><span class="n">reset</span><span class="p">();</span> <span class="n">c2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">pure_torch</span><span class="p">);</span> <span class="n">c2</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">406</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  自定义算子（编译后）  </span><span class="si">{</span><span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">c1</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">))</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">407</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  纯 torch（编译后）    </span><span class="si">{</span><span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">c2</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">))</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">408</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  我的 kernel（裸调）    </span><span class="si">{</span><span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">m</span><span class="o">.</span><span class="n">fss_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">))</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">409</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  eager 纯 torch        </span><span class="si">{</span><span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">pure_torch</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">w</span><span class="p">))</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">410</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  自定义算子是一个**不透明的边界**：Inductor 不能把它前后的算子"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">411</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  融进它，也不能把它拆开重排。写得比库快，才值得付这个边界的代价。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">412</span>     <span class="k">del</span> <span class="n">x</span><span class="p">,</span> <span class="n">w</span>
+<span class="linenos" aria-hidden="true">413</span>     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">414</span> 
+<span class="linenos" aria-hidden="true">415</span> 
+<span class="linenos" aria-hidden="true">416</span> <span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">417</span>             <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">,</span> <span class="s2">"E"</span><span class="p">:</span> <span class="n">section_E</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">418</span> 
+<span class="linenos" aria-hidden="true">419</span> <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">420</span>     <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">421</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  device </span><span class="si">{</span><span class="n">DEV</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">422</span>     <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">423</span>         <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos" aria-hidden="true">424</span>     <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">425</span>     <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 </pre></div>
 <div class="srcref"><code>labs/L2/custom_op.py 全文（425 行）</code><a href="../code/labs/L2/custom_op.py.html">在完整文件中打开 &rarr;</a></div></div></details>
 <p><strong>建议的消融</strong></p>
@@ -915,12 +942,12 @@ autograd 图是断的——它前面的所有参数<strong>收不到梯度</stro
 <ul>
 <li>缺 fake：<code>torch.compile</code> 时报 <code>RuntimeError when making fake tensor call</code>。eager 正常。</li>
 <li>缺 autograd：<code>.backward()</code> 时报错说算子不支持 autograd。前向正常。</li>
-<li>autograd 写错：<strong>永远不报错</strong>，前向精确正确，只有 gradcheck 能发现。</li>
+<li>autograd 写错：可能不报错；前向正确不保证梯度正确，需要独立检查反向。</li>
 </ul>
 <p>最危险的是第三种，其次是完全不注册（第一节那种：悄悄留在图外，也不报错）。</p>
 <p>一般规律：一个失败越晚被发现、越不产生显式信号，就越贵。
 注册这件事的价值一半在功能，一半在把静默失败变成显式失败。</p>
-</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.7-compiler-stack.html">&#8592; 2.7 编译器栈：torch.compile 到 MLIR</a><a class="nav-next" href="../L3/3.1-attention-memory-wall.html">3.1 从 attention 数学到内存墙 &#8594;</a></nav>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.7-compiler-stack.html">&#8592; 2.7 PyTorch 编译器：捕获、分图与代码生成</a><a class="nav-next" href="../L3/3.1-attention-memory-wall.html">3.1 从 attention 数学到内存墙 &#8594;</a></nav>
 </main>
 </body>
 </html>

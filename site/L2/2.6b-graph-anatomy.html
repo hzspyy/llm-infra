@@ -4,34 +4,34 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.6b 算子图的样子：Dynamo FX 图、Inductor 输出与真实文本</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">2.6b</div>
   <div class="sidebar-title">算子图的样子：Dynamo FX 图、Inductor 输出与真实文本</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">心智模型：四跳，四种表示</a></li>
 <li><a href="#_3">机制拆解</a><ul>
-<li><a href="#dynamo-fx">第一跳：Dynamo 的 FX 图长这样</a></li>
-<li><a href="#aotautograd">第二跳：AOTAutograd 把反向也变成图</a></li>
-<li><a href="#inductor-triton-kernel">第三跳：Inductor 生成一个 Triton kernel</a></li>
+<li><a href="#dynamo-fx">第一阶段：Dynamo 捕获 FX 图</a></li>
+<li><a href="#aotautograd">第二阶段：AOTAutograd 构建前向与反向图</a></li>
+<li><a href="#inductor-triton-kernel">第三阶段：Inductor 生成 Triton kernel</a></li>
 <li><a href="#368">融合的收益：3.68 倍</a></li>
 <li><a href="#item">图断裂：一句 .item() 的代价</a></li>
 </ul>
 </li>
 <li><a href="#vllm-piecewise">工程实现 · 源码走读：vLLM 的 piecewise 图</a><ul>
-<li><a href="#2026-09-10crater">补测：三种模式各是多少次（2026-09-10，crater）</a></li>
+<li><a href="#kernel">三种图模式的提交与 kernel 计数</a></li>
 </ul>
 </li>
 <li><a href="#_4">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_5">建议你做的消融</a></li>
+<li><a href="#_5">消融建议</a></li>
 </ul>
 </li>
 <li><a href="#_6">原始现场</a></li>
@@ -41,13 +41,43 @@
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：四跳，四种表示</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#dynamo-fx">第一阶段：Dynamo 捕获 FX 图</a></li>
+<li><a href="#aotautograd">第二阶段：AOTAutograd 构建前向与反向图</a></li>
+<li><a href="#inductor-triton-kernel">第三阶段：Inductor 生成 Triton kernel</a></li>
+<li><a href="#368">融合的收益：3.68 倍</a></li>
+<li><a href="#item">图断裂：一句 .item() 的代价</a></li>
+</ul>
+</li>
+<li><a href="#vllm-piecewise">工程实现 · 源码走读：vLLM 的 piecewise 图</a><ul>
+<li><a href="#kernel">三种图模式的提交与 kernel 计数</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_5">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
   <div class="mod-id">2.6b</div>
   <h1>算子图的样子：Dynamo FX 图、Inductor 输出与真实文本</h1>
-  <p class="lede">从小函数出发，阅读 FX 图、AOTAutograd 前向和反向图以及 Inductor 输出；区分编译分图、kernel 融合与 CUDA Graph 捕获。</p>
+  <p class="lede">检查 FX 图、AOTAutograd、Inductor 产物与 CUDA Graph，区分捕获、分图、融合和重放。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L2.3（融合的收益从哪来）· L2.5（Triton）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>“算子图”不是必须画出来的流程图，而是程序的一种数据结构：
@@ -63,6 +93,8 @@
 <hr />
 <h2 id="_2">心智模型：四跳，四种表示</h2>
 <figure>
+
+
 <svg viewBox="0 0 740 438" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="torch.compile 的四跳">
   <g font-size="11.5" fill="currentColor">
     <text x="12" y="18" font-size="12.5" font-weight="600">一段 7 行的 RMSNorm，torch.compile 走过的四跳（本机实测）</text>
@@ -124,12 +156,14 @@
     <text x="12" y="416" font-size="10.5" opacity="0.85">原因 <tspan font-family="ui-monospace,monospace" font-size="10">"Unsupported Tensor.item() call with capture..."</tspan>（呼应 L1.4 实测的 4.76 µs 同步开销）</text>
   </g>
 </svg>
+
+
 <figcaption>四跳的实际产物与融合收益。所有数字与名字均为本机实测。</figcaption>
 </figure>
 
 <hr />
 <h2 id="_3">机制拆解</h2>
-<h3 id="dynamo-fx">第一跳：Dynamo 的 FX 图长这样</h3>
+<h3 id="dynamo-fx">第一阶段：Dynamo 捕获 FX 图</h3>
 <p>被编译的源码只有 4 行：</p>
 <div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">rmsnorm_like</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">w</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
     <span class="n">v</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
@@ -186,7 +220,7 @@ output           output
 <p>这个样例出现了四种 op：<code>placeholder</code>、<code>call_function</code>、<code>call_method</code> 和 <code>output</code>。
 FX 还支持 <code>get_attr</code> 和 <code>call_module</code>，不能把样例里出现的类型当成全部类型。
 完整定义见 <a href="https://docs.pytorch.org/docs/2.13/fx.html">PyTorch 2.13 FX 文档</a>。</p>
-<h3 id="aotautograd">第二跳：AOTAutograd 把反向也变成图</h3>
+<h3 id="aotautograd">第二阶段：AOTAutograd 构建前向与反向图</h3>
 <p>如果需要梯度，AOTAutograd 会生成<strong>前向图 + 反向图</strong>。实测节点数：</p>
 <table>
 <thead>
@@ -267,8 +301,8 @@ AOTAutograd 加进去的——反向要用到它们。这是「保存中间值�
 <p><strong>关键的是 <code>mul</code></strong> —— 它是前向算出的归一化结果，
 一个和输入等大的张量，必须一路活到反向结束。
 一层就 2 MB，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math></span> 层的模型乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math></span> 倍。<strong>这就是训练显存的大头</strong>
-（activation memory，<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span> 会算这笔账；★7.0 会把整个反向过程再拆一遍）。</p>
-<h3 id="inductor-triton-kernel">第三跳：Inductor 生成一个 Triton kernel</h3>
+（activation memory，<span class="xref pending" title="训练循环的系统视角（后续章节）">L7.1</span> 会算这笔账；★7.0 会把整个反向过程再拆一遍）。</p>
+<h3 id="inductor-triton-kernel">第三阶段：Inductor 生成 Triton kernel</h3>
 <p>7 个算子 → <strong>1 个 kernel</strong>。生成的函数名本身就是清单：</p>
 <div class="highlight"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0</span><span class="p">(</span>
@@ -407,7 +441,7 @@ vLLM 的采样全在 GPU 上完成，结果通过异步拷贝 + 事件回传。<
 <p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 使用 <code>enforce_eager=True</code>，不能从该 trace 断言开启 graph 后的具体路径。
 而且一次 graph launch 仍可能执行多个 kernel；在支持节点级跟踪的 profiler 中，
 这些 kernel 仍然可见。图重放减少提交次数，算子融合减少 kernel 数，二者要分开看。</p>
-<h3 id="2026-09-10crater">补测：三种模式各是多少次（2026-09-10，crater）</h3>
+<h3 id="kernel">三种图模式的提交与 kernel 计数</h3>
 <p>上面那句「二者要分开看」现在有数了。同一份 decode 负载
 （Qwen3-1.7B，bs=4，每条生成 32 token，关掉 prefix caching），
 用 nsys 只统计 <code>generate</code> 那一段（<code>--capture-range=cudaProfilerApi</code>）：</p>
@@ -534,7 +568,7 @@ GPU kernel 数恰好等于 CPU launch 数，看起来像「图让 GPU 少跑了 
 <span class="nv">TORCH_LOGS</span><span class="o">=</span><span class="s2">"graph_code,aot_graphs,output_code"</span><span class="w"> </span>python<span class="w"> </span>your_model.py<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>less
 </code></pre></div>
 
-<h3 id="_5">建议你做的消融</h3>
+<h3 id="_5">消融建议</h3>
 <table>
 <thead>
 <tr>
@@ -565,7 +599,7 @@ GPU kernel 数恰好等于 CPU launch 数，看起来像「图让 GPU 少跑了 
 </tr>
 <tr>
 <td>改成需要梯度，打印反向图</td>
-<td>数一数保存了哪些中间值——那就是训练的 activation 显存（<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span>）</td>
+<td>数一数保存了哪些中间值——那就是训练的 activation 显存（<span class="xref pending" title="训练循环的系统视角（后续章节）">L7.1</span>）</td>
 </tr>
 </tbody>
 </table>
@@ -713,7 +747,7 @@ output           output                                            args=((mul_1,
 <p>注意函数签名里除了 <code>primals_*</code>（输入）和 <code>tangents_1</code>（上游梯度），
 还有 <strong><code>rsqrt</code>、<code>detach</code>、<code>mul</code></strong> —— 这三个是前向<strong>保存下来</strong>的中间值。</p>
 <p><strong>它们必须在整个前向-反向期间占着显存。</strong> 这就是训练的 activation memory，
-也是 activation checkpointing 要用重算换掉的东西（<span class="xref pending" title="梯度是怎么传的：autograd 图、反向算子与内存曲线（尚未写）">L7.0</span>、<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span>）。</p>
+也是 activation checkpointing 要用重算换掉的东西（<span class="xref pending" title="PyTorch autograd 引擎：反向图、调度与保存值（后续章节）">L7.0</span>、<span class="xref pending" title="训练循环的系统视角（后续章节）">L7.1</span>）。</p>
 <p>节点数：前向 11，反向 25。</p>
 <p>原始文件：<code>results/crater/graphs/30_aot_fwd_bwd_graphs.txt</code></p>
 </details>
@@ -728,7 +762,7 @@ output           output                                            args=((mul_1,
 （<code>graphs</code>、<code>ops_per_graph</code>、<code>out_guards</code> 等），全文见原始文件。</p>
 <p><strong><code>out_guards</code> 特别值得看</strong>：那是 Dynamo 为这张图安装的<strong>守卫条件</strong>——
 下次调用时如果任何一条守卫不成立（形状变了、dtype 变了、某个 Python 对象的
-<code>id</code> 变了），就要<strong>重新编译</strong>。<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a> 会展开讲守卫与重编译。</p>
+<code>id</code> 变了），就要<strong>重新编译</strong>。<a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a> 会展开讲守卫与重编译。</p>
 <p>原始文件：<code>results/crater/graphs/40_graph_break.txt</code></p>
 </details>
 <hr />
@@ -759,7 +793,7 @@ output           output                                            args=((mul_1,
 </tr>
 <tr>
 <td><strong>Inductor 的融合规则</strong></td>
-<td>目前主要融合逐元素与归约。GEMM 通常不融合（除了 epilogue）。融合决策的启发式是 <a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a> 的主题</td>
+<td>目前主要融合逐元素与归约。GEMM 通常不融合（除了 epilogue）。融合决策的启发式是 <a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a> 的主题</td>
 </tr>
 <tr>
 <td><strong>图级别的量化与重写</strong></td>
@@ -770,7 +804,7 @@ output           output                                            args=((mul_1,
 <hr />
 <h2 id="_8">陷阱</h2>
 <p><strong>1. 以为"图"是个抽象概念。</strong> 它是一个能打印、能读、带完整 shape 标注的 Python 类。
-<strong>永远先打印再讨论。</strong></p>
+先导出图节点与边，再判断捕获、分图和融合分别发生在哪里。</p>
 <p><strong>2. 在热路径里写 <code>.item()</code> / <code>print(tensor)</code> / <code>if tensor &gt; 0</code>。</strong>
 会断图，融合机会全没，还有 4.76 µs 的同步（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 实测）。</p>
 <p><strong>3. 不看 <code>graph_count</code> 就调优。</strong> 图被切成十几段时，
@@ -824,7 +858,7 @@ attention 的 softmax 累加、GEMM 的 K 方向累加，全都是 fp32（<a cla
 每层保存的激活约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>8</mn><mo>&#x000D7;</mo><mn>2048</mn><mo>&#x000D7;</mo><mn>2048</mn><mo>&#x000D7;</mo><mn>2</mn><mtext>&#x000A0;</mtext><mtext>B</mtext><mo>&#x02248;</mo><mn>67</mn></mrow></math></span> MB，
 28 层就是 <strong>1.9 GB</strong>——而权重才 3.44 GB（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 实测）。</p>
 <p><strong>这就是 activation checkpointing 的动机</strong>：不保存中间值，
-反向时<strong>重新前向算一遍</strong>。用大约 33% 的额外计算换取大幅的显存节省（<span class="xref pending" title="训练循环的系统视角（尚未写）">L7.1</span> 会实测）。</p>
+反向时<strong>重新前向算一遍</strong>。用大约 33% 的额外计算换取大幅的显存节省（<span class="xref pending" title="训练循环的系统视角（后续章节）">L7.1</span> 会实测）。</p>
 <p><strong>从图上看</strong>，checkpointing 就是把前向图的一段标记为"不保存输出、反向时重跑"。</p>
 </details>
 <details>
@@ -869,7 +903,7 @@ grep<span class="w"> </span>-l<span class="w"> </span><span class="s2">"@triton.
 （比如把某些模式重写成手写 kernel）。</p>
 <p><strong>判断编译有没有生效的最快方法</strong>：对比 <code>enforce_eager=True</code> 与默认的 kernel 数量
 （用 <a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 <code>kernel_trace.py</code>）。eager 是 444 个/步，编译后应该显著减少。</p>
-</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.6-profiling.html">&#8592; 2.6 Profiling 工程学</a><a class="nav-next" href="../L2/2.7-compiler-stack.html">2.7 编译器栈：torch.compile 到 MLIR &#8594;</a></nav>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.6-profiling.html">&#8592; 2.6 Profiling 工程学</a><a class="nav-next" href="../L2/2.7-compiler-stack.html">2.7 PyTorch 编译器：捕获、分图与代码生成 &#8594;</a></nav>
 </main>
 </body>
 </html>

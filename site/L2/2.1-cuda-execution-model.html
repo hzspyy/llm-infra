@@ -4,16 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.1 CUDA 执行模型与 CUDA Graph</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">2.1</div>
   <div class="sidebar-title">CUDA 执行模型与 CUDA Graph</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">心智模型：三层调度，每层都有自己的"整数倍"</a></li>
@@ -32,7 +32,7 @@
 </li>
 <li><a href="#_5">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_6">建议你做的消融</a></li>
+<li><a href="#_6">消融建议</a></li>
 </ul>
 </li>
 <li><a href="#_7">原始现场</a></li>
@@ -42,13 +42,44 @@
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：三层调度，每层都有自己的"整数倍"</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#602-8">分支发散：实测 6.02×，理论 8×</a></li>
+<li><a href="#1-2-2-6">占用率：1 → 2 有用，2 → 6 无用</a></li>
+<li><a href="#kernel-gpu">多流并发：只有 kernel 占不满 GPU 时才有意义</a></li>
+<li><a href="#_4">尾效应：耗时是阶梯，不是斜线</a></li>
+</ul>
+</li>
+<li><a href="#grid">工程实现 · 源码走读：引擎在哪里对齐 grid</a><ul>
+<li><a href="#1-vllm-reshape_and_cache_flash">1. vLLM 的 reshape_and_cache_flash</a></li>
+<li><a href="#2-flashattention-tile-scheduler">2. FlashAttention 的 tile scheduler</a></li>
+<li><a href="#3-cudaoccupancymaxactiveblockspermultiprocessor">3. cudaOccupancyMaxActiveBlocksPerMultiprocessor</a></li>
+</ul>
+</li>
+<li><a href="#_5">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_6">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_7">原始现场</a></li>
+<li><a href="#_8">前沿</a></li>
+<li><a href="#_9">陷阱</a></li>
+<li><a href="#_10">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
   <div class="mod-id">2.1</div>
   <h1>CUDA 执行模型与 CUDA Graph</h1>
-  <p class="lede">从 thread、block、grid 的组织方式理解分支、占用率、多流和尾效应；区分驻留容量、硬件忙碌程度与实际运行时间。</p>
+  <p class="lede">通过分支、驻留资源、多流和线程块扫描，理解 CUDA 执行与并行度约束。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（内存层次与 Little&#x27;s Law）· L1.4（launch 路径）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
@@ -63,6 +94,8 @@ occupancy（占用率）描述常驻 warp 数相对于硬件上限的比例，
 <hr />
 <h2 id="_2">心智模型：三层调度，每层都有自己的"整数倍"</h2>
 <figure>
+
+
 <svg viewBox="0 0 740 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CUDA 三层调度模型">
   <g font-size="11.5" fill="currentColor">
     <text x="12" y="18" font-size="12.5" font-weight="600">你写的 grid / block，硬件是这样消化的（crater 实测参数）</text>
@@ -112,6 +145,8 @@ occupancy（占用率）描述常驻 warp 数相对于硬件上限的比例，
     <text x="12" y="410" font-size="11" opacity="0.85">你的参数一旦跨过粒度边界，代价是跳变的而不是连续的。</text>
   </g>
 </svg>
+
+
 <figcaption>grid / SM / warp 三层调度，以及各自的"整数倍"效应。</figcaption>
 </figure>
 
@@ -300,7 +335,7 @@ occupancy（占用率）描述常驻 warp 数相对于硬件上限的比例，
 <p><strong>这直接对应推理里的场景</strong>：decode 每步有 444 个 kernel（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 实测），
 其中 RMSNorm、RoPE、SwiGLU 这些小算子在 batch=1 时根本占不满 GPU。
 理论上可以多流并发，但实际上它们之间有数据依赖（层与层串行），
-所以真正的解法是<strong>融合</strong>（<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）而不是并发。</p>
+所以真正的解法是<strong>融合</strong>（<a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>）而不是并发。</p>
 <p>多流真正有用的地方是<strong>无依赖的工作</strong>：H2D 传输与计算重叠（<a class="xref" href="../L1/1.3-host-pcie-numa.html" title="主机侧：NUMA、PCIe 与 DMA">L1.3</a>）、
 不同请求的 prefill 与 decode 重叠、以及 CPU 侧调度与 GPU 执行重叠（<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a>）。</p>
 <h3 id="_4">尾效应：耗时是阶梯，不是斜线</h3>
@@ -326,7 +361,7 @@ blocks    波数    耗时 ms    每 block 摊销 µs
 新增 block 需要等某个 SM 释放足够资源后才能开始。
 这里的“波”是分析并发容量的模型，不是所有 block 之间存在全局屏障。</p>
 <p>而 1018 / 1019 / 1020 三者耗时几乎相同（1.074 / 1.075 / 1.080）——
-<strong>波内加 block 是免费的</strong>。</p>
+这三个相邻配置未显示明显的时间增长，不能据此认为增加 block 没有成本。</p>
 <p>这解释了三件事：</p>
 <ol>
 <li><strong>grid 要按「SM 数 × 每 SM 可驻留 block 数」对齐。</strong>
@@ -401,7 +436,7 @@ grid 维度是 <code>(ceil(seqlen_q / 64), batch, heads)</code>。</p>
 </code></pre></div>
 
 <p>本机这个 kernel 是 6 block/SM，但换个 kernel（寄存器多一点）可能就是 4。
-<strong>写死数字的实验第二天就不对了。</strong></p>
+更换 kernel 或编译器后，应重新计算该配置的可驻留 block 数。</p>
 <hr />
 <h2 id="lab">动手 lab</h2>
 <div class="highlight"><pre><span></span><code>nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-Xptxas<span class="w"> </span>-v<span class="w"> </span>-o<span class="w"> </span>exec_model<span class="w"> </span>labs/L2/exec_model.cu
@@ -409,7 +444,7 @@ grid 维度是 <code>(ceil(seqlen_q / 64), batch, heads)</code>。</p>
 </code></pre></div>
 
 <p><code>-Xptxas -v</code> 会打印每个 kernel 的寄存器与共享内存用量——这是判断占用率的第一手信息。</p>
-<h3 id="_6">建议你做的消融</h3>
+<h3 id="_6">消融建议</h3>
 <table>
 <thead>
 <tr>
@@ -531,7 +566,7 @@ nvml, nvptxcompiler, nvrtc, nvtx, nvvm, opencl, profiler, sanitizer
 （.run / apt / 独立下载）获得，pip 装不了。</p>
 <p>所以本站的 <a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a>（Profiling）会建立在<strong>可用的手段</strong>上：
 <code>-Xptxas -v</code>、<code>clock64()</code> 在 kernel 内计时、torch profiler 的 kernel 时间与计数、
-以及贯穿全站的 roofline 分析。这些足以覆盖 90% 的诊断需求；
+以及贯穿全站的 roofline 分析。这些可用于定位部分提交、布局与同步问题；
 ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</strong>，会在 <a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 里说明它补的是哪一块。</p>
 </details>
 <hr />
@@ -566,12 +601,12 @@ ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</str
 </tr>
 <tr>
 <td><strong>绿色上下文 / MPS 分区</strong></td>
-<td>把 SM 划分给不同的上下文，让本章的"占不满 GPU"问题在多租户下有解（<span class="xref pending" title="编排：K8s / Ray / Slurm（尚未写）">L8.2</span>）</td>
+<td>把 SM 划分给不同的上下文，让本章的"占不满 GPU"问题在多租户下有解（<span class="xref pending" title="编排：K8s / Ray / Slurm（后续章节）">L8.2</span>）</td>
 </tr>
 </tbody>
 </table>
 <blockquote>
-<p>除本站实测外的内容来自各自文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+<p>除本章实测外的内容来自各自文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
 <h2 id="_9">陷阱</h2>
@@ -580,7 +615,7 @@ ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</str
 <p><strong>2. 忘了防优化。</strong> 共享内存不被读就会被删掉，占用率实验会完全失效。
 compute-bound 的累加值不被使用，整个循环会被删掉。</p>
 <p><strong>3. 用改 block 大小来调占用率。</strong> 它同时改变了太多变量，实验不干净。
-共享内存是唯一的单变量旋钮。</p>
+共享内存预留可用于控制驻留数，但还应检查 carveout 和额外访问是否引入其他影响。</p>
 <p><strong>4. 硬编码 grid 大小。</strong> 波长取决于 kernel 的寄存器用量，
 换个编译器版本就变了。用 <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> 现场问。</p>
 <p><strong>5. 以为多流总是有用。</strong> 单个 kernel 已经占满 GPU 时，多流是净亏损（实测 0.96×）。</p>
@@ -612,7 +647,7 @@ compute-bound 的累加值不被使用，整个循环会被删掉。</p>
 <p><strong>"凑成 2 的幂"在 GPU 上是个坏习惯。</strong> 该对齐的是
 <code>SM 数 × 每 SM 可驻留 block 数</code>，本机是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>170</mn><mo>&#x000D7;</mo><mn>6</mn><mo>&#x0003D;</mo><mn>1020</mn></mrow></math></span> —— 
 一个既不是 2 的幂也不好看的数。</p>
-<p><strong>唯一正确的做法是问 API，不是猜。</strong></p>
+<p>先用 occupancy API 计算资源约束，再测实际执行时间。</p>
 </details>
 <details>
 <summary>3. 为什么 compute-bound kernel 对占用率不敏感，而 memory-bound 从 1 到 2 block/SM 会涨 9%？</summary>
@@ -635,7 +670,7 @@ compute-bound 就会变得和 memory-bound 一样依赖占用率。
 <code>RMSNorm → QKV投影 → RoPE → attention → O投影 → 残差 → RMSNorm → SwiGLU</code>。
 每一步的输入是上一步的输出，没有并发空间。</p>
 <p>本章的多流实验之所以能重叠 3.77×，是因为那 4 个 kernel <strong>完全独立</strong>。</p>
-<p><strong>真正的解法是融合（<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）</strong>：把 RMSNorm + 残差加合成一个 kernel
+<p><strong>真正的解法是融合（<a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>）</strong>：把 RMSNorm + 残差加合成一个 kernel
 （<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> trace 里的 <code>fused_add_rms_norm</code> 就是），把 SwiGLU 的 silu 与 mul 合成一个
 （<code>act_and_mul_kernel</code>）。融合同时减少 launch 次数和访存往返。</p>
 <p><strong>多流在推理里真正有用的地方</strong>是无依赖的工作：
@@ -661,7 +696,7 @@ compute-bound 就会变得和 memory-bound 一样依赖占用率。
 那只会让编译器 spill 得更多。<code>__launch_bounds__</code> 是告诉编译器
 "我需要这个占用率"，编译器会为此牺牲寄存器，是<strong>用 spill 换占用率</strong>。
 按本章的结论，本机 2 block/SM 就够了，<strong>没必要为占用率牺牲寄存器</strong>。</p>
-</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.0-tensor-and-framework.html">&#8592; 2.0 框架内部：storage、stride、view 与 dispatcher</a><a class="nav-next" href="../L2/2.2-toolchain-ptx-sass.html">2.2 编译工具链：nvcc → PTX → SASS &#8594;</a></nav>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.0b-pytorch-dispatch-path.html">&#8592; 2.0b PyTorch 算子调用：从 Python 到 dispatcher 与 kernel</a><a class="nav-next" href="../L2/2.2-toolchain-ptx-sass.html">2.2 编译工具链：nvcc → PTX → SASS &#8594;</a></nav>
 </main>
 </body>
 </html>

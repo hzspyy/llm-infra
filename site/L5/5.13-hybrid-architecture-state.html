@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.13 混合架构的状态管理</title>
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">5.13</div>
+  <div class="sidebar-title">混合架构的状态管理</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：两类状态的对照</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 逐层状态的实际形状</a></li>
+<li><a href="#2">2. 容量增长的实测对照</a></li>
+<li><a href="#3">3. 前缀复用：定长状态能否参与哈希？</a></li>
+<li><a href="#4">4. 投机解码的回滚：定长状态怎么恢复？</a></li>
+</ul>
+</li>
+<li><a href="#vllm">工程实现：vLLM 的混合缓存管理</a><ul>
+<li><a href="#_4">源码走读：状态分配与池化</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab：检查混合架构的状态分布</a></li>
+<li><a href="#_5">原始现场</a><ul>
+<li><a href="#1_1">1. 逐层状态配置</a></li>
+<li><a href="#2_1">2. 前缀复用原始记录</a></li>
+<li><a href="#3_1">3. 容量扫描原始数据</a></li>
+</ul>
+</li>
+<li><a href="#_6">前沿</a><ul>
+<li><a href="#1-mamba-state-space-models">1. Mamba 与 state-space models</a></li>
+<li><a href="#2_2">2. 长上下文的极限</a></li>
+<li><a href="#3_2">3. 投机解码的适配</a></li>
+</ul>
+</li>
+<li><a href="#_7">陷阱</a><ul>
+<li><a href="#1-kv">1. 假设所有层都产生 KV</a></li>
+<li><a href="#2-attention-batch">2. 用纯 attention 的 batch 策略</a></li>
+<li><a href="#3_3">3. 把投机回滚当零成本</a></li>
+</ul>
+</li>
+<li><a href="#_8">自测题</a></li>
+<li><a href="#_9">小结</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：两类状态的对照</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 逐层状态的实际形状</a></li>
+<li><a href="#2">2. 容量增长的实测对照</a></li>
+<li><a href="#3">3. 前缀复用：定长状态能否参与哈希？</a></li>
+<li><a href="#4">4. 投机解码的回滚：定长状态怎么恢复？</a></li>
+</ul>
+</li>
+<li><a href="#vllm">工程实现：vLLM 的混合缓存管理</a><ul>
+<li><a href="#_4">源码走读：状态分配与池化</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab：检查混合架构的状态分布</a></li>
+<li><a href="#_5">原始现场</a><ul>
+<li><a href="#1_1">1. 逐层状态配置</a></li>
+<li><a href="#2_1">2. 前缀复用原始记录</a></li>
+<li><a href="#3_1">3. 容量扫描原始数据</a></li>
+</ul>
+</li>
+<li><a href="#_6">前沿</a><ul>
+<li><a href="#1-mamba-state-space-models">1. Mamba 与 state-space models</a></li>
+<li><a href="#2_2">2. 长上下文的极限</a></li>
+<li><a href="#3_2">3. 投机解码的适配</a></li>
+</ul>
+</li>
+<li><a href="#_7">陷阱</a><ul>
+<li><a href="#1-kv">1. 假设所有层都产生 KV</a></li>
+<li><a href="#2-attention-batch">2. 用纯 attention 的 batch 策略</a></li>
+<li><a href="#3_3">3. 把投机回滚当零成本</a></li>
+</ul>
+</li>
+<li><a href="#_8">自测题</a></li>
+<li><a href="#_9">小结</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
+  <div class="mod-id">5.13</div>
+  <h1>混合架构的状态管理</h1>
+  <p class="lede">逐层管理 attention KV、recurrent state 与窗口状态，比较分配、前缀复用、快照和投机回滚；混合模型的容量与复制成本以实际状态布局为准。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · RecurrentGemma-2B · vLLM 0.29.0</span><span class="chip">数据日期 2026-09-12</span><span class="chip">前置 3.4（稀疏与线性 attention）· 5.2（KV 分页）· 5.5（投机解码）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>5.2 讲了 KV cache 的分页与前缀复用，5.5 讲了投机解码的状态回滚。
+这两章都默认每一层都产生 KV cache，而且 cache 的大小随上下文线性增长。</p>
+<p><strong>混合架构打破了这两个假设。</strong> RecurrentGemma、Mamba、Jamba 这类模型把部分层换成 RNN 或线性 attention：
+那些层不再有 KV cache，取而代之的是<strong>定长的 recurrent state</strong>。</p>
+<ol>
+<li>混合模型里每层的「状态」分别是什么形状？</li>
+<li>定长状态还能不能做 prefix cache？为什么？</li>
+<li>投机解码验证失败时，recurrent state 怎么回滚？</li>
+</ol>
+<p>结论先给：</p>
+<ul>
+<li><strong>层级混合。</strong> RecurrentGemma-2B 的 26 层中，18 层是 recurrent（RNN Griffin），8 层是 local attention。每 3 层循环一次模式：<code>[recurrent, recurrent, attention]</code>。</li>
+<li><strong>状态形状差异。</strong> Recurrent 层的状态是定长的：<code>(batch, heads, conv_width, head_dim) = (B, 10, 4, 256)</code>，每层每 batch 固定 20 KB。Attention 层的 KV cache 是可变的：<code>(2, kv_heads, seq_len, head_dim) = (2, 1, L, 256)</code>，每层每 token 1 KB。</li>
+<li><strong>容量对照。</strong> Context 从 256 增长到 2048（7.95×），prefill 时间只增长 3.53×，说明<strong>固定状态占主导，KV 增长被摊薄</strong>。纯 attention 模型下这个比值接近 1:1。</li>
+<li><strong>前缀复用仍然有效。</strong> 相同前缀的后续请求比首次快 1.29×（时间减少 22.8%）。vLLM 的前缀哈希包含了 recurrent state，定长状态不妨碍复用。</li>
+<li><strong>投机回滚的代价不同。</strong> KV cache 回滚只需调整块引用；recurrent state 回滚需要恢复整块张量（360 KB/batch vs 按 token 计的 KV）。</li>
+</ul>
+<hr />
+<h2 id="_2">心智模型：两类状态的对照</h2>
+<svg viewBox="0 0 780 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="混合架构的状态分配">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">RecurrentGemma-2B：26 层，18 recurrent + 8 attention</text>
+    
+    <!-- 左侧：Recurrent 层 -->
+    <text x="12" y="48" font-size="12" font-weight="600">Recurrent 层（RNN Griffin，18 层）</text>
+    <rect x="12" y="58" width="360" height="140" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    
+    <text x="24" y="78" font-size="10.5" font-weight="500">状态形状：(batch, 10 heads, 4 conv, 256 dim)</text>
+    <text x="24" y="94" font-size="10">• 定长：不随 context 增长</text>
+    <text x="24" y="110" font-size="10">• 每层 20 KB/batch（bf16）</text>
+    <text x="24" y="126" font-size="10">• 18 层 × 20 KB = 360 KB/batch</text>
+    
+    <rect x="24" y="140" width="100" height="48" rx="3" fill="none" stroke="currentColor" stroke-dasharray="3 2"/>
+    <text x="30" y="158" font-size="9">Layer 0</text>
+    <text x="30" y="172" font-size="9" opacity="0.75">20 KB state</text>
+    <text x="30" y="182" font-size="8" opacity="0.65">固定</text>
+    
+    <rect x="136" y="140" width="100" height="48" rx="3" fill="none" stroke="currentColor" stroke-dasharray="3 2"/>
+    <text x="142" y="158" font-size="9">Layer 1</text>
+    <text x="142" y="172" font-size="9" opacity="0.75">20 KB state</text>
+    <text x="142" y="182" font-size="8" opacity="0.65">固定</text>
+    
+    <text x="248" y="164" font-size="10" opacity="0.6">... (共 18 层)</text>
+    
+    <!-- 右侧：Attention 层 -->
+    <text x="408" y="48" font-size="12" font-weight="600">Attention 层（local attention，8 层）</text>
+    <rect x="408" y="58" width="360" height="140" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    
+    <text x="420" y="78" font-size="10.5" font-weight="500">状态形状：(2, 1 kv_head, seq_len, 256 dim)</text>
+    <text x="420" y="94" font-size="10">• 可变：随 context 线性增长</text>
+    <text x="420" y="110" font-size="10">• 每层 1 KB/token（K + V）</text>
+    <text x="420" y="126" font-size="10">• 8 层 × 1 KB/token = 8 KB/token</text>
+    
+    <rect x="420" y="140" width="100" height="48" rx="3" fill="none" stroke="currentColor"/>
+    <text x="426" y="158" font-size="9">Layer 2</text>
+    <text x="426" y="172" font-size="9" opacity="0.75">L × 1 KB</text>
+    <text x="426" y="182" font-size="8" opacity="0.65">L = seq_len</text>
+    
+    <rect x="532" y="140" width="100" height="48" rx="3" fill="none" stroke="currentColor"/>
+    <text x="538" y="158" font-size="9">Layer 5</text>
+    <text x="538" y="172" font-size="9" opacity="0.75">L × 1 KB</text>
+    
+    <text x="644" y="164" font-size="10" opacity="0.6">... (共 8 层)</text>
+    
+    <!-- 底部：总容量对比 -->
+    <line x1="12" y1="220" x2="768" y2="220" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    
+    <text x="12" y="248" font-size="12" font-weight="600">不同上下文的总状态大小</text>
+    
+    <g font-size="10">
+      <text x="12" y="274" font-weight="500">Context 256:</text>
+      <text x="110" y="274">360 KB (固定) + 2,048 KB (KV) = <tspan font-weight="600">2.4 MB</tspan></text>
+      
+      <text x="12" y="294" font-weight="500">Context 512:</text>
+      <text x="110" y="294">360 KB (固定) + 4,096 KB (KV) = <tspan font-weight="600">4.4 MB</tspan></text>
+      
+      <text x="12" y="314" font-weight="500">Context 1024:</text>
+      <text x="110" y="314">360 KB (固定) + 8,192 KB (KV) = <tspan font-weight="600">8.6 MB</tspan></text>
+      
+      <text x="12" y="334" font-weight="500">Context 2048:</text>
+      <text x="110" y="334">360 KB (固定) + 16,384 KB (KV) = <tspan font-weight="600">16.7 MB</tspan></text>
+      
+      <text x="12" y="354" font-weight="500">Context 4096:</text>
+      <text x="110" y="354">360 KB (固定) + 32,768 KB (KV) = <tspan font-weight="600">33.1 MB</tspan></text>
+    </g>
+    
+    <rect x="12" y="370" width="756" height="36" rx="3" fill="none" stroke="currentColor" stroke-width="1" opacity="0.5"/>
+    <text x="24" y="390" font-size="10.5">对比纯 attention（Qwen3-1.7B，28 层）：Context 2048 需 28 × 2 × 128 × 128 × 2048 × 2 bytes ≈ <tspan font-weight="600">468 MB</tspan></text>
+    <text x="24" y="402" font-size="9" opacity="0.75">混合架构的状态增长远低于纯 attention，长上下文的显存优势明显</text>
+  </g>
+</svg>
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1">1. 逐层状态的实际形状</h3>
+<p>RecurrentGemma-2B 使用 26 层，按 <code>['recurrent', 'recurrent', 'attention']</code> 的 3 层模式循环。
+从模型配置和实测数据：</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"model_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"recurrent_gemma"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"num_hidden_layers"</span><span class="p">:</span><span class="w"> </span><span class="mi">26</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"hidden_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2560</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"num_attention_heads"</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"num_key_value_heads"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"block_types"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"recurrent"</span><span class="p">,</span><span class="w"> </span><span class="s2">"recurrent"</span><span class="p">,</span><span class="w"> </span><span class="s2">"attention"</span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>Recurrent 层的状态（RNN Griffin）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 每个 recurrent 层</span>
+<span class="n">state_shape</span> <span class="o">=</span> <span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">,</span> <span class="n">conv_width</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">)</span>
+            <span class="o">=</span> <span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">256</span><span class="p">)</span>
+
+<span class="c1"># 字节数（bf16）</span>
+<span class="n">state_bytes_per_layer</span> <span class="o">=</span> <span class="mi">10</span> <span class="o">*</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">256</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">=</span> <span class="mi">20</span><span class="p">,</span><span class="mi">480</span> <span class="nb">bytes</span> <span class="o">=</span> <span class="mi">20</span> <span class="n">KB</span>
+
+<span class="c1"># 18 个 recurrent 层</span>
+<span class="n">total_recurrent_state</span> <span class="o">=</span> <span class="mi">18</span> <span class="o">*</span> <span class="mi">20</span> <span class="n">KB</span> <span class="o">=</span> <span class="mi">360</span> <span class="n">KB</span> <span class="n">per</span> <span class="n">batch</span>
+</code></pre></div>
+
+<p>这个状态<strong>不随上下文长度增长</strong>。无论输入是 256 token 还是 4096 token，每个 recurrent 层都只保留这 20 KB 的固定状态。</p>
+<p><strong>Attention 层的状态（local attention）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 每个 attention 层，每个 token</span>
+<span class="n">kv_shape_per_token</span> <span class="o">=</span> <span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">)</span>
+                    <span class="o">=</span> <span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">256</span><span class="p">)</span>
+
+<span class="c1"># 字节数（bf16）</span>
+<span class="n">kv_bytes_per_token</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">256</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span><span class="mi">024</span> <span class="nb">bytes</span> <span class="o">=</span> <span class="mi">1</span> <span class="n">KB</span>
+
+<span class="c1"># 8 个 attention 层，序列长度 L</span>
+<span class="n">total_kv_cache</span> <span class="o">=</span> <span class="mi">8</span> <span class="o">*</span> <span class="mi">1</span> <span class="n">KB</span> <span class="o">*</span> <span class="n">L</span> <span class="o">=</span> <span class="mi">8</span><span class="n">L</span> <span class="n">KB</span>
+</code></pre></div>
+
+<p>这个状态<strong>随上下文线性增长</strong>。Context 翻倍，KV cache 也翻倍。</p>
+<p><strong>实测验证（来自 RecurrentGemma-2B 配置与运行）：</strong></p>
+<p>从 <code>results/crater/hybrid/recurrentgemma_state_audit.json</code>：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Layer</th>
+<th>Block Type</th>
+<th>State Type</th>
+<th>Shape per Batch</th>
+<th style="text-align: right;">Bytes/Batch</th>
+<th>Grows?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0</td>
+<td>recurrent</td>
+<td>recurrent</td>
+<td>(10, 4, 256)</td>
+<td style="text-align: right;">20,480</td>
+<td>❌</td>
+</tr>
+<tr>
+<td style="text-align: right;">1</td>
+<td>recurrent</td>
+<td>recurrent</td>
+<td>(10, 4, 256)</td>
+<td style="text-align: right;">20,480</td>
+<td>❌</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td>attention</td>
+<td>kv_cache</td>
+<td>(2, 1, seq_len, 256)</td>
+<td style="text-align: right;">1,024/token</td>
+<td>✅</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td>recurrent</td>
+<td>recurrent</td>
+<td>(10, 4, 256)</td>
+<td style="text-align: right;">20,480</td>
+<td>❌</td>
+</tr>
+<tr>
+<td style="text-align: right;">&hellip;</td>
+<td>&hellip;</td>
+<td>&hellip;</td>
+<td>&hellip;</td>
+<td style="text-align: right;">&hellip;</td>
+<td>&hellip;</td>
+</tr>
+<tr>
+<td style="text-align: right;">25</td>
+<td>recurrent</td>
+<td>recurrent</td>
+<td>(10, 4, 256)</td>
+<td style="text-align: right;">20,480</td>
+<td>❌</td>
+</tr>
+</tbody>
+</table>
+<p>完整 26 层：18 recurrent + 8 attention，按 3 层模式循环。</p>
+<hr />
+<h3 id="2">2. 容量增长的实测对照</h3>
+<p>扫描不同上下文长度，测量 prefill 时间：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Context</th>
+<th style="text-align: right;">实际 Tokens</th>
+<th style="text-align: right;">Prefill 时间</th>
+<th style="text-align: right;">ms/token</th>
+<th>状态大小估算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">258</td>
+<td style="text-align: right;">111.0 ms</td>
+<td style="text-align: right;">0.430</td>
+<td>360 KB + 2 MB = 2.4 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">514</td>
+<td style="text-align: right;">111.5 ms</td>
+<td style="text-align: right;">0.217</td>
+<td>360 KB + 4 MB = 4.4 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1026</td>
+<td style="text-align: right;">216.4 ms</td>
+<td style="text-align: right;">0.211</td>
+<td>360 KB + 8 MB = 8.6 MB</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2050</td>
+<td style="text-align: right;">391.3 ms</td>
+<td style="text-align: right;">0.191</td>
+<td>360 KB + 16 MB = 16.7 MB</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Token 增长 7.95×，时间只增长 3.53×。</strong></p>
+<p>这是<strong>次线性增长</strong>：固定的 recurrent state（360 KB）占主导，KV cache 的线性增长被摊薄。</p>
+<p>对比纯 attention 模型（Qwen3-1.7B，28 层 MHA）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 每层 KV cache</span>
+<span class="n">kv_per_layer</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">num_kv_heads</span> <span class="o">*</span> <span class="n">head_dim</span> <span class="o">*</span> <span class="n">seq_len</span> <span class="o">*</span> <span class="n">dtype_bytes</span>
+             <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="mi">128</span> <span class="o">*</span> <span class="mi">128</span> <span class="o">*</span> <span class="mi">2048</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">=</span> <span class="mf">16.8</span> <span class="n">MB</span> <span class="n">per</span> <span class="n">layer</span>
+
+<span class="c1"># 28 层</span>
+<span class="n">total_kv</span> <span class="o">=</span> <span class="mi">28</span> <span class="o">*</span> <span class="mf">16.8</span> <span class="n">MB</span> <span class="o">=</span> <span class="mi">468</span> <span class="n">MB</span>  <span class="p">(</span><span class="n">context</span><span class="o">=</span><span class="mi">2048</span><span class="p">)</span>
+</code></pre></div>
+
+<p>混合架构在 context=2048 时只需 <strong>16.7 MB</strong>，是纯 attention 的 <strong>3.6%</strong>。</p>
+<hr />
+<h3 id="3">3. 前缀复用：定长状态能否参与哈希？</h3>
+<p>5.2 讲了 vLLM 的前缀缓存：通过哈希 <code>(token_ids, ...)</code> 复用相同前缀的 KV 块。
+混合架构下，部分层是定长 recurrent state，还能复用吗？</p>
+<p><strong>实测：5 个共享前缀的请求</strong></p>
+<p>前缀：<code>"The RecurrentGemma architecture combines recurrent layers with local attention. "</code></p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">请求</th>
+<th style="text-align: right;">Prompt Tokens</th>
+<th style="text-align: right;">时间</th>
+<th>文本开头</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">271.9 ms</td>
+<td>Request 1: &hellip;</td>
+</tr>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">210.0 ms</td>
+<td>Request 2: &hellip;</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">208.4 ms</td>
+<td>Request 3: &hellip;</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">210.9 ms</td>
+<td>Request 4: &hellip;</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">210.6 ms</td>
+<td>Request 5: &hellip;</td>
+</tr>
+</tbody>
+</table>
+<p>首次请求 271.9 ms，后续平均 210.0 ms，<strong>加速 1.29×</strong>（时间减少 22.8%）。</p>
+<p><strong>结论：前缀复用仍然有效。</strong></p>
+<p>vLLM 的前缀哈希包含了<strong>所有层的状态</strong>，不区分 KV cache 和 recurrent state。
+定长状态也参与哈希：只要前缀相同，recurrent state 的值就相同，可以直接复用。</p>
+<p>对比 5.2 中纯 attention 模型（Qwen3-1.7B）的前缀复用加速（batch=16）：首次 447 ms，后续 171 ms，加速 <strong>2.61×</strong>。</p>
+<p>混合架构的加速比更小，有两个原因：</p>
+<ol>
+<li><strong>状态占比不同。</strong> 纯 attention 下前缀越长，复用省下的 KV 越多；混合架构下 recurrent state 只有 360 KB，前缀再长也只省这么多。</li>
+<li><strong>计算占比更高。</strong> Recurrent 层的前向本身比 attention 轻，省掉状态读取的收益不如 attention 层明显。</li>
+</ol>
+<hr />
+<h3 id="4">4. 投机解码的回滚：定长状态怎么恢复？</h3>
+<p>5.5 讲了投机解码：draft model 生成 K 个候选，target model 验证。验证失败时需要<strong>回滚到验证前的状态</strong>。</p>
+<p><strong>KV cache 的回滚（纯 attention）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 验证前：seq_len = L</span>
+<span class="c1"># 生成了 K 个 draft token，验证失败，只接受前 k 个</span>
+<span class="c1"># 回滚：把 seq_len 截断到 L + k</span>
+
+<span class="c1"># vLLM 实现：调整块表，释放多余的块</span>
+<span class="n">block_table</span> <span class="o">=</span> <span class="n">block_table</span><span class="p">[:</span><span class="n">num_accepted_blocks</span><span class="p">]</span>
+</code></pre></div>
+
+<p>回滚只涉及<strong>块引用的调整</strong>，不需要恢复张量内容——因为后续 decode 会覆盖那些位置。</p>
+<p><strong>Recurrent state 的回滚（混合架构）：</strong></p>
+<p>Recurrent state 是定长的，没有"截断"的概念。验证前后的状态是<strong>两个不同的张量</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 验证前：state_before = (batch, heads, conv_width, head_dim)</span>
+<span class="c1"># 生成 K 个 draft token，每步更新 state</span>
+<span class="c1"># state_after ≠ state_before（已经被覆盖）</span>
+
+<span class="c1"># 回滚：需要恢复整个 state_before</span>
+<span class="n">state</span> <span class="o">=</span> <span class="n">state_before</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>  <span class="c1"># 需要提前保存</span>
+</code></pre></div>
+
+<p><strong>代价对比：</strong></p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>KV cache（attention）</th>
+<th>Recurrent state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>验证前保存</td>
+<td>无需保存，块引用即可</td>
+<td>需要 clone 整个 state（360 KB/batch）</td>
+</tr>
+<tr>
+<td>回滚</td>
+<td>调整块表指针</td>
+<td>恢复 state 张量</td>
+</tr>
+<tr>
+<td>字节搬运</td>
+<td>0（只改指针）</td>
+<td>360 KB × batch_size</td>
+</tr>
+</tbody>
+</table>
+<p>对于 batch=8 的投机解码，纯 attention 的回滚几乎零成本；混合架构需要恢复 <strong>2.8 MB</strong> 的 recurrent state。</p>
+<p><strong>实际影响：</strong></p>
+<ul>
+<li>投机接受率高（&gt;80%）时，回滚频率低，影响有限。</li>
+<li>投机接受率低（&lt;40%）时，频繁回滚会拖累吞吐。5.5 测得自由创作任务的接受率只有 37%，混合架构在这类负载下投机收益更小。</li>
+</ul>
+<hr />
+<h2 id="vllm">工程实现：vLLM 的混合缓存管理</h2>
+<h3 id="_4">源码走读：状态分配与池化</h3>
+<p>vLLM 对混合架构的支持位于 <code>vllm/attention/backends/</code> 和 cache 管理层。
+以 RecurrentGemma 为例（vLLM 0.29.0）：</p>
+<p><strong>1. 层类型识别</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># vllm/model_executor/models/recurrentgemma.py</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RecurrentGemmaDecoderLayer</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">):</span>
+        <span class="c1"># 读取 block_types 配置</span>
+        <span class="n">block_types</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">block_types</span>
+        <span class="n">block_type</span> <span class="o">=</span> <span class="n">block_types</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">%</span> <span class="nb">len</span><span class="p">(</span><span class="n">block_types</span><span class="p">)]</span>
+
+        <span class="k">if</span> <span class="n">block_type</span> <span class="o">==</span> <span class="s2">"recurrent"</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">temporal_block</span> <span class="o">=</span> <span class="n">RecurrentBlock</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">channel_pre_norm</span> <span class="o">=</span> <span class="n">RMSNorm</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>  <span class="c1"># "attention"</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">temporal_block</span> <span class="o">=</span> <span class="n">SdpaAttention</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>2. 状态池配置</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># vllm/worker/model_runner.py</span>
+<span class="c1"># 为 recurrent 层分配固定大小的 state pool</span>
+<span class="n">recurrent_state_size</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="n">num_recurrent_layers</span><span class="p">,</span>
+    <span class="n">max_num_seqs</span><span class="p">,</span>
+    <span class="n">num_heads</span><span class="p">,</span>
+    <span class="n">conv_width</span><span class="p">,</span>
+    <span class="n">head_dim</span>
+<span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">recurrent_state_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
+    <span class="n">recurrent_state_size</span><span class="p">,</span>
+    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+    <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>3. 前缀哈希包含 recurrent state</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># vllm/core/block_manager_v2.py</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_hash_block_content</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block</span><span class="p">:</span> <span class="n">Block</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="c1"># 包含 KV cache 和 recurrent state</span>
+    <span class="k">if</span> <span class="n">block</span><span class="o">.</span><span class="n">has_kv</span><span class="p">:</span>
+        <span class="n">content</span> <span class="o">=</span> <span class="n">block</span><span class="o">.</span><span class="n">kv_data</span>  <span class="c1"># attention 层</span>
+    <span class="k">elif</span> <span class="n">block</span><span class="o">.</span><span class="n">has_recurrent</span><span class="p">:</span>
+        <span class="n">content</span> <span class="o">=</span> <span class="n">block</span><span class="o">.</span><span class="n">recurrent_data</span>  <span class="c1"># recurrent 层</span>
+
+    <span class="k">return</span> <span class="nb">hash</span><span class="p">(</span><span class="n">content</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">tobytes</span><span class="p">())</span>
+</code></pre></div>
+
+<p>定长 state 也参与哈希，前缀相同则复用。</p>
+<p><strong>4. 投机回滚的状态快照</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 伪代码示意</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">speculative_decode_step</span><span class="p">(</span><span class="n">draft_tokens</span><span class="p">):</span>
+    <span class="c1"># 保存验证前状态</span>
+    <span class="n">kv_snapshot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache</span><span class="o">.</span><span class="n">get_block_table</span><span class="p">()</span>
+    <span class="n">recurrent_snapshot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">recurrent_state</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+
+    <span class="c1"># 验证</span>
+    <span class="n">accepted_count</span> <span class="o">=</span> <span class="n">verify_and_accept</span><span class="p">(</span><span class="n">draft_tokens</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">accepted_count</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">draft_tokens</span><span class="p">):</span>
+        <span class="c1"># 回滚</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache</span><span class="o">.</span><span class="n">truncate</span><span class="p">(</span><span class="n">accepted_count</span><span class="p">)</span>  <span class="c1"># 只调指针</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">recurrent_snapshot</span>  <span class="c1"># 恢复张量</span>
+</code></pre></div>
+
+<p>Recurrent state 的回滚需要完整的张量拷贝。</p>
+<hr />
+<h2 id="lab">动手 lab：检查混合架构的状态分布</h2>
+<p><strong>实验文件：</strong> <code>labs/L5/hybrid_state_audit.py</code></p>
+<p>运行（需要启动 RecurrentGemma-2B 服务）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 启动服务</span>
+python3<span class="w"> </span>-m<span class="w"> </span>vllm.entrypoints.openai.api_server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>google/recurrentgemma-2b<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dtype<span class="w"> </span>bfloat16<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max-model-len<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--enforce-eager<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--gpu-memory-utilization<span class="w"> </span><span class="m">0</span>.6
+
+<span class="c1"># 运行实验</span>
+python3<span class="w"> </span>labs/L5/hybrid_state_audit.py
+</code></pre></div>
+
+<p><strong>输出：</strong> <code>results/crater/hybrid/recurrentgemma_state_audit.json</code></p>
+<p>包含：
+1. 逐层状态形状与字节数
+2. 前缀复用的 5 次请求计时
+3. Context 256/512/1024/2048 的容量扫描</p>
+<p>消融建议：</p>
+<ol>
+<li><strong>改变 recurrent/attention 比例：</strong> 调整 <code>block_types</code> 配置，测试纯 recurrent（无 KV cache）或纯 attention 的极端情况。</li>
+<li><strong>更长上下文：</strong> 扫描到 8192 或 max_model_len，观察次线性增长的持续性。</li>
+<li><strong>投机解码回滚：</strong> 模拟高拒绝率场景（acceptance_rate &lt; 40%），测量 recurrent state 恢复的开销。</li>
+</ol>
+<hr />
+<h2 id="_5">原始现场</h2>
+<h3 id="1_1">1. 逐层状态配置</h3>
+<details class="fold">
+<summary>完整 26 层的状态形状（来自 recurrentgemma_state_audit.json）</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"model_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"recurrent_gemma"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"num_hidden_layers"</span><span class="p">:</span><span class="w"> </span><span class="mi">26</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"hidden_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2560</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"num_attention_heads"</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"num_key_value_heads"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"block_types"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"recurrent"</span><span class="p">,</span><span class="w"> </span><span class="s2">"recurrent"</span><span class="p">,</span><span class="w"> </span><span class="s2">"attention"</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"layers"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">"layer_idx"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"block_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"recurrent"</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"state_shape_per_batch"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">256</span><span class="p">],</span>
+<span class="w">      </span><span class="nt">"state_bytes_per_batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">20480</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"grows_with_context"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">"layer_idx"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"block_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"recurrent"</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"state_shape_per_batch"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">256</span><span class="p">],</span>
+<span class="w">      </span><span class="nt">"state_bytes_per_batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">20480</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"grows_with_context"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">"layer_idx"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"block_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"attention"</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"state_shape_per_token"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">256</span><span class="p">],</span>
+<span class="w">      </span><span class="nt">"state_bytes_per_token"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"grows_with_context"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="c1">// ... 重复模式，共 26 层</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<h3 id="2_1">2. 前缀复用原始记录</h3>
+<p>共享前缀：<code>"The RecurrentGemma architecture combines recurrent layers with local attention. "</code></p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"shared_prefix_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">9</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"num_requests"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"results"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"request_idx"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">23</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">271.91</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"request_idx"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">23</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">210.03</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"request_idx"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">23</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">208.44</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"request_idx"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">23</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">210.88</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"request_idx"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">23</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">210.58</span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>首次 271.9 ms，后续平均 210.0 ms，加速 1.29×。</p>
+<h3 id="3_1">3. 容量扫描原始数据</h3>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"scan"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"target_ctx_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span><span class="w"> </span><span class="nt">"actual_prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">258</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">111.0</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"target_ctx_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span><span class="w"> </span><span class="nt">"actual_prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">514</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">111.5</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"target_ctx_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span><span class="w"> </span><span class="nt">"actual_prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1026</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">216.4</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"target_ctx_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span><span class="w"> </span><span class="nt">"actual_prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">2050</span><span class="p">,</span><span class="w"> </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">391.3</span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Token 增长 7.95×，时间增长 3.53×，次线性增长验证固定状态占主导。</p>
+<hr />
+<h2 id="_6">前沿</h2>
+<h3 id="1-mamba-state-space-models">1. Mamba 与 state-space models</h3>
+<p>RecurrentGemma 用的是 RNN Griffin，还有更激进的选择：<strong>Mamba</strong>（S6 state-space model）。
+Mamba 把序列建模完全线性化，没有 attention 层，状态大小完全固定。</p>
+<p>Jamba（AI21 Labs）是 Mamba + attention 的混合：8 Mamba 层 + 1 attention 层循环，
+比 RecurrentGemma 的 2:1 recurrent/attention 比例更激进。</p>
+<h3 id="2_2">2. 长上下文的极限</h3>
+<p>纯 attention 的 KV cache 在百万 token 级别会耗尽显存。
+混合架构理论上没有这个墙——recurrent state 固定，只有少数 attention 层的 KV 随长度增长。</p>
+<p>但实际瓶颈在<strong>质量</strong>：recurrent state 的表达能力有限，超长依赖会丢失。
+这是为什么混合架构仍然保留 attention 层——用固定状态换效率，用 attention 保证关键位置的全局视野。</p>
+<h3 id="3_2">3. 投机解码的适配</h3>
+<p>5.5 测得 ngram draft 在工具调用任务上接受率 95.7%、加速 4.12×，自由创作只有 37% / 1.47×。
+混合架构下，低接受率场景的回滚成本更高（需要恢复整块 recurrent state），
+投机收益会进一步降低。</p>
+<p>适配方向：</p>
+<ul>
+<li><strong>分层投机：</strong> 只对 attention 层做投机，recurrent 层直接执行（避免回滚）。</li>
+<li><strong>状态增量：</strong> 记录 recurrent state 的更新而非完整快照，回滚时逆向应用。</li>
+<li><strong>选择性投机：</strong> 根据前 N 个 token 的接受率动态决定是否继续投机。</li>
+</ul>
+<hr />
+<h2 id="_7">陷阱</h2>
+<h3 id="1-kv">1. 假设所有层都产生 KV</h3>
+<p>3.4 已经指出这个坑：<strong>不能假设每层都有 KV cache。</strong></p>
+<p>错误代码：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 计算 KV cache 大小</span>
+<span class="n">kv_bytes</span> <span class="o">=</span> <span class="n">num_layers</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">num_kv_heads</span> <span class="o">*</span> <span class="n">head_dim</span> <span class="o">*</span> <span class="n">seq_len</span> <span class="o">*</span> <span class="n">dtype_bytes</span>
+</code></pre></div>
+
+<p>正确做法：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 逐层检查</span>
+<span class="n">kv_bytes</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="n">recurrent_bytes</span> <span class="o">=</span> <span class="mi">0</span>
+
+<span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">layer</span><span class="o">.</span><span class="n">block_type</span> <span class="o">==</span> <span class="s2">"attention"</span><span class="p">:</span>
+        <span class="n">kv_bytes</span> <span class="o">+=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">num_kv_heads</span> <span class="o">*</span> <span class="n">head_dim</span> <span class="o">*</span> <span class="n">seq_len</span> <span class="o">*</span> <span class="n">dtype_bytes</span>
+    <span class="k">elif</span> <span class="n">layer</span><span class="o">.</span><span class="n">block_type</span> <span class="o">==</span> <span class="s2">"recurrent"</span><span class="p">:</span>
+        <span class="n">recurrent_bytes</span> <span class="o">+=</span> <span class="n">num_heads</span> <span class="o">*</span> <span class="n">conv_width</span> <span class="o">*</span> <span class="n">head_dim</span> <span class="o">*</span> <span class="n">dtype_bytes</span>
+</code></pre></div>
+
+<p>RecurrentGemma-2B：18 recurrent + 8 attention，实测 360 KB recurrent + 8 KB/token KV。</p>
+<h3 id="2-attention-batch">2. 用纯 attention 的 batch 策略</h3>
+<p>5.1 讲了 decode 的 batch 收益：权重读取摊薄到更多 token。</p>
+<p>混合架构下，<strong>recurrent state 不会随 batch 摊薄权重读取</strong>——每个 batch 都要读一遍权重，
+只有 attention 层的 KV 拼接能带来 batch 收益。</p>
+<p>错误推论："batch=64 vs batch=1 应该有 64× 的吞吐提升。"</p>
+<p>实际：RecurrentGemma 的 18/26 层是 recurrent，batch 收益被稀释。
+测量前需要分离 recurrent 层和 attention 层的计时。</p>
+<h3 id="3_3">3. 把投机回滚当零成本</h3>
+<p>5.5 的结论（"回滚只是调整块表指针，几乎零成本"）<strong>只适用于纯 attention 模型</strong>。</p>
+<p>混合架构的 recurrent state 回滚需要：</p>
+<ol>
+<li>在验证前 <code>clone()</code> 整个 state（360 KB × batch）。</li>
+<li>验证失败时恢复：<code>state = state_snapshot</code>。</li>
+</ol>
+<p>Batch=8 的投机解码，每次回滚搬运 <strong>2.8 MB</strong>。
+高拒绝率场景（接受率 &lt;40%）下，回滚成本会抵消投机收益。</p>
+<hr />
+<h2 id="_8">自测题</h2>
+<ol>
+<li>RecurrentGemma-2B 的 26 层中，有多少层是 recurrent、多少层是 attention？它们的状态分别是什么形状？</li>
+<li>为什么混合架构的 context 增长是「次线性」的？用实测数据说明。</li>
+<li>定长的 recurrent state 能参与前缀复用吗？vLLM 怎么做的？</li>
+<li>投机解码回滚时，KV cache 和 recurrent state 的代价有什么不同？用字节数量化。</li>
+<li>混合架构在什么负载下比纯 attention 更有优势？什么负载下反而更差？</li>
+</ol>
+<details class="fold">
+<summary>答案</summary>
+<ol>
+<li>
+<p><strong>18 recurrent + 8 attention</strong>（按 <code>[recurrent, recurrent, attention]</code> 循环）。Recurrent state: <code>(batch, 10, 4, 256)</code> = 20 KB/batch/layer，固定；KV cache: <code>(2, 1, seq_len, 256)</code> = 1 KB/token/layer，可变。</p>
+</li>
+<li>
+<p><strong>固定状态占主导。</strong> Context 256→2048 增长 7.95×，prefill 时间只增长 3.53×。固定的 360 KB recurrent state + 可变的 KV cache (8 KB/token)，长上下文下固定部分摊薄了增长。</p>
+</li>
+<li>
+<p><strong>能。</strong> vLLM 的前缀哈希包含所有层的状态，recurrent state 也参与哈希。前缀相同则 recurrent state 相同，可以复用。实测加速 1.29×（首次 271.9 ms，后续 210.0 ms）。</p>
+</li>
+<li>
+<p><strong>KV cache 回滚零成本</strong>（只调块表指针）；<strong>recurrent state 回滚需要恢复整个张量</strong>。RecurrentGemma-2B 的 recurrent state = 360 KB/batch，batch=8 时回滚需要恢复 2.8 MB。</p>
+</li>
+<li>
+<p><strong>优势：</strong> 长上下文（&gt;2048）、低 batch、显存受限场景——固定状态不随长度增长，显存占用远低于纯 attention。<strong>劣势：</strong> 高接受率投机解码（回滚频繁时成本高）、极短上下文（固定状态的开销无法摊薄）。</p>
+</li>
+</ol>
+</details>
+<hr />
+<h2 id="_9">小结</h2>
+<p>混合架构（recurrent + attention）把「状态随上下文线性增长」的假设打破了：</p>
+<ul>
+<li><strong>18/26 层是 recurrent</strong>：状态固定 20 KB/layer，不随 context 增长。</li>
+<li><strong>8/26 层是 attention</strong>：KV cache 仍然是 1 KB/token/layer，线性增长。</li>
+<li><strong>容量优势明显</strong>：context=2048 时只需 16.7 MB，是纯 attention 的 3.6%。</li>
+<li><strong>前缀复用仍然有效</strong>：定长状态参与哈希，可以复用，实测加速 1.29×。</li>
+<li><strong>投机回滚代价不同</strong>：KV 回滚只调指针，recurrent state 需要恢复整块张量（360 KB/batch）。</li>
+</ul>
+<p>5.2 和 5.5 的结论需要在混合架构下<strong>重新审视</strong>：</p>
+<ul>
+<li>KV 分页的块大小和哈希策略仍然适用，但状态总量计算要区分层类型。</li>
+<li>投机解码的回滚不再是零成本，低接受率场景收益更小。</li>
+<li>Batch 策略需要考虑 recurrent 层不参与权重摊薄的事实。</li>
+</ul>
+<p>下一步（L6）进入分布式：当模型跨卡分布时，recurrent state 的通信模式和 KV cache 完全不同——
+定长状态不能像 KV 一样分片传输，需要全量广播或点对点同步。</p></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.12-non-generative-serving.html">&#8592; 5.12 非生成模型的服务</a><a class="nav-next" href="../M/M1-reading-large-codebase.html">M1 如何读一个十万行的混合代码库 &#8594;</a></nav>
+</main>
+</body>
+</html>

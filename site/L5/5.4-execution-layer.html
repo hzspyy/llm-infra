@@ -4,41 +4,62 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.4 执行层：CUDA Graph 与流水重叠</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">5.4</div>
   <div class="sidebar-title">执行层：CUDA Graph 与流水重叠</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
-<li><a href="#batch">一 · 开图之后每步时间几乎与 batch 无关</a></li>
+<li><a href="#batch">一 · 所测 batch 范围内，图路径缩短了生成步耗时</a></li>
 <li><a href="#_2">二 · 代价一：启动时间与显存</a></li>
 <li><a href="#_3">三 · 代价二：只有捕获过的尺寸能用图</a></li>
-<li><a href="#_4">四 · 什么时候图完全没有收益</a></li>
-<li><a href="#_5">五 · 设计取舍</a><ul>
-<li><a href="#51">5.1 图为什么必须固定形状</a></li>
+<li><a href="#prefill">四 · 所测 prefill 调用的耗时接近</a></li>
+<li><a href="#_4">五 · 设计取舍</a><ul>
+<li><a href="#51">5.1 本实现使用固定缓冲区和离散捕获尺寸</a></li>
 <li><a href="#52-51">5.2 捕获 51 个尺寸是个什么量级的决定</a></li>
 <li><a href="#53">5.3 一条反复出现的判据</a></li>
 </ul>
 </li>
 <li><a href="#lab">六 · 动手 lab</a></li>
-<li><a href="#_6">七 · 陷阱</a></li>
-<li><a href="#_7">八 · 自测题</a></li>
+<li><a href="#_5">七 · 陷阱</a></li>
+<li><a href="#_6">八 · 自测题</a></li>
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#batch">一 · 所测 batch 范围内，图路径缩短了生成步耗时</a></li>
+<li><a href="#_2">二 · 代价一：启动时间与显存</a></li>
+<li><a href="#_3">三 · 代价二：只有捕获过的尺寸能用图</a></li>
+<li><a href="#prefill">四 · 所测 prefill 调用的耗时接近</a></li>
+<li><a href="#_4">五 · 设计取舍</a><ul>
+<li><a href="#51">5.1 本实现使用固定缓冲区和离散捕获尺寸</a></li>
+<li><a href="#52-51">5.2 捕获 51 个尺寸是个什么量级的决定</a></li>
+<li><a href="#53">5.3 一条反复出现的判据</a></li>
+</ul>
+</li>
+<li><a href="#lab">六 · 动手 lab</a></li>
+<li><a href="#_5">七 · 陷阱</a></li>
+<li><a href="#_6">八 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
   <div class="mod-id">5.4</div>
   <h1>执行层：CUDA Graph 与流水重叠</h1>
-  <p class="lede">2.6b 量到图把 CPU launch 降 16.2 倍，这里量它值多少 tok/s：1.19–1.41×。最清楚的一条是开图后每步时间几乎与 batch 无关（3.16–3.86 ms）。代价：启动 5.5→9.5 s、捕获 51 个尺寸、KV 变小。prefill 上完全没有收益（1.00×）；padding 的代价在 CPU 受限区间量不出来。</p>
+  <p class="lede">比较 eager 与图执行，检查启动、捕获尺寸、padding 和端到端收益的证据边界。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · vLLM 0.29.0 · Qwen3-1.7B</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 2.6b（图的 launch 计数）· L1.4（launch 开销）· 5.1（两相）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>2.6b 量过：CUDA Graph 把 CPU 侧 launch 从 <strong>14,003 降到 863</strong>（16.2×），
@@ -50,7 +71,7 @@
 <li>什么时候图完全没有收益？</li>
 </ol>
 <hr />
-<h2 id="batch">一 · 开图之后每步时间几乎与 batch 无关</h2>
+<h2 id="batch">一 · 所测 batch 范围内，图路径缩短了生成步耗时</h2>
 <table>
 <thead>
 <tr>
@@ -100,14 +121,14 @@
 <p>最清楚的一条在两列 ms 上：</p>
 <ul>
 <li><strong>eager 每步 4.44 → 5.01 ms</strong>（随 batch 增长）</li>
-<li><strong>图每步 3.16 → 3.86 ms</strong>（基本不随 batch 变）</li>
+<li><strong>图每步 3.16 → 3.86 ms</strong>（区间内仍有变化）</li>
 </ul>
-<p>这个区间里 step 时间由 <strong>CPU 提交</strong>主导，而图把它压成了近似常数。
+<p>这些总时间支持图路径在本组配置中更快，但不能单独证明 CPU 提交主导。需要同次运行的 CPU/GPU 时间线定位关键路径。
 按 <a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 的实测（每次 launch 2.68 µs），14,003 次 launch 就是 37 ms 的 CPU 时间——
 虽然它和 GPU 执行重叠，但重叠不完全时就直接体现在每步时间上。</p>
 <div class="admonition warning">
-<p class="admonition-title">加速比不是单调的，我没查清原因</p>
-<p>我原本预期加速比随 batch 单调下降（batch 大 → GPU 忙 → CPU 提交被藏住）。
+<p class="admonition-title">加速比的非单调变化尚未解释</p>
+<p>“batch 越大，图的相对收益越小”是一个待检验假设。
 <strong>数据不支持</strong>：1.41 → 1.23 → 1.19 → <strong>1.33</strong>，batch=16 是最低点，64 又回升。</p>
 <p>没有查清原因，<strong>不要引用这条趋势</strong>。可能的方向：
 eager 路径在大 batch 上的 python/dispatch 开销、或图捕获尺寸的 padding（第三节）。
@@ -121,7 +142,7 @@ CUDA Graph      启动    9.50 s   启动后驱动可见空闲   9.63 GiB
 
 <p><strong>启动慢了 4 秒</strong>（5.48 → 9.50 s）。图捕获发生在启动时：
 要为每个准备捕获的 batch 尺寸各跑一遍前向并录下来，
-本次捕获了 <strong>51 个尺寸</strong>（见第三节），所以这 4 秒是 51 次前向的成本。</p>
+本次捕获了 <strong>51 个尺寸</strong>（见第三节），因此不能把这 4 秒直接解释成恰好 51 次前向：预热、编译、图构建和内存分配也可能包含在内。</p>
 <p>对服务的含义：<strong>弹性伸缩的冷启动变慢</strong>。<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 算过一个 torch 进程
 光初始化就要 0.8 秒，加上加载权重和图捕获，一个新副本上线要十几秒。</p>
 <div class="admonition note">
@@ -218,12 +239,12 @@ vLLM 捕获一组离散尺寸，运行时把实际 batch <strong>向上取整</s
 <p><strong>所有 batch 的每步时间落在 3.505–3.859 ms，极差只有 10.1%</strong>——
 而且 batch=17（pad 1.41×）比 batch=16 还快一点。</p>
 <p><strong>padding 的代价在这个区间里量不出来。</strong> 原因和第一节是同一个：
-每步时间由 CPU 提交主导，多算几行 GPU 计算根本不构成瓶颈。</p>
+当前记录未显示随 padding 单调增加的耗时，但没有定位原因；需 CPU/GPU 时间线和重复样本区分计算、提交与配置变化。</p>
 <p>那 padding 什么时候才要紧？<strong>当 step 变成算力受限时</strong>——
-batch 大到 GPU 真的忙起来（5.1 算过 batch≈72 越过平衡点），或者序列很长。
+batch 大到 GPU 真的忙起来（5.1 算过 简化权重模型的 batch≈144 越过平衡点），或者序列很长。
 本 lab 的 batch 上限 64 还没到那里。</p>
 <hr />
-<h2 id="_4">四 · 什么时候图完全没有收益</h2>
+<h2 id="prefill">四 · 所测 prefill 调用的耗时接近</h2>
 <p>prefill（4 条，只生成 1 个 token）：</p>
 <table>
 <thead>
@@ -252,12 +273,10 @@ batch 大到 GPU 真的忙起来（5.1 算过 batch≈72 越过平衡点），�
 <p><strong>一点差别都没有。</strong> 这直接印证 2.6b 的结论：
 图减少的是<strong>提交次数</strong>，而 prefill 的时间由 GPU 计算主导（5.1 §一：
 prefill 的算术强度是 2048，牢牢在算力一侧）。</p>
-<p>而且 prefill 的形状随 prompt 长度变，本来也没法用固定形状的图——
-这就是 2.6b 里 <code>FULL_AND_PIECEWISE</code> 这个默认值的含义：
-<strong>decode 走整图，prefill/混合批走分段图或 eager。</strong></p>
+<p>prefill 的长度变化增加了图复用的复杂度，但并非无法捕获。应检查实际图模式、分桶、padding 与图外工作，分别判断支持范围和性能；不能由两个总耗时相近的点推出图对 TTFT 永远无益。</p>
 <hr />
-<h2 id="_5">五 · 设计取舍</h2>
-<h3 id="51">5.1 图为什么必须固定形状</h3>
+<h2 id="_4">五 · 设计取舍</h2>
+<h3 id="51">5.1 本实现使用固定缓冲区和离散捕获尺寸</h3>
 <p>CUDA Graph 记录的是一串<strong>已经绑定好参数的 kernel launch</strong>——
 包括 grid 大小、共享内存量、以及每个指针参数的<strong>具体地址</strong>。
 重放时不重新解释这些，直接把命令流交给 GPU。这正是它省下 CPU 时间的原因。</p>
@@ -268,7 +287,7 @@ prefill 的算术强度是 2048，牢牢在算力一侧）。</p>
 是因为 decode 的形状本来就只由 batch 决定，而 batch 的取值可以离散化。
 prefill 的形状由 prompt 长度决定，连续且范围极大，离散化的代价就不可接受。</p>
 <h3 id="52-51">5.2 捕获 51 个尺寸是个什么量级的决定</h3>
-<p>51 个尺寸 = 51 次额外前向（4 秒启动时间）+ 51 份图结构的显存。</p>
+<p>捕获 51 个尺寸需要额外预热、执行和图构建；图内存还可能通过池复用，不能按 51 份完整模型显存相加。</p>
 <p>如果只捕获 8 个尺寸，启动会快很多，但 padding 的浪费会大幅上升
 （比如 65 要 pad 到 128）。如果捕获 512 个，padding 几乎为零，
 但启动要几十秒、显存也吃不消。</p>
@@ -290,242 +309,243 @@ prefill 的形状由 prompt 长度决定，连续且范围极大，离散化的�
 3.2 的 exp 占比。判断方法都一样：<strong>先用 roofline 定位瓶颈，再估收益上限。</strong></p>
 <hr />
 <h2 id="lab">六 · 动手 lab</h2>
-<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L5 &amp;&amp; /scratch/learn/envs/serve/bin/python execution_layer.py'</span>
+<div class="highlight"><pre><span></span><code><span class="c1"># 在项目根目录运行；需要本章版本的 vLLM 和 Qwen3-1.7B 本地缓存</span>
+python<span class="w"> </span>labs/L5/execution_layer.py
 </code></pre></div>
 
 <p>原始输出：<code>results/crater/engine/54_execution_layer.txt</code>。</p>
-<details class="fold srcfold"><summary>labs/L5/execution_layer.py 全文（232 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
-<span class="linenos">  2</span><span class="sd">"""L5.4 —— 执行层：CUDA Graph 在引擎里值多少。</span>
-<span class="linenos">  3</span>
-<span class="linenos">  4</span><span class="sd">2.6b 量过 CUDA Graph 把 CPU 侧 launch 从 14,003 降到 863（16.2×）。</span>
-<span class="linenos">  5</span><span class="sd">这一章问：**这 16 倍的 launch 减少，在 tok/s 上体现为多少？**</span>
-<span class="linenos">  6</span>
-<span class="linenos">  7</span><span class="sd">  [A] eager vs CUDA Graph：decode 吞吐随 batch 的对照</span>
-<span class="linenos">  8</span><span class="sd">  [B] 代价一：捕获时间与显存</span>
-<span class="linenos">  9</span><span class="sd">  [C] 代价二：只有捕获过的 batch 尺寸能用图</span>
-<span class="linenos"> 10</span><span class="sd">  [D] 什么时候图没有收益</span>
-<span class="linenos"> 11</span>
-<span class="linenos"> 12</span><span class="sd">用法：</span>
-<span class="linenos"> 13</span><span class="sd">    python execution_layer.py</span>
-<span class="linenos"> 14</span><span class="sd">"""</span>
-<span class="linenos"> 15</span>
-<span class="linenos"> 16</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="linenos"> 17</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
-<span class="linenos"> 18</span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<span class="linenos"> 19</span>
-<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="linenos"> 21</span>
-<span class="linenos"> 22</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"HF_HUB_OFFLINE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
-<span class="linenos"> 23</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_ENABLE_V1_MULTIPROCESSING"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
-<span class="linenos"> 24</span>
-<span class="linenos"> 25</span><span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
-<span class="linenos"> 26</span><span class="n">MODEL</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"L54_MODEL"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen3-1.7B"</span><span class="p">)</span>
-<span class="linenos"> 27</span>
-<span class="linenos"> 28</span>
-<span class="linenos"> 29</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
-<span class="linenos"> 30</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
-<span class="linenos"> 31</span>
-<span class="linenos"> 32</span>
-<span class="linenos"> 33</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
-<span class="linenos"> 34</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
-<span class="linenos"> 35</span>
-<span class="linenos"> 36</span>
-<span class="linenos"> 37</span><span class="k">def</span><span class="w"> </span><span class="nf">safe_util</span><span class="p">(</span><span class="n">reserve_gib</span><span class="o">=</span><span class="mf">4.0</span><span class="p">,</span> <span class="n">cap</span><span class="o">=</span><span class="mf">0.55</span><span class="p">):</span>
-<span class="linenos"> 38</span>    <span class="n">free</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
-<span class="linenos"> 39</span>    <span class="n">gib</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">**</span> <span class="mi">3</span>
-<span class="linenos"> 40</span>    <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span><span class="n">free</span> <span class="o">/</span> <span class="n">gib</span> <span class="o">-</span> <span class="n">reserve_gib</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">total</span> <span class="o">/</span> <span class="n">gib</span><span class="p">))</span>
-<span class="linenos"> 41</span>
-<span class="linenos"> 42</span>
-<span class="linenos"> 43</span><span class="k">def</span><span class="w"> </span><span class="nf">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">):</span>
-<span class="linenos"> 44</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
-<span class="linenos"> 45</span>    <span class="n">d</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">MODEL</span><span class="p">,</span> <span class="n">gpu_memory_utilization</span><span class="o">=</span><span class="n">safe_util</span><span class="p">(),</span>
-<span class="linenos"> 46</span>             <span class="n">max_model_len</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span> <span class="n">enable_prefix_caching</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-<span class="linenos"> 47</span>             <span class="n">disable_log_stats</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos"> 48</span>    <span class="n">d</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">kw</span><span class="p">)</span>
-<span class="linenos"> 49</span>    <span class="k">return</span> <span class="n">LLM</span><span class="p">(</span><span class="o">**</span><span class="n">d</span><span class="p">)</span>
-<span class="linenos"> 50</span>
-<span class="linenos"> 51</span>
-<span class="linenos"> 52</span><span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">):</span>
-<span class="linenos"> 53</span>    <span class="k">try</span><span class="p">:</span>
-<span class="linenos"> 54</span>        <span class="n">llm</span><span class="o">.</span><span class="n">llm_engine</span><span class="o">.</span><span class="n">engine_core</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
-<span class="linenos"> 55</span>    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>                                         <span class="c1"># noqa: BLE001</span>
-<span class="linenos"> 56</span>        <span class="k">pass</span>
-<span class="linenos"> 57</span>    <span class="k">del</span> <span class="n">llm</span>
-<span class="linenos"> 58</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">gc</span>
-<span class="linenos"> 59</span>    <span class="n">gc</span><span class="o">.</span><span class="n">collect</span><span class="p">()</span>
-<span class="linenos"> 60</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos"> 61</span>
-<span class="linenos"> 62</span>
-<span class="linenos"> 63</span><span class="k">def</span><span class="w"> </span><span class="nf">rand_ids</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">rng</span><span class="p">):</span>
-<span class="linenos"> 64</span>    <span class="k">return</span> <span class="p">[</span><span class="n">rng</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">60000</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)]</span>
-<span class="linenos"> 65</span>
-<span class="linenos"> 66</span>
-<span class="linenos"> 67</span><span class="k">def</span><span class="w"> </span><span class="nf">decode_tps</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">B</span><span class="p">,</span> <span class="n">gen</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">plen</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">seed</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
-<span class="linenos"> 68</span><span class="w">    </span><span class="sd">"""量纯 decode 吞吐：用 (gen+1) 与 1 两次调用做差分，扣掉 prefill。"""</span>
-<span class="linenos"> 69</span>    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
-<span class="linenos"> 70</span>    <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
-<span class="linenos"> 71</span>    <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
-<span class="linenos"> 72</span>    <span class="n">ps</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="n">plen</span><span class="p">,</span> <span class="n">rng</span><span class="p">))</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">)]</span>
-<span class="linenos"> 73</span>    <span class="n">sp1</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos"> 74</span>    <span class="n">spG</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">gen</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos"> 75</span>    <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">spG</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>                   <span class="c1"># 预热（含图捕获）</span>
-<span class="linenos"> 76</span>    <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp1</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos"> 77</span>    <span class="n">t1</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
-<span class="linenos"> 78</span>    <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">spG</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos"> 79</span>    <span class="n">tG</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
-<span class="linenos"> 80</span>    <span class="n">per_step</span> <span class="o">=</span> <span class="p">(</span><span class="n">tG</span> <span class="o">-</span> <span class="n">t1</span><span class="p">)</span> <span class="o">/</span> <span class="n">gen</span>
-<span class="linenos"> 81</span>    <span class="k">return</span> <span class="n">B</span> <span class="o">/</span> <span class="n">per_step</span><span class="p">,</span> <span class="n">per_step</span> <span class="o">*</span> <span class="mi">1000</span>
-<span class="linenos"> 82</span>
-<span class="linenos"> 83</span>
-<span class="linenos"> 84</span><span class="c1"># ---------------------------------------------------------------- A</span>
-<span class="linenos"> 85</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
-<span class="linenos"> 86</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] eager vs CUDA Graph：decode 吞吐"</span><span class="p">)</span>
-<span class="linenos"> 87</span>
-<span class="linenos"> 88</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  2.6b 实测：CPU 侧 launch 14,003 -&gt; 863（16.2×），GPU kernel 数不变。"</span><span class="p">)</span>
-<span class="linenos"> 89</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  launch 省下的是 CPU 时间，所以收益应当在**CPU 提交是瓶颈**的地方最大，"</span><span class="p">)</span>
-<span class="linenos"> 90</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  也就是 **batch 小、模型小** 的时候（L1.4：每次 launch 2.68 µs）。"</span><span class="p">)</span>
-<span class="linenos"> 91</span>
-<span class="linenos"> 92</span>    <span class="n">rows</span> <span class="o">=</span> <span class="p">{}</span>
-<span class="linenos"> 93</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kw</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"eager（无图）"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">)),</span>
-<span class="linenos"> 94</span>                      <span class="p">(</span><span class="s2">"CUDA Graph"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">))]:</span>
-<span class="linenos"> 95</span>        <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">)</span>
-<span class="linenos"> 96</span>        <span class="n">rows</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-<span class="linenos"> 97</span>        <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">]:</span>
-<span class="linenos"> 98</span>            <span class="n">tps</span><span class="p">,</span> <span class="n">ms</span> <span class="o">=</span> <span class="n">decode_tps</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">B</span><span class="p">)</span>
-<span class="linenos"> 99</span>            <span class="n">rows</span><span class="p">[</span><span class="n">label</span><span class="p">][</span><span class="n">B</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">tps</span><span class="p">,</span> <span class="n">ms</span><span class="p">)</span>
-<span class="linenos">100</span>        <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
-<span class="linenos">101</span>
-<span class="linenos">102</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'eager ms/步'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'图 ms/步'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">103</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'eager tok/s'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'图 tok/s'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'加速'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">104</span>    <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">]:</span>
-<span class="linenos">105</span>        <span class="n">e_tps</span><span class="p">,</span> <span class="n">e_ms</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="s2">"eager（无图）"</span><span class="p">][</span><span class="n">B</span><span class="p">]</span>
-<span class="linenos">106</span>        <span class="n">g_tps</span><span class="p">,</span> <span class="n">g_ms</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="s2">"CUDA Graph"</span><span class="p">][</span><span class="n">B</span><span class="p">]</span>
-<span class="linenos">107</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">e_ms</span><span class="si">:</span><span class="s2">&gt;13.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">g_ms</span><span class="si">:</span><span class="s2">&gt;11.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">e_tps</span><span class="si">:</span><span class="s2">&gt;13.0f</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">108</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">g_tps</span><span class="si">:</span><span class="s2">&gt;11.0f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">g_tps</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">e_tps</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
-<span class="linenos">109</span>    <span class="n">e_ms</span> <span class="o">=</span> <span class="p">[</span><span class="n">rows</span><span class="p">[</span><span class="s2">"eager（无图）"</span><span class="p">][</span><span class="n">B</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">]]</span>
-<span class="linenos">110</span>    <span class="n">g_ms</span> <span class="o">=</span> <span class="p">[</span><span class="n">rows</span><span class="p">[</span><span class="s2">"CUDA Graph"</span><span class="p">][</span><span class="n">B</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">]]</span>
-<span class="linenos">111</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  eager 每步 </span><span class="si">{</span><span class="nb">min</span><span class="p">(</span><span class="n">e_ms</span><span class="p">)</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="nb">max</span><span class="p">(</span><span class="n">e_ms</span><span class="p">)</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> ms（随 batch 增长）"</span><span class="p">)</span>
-<span class="linenos">112</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  图   每步 </span><span class="si">{</span><span class="nb">min</span><span class="p">(</span><span class="n">g_ms</span><span class="p">)</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="nb">max</span><span class="p">(</span><span class="n">g_ms</span><span class="p">)</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> ms（基本不随 batch 变）"</span><span class="p">)</span>
-<span class="linenos">113</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  这是本节最清楚的一条：**开图之后每步时间几乎与 batch 无关**，"</span><span class="p">)</span>
-<span class="linenos">114</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  说明这个区间里的 step 时间由 CPU 提交主导，而图把它压成了常数。"</span><span class="p">)</span>
-<span class="linenos">115</span>    <span class="nb">print</span><span class="p">()</span>
-<span class="linenos">116</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  ⚠ 加速比**不是单调的**（batch=16 是最低点，64 又回升）。"</span><span class="p">)</span>
-<span class="linenos">117</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  我原本预期它随 batch 单调下降（batch 大 -&gt; GPU 忙 -&gt; CPU 提交被藏住），"</span><span class="p">)</span>
-<span class="linenos">118</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  数据不支持这个说法。**没有查清原因，不要引用这条趋势。**"</span><span class="p">)</span>
-<span class="linenos">119</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  可能的方向：eager 路径在大 batch 上的 python/dispatch 开销、"</span><span class="p">)</span>
-<span class="linenos">120</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  或图捕获尺寸的 padding（见 [C]）。判据：用 2.6 的 nsys 方法"</span><span class="p">)</span>
-<span class="linenos">121</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  分别抓两条路径在 batch=16 和 64 上的 CPU 时间线对比。"</span><span class="p">)</span>
-<span class="linenos">122</span>
-<span class="linenos">123</span>
-<span class="linenos">124</span><span class="c1"># ---------------------------------------------------------------- B</span>
-<span class="linenos">125</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
-<span class="linenos">126</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 代价一：捕获时间与显存"</span><span class="p">)</span>
-<span class="linenos">127</span>
-<span class="linenos">128</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kw</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"eager（无图）"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">)),</span>
-<span class="linenos">129</span>                      <span class="p">(</span><span class="s2">"CUDA Graph"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">))]:</span>
-<span class="linenos">130</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos">131</span>        <span class="n">free0</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
-<span class="linenos">132</span>        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
-<span class="linenos">133</span>        <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">)</span>
-<span class="linenos">134</span>        <span class="n">t_init</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
-<span class="linenos">135</span>        <span class="n">free1</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
-<span class="linenos">136</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2"> 启动 </span><span class="si">{</span><span class="n">t_init</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2"> s   "</span>
-<span class="linenos">137</span>              <span class="sa">f</span><span class="s2">"启动后驱动可见空闲 </span><span class="si">{</span><span class="n">free1</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1024</span><span class="si">:</span><span class="s2">&gt;6.2f</span><span class="si">}</span><span class="s2"> GiB"</span><span class="p">)</span>
-<span class="linenos">138</span>        <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
-<span class="linenos">139</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  图捕获发生在启动时：要为每个准备捕获的 batch 尺寸各跑一遍前向并录下来。"</span><span class="p">)</span>
-<span class="linenos">140</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  代价是**启动更慢**，以及**图本身占的显存池**（2.0 §4.3 里"</span><span class="p">)</span>
-<span class="linenos">141</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  vLLM 的 `cudagraph_memory_estimate_applied` 就是这一项）。"</span><span class="p">)</span>
-<span class="linenos">142</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  注意上面两行的空闲显存差不能直接当图的开销 —— "</span><span class="p">)</span>
-<span class="linenos">143</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  vLLM 会按 gpu_memory_utilization 把剩下的全分给 KV，两者是此消彼长的。"</span><span class="p">)</span>
-<span class="linenos">144</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  **真正被图吃掉的那部分，表现为 KV cache 变小、可容纳的并发变少。**"</span><span class="p">)</span>
-<span class="linenos">145</span>
-<span class="linenos">146</span>
-<span class="linenos">147</span><span class="c1"># ---------------------------------------------------------------- C</span>
-<span class="linenos">148</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
-<span class="linenos">149</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 代价二：只有捕获过的尺寸能用图"</span><span class="p">)</span>
-<span class="linenos">150</span>
-<span class="linenos">151</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  CUDA Graph 把张量地址和形状都固化在图里，所以**每个 batch 尺寸**"</span><span class="p">)</span>
-<span class="linenos">152</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  都要单独捕获一份。vLLM 捕获一组离散的尺寸，"</span><span class="p">)</span>
-<span class="linenos">153</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  运行时把实际 batch **向上取整**到最近的那个捕获尺寸（padding）。"</span><span class="p">)</span>
-<span class="linenos">154</span>
-<span class="linenos">155</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos">156</span>    <span class="n">cfg</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">llm_engine</span><span class="o">.</span><span class="n">vllm_config</span>
-<span class="linenos">157</span>    <span class="k">try</span><span class="p">:</span>
-<span class="linenos">158</span>        <span class="n">sizes</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">compilation_config</span><span class="o">.</span><span class="n">cudagraph_capture_sizes</span>
-<span class="linenos">159</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  本次捕获的尺寸（共 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">sizes</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个）："</span><span class="p">)</span>
-<span class="linenos">160</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">sizes</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">161</span>    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
-<span class="linenos">162</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  取捕获尺寸失败: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">163</span>        <span class="n">sizes</span> <span class="o">=</span> <span class="kc">None</span>
-<span class="linenos">164</span>
-<span class="linenos">165</span>    <span class="k">if</span> <span class="n">sizes</span><span class="p">:</span>
-<span class="linenos">166</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  判据：若 padding 真的有代价，batch=17 的每步时间应当"</span><span class="p">)</span>
-<span class="linenos">167</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  接近 batch=24（它被 pad 成 24），而明显高于 batch=16。"</span><span class="p">)</span>
-<span class="linenos">168</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'pad 到'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'浪费'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms/步'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'tok/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">169</span>        <span class="n">ms</span> <span class="o">=</span> <span class="p">{}</span>
-<span class="linenos">170</span>        <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">24</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">33</span><span class="p">,</span> <span class="mi">40</span><span class="p">,</span> <span class="mi">48</span><span class="p">,</span> <span class="mi">64</span><span class="p">]:</span>
-<span class="linenos">171</span>            <span class="n">padded</span> <span class="o">=</span> <span class="nb">min</span><span class="p">([</span><span class="n">s</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">sizes</span><span class="p">)</span> <span class="k">if</span> <span class="n">s</span> <span class="o">&gt;=</span> <span class="n">B</span><span class="p">],</span> <span class="n">default</span><span class="o">=</span><span class="n">B</span><span class="p">)</span>
-<span class="linenos">172</span>            <span class="n">tps</span><span class="p">,</span> <span class="n">m</span> <span class="o">=</span> <span class="n">decode_tps</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">B</span><span class="p">,</span> <span class="n">gen</span><span class="o">=</span><span class="mi">48</span><span class="p">)</span>
-<span class="linenos">173</span>            <span class="n">ms</span><span class="p">[</span><span class="n">B</span><span class="p">]</span> <span class="o">=</span> <span class="n">m</span>
-<span class="linenos">174</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">padded</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">padded</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6.2f</span><span class="si">}</span><span class="s2">× </span><span class="si">{</span><span class="n">m</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tps</span><span class="si">:</span><span class="s2">&gt;9.0f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">175</span>        <span class="n">lo</span><span class="p">,</span> <span class="n">hi</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">ms</span><span class="o">.</span><span class="n">values</span><span class="p">()),</span> <span class="nb">max</span><span class="p">(</span><span class="n">ms</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
-<span class="linenos">176</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  所有 batch 的每步时间落在 </span><span class="si">{</span><span class="n">lo</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">–</span><span class="si">{</span><span class="n">hi</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms，"</span>
-<span class="linenos">177</span>              <span class="sa">f</span><span class="s2">"极差只有 </span><span class="si">{</span><span class="p">(</span><span class="n">hi</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">lo</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">lo</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2">。"</span><span class="p">)</span>
-<span class="linenos">178</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  **padding 的代价在这个区间里量不出来** —— 因为每步时间由 CPU"</span><span class="p">)</span>
-<span class="linenos">179</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  提交主导（[A] 节已经看到图路径的每步时间几乎与 batch 无关），"</span><span class="p">)</span>
-<span class="linenos">180</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  多算几行 GPU 计算根本不构成瓶颈。"</span><span class="p">)</span>
-<span class="linenos">181</span>        <span class="nb">print</span><span class="p">()</span>
-<span class="linenos">182</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以 padding 什么时候才要紧？**当 step 变成算力受限时**："</span><span class="p">)</span>
-<span class="linenos">183</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  batch 大到 GPU 真的忙起来（5.1 算过 batch≈72 越过平衡点），"</span><span class="p">)</span>
-<span class="linenos">184</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  或者序列很长。本 lab 的 batch 上限 64 还没到那里。"</span><span class="p">)</span>
-<span class="linenos">185</span>        <span class="nb">print</span><span class="p">(</span><span class="s2">"  要看到 padding 的代价，把 batch 扫到几百（见消融 3）。"</span><span class="p">)</span>
-<span class="linenos">186</span>    <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
-<span class="linenos">187</span>
-<span class="linenos">188</span>
-<span class="linenos">189</span><span class="c1"># ---------------------------------------------------------------- D</span>
-<span class="linenos">190</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
-<span class="linenos">191</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 什么时候图没有收益"</span><span class="p">)</span>
-<span class="linenos">192</span>
-<span class="linenos">193</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  图省的是 CPU 提交时间。以下两种情况它帮不上忙："</span><span class="p">)</span>
-<span class="linenos">194</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    1. prefill —— 形状随 prompt 长度变，且 GPU 本来就很忙"</span><span class="p">)</span>
-<span class="linenos">195</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    2. batch 很大 —— CPU 提交已经被 GPU 执行藏住了"</span><span class="p">)</span>
-<span class="linenos">196</span>
-<span class="linenos">197</span>    <span class="n">rows</span> <span class="o">=</span> <span class="p">{}</span>
-<span class="linenos">198</span>    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kw</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"eager"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">)),</span>
-<span class="linenos">199</span>                      <span class="p">(</span><span class="s2">"CUDA Graph"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">))]:</span>
-<span class="linenos">200</span>        <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
-<span class="linenos">201</span>        <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
-<span class="linenos">202</span>        <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">)</span>
-<span class="linenos">203</span>        <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">7</span><span class="p">)</span>
-<span class="linenos">204</span>        <span class="n">out</span> <span class="o">=</span> <span class="p">{}</span>
-<span class="linenos">205</span>        <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">512</span><span class="p">,</span> <span class="mi">2048</span><span class="p">]:</span>
-<span class="linenos">206</span>            <span class="n">ps</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="n">S</span><span class="p">,</span> <span class="n">rng</span><span class="p">))</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">4</span><span class="p">)]</span>
-<span class="linenos">207</span>            <span class="n">sp</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
-<span class="linenos">208</span>            <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos">209</span>            <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
-<span class="linenos">210</span>            <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos">211</span>            <span class="n">out</span><span class="p">[</span><span class="n">S</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
-<span class="linenos">212</span>        <span class="n">rows</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span>
-<span class="linenos">213</span>        <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
-<span class="linenos">214</span>
-<span class="linenos">215</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  prefill（4 条，只生成 1 个 token）"</span><span class="p">)</span>
-<span class="linenos">216</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'prompt 长度'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'eager ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'图 ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'加速'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">217</span>    <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">512</span><span class="p">,</span> <span class="mi">2048</span><span class="p">]:</span>
-<span class="linenos">218</span>        <span class="n">e</span><span class="p">,</span> <span class="n">g</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="s2">"eager"</span><span class="p">][</span><span class="n">S</span><span class="p">],</span> <span class="n">rows</span><span class="p">[</span><span class="s2">"CUDA Graph"</span><span class="p">][</span><span class="n">S</span><span class="p">]</span>
-<span class="linenos">219</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">e</span><span class="si">:</span><span class="s2">&gt;10.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">g</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">e</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">g</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
-<span class="linenos">220</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  prefill 上基本没有差别 —— 印证 2.6b 的结论："</span><span class="p">)</span>
-<span class="linenos">221</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  图减少的是**提交次数**，而 prefill 的时间由 GPU 计算主导。"</span><span class="p">)</span>
-<span class="linenos">222</span>
-<span class="linenos">223</span>
-<span class="linenos">224</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span> <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">}</span>
-<span class="linenos">225</span>
-<span class="linenos">226</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
-<span class="linenos">227</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
-<span class="linenos">228</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  model </span><span class="si">{</span><span class="n">MODEL</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">229</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
-<span class="linenos">230</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
-<span class="linenos">231</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
-<span class="linenos">232</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<details class="fold srcfold"><summary>labs/L5/execution_layer.py 全文（232 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""L5.4 —— 执行层：CUDA Graph 在引擎里值多少。</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">2.6b 量过 CUDA Graph 把 CPU 侧 launch 从 14,003 降到 863（16.2×）。</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">这一章问：**这 16 倍的 launch 减少，在 tok/s 上体现为多少？**</span>
+<span class="linenos" aria-hidden="true">  6</span> 
+<span class="linenos" aria-hidden="true">  7</span> <span class="sd">  [A] eager vs CUDA Graph：decode 吞吐随 batch 的对照</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">  [B] 代价一：捕获时间与显存</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="sd">  [C] 代价二：只有捕获过的 batch 尺寸能用图</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="sd">  [D] 什么时候图没有收益</span>
+<span class="linenos" aria-hidden="true"> 11</span> 
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">用法：</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="sd">    python execution_layer.py</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 15</span> 
+<span class="linenos" aria-hidden="true"> 16</span> <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos" aria-hidden="true"> 19</span> 
+<span class="linenos" aria-hidden="true"> 20</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos" aria-hidden="true"> 21</span> 
+<span class="linenos" aria-hidden="true"> 22</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"HF_HUB_OFFLINE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_ENABLE_V1_MULTIPROCESSING"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 24</span> 
+<span class="linenos" aria-hidden="true"> 25</span> <span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="n">MODEL</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"L54_MODEL"</span><span class="p">,</span> <span class="s2">"Qwen/Qwen3-1.7B"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 27</span> 
+<span class="linenos" aria-hidden="true"> 28</span> 
+<span class="linenos" aria-hidden="true"> 29</span> <span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 30</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 31</span> 
+<span class="linenos" aria-hidden="true"> 32</span> 
+<span class="linenos" aria-hidden="true"> 33</span> <span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 34</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true"> 35</span> 
+<span class="linenos" aria-hidden="true"> 36</span> 
+<span class="linenos" aria-hidden="true"> 37</span> <span class="k">def</span><span class="w"> </span><span class="nf">safe_util</span><span class="p">(</span><span class="n">reserve_gib</span><span class="o">=</span><span class="mf">4.0</span><span class="p">,</span> <span class="n">cap</span><span class="o">=</span><span class="mf">0.55</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 38</span>     <span class="n">free</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 39</span>     <span class="n">gib</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">**</span> <span class="mi">3</span>
+<span class="linenos" aria-hidden="true"> 40</span>     <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span><span class="n">free</span> <span class="o">/</span> <span class="n">gib</span> <span class="o">-</span> <span class="n">reserve_gib</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">total</span> <span class="o">/</span> <span class="n">gib</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 41</span> 
+<span class="linenos" aria-hidden="true"> 42</span> 
+<span class="linenos" aria-hidden="true"> 43</span> <span class="k">def</span><span class="w"> </span><span class="nf">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 44</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="linenos" aria-hidden="true"> 45</span>     <span class="n">d</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">MODEL</span><span class="p">,</span> <span class="n">gpu_memory_utilization</span><span class="o">=</span><span class="n">safe_util</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true"> 46</span>              <span class="n">max_model_len</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span> <span class="n">enable_prefix_caching</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 47</span>              <span class="n">disable_log_stats</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 48</span>     <span class="n">d</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">kw</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 49</span>     <span class="k">return</span> <span class="n">LLM</span><span class="p">(</span><span class="o">**</span><span class="n">d</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 50</span> 
+<span class="linenos" aria-hidden="true"> 51</span> 
+<span class="linenos" aria-hidden="true"> 52</span> <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 53</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 54</span>         <span class="n">llm</span><span class="o">.</span><span class="n">llm_engine</span><span class="o">.</span><span class="n">engine_core</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 55</span>     <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>                                         <span class="c1"># noqa: BLE001</span>
+<span class="linenos" aria-hidden="true"> 56</span>         <span class="k">pass</span>
+<span class="linenos" aria-hidden="true"> 57</span>     <span class="k">del</span> <span class="n">llm</span>
+<span class="linenos" aria-hidden="true"> 58</span>     <span class="kn">import</span><span class="w"> </span><span class="nn">gc</span>
+<span class="linenos" aria-hidden="true"> 59</span>     <span class="n">gc</span><span class="o">.</span><span class="n">collect</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 60</span>     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 61</span> 
+<span class="linenos" aria-hidden="true"> 62</span> 
+<span class="linenos" aria-hidden="true"> 63</span> <span class="k">def</span><span class="w"> </span><span class="nf">rand_ids</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">rng</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 64</span>     <span class="k">return</span> <span class="p">[</span><span class="n">rng</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">60000</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true"> 65</span> 
+<span class="linenos" aria-hidden="true"> 66</span> 
+<span class="linenos" aria-hidden="true"> 67</span> <span class="k">def</span><span class="w"> </span><span class="nf">decode_tps</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">B</span><span class="p">,</span> <span class="n">gen</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">plen</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">seed</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 68</span> <span class="w">    </span><span class="sd">"""量纯 decode 吞吐：用 (gen+1) 与 1 两次调用做差分，扣掉 prefill。"""</span>
+<span class="linenos" aria-hidden="true"> 69</span>     <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos" aria-hidden="true"> 70</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos" aria-hidden="true"> 71</span>     <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 72</span>     <span class="n">ps</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="n">plen</span><span class="p">,</span> <span class="n">rng</span><span class="p">))</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true"> 73</span>     <span class="n">sp1</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 74</span>     <span class="n">spG</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="n">gen</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 75</span>     <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">spG</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>                   <span class="c1"># 预热（含图捕获）</span>
+<span class="linenos" aria-hidden="true"> 76</span>     <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp1</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 77</span>     <span class="n">t1</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true"> 78</span>     <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">spG</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 79</span>     <span class="n">tG</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true"> 80</span>     <span class="n">per_step</span> <span class="o">=</span> <span class="p">(</span><span class="n">tG</span> <span class="o">-</span> <span class="n">t1</span><span class="p">)</span> <span class="o">/</span> <span class="n">gen</span>
+<span class="linenos" aria-hidden="true"> 81</span>     <span class="k">return</span> <span class="n">B</span> <span class="o">/</span> <span class="n">per_step</span><span class="p">,</span> <span class="n">per_step</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos" aria-hidden="true"> 82</span> 
+<span class="linenos" aria-hidden="true"> 83</span> 
+<span class="linenos" aria-hidden="true"> 84</span> <span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos" aria-hidden="true"> 85</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 86</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[A] eager vs CUDA Graph：decode 吞吐"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 87</span> 
+<span class="linenos" aria-hidden="true"> 88</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  2.6b 实测：CPU 侧 launch 14,003 -&gt; 863（16.2×），GPU kernel 数不变。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 89</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  launch 省下的是 CPU 时间，所以收益应当在**CPU 提交是瓶颈**的地方最大，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 90</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  也就是 **batch 小、模型小** 的时候（L1.4：每次 launch 2.68 µs）。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 91</span> 
+<span class="linenos" aria-hidden="true"> 92</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true"> 93</span>     <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kw</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"eager（无图）"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">)),</span>
+<span class="linenos" aria-hidden="true"> 94</span>                       <span class="p">(</span><span class="s2">"CUDA Graph"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">))]:</span>
+<span class="linenos" aria-hidden="true"> 95</span>         <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 96</span>         <span class="n">rows</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true"> 97</span>         <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true"> 98</span>             <span class="n">tps</span><span class="p">,</span> <span class="n">ms</span> <span class="o">=</span> <span class="n">decode_tps</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">B</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 99</span>             <span class="n">rows</span><span class="p">[</span><span class="n">label</span><span class="p">][</span><span class="n">B</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">tps</span><span class="p">,</span> <span class="n">ms</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">100</span>         <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">101</span> 
+<span class="linenos" aria-hidden="true">102</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'eager ms/步'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'图 ms/步'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">103</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'eager tok/s'</span><span class="si">:</span><span class="s2">&gt;13</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'图 tok/s'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'加速'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">104</span>     <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">105</span>         <span class="n">e_tps</span><span class="p">,</span> <span class="n">e_ms</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="s2">"eager（无图）"</span><span class="p">][</span><span class="n">B</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">106</span>         <span class="n">g_tps</span><span class="p">,</span> <span class="n">g_ms</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="s2">"CUDA Graph"</span><span class="p">][</span><span class="n">B</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">107</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">e_ms</span><span class="si">:</span><span class="s2">&gt;13.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">g_ms</span><span class="si">:</span><span class="s2">&gt;11.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">e_tps</span><span class="si">:</span><span class="s2">&gt;13.0f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">108</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">g_tps</span><span class="si">:</span><span class="s2">&gt;11.0f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">g_tps</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">e_tps</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">109</span>     <span class="n">e_ms</span> <span class="o">=</span> <span class="p">[</span><span class="n">rows</span><span class="p">[</span><span class="s2">"eager（无图）"</span><span class="p">][</span><span class="n">B</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">]]</span>
+<span class="linenos" aria-hidden="true">110</span>     <span class="n">g_ms</span> <span class="o">=</span> <span class="p">[</span><span class="n">rows</span><span class="p">[</span><span class="s2">"CUDA Graph"</span><span class="p">][</span><span class="n">B</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">]]</span>
+<span class="linenos" aria-hidden="true">111</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  eager 每步 </span><span class="si">{</span><span class="nb">min</span><span class="p">(</span><span class="n">e_ms</span><span class="p">)</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="nb">max</span><span class="p">(</span><span class="n">e_ms</span><span class="p">)</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> ms（随 batch 增长）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">112</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  图   每步 </span><span class="si">{</span><span class="nb">min</span><span class="p">(</span><span class="n">g_ms</span><span class="p">)</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="nb">max</span><span class="p">(</span><span class="n">g_ms</span><span class="p">)</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> ms（基本不随 batch 变）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">113</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  这是本节最清楚的一条：**开图之后每步时间几乎与 batch 无关**，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">114</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  说明这个区间里的 step 时间由 CPU 提交主导，而图把它压成了常数。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">115</span>     <span class="nb">print</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">116</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  ⚠ 加速比**不是单调的**（batch=16 是最低点，64 又回升）。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">117</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  我原本预期它随 batch 单调下降（batch 大 -&gt; GPU 忙 -&gt; CPU 提交被藏住），"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">118</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  数据不支持这个说法。**没有查清原因，不要引用这条趋势。**"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">119</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  可能的方向：eager 路径在大 batch 上的 python/dispatch 开销、"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">120</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  或图捕获尺寸的 padding（见 [C]）。判据：用 2.6 的 nsys 方法"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">121</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  分别抓两条路径在 batch=16 和 64 上的 CPU 时间线对比。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">122</span> 
+<span class="linenos" aria-hidden="true">123</span> 
+<span class="linenos" aria-hidden="true">124</span> <span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos" aria-hidden="true">125</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">126</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 代价一：捕获时间与显存"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">127</span> 
+<span class="linenos" aria-hidden="true">128</span>     <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kw</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"eager（无图）"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">)),</span>
+<span class="linenos" aria-hidden="true">129</span>                       <span class="p">(</span><span class="s2">"CUDA Graph"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">))]:</span>
+<span class="linenos" aria-hidden="true">130</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">131</span>         <span class="n">free0</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">132</span>         <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">133</span>         <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">134</span>         <span class="n">t_init</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true">135</span>         <span class="n">free1</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">mem_get_info</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">136</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">label</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}</span><span class="s2"> 启动 </span><span class="si">{</span><span class="n">t_init</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2"> s   "</span>
+<span class="linenos" aria-hidden="true">137</span>               <span class="sa">f</span><span class="s2">"启动后驱动可见空闲 </span><span class="si">{</span><span class="n">free1</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1024</span><span class="si">:</span><span class="s2">&gt;6.2f</span><span class="si">}</span><span class="s2"> GiB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">138</span>         <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">139</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  图捕获发生在启动时：要为每个准备捕获的 batch 尺寸各跑一遍前向并录下来。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">140</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  代价是**启动更慢**，以及**图本身占的显存池**（2.0 §4.3 里"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">141</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  vLLM 的 `cudagraph_memory_estimate_applied` 就是这一项）。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">142</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  注意上面两行的空闲显存差不能直接当图的开销 —— "</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">143</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  vLLM 会按 gpu_memory_utilization 把剩下的全分给 KV，两者是此消彼长的。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">144</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  **真正被图吃掉的那部分，表现为 KV cache 变小、可容纳的并发变少。**"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">145</span> 
+<span class="linenos" aria-hidden="true">146</span> 
+<span class="linenos" aria-hidden="true">147</span> <span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos" aria-hidden="true">148</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">149</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 代价二：只有捕获过的尺寸能用图"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">150</span> 
+<span class="linenos" aria-hidden="true">151</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  CUDA Graph 把张量地址和形状都固化在图里，所以**每个 batch 尺寸**"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">152</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  都要单独捕获一份。vLLM 捕获一组离散的尺寸，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">153</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  运行时把实际 batch **向上取整**到最近的那个捕获尺寸（padding）。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">154</span> 
+<span class="linenos" aria-hidden="true">155</span>     <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">156</span>     <span class="n">cfg</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">llm_engine</span><span class="o">.</span><span class="n">vllm_config</span>
+<span class="linenos" aria-hidden="true">157</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">158</span>         <span class="n">sizes</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">compilation_config</span><span class="o">.</span><span class="n">cudagraph_capture_sizes</span>
+<span class="linenos" aria-hidden="true">159</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  本次捕获的尺寸（共 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">sizes</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个）："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">160</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">sizes</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">161</span>     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                                  <span class="c1"># noqa: BLE001</span>
+<span class="linenos" aria-hidden="true">162</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  取捕获尺寸失败: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">163</span>         <span class="n">sizes</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">164</span> 
+<span class="linenos" aria-hidden="true">165</span>     <span class="k">if</span> <span class="n">sizes</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">166</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  判据：若 padding 真的有代价，batch=17 的每步时间应当"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">167</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  接近 batch=24（它被 pad 成 24），而明显高于 batch=16。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">168</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'pad 到'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'浪费'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms/步'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'tok/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">169</span>         <span class="n">ms</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true">170</span>         <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">24</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">33</span><span class="p">,</span> <span class="mi">40</span><span class="p">,</span> <span class="mi">48</span><span class="p">,</span> <span class="mi">64</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">171</span>             <span class="n">padded</span> <span class="o">=</span> <span class="nb">min</span><span class="p">([</span><span class="n">s</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">sizes</span><span class="p">)</span> <span class="k">if</span> <span class="n">s</span> <span class="o">&gt;=</span> <span class="n">B</span><span class="p">],</span> <span class="n">default</span><span class="o">=</span><span class="n">B</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">172</span>             <span class="n">tps</span><span class="p">,</span> <span class="n">m</span> <span class="o">=</span> <span class="n">decode_tps</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">B</span><span class="p">,</span> <span class="n">gen</span><span class="o">=</span><span class="mi">48</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">173</span>             <span class="n">ms</span><span class="p">[</span><span class="n">B</span><span class="p">]</span> <span class="o">=</span> <span class="n">m</span>
+<span class="linenos" aria-hidden="true">174</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">padded</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">padded</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6.2f</span><span class="si">}</span><span class="s2">× </span><span class="si">{</span><span class="n">m</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">tps</span><span class="si">:</span><span class="s2">&gt;9.0f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">175</span>         <span class="n">lo</span><span class="p">,</span> <span class="n">hi</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">ms</span><span class="o">.</span><span class="n">values</span><span class="p">()),</span> <span class="nb">max</span><span class="p">(</span><span class="n">ms</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">176</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  所有 batch 的每步时间落在 </span><span class="si">{</span><span class="n">lo</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">–</span><span class="si">{</span><span class="n">hi</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms，"</span>
+<span class="linenos" aria-hidden="true">177</span>               <span class="sa">f</span><span class="s2">"极差只有 </span><span class="si">{</span><span class="p">(</span><span class="n">hi</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">lo</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">lo</span><span class="si">:</span><span class="s2">.1%</span><span class="si">}</span><span class="s2">。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">178</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  **padding 的代价在这个区间里量不出来** —— 因为每步时间由 CPU"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">179</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  提交主导（[A] 节已经看到图路径的每步时间几乎与 batch 无关），"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">180</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  多算几行 GPU 计算根本不构成瓶颈。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">181</span>         <span class="nb">print</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">182</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以 padding 什么时候才要紧？**当 step 变成算力受限时**："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">183</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  batch 大到 GPU 真的忙起来（5.1 算过 batch≈72 越过平衡点），"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">184</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  或者序列很长。本 lab 的 batch 上限 64 还没到那里。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">185</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"  要看到 padding 的代价，把 batch 扫到几百（见消融 3）。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">186</span>     <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">187</span> 
+<span class="linenos" aria-hidden="true">188</span> 
+<span class="linenos" aria-hidden="true">189</span> <span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos" aria-hidden="true">190</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">191</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 什么时候图没有收益"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">192</span> 
+<span class="linenos" aria-hidden="true">193</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  图省的是 CPU 提交时间。以下两种情况它帮不上忙："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">194</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    1. prefill —— 形状随 prompt 长度变，且 GPU 本来就很忙"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">195</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    2. batch 很大 —— CPU 提交已经被 GPU 执行藏住了"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">196</span> 
+<span class="linenos" aria-hidden="true">197</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true">198</span>     <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kw</span> <span class="ow">in</span> <span class="p">[(</span><span class="s2">"eager"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">True</span><span class="p">)),</span>
+<span class="linenos" aria-hidden="true">199</span>                       <span class="p">(</span><span class="s2">"CUDA Graph"</span><span class="p">,</span> <span class="nb">dict</span><span class="p">(</span><span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">))]:</span>
+<span class="linenos" aria-hidden="true">200</span>         <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+<span class="linenos" aria-hidden="true">201</span>         <span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">TokensPrompt</span>
+<span class="linenos" aria-hidden="true">202</span>         <span class="n">llm</span> <span class="o">=</span> <span class="n">make_llm</span><span class="p">(</span><span class="o">**</span><span class="n">kw</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">203</span>         <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="mi">7</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">204</span>         <span class="n">out</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true">205</span>         <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">512</span><span class="p">,</span> <span class="mi">2048</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">206</span>             <span class="n">ps</span> <span class="o">=</span> <span class="p">[</span><span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="n">S</span><span class="p">,</span> <span class="n">rng</span><span class="p">))</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">4</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">207</span>             <span class="n">sp</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">208</span>             <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">209</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">210</span>             <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">ps</span><span class="p">,</span> <span class="n">sp</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">211</span>             <span class="n">out</span><span class="p">[</span><span class="n">S</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+<span class="linenos" aria-hidden="true">212</span>         <span class="n">rows</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">out</span>
+<span class="linenos" aria-hidden="true">213</span>         <span class="n">shutdown</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">214</span> 
+<span class="linenos" aria-hidden="true">215</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  prefill（4 条，只生成 1 个 token）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">216</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'prompt 长度'</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'eager ms'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'图 ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'加速'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">217</span>     <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">512</span><span class="p">,</span> <span class="mi">2048</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">218</span>         <span class="n">e</span><span class="p">,</span> <span class="n">g</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="s2">"eager"</span><span class="p">][</span><span class="n">S</span><span class="p">],</span> <span class="n">rows</span><span class="p">[</span><span class="s2">"CUDA Graph"</span><span class="p">][</span><span class="n">S</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">219</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;11</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">e</span><span class="si">:</span><span class="s2">&gt;10.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">g</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">e</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">g</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">220</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  prefill 上基本没有差别 —— 印证 2.6b 的结论："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">221</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  图减少的是**提交次数**，而 prefill 的时间由 GPU 计算主导。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">222</span> 
+<span class="linenos" aria-hidden="true">223</span> 
+<span class="linenos" aria-hidden="true">224</span> <span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span> <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">225</span> 
+<span class="linenos" aria-hidden="true">226</span> <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">227</span>     <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">228</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  model </span><span class="si">{</span><span class="n">MODEL</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">229</span>     <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">230</span>         <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos" aria-hidden="true">231</span>     <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">232</span>     <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 </pre></div>
 <div class="srcref"><code>labs/L5/execution_layer.py 全文（232 行）</code><a href="../code/labs/L5/execution_layer.py.html">在完整文件中打开 &rarr;</a></div></div></details>
 <p><strong>建议的消融</strong></p>
@@ -535,16 +555,16 @@ prefill 的形状由 prompt 长度决定，连续且范围极大，离散化的�
 <li>读引擎启动日志里报告的 <strong>KV block 数</strong>，对比 eager 与开图两种配置——
    这才是第二节里"图吃了多少显存"的正确量法。</li>
 <li><strong>把 batch 扫到 128/256/512</strong>，看 padding 的代价什么时候开始显现。
-   按 5.1 的账，batch≈72 越过平衡点之后应该出现。</li>
+   按 5.1 的账，简化权重模型的 batch≈144 越过平衡点之后应该出现。</li>
 <li>用 <code>compilation_config={"cudagraph_capture_sizes": [1, 8, 64, 512]}</code>
    只捕获 4 个尺寸，对比启动时间与 batch=17/33 的每步时间。</li>
 </ol>
 <hr />
-<h2 id="_6">七 · 陷阱</h2>
+<h2 id="_5">七 · 陷阱</h2>
 <ol>
 <li><strong>"启动后空闲显存差不多"不等于"图不占显存"。</strong> vLLM 把剩余显存全给 KV，
    图占多少 KV 就少多少。要看 KV block 数。</li>
-<li><strong>图对 prefill 没有收益</strong>（本章 1.00–1.01×）。别指望它改善 TTFT。</li>
+<li><strong>本组 prefill 调用只观察到 1.00–1.01×。</strong> 不能外推为所有模型和图模式都无法改善 TTFT。</li>
 <li><strong>padding 的代价在 CPU 受限区间量不出来</strong>（本章极差 10.1%）。
    不能因此说"padding 没有代价"，只能说"这个配置下量不到"。</li>
 <li><strong>开图会让启动慢几秒</strong>（本章 5.48 → 9.50 s）。弹性伸缩要算进去。</li>
@@ -553,7 +573,7 @@ prefill 的形状由 prompt 长度决定，连续且范围极大，离散化的�
    不能直接用新分配的张量（2.0 §4.3 的 allocator 会给你不同地址）。</li>
 </ol>
 <hr />
-<h2 id="_7">八 · 自测题</h2>
+<h2 id="_6">八 · 自测题</h2>
 <details>
 <summary>1. CUDA Graph 把 launch 减少了 16 倍，为什么吞吐只快 1.2–1.4 倍？</summary>
 <p>因为 launch 省的是 <strong>CPU 时间</strong>，而每步的总时间是 CPU 提交与 GPU 执行的
@@ -568,28 +588,19 @@ prefill 的形状由 prompt 长度决定，连续且范围极大，离散化的�
 </details>
 <details>
 <summary>2. batch=17 被 pad 到 24，多算 41%，为什么测不到变慢？</summary>
-<p>因为这个区间里 step 时间由 <strong>CPU 提交</strong>主导，不是 GPU 计算。
+<p>仅凭这些 step 总时间不能确定是 CPU 提交主导。
 本章实测图路径的每步时间在 batch 1→64 之间只在 3.16–3.86 ms 之间波动——
 <strong>几乎与 batch 无关</strong>，说明 GPU 那部分远没吃饱。</p>
 <p>多算 7 行（17→24）的 GPU 工作，落在一个本来就闲着的部件上，自然量不出来。</p>
 <p>padding 要紧的条件是 <strong>step 变成算力受限</strong>：batch 大到越过平衡点
-（5.1 算的 batch≈72），或者序列很长。消融 3 就是去找这个点。</p>
+（5.1 算的 简化权重模型的 batch≈144），或者序列很长。消融 3 就是去找这个点。</p>
 <p><strong>这也是一条通用判据：一个代价能不能被测到，取决于它落在哪个部件上，
 以及那个部件是不是当前的瓶颈。</strong></p>
 </details>
 <details>
-<summary>3. 为什么 prefill 不用 CUDA Graph？</summary>
-<p>两个独立的理由：</p>
-<ol>
-<li><strong>没收益。</strong> prefill 的时间由 GPU 计算主导（5.1：算术强度 2048，
-   牢牢在算力一侧）。本章实测 eager 与图在 prefill 上差 1.00–1.01×。</li>
-<li><strong>做不到。</strong> 图要求形状固定，而 prefill 的形状由 prompt 长度决定，
-   连续且范围极大（1 到几万）。离散化会导致巨大的 padding 浪费。</li>
-</ol>
-<p>decode 恰好相反：形状只由 batch 决定，batch 可以离散化成几十个点；
-而且它是 CPU 受限的，正好是图能帮上忙的地方。</p>
-<p>这就是 2.6b 里 <code>FULL_AND_PIECEWISE</code> 这个默认值的含义——
-<strong>decode 走整图，prefill/混合批走别的路径。</strong></p>
+<summary>3. prefill 是否无法使用 CUDA Graph？</summary>
+<p>不是。可以使用形状分桶、padding、分段捕获或支持相应动态元数据的实现。本章两个 prefill 配置的 eager 与图模式耗时接近，只能说明这组调用没有明显收益。</p>
+<p>CUDA Graph API 本身还提供节点更新等能力。本章引擎采用固定地址缓冲区和离散捕获尺寸，是具体实现选择，不是所有图执行只能处理固定业务输入的证明。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.3-scheduling.html">&#8592; 5.3 调度：continuous batching 与 chunked prefill</a><a class="nav-next" href="../L5/5.5-speculative-decoding.html">5.5 投机解码 &#8594;</a></nav>
 </main>
 </body>

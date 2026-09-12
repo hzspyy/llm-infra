@@ -4,16 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>1.1 GPU 微架构与内存层次</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">1.1</div>
   <div class="sidebar-title">GPU 微架构与内存层次</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">心智模型：一座延迟递增、带宽递减的金字塔</a></li>
@@ -31,7 +31,7 @@
 </li>
 <li><a href="#_6">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_7">建议你做的消融</a></li>
+<li><a href="#_7">消融建议</a></li>
 </ul>
 </li>
 <li><a href="#_8">原始现场</a></li>
@@ -41,13 +41,43 @@
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一座延迟递增、带宽递减的金字塔</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#simtwarp">SIMT：warp 是真正的调度单位</a></li>
+<li><a href="#_4">延迟：三段平台，拐点精确落在容量边界</a></li>
+<li><a href="#_5">带宽：随工作集掉三级</a></li>
+<li><a href="#bank-conflict">共享内存与 bank conflict</a></li>
+<li><a href="#-">带宽-延迟积：需要多少并发才能喂饱</a></li>
+</ul>
+</li>
+<li><a href="#tile">工程实现 · 源码走读：硬件容量如何约束 tile</a><ul>
+<li><a href="#sharedmemperblockoptin-optin">另一处：sharedMemPerBlockOptin 为什么是 "Optin"</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_8">原始现场</a></li>
+<li><a href="#_9">前沿</a></li>
+<li><a href="#_10">陷阱</a></li>
+<li><a href="#_11">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L1 · 硬件与操作系统底座</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L1 · 硬件与操作系统底座</div>
   <div class="mod-id">1.1</div>
   <h1>GPU 微架构与内存层次</h1>
-  <p class="lede">认识 SM、warp 与内存层次，区分延迟和带宽；通过访问模式理解并发与 bank conflict，再用容量约束分析 tile 的可行范围。</p>
+  <p class="lede">用微基准观察寄存器、共享内存、缓存与显存，分析延迟、带宽和并行访问需求。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) + worldvln (L40S, sm_89)</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L0.2（roofline 与账本）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
@@ -63,6 +93,8 @@ GPU 可以让许多访问同时进行，因此带宽高不代表单次访问延�
 <hr />
 <h2 id="_2">心智模型：一座延迟递增、带宽递减的金字塔</h2>
 <figure>
+
+
 <svg viewBox="0 0 740 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GPU 内存层次金字塔">
   <g font-size="11.5" fill="currentColor">
     <text x="12" y="18" font-size="12.5" font-weight="600">RTX 5090 D（sm_120）· 全部为本机实测</text>
@@ -104,6 +136,8 @@ GPU 可以让许多访问同时进行，因此带宽高不代表单次访问延�
     <text x="12" y="386" font-size="11" opacity="0.85">L40S 只需要 169 KB（681 GB/s × 253 ns）—— <tspan font-weight="600">带宽越高的卡，越难喂饱</tspan>。</text>
   </g>
 </svg>
+
+
 <figcaption>每一级的数字都来自 <code>labs/L1/mem_hierarchy.cu</code> 的实测，不是厂商标称。</figcaption>
 </figure>
 
@@ -178,11 +212,11 @@ GPU 可以让许多访问同时进行，因此带宽高不代表单次访问延�
 </tr>
 </tbody>
 </table>
-<p>三段平台干净到令人愉快：<strong>44 / 360 / 929</strong>（5090），<strong>40 / 279 / 636</strong>（L40S）。
+<p>三段平台的代表读数为：<strong>44 / 360 / 929</strong>（5090），<strong>40 / 279 / 636</strong>（L40S）。
 中间的两个跳变分别发生在 128 KiB 和 96 MiB —— 正好是 L1 与 L2 的容量。</p>
 <p><strong>跨架构的观察很反直觉</strong>：5090 在<strong>每一级</strong>的延迟都比 L40S 高
 （L2 360 vs 279 周期，显存 929 vs 636 周期），但它的带宽高 2.5 倍。</p>
-<p>这是 GDDR7 的典型形态：靠更多的 bank 与更深的流水换带宽，代价是单次访问的往返更长。
+<p>延迟与带宽反映不同性质。仅凭两台机器的结果，尚不能将延迟差异归因于 GDDR7 的 bank 数或流水深度。
 <strong>「更快的显存」在延迟意义上可能更慢。</strong> 对 decode 这种高并发访存的负载无所谓；
 对访存链很长又并发不足的 kernel 则是实打实的损失。</p>
 <h3 id="_5">带宽：随工作集掉三级</h3>
@@ -387,7 +421,7 @@ GPU 可以让许多访问同时进行，因此带宽高不代表单次访问延�
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><munder><munder><mrow><mn>64</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>Q</mi><mtext>&#x000A0;</mtext><mo>&#x0003D;</mo><mtext>&#x000A0;</mtext><mn>16</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>128</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>K</mi><mtext>&#x000A0;</mtext><mo>&#x0003D;</mo><mtext>&#x000A0;</mtext><mn>32</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>128</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>V</mi><mtext>&#x000A0;</mtext><mo>&#x0003D;</mo><mtext>&#x000A0;</mtext><mn>32</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></munder><mo>&#x0003D;</mo><mn>80</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></math></div></p>
 <p>而本机实测 <code>sharedMemPerBlockOptin = 99 KB</code>。<strong>80 &lt; 99，刚好放得下。</strong></p>
 <p>如果把 <code>kBlockN</code> 从 128 提到 256：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>16</mn><mo>&#x0002B;</mo><mn>64</mn><mo>&#x0002B;</mo><mn>64</mn><mo>&#x0003D;</mo><mn>144</mn></mrow></math></span> KB &gt; 99 KB，<strong>编译期就会失败</strong>。
-如果降到 64：smem 只用 48 KB，但每个 Q tile 要多循环一倍次数，K/V 的重复加载翻倍。</p>
+如果降到 64：smem 只用 48 KB，但每个 Q tile 要多循环一倍次数，K/V 循环次数翻倍，但每次块大小减半，总读取量不因此自动翻倍。</p>
 <p>在上面的 Q/K/V 同时驻留假设下，容量可以排除较大的候选配置。
 但这不是对源码最优 tile 的证明：缓冲复用、流水级数、寄存器布局与调度都会改变选择。
 应先核对实际 kernel 的共享内存布局，再用容量计算和实测共同判断。</p>
@@ -471,7 +505,7 @@ kernel launch 的几微秒被算进 event 时间，把频率压到 1.45 GHz —�
 
 <p><code>-arch</code> 必须匹配你的卡（5090 是 <code>sm_120</code>，L40S 是 <code>sm_89</code>）。
 架构不匹配时 nvcc 不会报错，驱动会 JIT PTX，性能特征可能变化（<a class="xref" href="../L2/2.2-toolchain-ptx-sass.html" title="编译工具链：nvcc → PTX → SASS">L2.2</a> 详解）。</p>
-<h3 id="_7">建议你做的消融</h3>
+<h3 id="_7">消融建议</h3>
 <table>
 <thead>
 <tr>
@@ -652,16 +686,16 @@ totalGlobalMem                33.7 GB
 </tbody>
 </table>
 <blockquote>
-<p>除本站实测外的内容来自各自文档与论文，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+<p>除本章实测外的内容来自各自文档与论文，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
 <h2 id="_10">陷阱</h2>
 <p><strong>1. 用顺序访问测延迟。</strong> 硬件预取器会把顺序访问的延迟完全掩盖，测出的显存延迟可能只有真实值的 1/5。必须随机。</p>
 <p><strong>2. 工作集没走遍。</strong> 本章踩过：固定步数的指针追逐，对大 buffer 而言只触碰了很小一部分，三段平台会消失。</p>
-<p><strong>3. 用依赖链测吞吐 / 用独立操作测延迟。</strong> 两者测的是不同的东西，用反了会得到"没有效应"的假结论。本章的 bank conflict 实验就是这么翻车的。</p>
+<p><strong>3. 用依赖链测吞吐 / 用独立操作测延迟。</strong> 两者测的是不同的东西，用反了会得到"没有效应"的假结论。本章用不同依赖关系对照了这两种测量口径。</p>
 <p><strong>4. 相信 <code>cudaDevAttrClockRate</code>。</strong> 那是基频。要么自校准，要么只报周期数不报纳秒。</p>
 <p><strong>5. 标定 kernel 太短。</strong> launch 开销几微秒，对 0.1 ms 的 kernel 是 5% 误差，对更短的就是数倍误差。</p>
-<p><strong>6. 忘了 smem 和 L1 是同一块 SRAM。</strong> 申请 99 KB smem 后 L1 只剩 29 KB。这解释了为什么 128 KiB 工作集的延迟已经不是 L1 的 44 周期。</p>
+<p><strong>6. 忘了 smem 和 L1 是同一块 SRAM。</strong> 共享内存 carveout 会影响可用于 L1 的容量，但不能用总容量减申请值直接确定有效 L1 容量。这解释了为什么 128 KiB 工作集的延迟已经不是 L1 的 44 周期。</p>
 <p><strong>7. 把"占用率高"当成"性能好"。</strong> 实测 2 个 block/SM 就饱和了带宽，再往上加没有收益。占用率只是掩盖延迟的<strong>手段</strong>，不是目标（<a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 会展开 occupancy vs ILP 的取舍）。</p>
 <hr />
 <h2 id="_11">自测题</h2>
@@ -699,7 +733,7 @@ L2 变大（同为 96 MiB 但 Blackwell 的分片更多、跨片距离更远）�
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><munder><munder><mrow><mn>64</mn><mo>&#x000D7;</mo><mn>256</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>Q</mi><mo>&#x0003D;</mo><mn>32</mn><mspace width="0.167em" /><mtext>KB</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>128</mn><mo>&#x000D7;</mo><mn>256</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>K</mi><mo>&#x0003D;</mo><mn>64</mn><mspace width="0.167em" /><mtext>KB</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>128</mn><mo>&#x000D7;</mo><mn>256</mn><mo>&#x000D7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mi>V</mi><mo>&#x0003D;</mo><mn>64</mn><mspace width="0.167em" /><mtext>KB</mtext></mrow></munder><mo>&#x0003D;</mo><mn>160</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext></mrow></math></div></p>
 <p><strong>远超 99 KB 上限</strong>，编译不过。必须缩小 tile，通常是把 <code>kBlockN</code> 砍到 64：</p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>32</mn><mo>&#x0002B;</mo><mn>32</mn><mo>&#x0002B;</mo><mn>32</mn><mo>&#x0003D;</mo><mn>96</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext><mo>&#x0003C;</mo><mn>99</mn><mtext>&#x000A0;</mtext><mtext>KB</mtext><mspace width="1em" /><mi>&#x02713;</mi></mrow></math></div></p>
-<p><strong>代价</strong>：KV tile 减半意味着每个 Q tile 要循环两倍次数，K/V 从 L2/显存重复加载的量翻倍。
+<p><strong>代价</strong>：KV tile 减半意味着每个 Q tile 要循环两倍次数，循环次数翻倍；总 K/V 流量还取决于缓存与循环组织，不能直接写成翻倍。
 所以 <strong>head_dim 越大，attention 的实际效率越低</strong>——这是一个纯粹由 smem 容量决定的硬约束。</p>
 <p>（这也解释了为什么大部分模型的 head_dim 停在 128：再大就打不满 tensor core 又装不下 tile。
 DeepSeek 的 MLA 之所以能用 576 维的压缩 KV，是因为它的 kernel 是专门重写的，
@@ -729,7 +763,7 @@ tile 变小 = 少复用 = 更多流量掉回 L2/显存。</p>
 - 2.126 ms → 3.085 ms（GPU 忙时）：<strong>效率 69%</strong>。差的部分是 kernel 效率、
   非 GEMM 小算子、以及 attention 那部分不是纯顺序读。
 - 3.085 ms → 4.48 ms（墙钟）：<strong>1.4 ms 的 CPU launch 开销</strong>（444 次 × 2.68 µs ≈ 1.19 ms）。</p>
-<p><strong>能把 4.48 ms 拆成 2.13 + 0.96 + 1.40 三段，才算真的懂了这一步在干什么。</strong>
+<p>上述差值只是待解释的残差，不是已测得的互斥时间段。带宽估计、GPU 忙时与墙钟时间来自不同口径，需要同次运行时间线才能做归因。
 每一段对应一层优化：带宽（换卡/量化）、kernel 效率（L2）、launch 开销（CUDA Graph，<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a>）。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L0/0.5-tensor-to-text.html">&#8592; 0.5 文本闭环（下）：从 logits 到你看到的那段文字</a><a class="nav-next" href="../L1/1.2-tensor-core-lineage.html">1.2 Tensor Core 世代史与 sm_120 的岔路 &#8594;</a></nav>
 </main>

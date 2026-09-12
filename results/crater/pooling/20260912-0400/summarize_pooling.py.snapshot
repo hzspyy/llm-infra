@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""从 5.12 的原始 JSON 汇总派生统计，不重跑实验。
+
+    python summarize_pooling.py results/crater/pooling/20260912-0400
+
+各阶段分目录存放（脚本按固定文件名落盘，共用一个目录会互相覆盖）：
+  data/       三点 roofline 与 batch 上限
+  data-bge/   bge-small 的 batch 扫描与变长对照
+  data-qwen/  同一 backbone 用 --convert embed 当 embedding 服务
+"""
+from __future__ import annotations
+
+import json
+import statistics
+import sys
+from pathlib import Path
+
+
+def agg(rows):
+    """按并发档位聚合多次重复，取中位数。"""
+    by_k = {}
+    for r in rows:
+        k = r["n_requests"]
+        by_k.setdefault(k, []).append(r)
+    out = []
+    for k in sorted(by_k):
+        group = by_k[k]
+        def med(key):
+            vals = [g[key] for g in group if g.get(key) is not None]
+            return round(statistics.median(vals), 3) if vals else None
+        eng = [g["engine_per_request_ms"] for g in group]
+        out.append({
+            "concurrency": k, "repeats": len(group),
+            "req_per_s": med("req_per_s"), "tokens_per_s": med("tokens_per_s"),
+            "lat_mean_ms": med("lat_mean_ms"), "lat_p50_ms": med("lat_p50_ms"),
+            "lat_p95_ms": med("lat_p95_ms"),
+            "engine_e2e_ms": round(statistics.median(
+                [e["e2e"] for e in eng if e.get("e2e") is not None]), 3),
+            "engine_inference_ms": round(statistics.median(
+                [e["inference"] for e in eng if e.get("inference") is not None]), 3),
+            "engine_queue_ms": round(statistics.median(
+                [e["queue"] for e in eng if e.get("queue") is not None]), 4),
+            "prompt_tokens_total": med("prompt_tokens_total"),
+            "errors": sum(len(g.get("errors") or []) for g in group),
+        })
+    for row in out:
+        if row["lat_mean_ms"] and row["engine_e2e_ms"]:
+            row["client_minus_engine_ms"] = round(
+                row["lat_mean_ms"] - row["engine_e2e_ms"], 3)
+    return out
+
+
+def main():
+    root = Path(sys.argv[1])
+    out = {"dir": str(root)}
+    for sub in ("data-bge", "data-qwen", "data"):
+        d = root / sub
+        if not d.is_dir():
+            continue
+        for name in ("serving-fixed", "serving-variable"):
+            f = d / f"{name}.json"
+            if f.exists():
+                rows = json.loads(f.read_text())["rows"]
+                out[f"{sub}/{name}"] = agg(rows)
+                out[f"{sub}/{name}_raw_rows"] = len(rows)
+        f = d / "roofline.json"
+        if f.exists():
+            r = json.loads(f.read_text())
+            out["roofline_env"] = r["env"]
+            out["roofline_points"] = [
+                {k: p[k] for k in ("mode", "B", "L", "C", "ms", "arithmetic_intensity",
+                                   "achieved_tflops", "achieved_gbps", "pct_of_peak", "bound")}
+                for p in r["points"]]
+            out["padding"] = {k: v for k, v in r["padding"].items() if k != "lengths_head"}
+        f = d / "batch_limit.json"
+        if f.exists():
+            b = json.loads(f.read_text())
+            out["batch_limit"] = {"analytic": b["analytic"], "measured": b["measured"]}
+    for name in ("boundary-fit", "boundary-fit-multi", "boundary-gen"):
+        f = root / f"{name}.log"
+        if f.exists():
+            out[name] = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+    for name in ("startup-gen-small-budget", "startup-pool-small-budget", "startup-pool-fit-budget"):
+        f = root / f"{name}.txt"
+        if f.exists():
+            out[name] = f.read_text().strip()
+    (root / "summary.json").write_text(json.dumps(out, ensure_ascii=False, indent=2))
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

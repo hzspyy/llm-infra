@@ -4,26 +4,26 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.3 优化阶梯 I：memory-bound 算子</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">2.3</div>
   <div class="sidebar-title">优化阶梯 I：memory-bound 算子</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">心智模型：把大量局部和逐级合并</a></li>
 <li><a href="#_3">机制拆解</a><ul>
-<li><a href="#v0">v0：又慢又错，而且是同一个原因</a></li>
+<li><a href="#v0">v0：全局原子竞争同时影响性能与数值</a></li>
 <li><a href="#v1253">v1：253 倍提升，来自消除竞争</a></li>
-<li><a href="#v2-v3">v2 / v3：教科书优化，增量为零</a></li>
+<li><a href="#v2-v3">v2 / v3：所测配置未显示额外收益</a></li>
 <li><a href="#v4">v4：每次访存指令读取更多元素</a></li>
 <li><a href="#v5-v6-4">v5 / v6：最后的 4%</a></li>
-<li><a href="#pytorch-17">打过 PyTorch 17%</a></li>
+<li><a href="#pytorch">在所测连续归约上比较 PyTorch 与专用实现</a></li>
 </ul>
 </li>
 <li><a href="#llm">工程实现 · 源码走读：LLM 里的归约在哪</a><ul>
@@ -34,7 +34,7 @@
 </li>
 <li><a href="#_4">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_5">建议你做的消融</a></li>
+<li><a href="#_5">消融建议</a></li>
 </ul>
 </li>
 <li><a href="#_6">原始现场</a></li>
@@ -44,13 +44,46 @@
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：把大量局部和逐级合并</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#v0">v0：全局原子竞争同时影响性能与数值</a></li>
+<li><a href="#v1253">v1：253 倍提升，来自消除竞争</a></li>
+<li><a href="#v2-v3">v2 / v3：所测配置未显示额外收益</a></li>
+<li><a href="#v4">v4：每次访存指令读取更多元素</a></li>
+<li><a href="#v5-v6-4">v5 / v6：最后的 4%</a></li>
+<li><a href="#pytorch">在所测连续归约上比较 PyTorch 与专用实现</a></li>
+</ul>
+</li>
+<li><a href="#llm">工程实现 · 源码走读：LLM 里的归约在哪</a><ul>
+<li><a href="#1-rmsnorm">1. RMSNorm 就是一个归约 + 逐元素</a></li>
+<li><a href="#2-fused_add_rms_norm">2. fused_add_rms_norm：融合掉一次往返</a></li>
+<li><a href="#3-attention-online-softmax">3. attention 里的 online softmax 也是归约</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_5">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
   <div class="mod-id">2.3</div>
   <h1>优化阶梯 I：memory-bound 算子</h1>
-  <p class="lede">用数组求和串联线程分工、共享内存归约、shuffle、向量化和数值误差；每步检查适用范围，不把单个样例的收益写成普遍规律。</p>
+  <p class="lede">逐步实现连续归约，比较原子操作、分块、向量化与数值累加的代价。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88 · torch 2.13.0</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（带宽与 Little&#x27;s Law）· L2.1（占用率与尾效应）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
@@ -65,6 +98,8 @@
 <hr />
 <h2 id="_2">心智模型：把大量局部和逐级合并</h2>
 <figure>
+
+
 <svg viewBox="0 0 740 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="归约优化阶梯">
   <g font-size="11.5" fill="currentColor">
     <text x="12" y="18" font-size="12.5" font-weight="600">归约 256 MB fp32：每一步的实测增量（下界 0.160 ms）</text>
@@ -117,12 +152,14 @@
     <text x="12" y="396" font-size="10.5" opacity="0.8">而换成 fp64 累加会慢 4.7 倍：<tspan font-weight="600">精度不是免费的</tspan>。</text>
   </g>
 </svg>
+
+
 <figcaption>七个版本的实测。注意 v1→v2→v3 三步完全平坦，v3→v4 才是真正的跳变。</figcaption>
 </figure>
 
 <hr />
 <h2 id="_3">机制拆解</h2>
-<h3 id="v0">v0：又慢又错，而且是同一个原因</h3>
+<h3 id="v0">v0：全局原子竞争同时影响性能与数值</h3>
 <div class="highlight"><pre><span></span><code><span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">red_v0</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">float</span><span class="o">*</span><span class="w"> </span><span class="n">in</span><span class="p">,</span><span class="w"> </span><span class="kt">float</span><span class="o">*</span><span class="w"> </span><span class="n">out</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">n</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 <span class="w">    </span><span class="kt">size_t</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blockIdx</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">blockDim</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="p">;</span>
 <span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">n</span><span class="p">)</span><span class="w"> </span><span class="n">atomicAdd</span><span class="p">(</span><span class="n">out</span><span class="p">,</span><span class="w"> </span><span class="n">in</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span><span class="w">       </span><span class="c1">// 6700 万个线程抢同一个地址</span>
@@ -172,7 +209,7 @@ GPU v6 (fp32 分层)   67108864.0   相对误差 0.00e+00
 </code></pre></div>
 
 <p>82.897 → 0.328 ms，<strong>253 倍</strong>。到达带宽上限的 49%。</p>
-<h3 id="v2-v3">v2 / v3：教科书优化，增量为零</h3>
+<h3 id="v2-v3">v2 / v3：所测配置未显示额外收益</h3>
 <p>经典的《CUDA 归约优化》教程会告诉你接下来该做两件事：</p>
 <ol>
 <li><strong>最后一个 warp 用 shuffle</strong>：warp 内天然同步，不需要 <code>__syncthreads</code></li>
@@ -262,9 +299,9 @@ v4 用的是 <code>grid = ceil(n4 / 256) = 65536</code> 个 block = 64.3 个波�
 <p><strong>v6：每线程 4 个独立累加器</strong></p>
 <p>0.160 → 0.160 ms，<strong>+0.2%</strong>（在噪声内）。</p>
 <p>ILP 在这里没用，因为已经完全 memory-bound——
-FADD 的延迟早就被访存延迟掩盖了。<strong>这是一个诚实的负结果</strong>：
+FADD 的延迟早就被访存延迟掩盖了。<strong>这组对照未观察到收益</strong>：
 <a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 里 ILP 对 compute-bound kernel 很关键，这里没用。</p>
-<h3 id="pytorch-17">打过 PyTorch 17%</h3>
+<h3 id="pytorch">在所测连续归约上比较 PyTorch 与专用实现</h3>
 <table>
 <thead>
 <tr>
@@ -316,12 +353,12 @@ FADD 的延迟早就被访存延迟掩盖了。<strong>这是一个诚实的负�
 <p><strong>手写 60 行比 PyTorch 快 17%。</strong> 为什么？</p>
 <p>因为 <code>torch.sum</code> 是<strong>通用</strong>的：要处理任意 shape、任意 stride、任意 dtype、
 沿任意维度归约、还要支持 autograd。这些通用性在 kernel 里表现为
-额外的索引计算和分支。我们的版本只做一件事：连续 fp32 全归约。</p>
+额外的索引计算和分支。本章版本只支持连续 fp32 全归约。</p>
 <p>专用实现可以利用固定的输入条件减少通用处理开销。
 比较时应同时列出它不支持的情况；本例不能推出手写 kernel 普遍快于框架算子。</p>
 <p>最后一行值得单独看：<strong>fp64 累加慢 4.7 倍</strong>（301 vs 1431 GB/s）。
 读的字节数完全一样，但消费级 GPU 的 fp64 算力只有 fp32 的 1/64，
-于是从 memory-bound 变成了 compute-bound。<strong>精度不是免费的</strong>（<a class="xref" href="../L4/4.2-numerics.html" title="数值系统与确定性">L4.2</a> 会展开）。</p>
+这提示高精度累加可能改变主要成本；确定瓶颈仍需结合相应指令吞吐和计数器。<strong>精度不是免费的</strong>（<a class="xref" href="../L4/4.2-numerics.html" title="数值系统与确定性">L4.2</a> 会展开）。</p>
 <hr />
 <h2 id="llm">工程实现 · 源码走读：LLM 里的归约在哪</h2>
 <h3 id="1-rmsnorm">1. RMSNorm 就是一个归约 + 逐元素</h3>
@@ -350,7 +387,7 @@ RMSNorm 是每行 2048 个元素归约成 1 个，有 batch×seq 行。</p>
 <p>按 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 的带宽算，每次省 8 MB / 1674 GB/s ≈ 4.8 µs，
 952 次就是 4.5 ms —— 但注意那是 17 步的总和，每步约 0.27 ms。
 对照 decode 每步 4.3 ms 的墙钟，<strong>融合省下约 6%</strong>。</p>
-<p><strong>这就是 <a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>（算子融合）的基本盘。</strong></p>
+<p><strong>这就是 <a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>（算子融合）的基本盘。</strong></p>
 <h3 id="3-attention-online-softmax">3. attention 里的 online softmax 也是归约</h3>
 <p>FlashAttention 的核心是把 softmax 的两次归约（求 max、求 sum）
 变成<strong>单遍在线更新</strong>，避免把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 的中间矩阵写回显存。
@@ -401,7 +438,7 @@ Volta 之后必须用带 <code>_sync</code> 后缀的版本——因为独立线
 python<span class="w"> </span>labs/L2/torch_reduce_ref.py<span class="w"> </span><span class="m">256</span><span class="w">      </span><span class="c1"># 与 PyTorch 对照</span>
 </code></pre></div>
 
-<h3 id="_5">建议你做的消融</h3>
+<h3 id="_5">消融建议</h3>
 <table>
 <thead>
 <tr>
@@ -437,7 +474,7 @@ python<span class="w"> </span>labs/L2/torch_reduce_ref.py<span class="w"> </span
 </tbody>
 </table>
 <p>第一行最值得做：它会让你意识到<strong>"最优 kernel"是相对于数据规模的</strong>，
-这也是 cuBLAS/cuDNN 要做 autotuning 的原因（<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）。</p>
+这也是 cuBLAS/cuDNN 要做 autotuning 的原因（<a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>）。</p>
 <hr />
 <h2 id="_6">原始现场</h2>
 <details>
@@ -521,7 +558,7 @@ python<span class="w"> </span>labs/L2/torch_reduce_ref.py<span class="w"> </span
 <tbody>
 <tr>
 <td><strong>算子融合</strong></td>
-<td>归约往往夹在逐元素操作中间（RMSNorm = 归约 + 缩放）。融合能省掉整趟显存往返。vLLM 的 <code>fused_add_rms_norm</code>、torch.compile 的 Inductor 都在做（<a class="xref" href="../L2/2.7-compiler-stack.html" title="编译器栈：torch.compile 到 MLIR">L2.7</a>）</td>
+<td>归约往往夹在逐元素操作中间（RMSNorm = 归约 + 缩放）。融合能省掉整趟显存往返。vLLM 的 <code>fused_add_rms_norm</code>、torch.compile 的 Inductor 都在做（<a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>）</td>
 </tr>
 <tr>
 <td><strong>持久化 kernel + 单次 launch 多归约</strong></td>

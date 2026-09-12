@@ -4,16 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.4 优化阶梯 II：逐步实现 GEMM</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">2.4</div>
   <div class="sidebar-title">优化阶梯 II：逐步实现 GEMM</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">心智模型：把数据从"远"搬到"近"，然后尽量多用几次</a></li>
@@ -35,7 +35,7 @@
 </li>
 <li><a href="#_4">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_5">建议你做的消融</a></li>
+<li><a href="#_5">消融建议</a></li>
 </ul>
 </li>
 <li><a href="#_6">原始现场</a></li>
@@ -45,13 +45,47 @@
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：把数据从"远"搬到"近"，然后尽量多用几次</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#v0-025-decode">v0：算术强度 0.25，比 decode 还低</a></li>
+<li><a href="#v1-12">v1：共享内存分块只带来 1.2 倍 —— 为什么</a></li>
+<li><a href="#v251">v2：5.1 倍 —— 整条阶梯上最关键的一步</a></li>
+<li><a href="#v3-113">v3：向量化只带来 1.13 倍</a></li>
+<li><a href="#v5-v6bank-62">v5 → v6：bank 冲突值 62%</a></li>
+<li><a href="#cublas-34">还差 cuBLAS 34%：剩下的是什么</a></li>
+<li><a href="#v6-cublas">一个意外的发现：v6 与 cuBLAS 逐位相同</a></li>
+</ul>
+</li>
+<li><a href="#gemm">工程实现 · 源码走读：真实 GEMM 里的这些手段</a><ul>
+<li><a href="#1-cutlass-kernel">1. CUTLASS kernel 名里的每一段</a></li>
+<li><a href="#2-tile-128128">2. 为什么 tile 是 128×128 而不是别的</a></li>
+<li><a href="#3-llm-gemm">3. LLM 里的 GEMM 形状很特殊</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_5">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
   <div class="mod-id">2.4</div>
   <h1>优化阶梯 II：逐步实现 GEMM</h1>
-  <p class="lede">沿 fp32 与 bf16 两条路线学习分块、外积累加、共享内存布局和 Tensor Core；保留数值比较，同时区分输出一致与实现顺序一致。</p>
+  <p class="lede">从朴素 GEMM 到分块和 Tensor Core，结合源码、布局与计时分析优化取舍。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88 · cuBLAS</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（内存层次、bank 冲突）· L1.2（tensor core 峰值）· L2.1（占用率）· L2.3（向量化）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
@@ -66,6 +100,8 @@
 <hr />
 <h2 id="_2">心智模型：把数据从"远"搬到"近"，然后尽量多用几次</h2>
 <figure>
+
+
 <svg viewBox="0 0 740 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GEMM 优化阶梯">
   <g font-size="11.5" fill="currentColor">
     <text x="12" y="18" font-size="12.5" font-weight="600">GEMM 4096³ = 137.4 GFLOP，实测阶梯</text>
@@ -119,6 +155,8 @@
     <text x="12" y="422" font-size="11" opacity="0.85">"读 8+8 个数做 64 次乘加"——<tspan font-weight="600">外积累加（outer product）</tspan>。</text>
   </g>
 </svg>
+
+
 <figcaption>fp32 与 bf16 两条阶梯的实测。注意 v1 几乎没有收益，而 v2 与 v6 各有一次大跳变。</figcaption>
 </figure>
 
@@ -218,7 +256,7 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 <thead>
 <tr>
 <th>手段</th>
-<th>我们有吗</th>
+<th>本章实现</th>
 <th>说明</th>
 </tr>
 </thead>
@@ -285,11 +323,11 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 
 <ul>
 <li><code>128x64_64</code> = block tile M×N，BK=64 —— 对照我们的 128×128×32</li>
-<li><code>x3</code> = <strong>3 段软件流水</strong>（我们是 0 段，即无双缓冲）</li>
+<li><code>x3</code> = <strong>3 段软件流水</strong>（本章版本没有双缓冲）</li>
 <li><code>align8</code> = 按 8 个元素（16 字节）对齐，可用 <code>LDG.128</code> —— 我们的 v6 也做了</li>
 <li><code>s16816</code> = <code>m16n8k16</code> —— 和我们的 WMMA 底层是同一条指令</li>
 </ul>
-<p><strong>我们的 v6 和它的差距，主要就在那个 <code>x3</code>。</strong></p>
+<p>三段流水是可见的实现差异之一。要量化它对性能差距的贡献，仍需控制 tile、布局等变量做对照。</p>
 <h3 id="2-tile-128128">2. 为什么 tile 是 128×128 而不是别的</h3>
 <p>三个硬约束同时卡着：</p>
 <p><strong>共享内存</strong>（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测每 block 上限 99 KB）：</p>
@@ -392,7 +430,7 @@ nvcc<span class="w"> </span>...<span class="w"> </span>-c<span class="w"> </span
 python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp/gl.log
 </code></pre></div>
 
-<h3 id="_5">建议你做的消融</h3>
+<h3 id="_5">消融建议</h3>
 <table>
 <thead>
 <tr>

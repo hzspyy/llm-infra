@@ -4,19 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>3.3 Decode 侧 attention</title>
-<link rel="stylesheet" href="../assets/style.css?v=60262162">
-<link rel="stylesheet" href="../assets/code.css?v=60262162">
+<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
 
 </head>
 <body>
 <aside class="sidebar">
-  <a class="sidebar-home" href="../index.html">&#8592; 全景地图</a>
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">3.3</div>
   <div class="sidebar-title">Decode 侧 attention</div>
-  <nav class="toc"><div class="toc">
+  <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
-<li><a href="#decode-1">一 · decode 的算术强度是 1</a></li>
+<li><a href="#bf16-mha-1">一 · bf16 MHA 的简化算术强度为 1</a></li>
 <li><a href="#gqa-mqa">二 · GQA / MQA：把读取量按比例砍掉</a><ul>
 <li><a href="#_2">换算成真实模型</a></li>
 <li><a href="#mla">MLA：本章没有实测</a></li>
@@ -27,8 +27,8 @@
 <li><a href="#flashinfer">五 · 广度：FlashInfer 的主场</a></li>
 <li><a href="#_4">六 · 设计取舍</a><ul>
 <li><a href="#61-prefill-decode-kernel">6.1 prefill 与 decode 是两道题，不该用一个 kernel</a></li>
-<li><a href="#62-gqa">6.2 GQA 是一次质量换带宽的交易，而且交易条件很好</a></li>
-<li><a href="#63-split-k">6.3 split-K 为什么是免费的</a></li>
+<li><a href="#62-gqa-kv">6.2 GQA 减少 KV 容量，也改变模型参数化</a></li>
+<li><a href="#63-split-k">6.3 split-K 用中间存储和归约换取并行度</a></li>
 </ul>
 </li>
 <li><a href="#lab">七 · 动手 lab</a></li>
@@ -37,32 +37,56 @@
 </ul>
 </div>
 </nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#bf16-mha-1">一 · bf16 MHA 的简化算术强度为 1</a></li>
+<li><a href="#gqa-mqa">二 · GQA / MQA：把读取量按比例砍掉</a><ul>
+<li><a href="#_2">换算成真实模型</a></li>
+<li><a href="#mla">MLA：本章没有实测</a></li>
+</ul>
+</li>
+<li><a href="#bh-170-sm">三 · 并行度：只有 B·H 个单元怎么喂饱 170 个 SM</a></li>
+<li><a href="#_3">四 · 分页布局的代价</a></li>
+<li><a href="#flashinfer">五 · 广度：FlashInfer 的主场</a></li>
+<li><a href="#_4">六 · 设计取舍</a><ul>
+<li><a href="#61-prefill-decode-kernel">6.1 prefill 与 decode 是两道题，不该用一个 kernel</a></li>
+<li><a href="#62-gqa-kv">6.2 GQA 减少 KV 容量，也改变模型参数化</a></li>
+<li><a href="#63-split-k">6.3 split-K 用中间存储和归约换取并行度</a></li>
+</ul>
+</li>
+<li><a href="#lab">七 · 动手 lab</a></li>
+<li><a href="#_5">八 · 陷阱</a></li>
+<li><a href="#_6">九 · 自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">全景地图</a> <span>&#8250;</span> L3 · Attention 与序列核心</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L3 · Attention 与序列核心</div>
   <div class="mod-id">3.3</div>
   <h1>Decode 侧 attention</h1>
-  <p class="lede">decode 是另一道题：算术强度恒为 1，与 S、D 都无关，永远在带宽侧。GQA 收益线性且可预测（相对 MHA 逐行跟住字节比）；B·H=8 就跑满 170 个 SM 的带宽，证明 split-K 存在。并置 SDPA 与 FlashInfer——后者 prefill 输、decode 赢 1.83 倍。</p>
+  <p class="lede">分析 decode 的 KV 读取、头共享与 split-K，并区分分页模拟和真实分页 kernel。</p>
   <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · flashinfer 0.6.18</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 3.1（分块与 online softmax）· 3.2（并行度）· 0.2（roofline）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>3.1 和 3.2 讲的都是 prefill：Q 有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 行，attention 是一道 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup></mrow></math></span> 的题。
 decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩下的是一道完全不同的题：
 <strong>读完整个 KV cache，只为算出一个 token。</strong></p>
 <ol>
-<li>为什么 decode 必然是访存受限，而且怎么调都走不出去？</li>
+<li>哪些假设下 decode attention 的算术强度接近 1，何时会改变？</li>
 <li>GQA/MQA/MLA 到底省了什么？收益是线性的吗？</li>
 <li>单请求长上下文 decode，只有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 个并行单元，怎么喂饱 170 个 SM？</li>
 </ol>
 <hr />
-<h2 id="decode-1">一 · decode 的算术强度是 1</h2>
+<h2 id="bf16-mha-1">一 · bf16 MHA 的简化算术强度为 1</h2>
 <p>一步 decode，单头：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi></mrow></math></span> 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><mi>D</mi></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>K</mi><mo>&#x0002F;</mo><mi>V</mi></mrow></math></span> 各是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>D</mi></mrow></math></span>。</p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>FLOP</mtext><mo>&#x0003D;</mo><munder><munder><mrow><mn>2</mn><mi>S</mi><mi>D</mi></mrow><mo>&#x23DF;</mo></munder><mrow><mi>q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>2</mn><mi>S</mi><mi>D</mi></mrow><mo>&#x23DF;</mo></munder><mrow><mi>p</mi><mi>V</mi></mrow></munder><mo>&#x0003D;</mo><mn>4</mn><mi>S</mi><mi>D</mi></mrow></math></div></p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>字节</mtext><mo>&#x0003D;</mo><munder><munder><mrow><mn>2</mn><mo>&#x000B7;</mo><mi>S</mi><mo>&#x000B7;</mo><mi>D</mi><mo>&#x000B7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mtext>读&#x000A0;K&#x000A0;和&#x000A0;V,&#x000A0;bf16</mtext></mrow></munder><mo>&#x0003D;</mo><mn>4</mn><mi>S</mi><mi>D</mi><mspace width="2em" /><mo stretchy="false">&#x00028;</mo><mi>Q</mi><mo>&#x0002C;</mo><mi>O</mi><mtext>&#x000A0;只有&#x000A0;</mtext><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>D</mi><mo stretchy="false">&#x00029;</mo><mtext>，忽略</mtext><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>I</mi><mo>&#x0003D;</mo><mfrac><mrow><mn>4</mn><mi>S</mi><mi>D</mi></mrow><mrow><mn>4</mn><mi>S</mi><mi>D</mi></mrow></mfrac><mo>&#x0003D;</mo><menclose notation="box"><mrow><mn>1</mn><mtext>&#x000A0;</mtext><mtext>FLOP/byte</mtext></mrow></menclose></mrow></math></div></p>
-<p><strong>和 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 都无关。</strong> 这张卡的机器平衡点是 144.3 FLOP/byte
-（232 TFLOP/s ÷ 1608.6 GB/s）。1 远远小于它，
-所以 decode attention <strong>永远</strong>在带宽一侧，再怎么优化 kernel 都走不出去。</p>
+<p>在上述 bf16、MHA、每份 K/V 只服务一个 query 头的模型中，比值与 S、D 无关。232 TFLOP/s ÷ 1608.6 GB/s≈144.2 FLOP/byte 是本机微基准参照。低算术强度提示访存可能重要，但短序列也可能受提交与并行度限制；GQA 的跨头复用、KV 量化和投机验证都会改变这个比值。</p>
 <p>结论是：decode attention 的时间下限就是"把 KV cache 按带宽读一遍要多久"。
 优化只有两条路——<strong>读得更快</strong>（榨满带宽）或<strong>读得更少</strong>（GQA/MLA/量化/稀疏）。</p>
 <p>实测（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>H</mi><mo>&#x0003D;</mo><mn>32</mn></mrow></math></span>, <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>, bf16）：</p>
@@ -82,7 +106,7 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 <tr>
 <td style="text-align: right;">1</td>
 <td style="text-align: right;">1024</td>
-<td style="text-align: right;">16.0 MB</td>
+<td style="text-align: right;">16.0 MiB</td>
 <td style="text-align: right;">是</td>
 <td style="text-align: right;">0.0168</td>
 <td style="text-align: right;">999.6</td>
@@ -91,7 +115,7 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 <tr>
 <td style="text-align: right;">1</td>
 <td style="text-align: right;">4096</td>
-<td style="text-align: right;">64.0 MB</td>
+<td style="text-align: right;">64.0 MiB</td>
 <td style="text-align: right;">是</td>
 <td style="text-align: right;">0.0432</td>
 <td style="text-align: right;">1552.3</td>
@@ -100,7 +124,7 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 <tr>
 <td style="text-align: right;">1</td>
 <td style="text-align: right;">16384</td>
-<td style="text-align: right;">256.0 MB</td>
+<td style="text-align: right;">256.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.1735</td>
 <td style="text-align: right;">1547.1</td>
@@ -109,7 +133,7 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 <tr>
 <td style="text-align: right;">1</td>
 <td style="text-align: right;">65536</td>
-<td style="text-align: right;">1024.0 MB</td>
+<td style="text-align: right;">1024.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.6500</td>
 <td style="text-align: right;">1652.0</td>
@@ -118,7 +142,7 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 <tr>
 <td style="text-align: right;">8</td>
 <td style="text-align: right;">4096</td>
-<td style="text-align: right;">512.0 MB</td>
+<td style="text-align: right;">512.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.3350</td>
 <td style="text-align: right;">1602.4</td>
@@ -127,7 +151,7 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 <tr>
 <td style="text-align: right;">32</td>
 <td style="text-align: right;">4096</td>
-<td style="text-align: right;">2048.0 MB</td>
+<td style="text-align: right;">2048.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">1.4656</td>
 <td style="text-align: right;">1465.3</td>
@@ -136,7 +160,7 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 <tr>
 <td style="text-align: right;">256</td>
 <td style="text-align: right;">4096</td>
-<td style="text-align: right;">16384.0 MB</td>
+<td style="text-align: right;">16384.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">10.4607</td>
 <td style="text-align: right;">1642.3</td>
@@ -158,10 +182,8 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <p>教训：报"占峰值多少"之前，先确认分子和分母<strong>是同一种访存</strong>。</p>
 </div>
 <div class="admonition note">
-<p class="admonition-title">L2 这次做成了一列，而不是又一个坑</p>
-<p>2.0、2.7 各栽过一次"工作集装进 L2、测出超过 DRAM 上限"。
-这次直接把"在 L2?"做成表格的一列。
-前两行标"是"的，量的是 L2 不是 DRAM——它们的数字不该和后面几行放在一起比。</p>
+<p class="admonition-title">工作集大小与缓存命中不同</p>
+<p>表中的容量判断只说明 KV 是否小于已记录的 96 MiB L2，并不证明实际命中 L2。其他张量、访问顺序和缓存策略都会影响驻留。大于 L2 的工作集是检查持续显存带宽的必要条件之一；实际层级流量仍需计数器。</p>
 </div>
 <hr />
 <h2 id="gqa-mqa">二 · GQA / MQA：把读取量按比例砍掉</h2>
@@ -189,7 +211,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <tr>
 <td style="text-align: right;">32</td>
 <td style="text-align: right;">MHA</td>
-<td style="text-align: right;">4096.0 MB</td>
+<td style="text-align: right;">4096.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">2.9300</td>
 <td style="text-align: right;">1465.8</td>
@@ -199,7 +221,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <tr>
 <td style="text-align: right;">16</td>
 <td style="text-align: right;">GQA</td>
-<td style="text-align: right;">2048.0 MB</td>
+<td style="text-align: right;">2048.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">1.6606</td>
 <td style="text-align: right;">1293.2</td>
@@ -209,7 +231,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <tr>
 <td style="text-align: right;">8</td>
 <td style="text-align: right;">GQA</td>
-<td style="text-align: right;">1024.0 MB</td>
+<td style="text-align: right;">1024.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.6508</td>
 <td style="text-align: right;">1649.8</td>
@@ -219,7 +241,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <tr>
 <td style="text-align: right;">4</td>
 <td style="text-align: right;">GQA</td>
-<td style="text-align: right;">512.0 MB</td>
+<td style="text-align: right;">512.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.3333</td>
 <td style="text-align: right;">1610.6</td>
@@ -229,7 +251,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <tr>
 <td style="text-align: right;">2</td>
 <td style="text-align: right;">GQA</td>
-<td style="text-align: right;">256.0 MB</td>
+<td style="text-align: right;">256.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.1739</td>
 <td style="text-align: right;">1544.0</td>
@@ -239,7 +261,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <tr>
 <td style="text-align: right;">1</td>
 <td style="text-align: right;">MQA</td>
-<td style="text-align: right;">128.0 MB</td>
+<td style="text-align: right;">128.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.0947</td>
 <td style="text-align: right;">1417.2</td>
@@ -250,20 +272,16 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 </table>
 <p><strong>「相对 MHA」逐行跟住「字节比」。</strong> 这不是巧合，是第一节那个结论的直接推论：
 时间 = 字节 ÷ 带宽，带宽基本恒定，所以时间正比于字节。</p>
-<p>GQA 的收益因此是<strong>线性且可预测的</strong>——不需要实测就能算出来。
+<p>KV 容量随头数线性变化，但时间还取决于跨头复用、实际流量和 kernel 选择，必须实测。
 （单行偏差 1.76 vs 2、4.50 vs 4 来自带宽列本身在 1293–1650 之间的抖动。）</p>
-<div class="admonition warning">
-<p class="admonition-title">这张表的第一版是错的，超线性</p>
-<p>第一版用 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x0003D;</mo><mn>8</mn></mrow></math></span>，于是 KV 头数 2 和 1 那两档的 KV 只有 64 MB 和 32 MB，
-<strong>装得进 96 MiB 的 L2</strong>。测出来"相对 MHA"是 20.99× 和 30.53×，
-而字节比只有 16× 和 32×——2 头那档超线性，看起来像"GQA 有额外收益"。</p>
-<p>那是 L2 带宽冒充了 DRAM 带宽。把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi></mrow></math></span> 改成 32，让最小的一档也有 128 MB，
-超线性就消失了。<strong>凡是测出"超过理论比例的收益"，先查工作集有没有掉进 cache。</strong></p>
+<div class="admonition note">
+<p class="admonition-title">对照时同时检查工作集与后端</p>
+<p>较小 batch 会使少头数配置的 KV 落入 L2 容量范围，改变缓存条件；但大于 L2 也不保证速度严格按字节比变化。上表仍有 4.50× 对 4×、8.79× 对 8× 的偏差，不能写成“超线性消失”。应检查实际流量、kernel 选择与重复样本。</p>
 </div>
 <h3 id="_2">换算成真实模型</h3>
 <p>Qwen3-1.7B：28 层，16 query 头，<strong>8 KV 头</strong>（GQA <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>g</mi><mo>&#x0003D;</mo><mn>2</mn></mrow></math></span>），head_dim 128。</p>
 <p>每 token 每层 KV = <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn><mtext>B</mtext><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span> B，
-28 层合计 <strong>114688 B ≈ 112 KB/token</strong>：</p>
+28 层合计 <strong>114688 B = 112 KiB/token</strong>：</p>
 <table>
 <thead>
 <tr>
@@ -274,15 +292,15 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <tbody>
 <tr>
 <td style="text-align: right;">4096</td>
-<td style="text-align: right;">448.0 MB</td>
+<td style="text-align: right;">448.0 MiB</td>
 </tr>
 <tr>
 <td style="text-align: right;">32768</td>
-<td style="text-align: right;">3584.0 MB</td>
+<td style="text-align: right;">3584.0 MiB</td>
 </tr>
 <tr>
 <td style="text-align: right;">131072</td>
-<td style="text-align: right;">14336.0 MB</td>
+<td style="text-align: right;">14336.0 MiB</td>
 </tr>
 </tbody>
 </table>
@@ -324,7 +342,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 <tbody>
 <tr>
 <td style="text-align: right;">1024</td>
-<td style="text-align: right;">4.0 MB</td>
+<td style="text-align: right;">4.0 MiB</td>
 <td style="text-align: right;">是</td>
 <td style="text-align: right;">0.0106</td>
 <td style="text-align: right;">393.9</td>
@@ -332,7 +350,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 </tr>
 <tr>
 <td style="text-align: right;">4096</td>
-<td style="text-align: right;">16.0 MB</td>
+<td style="text-align: right;">16.0 MiB</td>
 <td style="text-align: right;">是</td>
 <td style="text-align: right;">0.0207</td>
 <td style="text-align: right;">808.6</td>
@@ -340,7 +358,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 </tr>
 <tr>
 <td style="text-align: right;">16384</td>
-<td style="text-align: right;">64.0 MB</td>
+<td style="text-align: right;">64.0 MiB</td>
 <td style="text-align: right;">是</td>
 <td style="text-align: right;">0.0413</td>
 <td style="text-align: right;">1623.7</td>
@@ -348,7 +366,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 </tr>
 <tr>
 <td style="text-align: right;">65536</td>
-<td style="text-align: right;">256.0 MB</td>
+<td style="text-align: right;">256.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.1764</td>
 <td style="text-align: right;">1522.1</td>
@@ -356,7 +374,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 </tr>
 <tr>
 <td style="text-align: right;">262144</td>
-<td style="text-align: right;">1024.0 MB</td>
+<td style="text-align: right;">1024.0 MiB</td>
 <td style="text-align: right;">否</td>
 <td style="text-align: right;">0.6604</td>
 <td style="text-align: right;">1625.9</td>
@@ -366,9 +384,9 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 </table>
 <p><strong>8 个并行单元把 170 个 SM 的带宽跑满了。</strong>
 如果只沿 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 切分，8 个单元最多用 8/170 = 4.7% 的 SM，
-不可能达到 100% 的带宽。所以 PyTorch 的这条 decode 路径<strong>确实做了 split-K</strong>。</p>
+不可能达到 100% 的带宽。这些吞吐结果支持继续检查其他并行维度，但不能仅凭 SM 占比证明 split-K；需核对 kernel grid 与实现。</p>
 <p>前两行的 24.5% 和 50.3% 不是并行度不足的证据——那是工作集太小
-（4 MB、16 MB），根本没有足够的字节去填满流水。</p>
+（4 MiB、16 MiB），根本没有足够的字节去填满流水。</p>
 <p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>H</mi><mo>&#x0003D;</mo><mn>32</mn></mrow></math></span> 那组同样在长上下文上贴顶（102.5%、104.8%）。</p>
 <hr />
 <h2 id="_3">四 · 分页布局的代价</h2>
@@ -401,13 +419,13 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 </tbody>
 </table>
 <p>慢 5 倍。</p>
-<div class="admonition danger">
-<p class="admonition-title">这个 5 倍是上界，不是 vLLM 的真实代价</p>
-<p>我这里的做法是<strong>先把分散的块 gather 成一个连续张量，再跑普通 attention</strong>。
+<div class="admonition warning">
+<p class="admonition-title">该比值只描述 gather 模拟，不是性能上界</p>
+<p>本章模拟的做法是<strong>先把分散的块 gather 成一个连续张量，再跑普通 attention</strong>。
 这多了一次全量的读+写，本身就要 2× 的流量，加上 gather 的不规则访存。</p>
 <p>真实的 paged attention kernel <strong>在 kernel 内部按 block table 直接寻址</strong>，
 不产生这份拷贝——K/V 仍然只读一遍，只是地址来自查表。
-所以真实代价远小于 5×。</p>
+因此它与框架层 gather 的流量不同；真实代价尚未测量，不能由此给出严格大小关系。</p>
 <p><strong>本节量的是"如果你用最朴素的方式实现分页会有多贵"</strong>，
 它的用处是说明为什么必须写专门的 kernel，而不是在框架层 gather。
 真实实现的代价要在 5.2 里量。</p>
@@ -502,309 +520,296 @@ FlashInfer 在真实服务里的表现。</strong></p>
 </tbody>
 </table>
 <p>两列<strong>没有一行是相同的</strong>。所以引擎里 prefill 和 decode 走不同的 kernel、
-不同的调度、甚至不同的机器（PD 分离，<span class="xref pending" title="PD 分离：KV cache 成为数据平面（尚未写）">L6.4</span>）。
+不同的调度、甚至不同的机器（PD 分离，<span class="xref pending" title="PD 分离：KV cache 成为数据平面（后续章节）">L6.4</span>）。
 把它们当成"同一个算子的两种输入形状"是这一层最常见的误解。</p>
 <p>这也解释了 3.2 那个看似矛盾的结果：同一个库在两种形状上排名相反。
 <strong>问"哪个 attention 实现最快"是一个没有答案的问题</strong>，
 必须先说是哪一相、什么长度、多大批。</p>
-<h3 id="62-gqa">6.2 GQA 是一次质量换带宽的交易，而且交易条件很好</h3>
-<p>GQA 减少 KV 头数会损失表达能力——这是真的代价。
-但从本章的账看，它换来的东西非常大：</p>
-<ul>
-<li>带宽按比例下降（实测线性，第二节）</li>
-<li>KV cache 按比例缩小，直接决定并发数（0.2 那本账）</li>
-<li><strong>而 query 头数不变</strong>，模型的主要参数量和表达力在 query 侧保留</li>
-</ul>
-<p>关键在于最后一条：GQA 只压缩了"需要被反复读取"的那部分（KV），
-没有动"只读一次"的那部分（权重）。<strong>它精确地压在瓶颈上。</strong></p>
-<p>对比一个坏的交易：直接减少层数或 hidden_size 也能减小 KV，
-但同时把模型能力砍掉了。GQA 的设计好在<strong>找到了一个几乎只影响带宽、
-不太影响能力的维度</strong>。</p>
-<p>MLA 是把这个思路推到极致（57× 的压缩比，第二节）——
-代价是要多做一次投影，也就是<strong>用算力换带宽</strong>。
-在一个算术强度只有 1 的场景里，这个方向是对的：算力大把闲着。
-（但我没有实测，见第二节末尾。）</p>
-<h3 id="63-split-k">6.3 split-K 为什么是免费的</h3>
+<h3 id="62-gqa-kv">6.2 GQA 减少 KV 容量，也改变模型参数化</h3>
+<p>query 头数固定时，减少 KV 头数按比例减少缓存元素，也减少 K/V 投影矩阵的参数。多个 query 头若能复用同一份 K/V 读取，算术强度会随共享程度提高；是否达到该复用取决于 kernel。</p>
+<p>这不是对已有 MHA 模型的无损存储变换。GQA 和 MLA 各自有训练与质量约束，不能从缓存字节量直接推断表达能力或端到端加速。MLA 还可通过矩阵吸收避免显式还原完整 K/V；本章没有实测该路径。</p>
+<h3 id="63-split-k">6.3 split-K 用中间存储和归约换取并行度</h3>
 <p>split-K 需要把 KV 切段、各段独立算、最后归约。
-归约用的是 3.1 那个合并公式，<strong>它是精确的</strong>——所以 split-K 不改变结果。</p>
+归约用的是 3.1 那个合并公式，<strong>它是精确的</strong>——所以 split-K 在实数算术下等价；浮点结果仍需按容限验证。</p>
 <p>代价只有两项：一点额外的中间存储（每段的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi><mo>&#x0002C;</mo><mi>l</mi><mo>&#x0002C;</mo><mi>O</mi></mrow></math></span>），
 和一次小规模归约。相比它换来的东西（并行度从 8 提到几百），
 这笔交易几乎没有反对理由。</p>
 <p>这也是为什么 FlashDecoding 能被迅速普遍采用：
-和 3.1 §7.1 说的一样，<strong>精确的优化不需要任何人重新评估质量</strong>。</p>
+和 3.1 §7.1 说的一样，实数等价的优化仍需做数值、边界和端到端回归检查。</p>
 <hr />
 <h2 id="lab">七 · 动手 lab</h2>
-<div class="highlight"><pre><span></span><code>ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'source /scratch/learn/env.sh &amp;&amp; cd /scratch/learn/work/labs/L3 &amp;&amp; /scratch/learn/envs/serve/bin/python decode_attention.py'</span>
+<div class="highlight"><pre><span></span><code><span class="c1"># 需要 CUDA GPU、PyTorch 和匹配版本的 FlashInfer</span>
+python<span class="w"> </span>labs/L3/decode_attention.py
 </code></pre></div>
 
 <p>原始输出：<code>results/crater/attn/33_decode_attention.txt</code>。</p>
-<details class="fold srcfold"><summary>labs/L3/decode_attention.py 全文（267 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos">  1</span><span class="ch">#!/usr/bin/env python3</span>
-<span class="linenos">  2</span><span class="sd">"""L3.3 —— decode 侧 attention：完全不同的一道题。</span>
-<span class="linenos">  3</span>
-<span class="linenos">  4</span><span class="sd">prefill 时 Q 有 S 行，attention 是 S×S 的二次问题（3.1/3.2）。</span>
-<span class="linenos">  5</span><span class="sd">decode 时 Q 只有 1 行，那个二次项直接消失，剩下的是</span>
-<span class="linenos">  6</span><span class="sd">「读完整个 KV cache，只为算一个 token」—— 一道纯访存题。</span>
-<span class="linenos">  7</span>
-<span class="linenos">  8</span><span class="sd">  [A] 算术强度：decode 为什么必然是访存受限</span>
-<span class="linenos">  9</span><span class="sd">  [B] GQA / MQA：把 KV 读取量按比例砍掉</span>
-<span class="linenos"> 10</span><span class="sd">  [C] 并行度：单请求长上下文 decode 为什么需要 split-K</span>
-<span class="linenos"> 11</span><span class="sd">  [D] 分页布局要付多少代价</span>
-<span class="linenos"> 12</span><span class="sd">  [E] 广度：SDPA 与 FlashInfer 的 decode 路径</span>
-<span class="linenos"> 13</span>
-<span class="linenos"> 14</span><span class="sd">用法：</span>
-<span class="linenos"> 15</span><span class="sd">    python decode_attention.py</span>
-<span class="linenos"> 16</span><span class="sd">    python decode_attention.py B C</span>
-<span class="linenos"> 17</span><span class="sd">"""</span>
-<span class="linenos"> 18</span>
-<span class="linenos"> 19</span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="linenos"> 20</span><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
-<span class="linenos"> 21</span>
-<span class="linenos"> 22</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="linenos"> 23</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
-<span class="linenos"> 24</span>
-<span class="linenos"> 25</span><span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
-<span class="linenos"> 26</span><span class="c1"># decode attention 只读不写 KV，所以参照应当用**只读**带宽而不是 copy 带宽。</span>
-<span class="linenos"> 27</span><span class="c1"># L1.1 实测 crater: copy 1519.3 GB/s（含读+写两份流量），readonly 1608.6 GB/s。</span>
-<span class="linenos"> 28</span><span class="n">PEAK_BW</span> <span class="o">=</span> <span class="mf">1608.6</span>        <span class="c1"># 只读带宽，GB/s</span>
-<span class="linenos"> 29</span><span class="n">PEAK_COPY</span> <span class="o">=</span> <span class="mf">1519.3</span>
-<span class="linenos"> 30</span><span class="n">PEAK_TF</span> <span class="o">=</span> <span class="mf">232.0</span>         <span class="c1"># L1.2 实测 bf16 上限 TFLOP/s</span>
-<span class="linenos"> 31</span><span class="n">L2_MB</span> <span class="o">=</span> <span class="mf">96.0</span>            <span class="c1"># 这张卡的 L2；工作集小于它时测的是 L2 不是 DRAM</span>
-<span class="linenos"> 32</span>
-<span class="linenos"> 33</span>
-<span class="linenos"> 34</span><span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
-<span class="linenos"> 35</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
-<span class="linenos"> 36</span>
-<span class="linenos"> 37</span>
-<span class="linenos"> 38</span><span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
-<span class="linenos"> 39</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
-<span class="linenos"> 40</span>
-<span class="linenos"> 41</span>
-<span class="linenos"> 42</span><span class="k">def</span><span class="w"> </span><span class="nf">timeit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">30</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">10</span><span class="p">):</span>
-<span class="linenos"> 43</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">warmup</span><span class="p">):</span>
-<span class="linenos"> 44</span>        <span class="n">fn</span><span class="p">()</span>
-<span class="linenos"> 45</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-<span class="linenos"> 46</span>    <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos"> 47</span>    <span class="n">a</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
-<span class="linenos"> 48</span>    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
-<span class="linenos"> 49</span>        <span class="n">fn</span><span class="p">()</span>
-<span class="linenos"> 50</span>    <span class="n">b</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
-<span class="linenos"> 51</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-<span class="linenos"> 52</span>    <span class="k">return</span> <span class="n">a</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
-<span class="linenos"> 53</span>
-<span class="linenos"> 54</span>
-<span class="linenos"> 55</span><span class="c1"># ---------------------------------------------------------------- A</span>
-<span class="linenos"> 56</span><span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
-<span class="linenos"> 57</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[A] decode 的算术强度：为什么它必然是访存受限"</span><span class="p">)</span>
-<span class="linenos"> 58</span>
-<span class="linenos"> 59</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  一步 decode，单头：Q 是 1×D，K/V 各是 S×D。"</span><span class="p">)</span>
-<span class="linenos"> 60</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    FLOP: qK^T 2SD + pV 2SD = 4SD"</span><span class="p">)</span>
-<span class="linenos"> 61</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    字节: 读 K/V = 2·S·D·2 = 4SD（bf16）；Q 与 O 只有 O(D)，忽略"</span><span class="p">)</span>
-<span class="linenos"> 62</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    算术强度 = 4SD / 4SD = **1 FLOP/byte**"</span><span class="p">)</span>
-<span class="linenos"> 63</span>    <span class="nb">print</span><span class="p">()</span>
-<span class="linenos"> 64</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  而这张卡的机器平衡点是 </span><span class="si">{</span><span class="n">PEAK_TF</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e12</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">PEAK_BW</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e9</span><span class="p">)</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> FLOP/byte。"</span><span class="p">)</span>
-<span class="linenos"> 65</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  1 远小于它，**而且与 S、D 都无关** —— 再怎么调也走不出访存一侧。"</span><span class="p">)</span>
-<span class="linenos"> 66</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  batch 能帮忙：B 条请求共享一次权重读取，但 KV 是各自的，读取量线性增长。"</span><span class="p">)</span>
-<span class="linenos"> 67</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以 decode attention 的上限就是：把 KV cache 按带宽读一遍要多久。"</span><span class="p">)</span>
-<span class="linenos"> 68</span>
-<span class="linenos"> 69</span>    <span class="n">D</span><span class="p">,</span> <span class="n">H</span> <span class="o">=</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">32</span>
-<span class="linenos"> 70</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> bf16，逐个 (batch, kv_len) 量实际带宽"</span><span class="p">)</span>
-<span class="linenos"> 71</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  参照：只读带宽 </span><span class="si">{</span><span class="n">PEAK_BW</span><span class="si">}</span><span class="s2"> GB/s。L2=</span><span class="si">{</span><span class="n">L2_MB</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> MiB —— "</span>
-<span class="linenos"> 72</span>          <span class="sa">f</span><span class="s2">"工作集小于它时量的是 L2，不是 DRAM。"</span><span class="p">)</span>
-<span class="linenos"> 73</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'kv_len'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'KV 大小'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'在 L2?'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos"> 74</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'占只读峰值'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos"> 75</span>    <span class="k">for</span> <span class="n">B</span><span class="p">,</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1024</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">16384</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">65536</span><span class="p">),</span>
-<span class="linenos"> 76</span>                 <span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">128</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">256</span><span class="p">,</span> <span class="mi">4096</span><span class="p">)]:</span>
-<span class="linenos"> 77</span>        <span class="k">try</span><span class="p">:</span>
-<span class="linenos"> 78</span>            <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos"> 79</span>            <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos"> 80</span>            <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos"> 81</span>        <span class="k">except</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">OutOfMemoryError</span><span class="p">:</span>
-<span class="linenos"> 82</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">  显存不够"</span><span class="p">);</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">();</span> <span class="k">continue</span>
-<span class="linenos"> 83</span>        <span class="n">kv_bytes</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
-<span class="linenos"> 84</span>        <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">))</span>
-<span class="linenos"> 85</span>        <span class="n">gbs</span> <span class="o">=</span> <span class="n">kv_bytes</span> <span class="o">/</span> <span class="n">t</span> <span class="o">/</span> <span class="mf">1e6</span>
-<span class="linenos"> 86</span>        <span class="n">in_l2</span> <span class="o">=</span> <span class="s2">"是"</span> <span class="k">if</span> <span class="n">kv_bytes</span> <span class="o">/</span> <span class="n">MB</span> <span class="o">&lt;=</span> <span class="n">L2_MB</span> <span class="k">else</span> <span class="s2">"否"</span>
-<span class="linenos"> 87</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB </span><span class="si">{</span><span class="n">in_l2</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos"> 88</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">gbs</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">gbs</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">PEAK_BW</span><span class="si">:</span><span class="s2">&gt;9.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos"> 89</span>        <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
-<span class="linenos"> 90</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos"> 91</span>
-<span class="linenos"> 92</span>
-<span class="linenos"> 93</span><span class="c1"># ---------------------------------------------------------------- B</span>
-<span class="linenos"> 94</span><span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
-<span class="linenos"> 95</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[B] GQA / MQA：直接砍 KV 的读取量"</span><span class="p">)</span>
-<span class="linenos"> 96</span>
-<span class="linenos"> 97</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  MHA：每个 query 头有自己的 K/V 头     -&gt; KV 头数 = H"</span><span class="p">)</span>
-<span class="linenos"> 98</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  GQA：若干 query 头共享一组 K/V        -&gt; KV 头数 = H/g"</span><span class="p">)</span>
-<span class="linenos"> 99</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  MQA：所有 query 头共享一组 K/V        -&gt; KV 头数 = 1"</span><span class="p">)</span>
-<span class="linenos">100</span>    <span class="nb">print</span><span class="p">()</span>
-<span class="linenos">101</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  decode 是访存受限（[A] 节），KV 读取量按比例下降，时间就该按比例下降。"</span><span class="p">)</span>
-<span class="linenos">102</span>
-<span class="linenos">103</span>    <span class="c1"># B 取 32：让 KV 头数=1 时的 KV（128 MB）也大于 L2（96 MiB），</span>
-<span class="linenos">104</span>    <span class="c1"># 否则小 KV 那几档量的是 L2 带宽，会得到超线性的假加速。</span>
-<span class="linenos">105</span>    <span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">HQ</span> <span class="o">=</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8192</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">32</span>
-<span class="linenos">106</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> kv_len=</span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> query 头=</span><span class="si">{</span><span class="n">HQ</span><span class="si">}</span><span class="s2"> bf16"</span><span class="p">)</span>
-<span class="linenos">107</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'KV 头数'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'名称'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'KV 大小'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'在 L2?'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">108</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对 MHA'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'字节比'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">109</span>    <span class="n">base</span> <span class="o">=</span> <span class="kc">None</span>
-<span class="linenos">110</span>    <span class="k">for</span> <span class="n">hkv</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">]:</span>
-<span class="linenos">111</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">HQ</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">112</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">hkv</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">113</span>        <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">hkv</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">114</span>        <span class="n">kv_bytes</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">hkv</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
-<span class="linenos">115</span>        <span class="c1"># enable_gqa 让 SDPA 直接吃不同的 KV 头数，不用手工 expand</span>
-<span class="linenos">116</span>        <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">enable_gqa</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
-<span class="linenos">117</span>        <span class="k">if</span> <span class="n">base</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-<span class="linenos">118</span>            <span class="n">base</span> <span class="o">=</span> <span class="n">t</span>
-<span class="linenos">119</span>        <span class="n">name</span> <span class="o">=</span> <span class="s2">"MHA"</span> <span class="k">if</span> <span class="n">hkv</span> <span class="o">==</span> <span class="n">HQ</span> <span class="k">else</span> <span class="p">(</span><span class="s2">"MQA"</span> <span class="k">if</span> <span class="n">hkv</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="s2">"GQA"</span><span class="p">)</span>
-<span class="linenos">120</span>        <span class="n">in_l2</span> <span class="o">=</span> <span class="s2">"是"</span> <span class="k">if</span> <span class="n">kv_bytes</span> <span class="o">/</span> <span class="n">MB</span> <span class="o">&lt;=</span> <span class="n">L2_MB</span> <span class="k">else</span> <span class="s2">"否"</span>
-<span class="linenos">121</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">hkv</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB </span><span class="si">{</span><span class="n">in_l2</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">122</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">base</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2">× </span><span class="si">{</span><span class="n">HQ</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">hkv</span><span class="si">:</span><span class="s2">&gt;7.0f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
-<span class="linenos">123</span>        <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
-<span class="linenos">124</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos">125</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  「相对 MHA」应当与最后一列「字节比」一致 —— 一致就说明"</span><span class="p">)</span>
-<span class="linenos">126</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  时间确实由 KV 读取量决定，GQA 的收益是线性的、可预测的。"</span><span class="p">)</span>
-<span class="linenos">127</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  若某一行明显超过字节比，先查它是不是已经装进 L2 了。"</span><span class="p">)</span>
-<span class="linenos">128</span>
-<span class="linenos">129</span>    <span class="n">sub</span><span class="p">(</span><span class="s2">"换算成一个真实模型的 KV cache"</span><span class="p">)</span>
-<span class="linenos">130</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  Qwen3-1.7B: 28 层, 16 query 头, 8 KV 头, head_dim 128 (GQA g=2)"</span><span class="p">)</span>
-<span class="linenos">131</span>    <span class="n">L</span><span class="p">,</span> <span class="n">hkv</span><span class="p">,</span> <span class="n">D2</span> <span class="o">=</span> <span class="mi">28</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">128</span>
-<span class="linenos">132</span>    <span class="k">for</span> <span class="n">ctx</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">32768</span><span class="p">,</span> <span class="mi">131072</span><span class="p">]:</span>
-<span class="linenos">133</span>        <span class="n">per_tok</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">L</span> <span class="o">*</span> <span class="n">hkv</span> <span class="o">*</span> <span class="n">D2</span> <span class="o">*</span> <span class="mi">2</span>                <span class="c1"># K和V, bf16</span>
-<span class="linenos">134</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    上下文 </span><span class="si">{</span><span class="n">ctx</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">: 每 token </span><span class="si">{</span><span class="n">per_tok</span><span class="si">}</span><span class="s2"> B, 单请求 KV = "</span>
-<span class="linenos">135</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">per_tok</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2"> MB"</span><span class="p">)</span>
-<span class="linenos">136</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"    若是 MHA（16 个 KV 头），上面每个数字都要乘 2。"</span><span class="p">)</span>
-<span class="linenos">137</span>
-<span class="linenos">138</span>
-<span class="linenos">139</span><span class="c1"># ---------------------------------------------------------------- C</span>
-<span class="linenos">140</span><span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
-<span class="linenos">141</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 并行度：单请求长上下文 decode 为什么需要 split-K"</span><span class="p">)</span>
-<span class="linenos">142</span>
-<span class="linenos">143</span>    <span class="n">sm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">multi_processor_count</span>
-<span class="linenos">144</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  这张卡 </span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2"> 个 SM。decode 时 Q 只有 1 行："</span><span class="p">)</span>
-<span class="linenos">145</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  沿 batch×head 切分能得到的并行单元只有 B·H 个。"</span><span class="p">)</span>
-<span class="linenos">146</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  B=1、H=32 时只有 32 个单元 —— 一多半 SM 闲着，无论上下文多长。"</span><span class="p">)</span>
-<span class="linenos">147</span>    <span class="nb">print</span><span class="p">()</span>
-<span class="linenos">148</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  FlashDecoding 的做法：**再沿 KV 长度切分**（split-K），"</span><span class="p">)</span>
-<span class="linenos">149</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  每段各自算局部的 m/l/O，最后用 3.1 的合并公式归约到一起。"</span><span class="p">)</span>
-<span class="linenos">150</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  判据：固定 B·H 很小，把 kv_len 拉长。"</span><span class="p">)</span>
-<span class="linenos">151</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  若没有 split-K，带宽利用率会随 kv_len 停在低位；有的话会随之上升。"</span><span class="p">)</span>
-<span class="linenos">152</span>
-<span class="linenos">153</span>    <span class="n">D</span> <span class="o">=</span> <span class="mi">128</span>
-<span class="linenos">154</span>    <span class="k">for</span> <span class="n">B</span><span class="p">,</span> <span class="n">H</span> <span class="ow">in</span> <span class="p">[(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">)]:</span>
-<span class="linenos">155</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">  (B·H=</span><span class="si">{</span><span class="n">B</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">H</span><span class="si">}</span><span class="s2">, 占 SM 的 </span><span class="si">{</span><span class="n">B</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">H</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">sm</span><span class="si">:</span><span class="s2">.0%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
-<span class="linenos">156</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'kv_len'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'KV 大小'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'在 L2?'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">157</span>              <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'占只读峰值'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">158</span>        <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="mi">16384</span><span class="p">,</span> <span class="mi">65536</span><span class="p">,</span> <span class="mi">262144</span><span class="p">]:</span>
-<span class="linenos">159</span>            <span class="k">try</span><span class="p">:</span>
-<span class="linenos">160</span>                <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">161</span>                <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">162</span>                <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">163</span>            <span class="k">except</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">OutOfMemoryError</span><span class="p">:</span>
-<span class="linenos">164</span>                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">  显存不够"</span><span class="p">);</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">();</span> <span class="k">continue</span>
-<span class="linenos">165</span>            <span class="n">kv</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
-<span class="linenos">166</span>            <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">))</span>
-<span class="linenos">167</span>            <span class="n">gbs</span> <span class="o">=</span> <span class="n">kv</span> <span class="o">/</span> <span class="n">t</span> <span class="o">/</span> <span class="mf">1e6</span>
-<span class="linenos">168</span>            <span class="n">in_l2</span> <span class="o">=</span> <span class="s2">"是"</span> <span class="k">if</span> <span class="n">kv</span> <span class="o">/</span> <span class="n">MB</span> <span class="o">&lt;=</span> <span class="n">L2_MB</span> <span class="k">else</span> <span class="s2">"否"</span>
-<span class="linenos">169</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB </span><span class="si">{</span><span class="n">in_l2</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">gbs</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">170</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">gbs</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">PEAK_BW</span><span class="si">:</span><span class="s2">&gt;9.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">171</span>            <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
-<span class="linenos">172</span>            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos">173</span>
-<span class="linenos">174</span>
-<span class="linenos">175</span><span class="c1"># ---------------------------------------------------------------- D</span>
-<span class="linenos">176</span><span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
-<span class="linenos">177</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 分页布局要付多少代价"</span><span class="p">)</span>
-<span class="linenos">178</span>
-<span class="linenos">179</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  vLLM 的 KV cache 不是每条序列一段连续内存，而是若干固定大小的块，"</span><span class="p">)</span>
-<span class="linenos">180</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  用 block table 记录逻辑块-&gt;物理块（5.2）。好处是不用预留最大长度；"</span><span class="p">)</span>
-<span class="linenos">181</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  代价是读 KV 时要先查表再 gather。这里量一下 gather 本身有多贵。"</span><span class="p">)</span>
-<span class="linenos">182</span>
-<span class="linenos">183</span>    <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">BLK</span> <span class="o">=</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8192</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">16</span>
-<span class="linenos">184</span>    <span class="n">S</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">8192</span><span class="p">,</span> <span class="mi">128</span>
-<span class="linenos">185</span>    <span class="n">nblk</span> <span class="o">=</span> <span class="n">S</span> <span class="o">//</span> <span class="n">BLK</span>
-<span class="linenos">186</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2"> kv_len=</span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> 块大小=</span><span class="si">{</span><span class="n">BLK</span><span class="si">}</span><span class="s2"> -&gt; 每条序列 </span><span class="si">{</span><span class="n">nblk</span><span class="si">}</span><span class="s2"> 块"</span><span class="p">)</span>
-<span class="linenos">187</span>
-<span class="linenos">188</span>    <span class="c1"># 连续布局</span>
-<span class="linenos">189</span>    <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">190</span>    <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">191</span>    <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">192</span>    <span class="n">t_cont</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">))</span>
-<span class="linenos">193</span>
-<span class="linenos">194</span>    <span class="c1"># 分页布局：物理块池 + 打乱的 block table</span>
-<span class="linenos">195</span>    <span class="n">pool_k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">nblk</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">BLK</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">196</span>    <span class="n">pool_v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">nblk</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">BLK</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">197</span>    <span class="n">perm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randperm</span><span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">nblk</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
-<span class="linenos">198</span>    <span class="n">table</span> <span class="o">=</span> <span class="n">perm</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">nblk</span><span class="p">)</span>
-<span class="linenos">199</span>
-<span class="linenos">200</span>    <span class="k">def</span><span class="w"> </span><span class="nf">paged</span><span class="p">():</span>
-<span class="linenos">201</span>        <span class="c1"># gather 出每条序列的 KV，再走同一个 attention</span>
-<span class="linenos">202</span>        <span class="n">kk</span> <span class="o">=</span> <span class="n">pool_k</span><span class="p">[</span><span class="n">table</span><span class="p">]</span>                      <span class="c1"># [B, nblk, H, BLK, D]</span>
-<span class="linenos">203</span>        <span class="n">vv</span> <span class="o">=</span> <span class="n">pool_v</span><span class="p">[</span><span class="n">table</span><span class="p">]</span>
-<span class="linenos">204</span>        <span class="n">kk</span> <span class="o">=</span> <span class="n">kk</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span>
-<span class="linenos">205</span>        <span class="n">vv</span> <span class="o">=</span> <span class="n">vv</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span>
-<span class="linenos">206</span>        <span class="k">return</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">kk</span><span class="p">,</span> <span class="n">vv</span><span class="p">)</span>
-<span class="linenos">207</span>
-<span class="linenos">208</span>    <span class="n">t_paged</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="n">paged</span><span class="p">)</span>
-<span class="linenos">209</span>    <span class="n">kv_bytes</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
-<span class="linenos">210</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'布局'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对连续'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">211</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'连续'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_cont</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_cont</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="mf">1.0</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
-<span class="linenos">212</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'分页 + 显式 gather'</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_paged</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">213</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_paged</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_cont</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_paged</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
-<span class="linenos">214</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  注意：这里的 gather 是**显式物化**成连续张量再算，"</span><span class="p">)</span>
-<span class="linenos">215</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  是分页代价的**上界**。真实的 paged attention kernel 在 kernel 内部"</span><span class="p">)</span>
-<span class="linenos">216</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  按 block table 直接寻址，不产生这份拷贝 —— 5.2 会看真实实现。"</span><span class="p">)</span>
-<span class="linenos">217</span>    <span class="k">del</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">pool_k</span><span class="p">,</span> <span class="n">pool_v</span>
-<span class="linenos">218</span>    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos">219</span>
-<span class="linenos">220</span>
-<span class="linenos">221</span><span class="c1"># ---------------------------------------------------------------- E</span>
-<span class="linenos">222</span><span class="k">def</span><span class="w"> </span><span class="nf">section_E</span><span class="p">():</span>
-<span class="linenos">223</span>    <span class="n">title</span><span class="p">(</span><span class="s2">"[E] 广度：SDPA 与 FlashInfer 的 decode 路径"</span><span class="p">)</span>
-<span class="linenos">224</span>
-<span class="linenos">225</span>    <span class="n">D</span> <span class="o">=</span> <span class="mi">128</span>
-<span class="linenos">226</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'B'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'H'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'Hkv'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'kv_len'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'SDPA ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
-<span class="linenos">227</span>          <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'FlashInfer ms'</span><span class="si">:</span><span class="s2">&gt;14</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'比值'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">228</span>    <span class="k">for</span> <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8192</span><span class="p">),</span> <span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8192</span><span class="p">),</span>
-<span class="linenos">229</span>                         <span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">65536</span><span class="p">)]:</span>
-<span class="linenos">230</span>        <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">231</span>        <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">232</span>        <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-<span class="linenos">233</span>        <span class="n">t_sdpa</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">enable_gqa</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
-<span class="linenos">234</span>        <span class="n">t_fi</span> <span class="o">=</span> <span class="kc">None</span>
-<span class="linenos">235</span>        <span class="k">try</span><span class="p">:</span>
-<span class="linenos">236</span>            <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
-<span class="linenos">237</span>            <span class="c1"># FlashInfer 的单请求 decode 接口：q [H,D], k/v [S,Hkv,D]</span>
-<span class="linenos">238</span>            <span class="k">if</span> <span class="n">B</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
-<span class="linenos">239</span>                <span class="n">q2</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span>
-<span class="linenos">240</span>                <span class="n">k2</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
-<span class="linenos">241</span>                <span class="n">v2</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
-<span class="linenos">242</span>                <span class="n">t_fi</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">single_decode_with_kv_cache</span><span class="p">(</span><span class="n">q2</span><span class="p">,</span> <span class="n">k2</span><span class="p">,</span> <span class="n">v2</span><span class="p">))</span>
-<span class="linenos">243</span>        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                              <span class="c1"># noqa: BLE001</span>
-<span class="linenos">244</span>            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    (FlashInfer: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[</span><span class="mi">0</span><span class="p">][:</span><span class="mi">80</span><span class="p">]</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
-<span class="linenos">245</span>            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos">246</span>        <span class="n">fi_s</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">t_fi</span><span class="si">:</span><span class="s2">&gt;14.4f</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">t_fi</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'—'</span><span class="si">:</span><span class="s2">&gt;14</span><span class="si">}</span><span class="s2">"</span>
-<span class="linenos">247</span>        <span class="n">ratio</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">t_sdpa</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_fi</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2">×"</span> <span class="k">if</span> <span class="n">t_fi</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'—'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span>
-<span class="linenos">248</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">H</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">HKV</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_sdpa</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">fi_s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ratio</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">249</span>        <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
-<span class="linenos">250</span>        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
-<span class="linenos">251</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  FlashInfer 的批量接口需要先 plan（建 block table 与调度），"</span><span class="p">)</span>
-<span class="linenos">252</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">"  单次调用的对比会低估它在服务里的价值。5.2/5.3 会在真实引擎里看。"</span><span class="p">)</span>
-<span class="linenos">253</span>
-<span class="linenos">254</span>
-<span class="linenos">255</span><span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span>
-<span class="linenos">256</span>            <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">,</span> <span class="s2">"E"</span><span class="p">:</span> <span class="n">section_E</span><span class="p">}</span>
-<span class="linenos">257</span>
-<span class="linenos">258</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
-<span class="linenos">259</span>    <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
-<span class="linenos">260</span>    <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
-<span class="linenos">261</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">  SM </span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">multi_processor_count</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos">262</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"参照：只读 </span><span class="si">{</span><span class="n">PEAK_BW</span><span class="si">}</span><span class="s2"> / copy </span><span class="si">{</span><span class="n">PEAK_COPY</span><span class="si">}</span><span class="s2"> GB/s, bf16 </span><span class="si">{</span><span class="n">PEAK_TF</span><span class="si">}</span><span class="s2"> TFLOP/s "</span>
-<span class="linenos">263</span>          <span class="sa">f</span><span class="s2">"(L1.1/L1.2 实测)  L2 </span><span class="si">{</span><span class="n">L2_MB</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> MiB"</span><span class="p">)</span>
-<span class="linenos">264</span>    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
-<span class="linenos">265</span>        <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
-<span class="linenos">266</span>    <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
-<span class="linenos">267</span>    <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<details class="fold srcfold"><summary>labs/L3/decode_attention.py 全文（267 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""L3.3 —— decode 侧 attention：完全不同的一道题。</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">prefill 时 Q 有 S 行，attention 是 S×S 的二次问题（3.1/3.2）。</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">decode 时 Q 只有 1 行，那个二次项直接消失，剩下的是</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="sd">「读完整个 KV cache，只为算一个 token」—— 一道纯访存题。</span>
+<span class="linenos" aria-hidden="true">  7</span> 
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">  [A] 算术强度：decode 为什么必然是访存受限</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="sd">  [B] GQA / MQA：把 KV 读取量按比例砍掉</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="sd">  [C] 并行度：单请求长上下文 decode 为什么需要 split-K</span>
+<span class="linenos" aria-hidden="true"> 11</span> <span class="sd">  [D] 分页布局要付多少代价</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">  [E] 广度：SDPA 与 FlashInfer 的 decode 路径</span>
+<span class="linenos" aria-hidden="true"> 13</span> 
+<span class="linenos" aria-hidden="true"> 14</span> <span class="sd">用法：</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="sd">    python decode_attention.py</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="sd">    python decode_attention.py B C</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 18</span> 
+<span class="linenos" aria-hidden="true"> 19</span> <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos" aria-hidden="true"> 21</span> 
+<span class="linenos" aria-hidden="true"> 22</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+<span class="linenos" aria-hidden="true"> 24</span> 
+<span class="linenos" aria-hidden="true"> 25</span> <span class="n">MB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="c1"># decode attention 只读不写 KV，所以参照应当用**只读**带宽而不是 copy 带宽。</span>
+<span class="linenos" aria-hidden="true"> 27</span> <span class="c1"># L1.1 实测 crater: copy 1519.3 GB/s（含读+写两份流量），readonly 1608.6 GB/s。</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="n">PEAK_BW</span> <span class="o">=</span> <span class="mf">1608.6</span>        <span class="c1"># 只读带宽，GB/s</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="n">PEAK_COPY</span> <span class="o">=</span> <span class="mf">1519.3</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="n">PEAK_TF</span> <span class="o">=</span> <span class="mf">232.0</span>         <span class="c1"># L1.2 实测 bf16 上限 TFLOP/s</span>
+<span class="linenos" aria-hidden="true"> 31</span> <span class="n">L2_MB</span> <span class="o">=</span> <span class="mf">96.0</span>            <span class="c1"># 这张卡的 L2；工作集小于它时测的是 L2 不是 DRAM</span>
+<span class="linenos" aria-hidden="true"> 32</span> 
+<span class="linenos" aria-hidden="true"> 33</span> 
+<span class="linenos" aria-hidden="true"> 34</span> <span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 35</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 36</span> 
+<span class="linenos" aria-hidden="true"> 37</span> 
+<span class="linenos" aria-hidden="true"> 38</span> <span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 39</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">72</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true"> 40</span> 
+<span class="linenos" aria-hidden="true"> 41</span> 
+<span class="linenos" aria-hidden="true"> 42</span> <span class="k">def</span><span class="w"> </span><span class="nf">timeit</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">30</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="mi">10</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 43</span>     <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">warmup</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 44</span>         <span class="n">fn</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 45</span>     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 46</span>     <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 47</span>     <span class="n">a</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 48</span>     <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 49</span>         <span class="n">fn</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 50</span>     <span class="n">b</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 51</span>     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 52</span>     <span class="k">return</span> <span class="n">a</span><span class="o">.</span><span class="n">elapsed_time</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="o">/</span> <span class="n">n</span>
+<span class="linenos" aria-hidden="true"> 53</span> 
+<span class="linenos" aria-hidden="true"> 54</span> 
+<span class="linenos" aria-hidden="true"> 55</span> <span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos" aria-hidden="true"> 56</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 57</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[A] decode 的算术强度：为什么它必然是访存受限"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 58</span> 
+<span class="linenos" aria-hidden="true"> 59</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  一步 decode，单头：Q 是 1×D，K/V 各是 S×D。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 60</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    FLOP: qK^T 2SD + pV 2SD = 4SD"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 61</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    字节: 读 K/V = 2·S·D·2 = 4SD（bf16）；Q 与 O 只有 O(D)，忽略"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 62</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    算术强度 = 4SD / 4SD = **1 FLOP/byte**"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 63</span>     <span class="nb">print</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 64</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  而这张卡的机器平衡点是 </span><span class="si">{</span><span class="n">PEAK_TF</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e12</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">PEAK_BW</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1e9</span><span class="p">)</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> FLOP/byte。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 65</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  1 远小于它，**而且与 S、D 都无关** —— 再怎么调也走不出访存一侧。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 66</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  batch 能帮忙：B 条请求共享一次权重读取，但 KV 是各自的，读取量线性增长。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 67</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以 decode attention 的上限就是：把 KV cache 按带宽读一遍要多久。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 68</span> 
+<span class="linenos" aria-hidden="true"> 69</span>     <span class="n">D</span><span class="p">,</span> <span class="n">H</span> <span class="o">=</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">32</span>
+<span class="linenos" aria-hidden="true"> 70</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> bf16，逐个 (batch, kv_len) 量实际带宽"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 71</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  参照：只读带宽 </span><span class="si">{</span><span class="n">PEAK_BW</span><span class="si">}</span><span class="s2"> GB/s。L2=</span><span class="si">{</span><span class="n">L2_MB</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> MiB —— "</span>
+<span class="linenos" aria-hidden="true"> 72</span>           <span class="sa">f</span><span class="s2">"工作集小于它时量的是 L2，不是 DRAM。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 73</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'batch'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'kv_len'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'KV 大小'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'在 L2?'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true"> 74</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'占只读峰值'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 75</span>     <span class="k">for</span> <span class="n">B</span><span class="p">,</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1024</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">16384</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">65536</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true"> 76</span>                  <span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">128</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">256</span><span class="p">,</span> <span class="mi">4096</span><span class="p">)]:</span>
+<span class="linenos" aria-hidden="true"> 77</span>         <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 78</span>             <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 79</span>             <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 80</span>             <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 81</span>         <span class="k">except</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">OutOfMemoryError</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 82</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">  显存不够"</span><span class="p">);</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">();</span> <span class="k">continue</span>
+<span class="linenos" aria-hidden="true"> 83</span>         <span class="n">kv_bytes</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos" aria-hidden="true"> 84</span>         <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 85</span>         <span class="n">gbs</span> <span class="o">=</span> <span class="n">kv_bytes</span> <span class="o">/</span> <span class="n">t</span> <span class="o">/</span> <span class="mf">1e6</span>
+<span class="linenos" aria-hidden="true"> 86</span>         <span class="n">in_l2</span> <span class="o">=</span> <span class="s2">"是"</span> <span class="k">if</span> <span class="n">kv_bytes</span> <span class="o">/</span> <span class="n">MB</span> <span class="o">&lt;=</span> <span class="n">L2_MB</span> <span class="k">else</span> <span class="s2">"否"</span>
+<span class="linenos" aria-hidden="true"> 87</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB </span><span class="si">{</span><span class="n">in_l2</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true"> 88</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">gbs</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">gbs</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">PEAK_BW</span><span class="si">:</span><span class="s2">&gt;9.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 89</span>         <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
+<span class="linenos" aria-hidden="true"> 90</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 91</span> 
+<span class="linenos" aria-hidden="true"> 92</span> 
+<span class="linenos" aria-hidden="true"> 93</span> <span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos" aria-hidden="true"> 94</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 95</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[B] GQA / MQA：直接砍 KV 的读取量"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 96</span> 
+<span class="linenos" aria-hidden="true"> 97</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  MHA：每个 query 头有自己的 K/V 头     -&gt; KV 头数 = H"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 98</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  GQA：若干 query 头共享一组 K/V        -&gt; KV 头数 = H/g"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 99</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  MQA：所有 query 头共享一组 K/V        -&gt; KV 头数 = 1"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">100</span>     <span class="nb">print</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">101</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  decode 是访存受限（[A] 节），KV 读取量按比例下降，时间就该按比例下降。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">102</span> 
+<span class="linenos" aria-hidden="true">103</span>     <span class="c1"># B 取 32：让 KV 头数=1 时的 KV（128 MB）也大于 L2（96 MiB），</span>
+<span class="linenos" aria-hidden="true">104</span>     <span class="c1"># 否则小 KV 那几档量的是 L2 带宽，会得到超线性的假加速。</span>
+<span class="linenos" aria-hidden="true">105</span>     <span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">HQ</span> <span class="o">=</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8192</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">32</span>
+<span class="linenos" aria-hidden="true">106</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> kv_len=</span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> query 头=</span><span class="si">{</span><span class="n">HQ</span><span class="si">}</span><span class="s2"> bf16"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">107</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'KV 头数'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'名称'</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'KV 大小'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'在 L2?'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">108</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对 MHA'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'字节比'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">109</span>     <span class="n">base</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">110</span>     <span class="k">for</span> <span class="n">hkv</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">111</span>         <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">HQ</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">112</span>         <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">hkv</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">113</span>         <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">hkv</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">114</span>         <span class="n">kv_bytes</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">hkv</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos" aria-hidden="true">115</span>         <span class="c1"># enable_gqa 让 SDPA 直接吃不同的 KV 头数，不用手工 expand</span>
+<span class="linenos" aria-hidden="true">116</span>         <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">enable_gqa</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">117</span>         <span class="k">if</span> <span class="n">base</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">118</span>             <span class="n">base</span> <span class="o">=</span> <span class="n">t</span>
+<span class="linenos" aria-hidden="true">119</span>         <span class="n">name</span> <span class="o">=</span> <span class="s2">"MHA"</span> <span class="k">if</span> <span class="n">hkv</span> <span class="o">==</span> <span class="n">HQ</span> <span class="k">else</span> <span class="p">(</span><span class="s2">"MQA"</span> <span class="k">if</span> <span class="n">hkv</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="s2">"GQA"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">120</span>         <span class="n">in_l2</span> <span class="o">=</span> <span class="s2">"是"</span> <span class="k">if</span> <span class="n">kv_bytes</span> <span class="o">/</span> <span class="n">MB</span> <span class="o">&lt;=</span> <span class="n">L2_MB</span> <span class="k">else</span> <span class="s2">"否"</span>
+<span class="linenos" aria-hidden="true">121</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">hkv</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB </span><span class="si">{</span><span class="n">in_l2</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">122</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">base</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2">× </span><span class="si">{</span><span class="n">HQ</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">hkv</span><span class="si">:</span><span class="s2">&gt;7.0f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">123</span>         <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
+<span class="linenos" aria-hidden="true">124</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">125</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  「相对 MHA」应当与最后一列「字节比」一致 —— 一致就说明"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">126</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  时间确实由 KV 读取量决定，GQA 的收益是线性的、可预测的。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">127</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  若某一行明显超过字节比，先查它是不是已经装进 L2 了。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">128</span> 
+<span class="linenos" aria-hidden="true">129</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"换算成一个真实模型的 KV cache"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">130</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  Qwen3-1.7B: 28 层, 16 query 头, 8 KV 头, head_dim 128 (GQA g=2)"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">131</span>     <span class="n">L</span><span class="p">,</span> <span class="n">hkv</span><span class="p">,</span> <span class="n">D2</span> <span class="o">=</span> <span class="mi">28</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">128</span>
+<span class="linenos" aria-hidden="true">132</span>     <span class="k">for</span> <span class="n">ctx</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">32768</span><span class="p">,</span> <span class="mi">131072</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">133</span>         <span class="n">per_tok</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">L</span> <span class="o">*</span> <span class="n">hkv</span> <span class="o">*</span> <span class="n">D2</span> <span class="o">*</span> <span class="mi">2</span>                <span class="c1"># K和V, bf16</span>
+<span class="linenos" aria-hidden="true">134</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    上下文 </span><span class="si">{</span><span class="n">ctx</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">: 每 token </span><span class="si">{</span><span class="n">per_tok</span><span class="si">}</span><span class="s2"> B, 单请求 KV = "</span>
+<span class="linenos" aria-hidden="true">135</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">per_tok</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2"> MB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">136</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    若是 MHA（16 个 KV 头），上面每个数字都要乘 2。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">137</span> 
+<span class="linenos" aria-hidden="true">138</span> 
+<span class="linenos" aria-hidden="true">139</span> <span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos" aria-hidden="true">140</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">141</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 并行度：单请求长上下文 decode 为什么需要 split-K"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">142</span> 
+<span class="linenos" aria-hidden="true">143</span>     <span class="n">sm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">multi_processor_count</span>
+<span class="linenos" aria-hidden="true">144</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  这张卡 </span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2"> 个 SM。decode 时 Q 只有 1 行："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">145</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  沿 batch×head 切分能得到的并行单元只有 B·H 个。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">146</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  B=1、H=32 时只有 32 个单元 —— 一多半 SM 闲着，无论上下文多长。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">147</span>     <span class="nb">print</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">148</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  FlashDecoding 的做法：**再沿 KV 长度切分**（split-K），"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">149</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  每段各自算局部的 m/l/O，最后用 3.1 的合并公式归约到一起。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">150</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  判据：固定 B·H 很小，把 kv_len 拉长。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">151</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  若没有 split-K，带宽利用率会随 kv_len 停在低位；有的话会随之上升。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">152</span> 
+<span class="linenos" aria-hidden="true">153</span>     <span class="n">D</span> <span class="o">=</span> <span class="mi">128</span>
+<span class="linenos" aria-hidden="true">154</span>     <span class="k">for</span> <span class="n">B</span><span class="p">,</span> <span class="n">H</span> <span class="ow">in</span> <span class="p">[(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">)]:</span>
+<span class="linenos" aria-hidden="true">155</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2">  (B·H=</span><span class="si">{</span><span class="n">B</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">H</span><span class="si">}</span><span class="s2">, 占 SM 的 </span><span class="si">{</span><span class="n">B</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">H</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">sm</span><span class="si">:</span><span class="s2">.0%</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">156</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'kv_len'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'KV 大小'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'在 L2?'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">157</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'占只读峰值'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">158</span>         <span class="k">for</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="mi">16384</span><span class="p">,</span> <span class="mi">65536</span><span class="p">,</span> <span class="mi">262144</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">159</span>             <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">160</span>                 <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">161</span>                 <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">162</span>                 <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">163</span>             <span class="k">except</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">OutOfMemoryError</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">164</span>                 <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">  显存不够"</span><span class="p">);</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">();</span> <span class="k">continue</span>
+<span class="linenos" aria-hidden="true">165</span>             <span class="n">kv</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos" aria-hidden="true">166</span>             <span class="n">t</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">167</span>             <span class="n">gbs</span> <span class="o">=</span> <span class="n">kv</span> <span class="o">/</span> <span class="n">t</span> <span class="o">/</span> <span class="mf">1e6</span>
+<span class="linenos" aria-hidden="true">168</span>             <span class="n">in_l2</span> <span class="o">=</span> <span class="s2">"是"</span> <span class="k">if</span> <span class="n">kv</span> <span class="o">/</span> <span class="n">MB</span> <span class="o">&lt;=</span> <span class="n">L2_MB</span> <span class="k">else</span> <span class="s2">"否"</span>
+<span class="linenos" aria-hidden="true">169</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">MB</span><span class="si">:</span><span class="s2">&gt;8.1f</span><span class="si">}</span><span class="s2">MB </span><span class="si">{</span><span class="n">in_l2</span><span class="si">:</span><span class="s2">&gt;6</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">gbs</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">170</span>                   <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">gbs</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">PEAK_BW</span><span class="si">:</span><span class="s2">&gt;9.1%</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">171</span>             <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
+<span class="linenos" aria-hidden="true">172</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">173</span> 
+<span class="linenos" aria-hidden="true">174</span> 
+<span class="linenos" aria-hidden="true">175</span> <span class="c1"># ---------------------------------------------------------------- D</span>
+<span class="linenos" aria-hidden="true">176</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_D</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">177</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[D] 分页布局要付多少代价"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">178</span> 
+<span class="linenos" aria-hidden="true">179</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  vLLM 的 KV cache 不是每条序列一段连续内存，而是若干固定大小的块，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">180</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  用 block table 记录逻辑块-&gt;物理块（5.2）。好处是不用预留最大长度；"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">181</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  代价是读 KV 时要先查表再 gather。这里量一下 gather 本身有多贵。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">182</span> 
+<span class="linenos" aria-hidden="true">183</span>     <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">BLK</span> <span class="o">=</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8192</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">16</span>
+<span class="linenos" aria-hidden="true">184</span>     <span class="n">S</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">8192</span><span class="p">,</span> <span class="mi">128</span>
+<span class="linenos" aria-hidden="true">185</span>     <span class="n">nblk</span> <span class="o">=</span> <span class="n">S</span> <span class="o">//</span> <span class="n">BLK</span>
+<span class="linenos" aria-hidden="true">186</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  B=</span><span class="si">{</span><span class="n">B</span><span class="si">}</span><span class="s2"> H=</span><span class="si">{</span><span class="n">H</span><span class="si">}</span><span class="s2"> kv_len=</span><span class="si">{</span><span class="n">S</span><span class="si">}</span><span class="s2"> D=</span><span class="si">{</span><span class="n">D</span><span class="si">}</span><span class="s2"> 块大小=</span><span class="si">{</span><span class="n">BLK</span><span class="si">}</span><span class="s2"> -&gt; 每条序列 </span><span class="si">{</span><span class="n">nblk</span><span class="si">}</span><span class="s2"> 块"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">187</span> 
+<span class="linenos" aria-hidden="true">188</span>     <span class="c1"># 连续布局</span>
+<span class="linenos" aria-hidden="true">189</span>     <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">190</span>     <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">191</span>     <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">192</span>     <span class="n">t_cont</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">193</span> 
+<span class="linenos" aria-hidden="true">194</span>     <span class="c1"># 分页布局：物理块池 + 打乱的 block table</span>
+<span class="linenos" aria-hidden="true">195</span>     <span class="n">pool_k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">nblk</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">BLK</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">196</span>     <span class="n">pool_v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">nblk</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">BLK</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">197</span>     <span class="n">perm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randperm</span><span class="p">(</span><span class="n">B</span> <span class="o">*</span> <span class="n">nblk</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">198</span>     <span class="n">table</span> <span class="o">=</span> <span class="n">perm</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">nblk</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">199</span> 
+<span class="linenos" aria-hidden="true">200</span>     <span class="k">def</span><span class="w"> </span><span class="nf">paged</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">201</span>         <span class="c1"># gather 出每条序列的 KV，再走同一个 attention</span>
+<span class="linenos" aria-hidden="true">202</span>         <span class="n">kk</span> <span class="o">=</span> <span class="n">pool_k</span><span class="p">[</span><span class="n">table</span><span class="p">]</span>                      <span class="c1"># [B, nblk, H, BLK, D]</span>
+<span class="linenos" aria-hidden="true">203</span>         <span class="n">vv</span> <span class="o">=</span> <span class="n">pool_v</span><span class="p">[</span><span class="n">table</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">204</span>         <span class="n">kk</span> <span class="o">=</span> <span class="n">kk</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">205</span>         <span class="n">vv</span> <span class="o">=</span> <span class="n">vv</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">206</span>         <span class="k">return</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">kk</span><span class="p">,</span> <span class="n">vv</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">207</span> 
+<span class="linenos" aria-hidden="true">208</span>     <span class="n">t_paged</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="n">paged</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">209</span>     <span class="n">kv_bytes</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">B</span> <span class="o">*</span> <span class="n">H</span> <span class="o">*</span> <span class="n">S</span> <span class="o">*</span> <span class="n">D</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos" aria-hidden="true">210</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  </span><span class="si">{</span><span class="s1">'布局'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'GB/s'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'相对连续'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">211</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'连续'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_cont</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_cont</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="mf">1.0</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">212</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'分页 + 显式 gather'</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_paged</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">213</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">kv_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_paged</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e6</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_cont</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_paged</span><span class="si">:</span><span class="s2">&gt;8.2f</span><span class="si">}</span><span class="s2">×"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">214</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  注意：这里的 gather 是**显式物化**成连续张量再算，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">215</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  是分页代价的**上界**。真实的 paged attention kernel 在 kernel 内部"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">216</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  按 block table 直接寻址，不产生这份拷贝 —— 5.2 会看真实实现。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">217</span>     <span class="k">del</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">pool_k</span><span class="p">,</span> <span class="n">pool_v</span>
+<span class="linenos" aria-hidden="true">218</span>     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">219</span> 
+<span class="linenos" aria-hidden="true">220</span> 
+<span class="linenos" aria-hidden="true">221</span> <span class="c1"># ---------------------------------------------------------------- E</span>
+<span class="linenos" aria-hidden="true">222</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_E</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">223</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[E] 广度：SDPA 与 FlashInfer 的 decode 路径"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">224</span> 
+<span class="linenos" aria-hidden="true">225</span>     <span class="n">D</span> <span class="o">=</span> <span class="mi">128</span>
+<span class="linenos" aria-hidden="true">226</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'B'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'H'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'Hkv'</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'kv_len'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'SDPA ms'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">227</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'FlashInfer ms'</span><span class="si">:</span><span class="s2">&gt;14</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'比值'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">228</span>     <span class="k">for</span> <span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">S</span> <span class="ow">in</span> <span class="p">[(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8192</span><span class="p">),</span> <span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">8192</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">229</span>                          <span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">4096</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">65536</span><span class="p">)]:</span>
+<span class="linenos" aria-hidden="true">230</span>         <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">231</span>         <span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">232</span>         <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">233</span>         <span class="n">t_sdpa</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">scaled_dot_product_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">enable_gqa</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">234</span>         <span class="n">t_fi</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">235</span>         <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">236</span>             <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
+<span class="linenos" aria-hidden="true">237</span>             <span class="c1"># FlashInfer 的单请求 decode 接口：q [H,D], k/v [S,Hkv,D]</span>
+<span class="linenos" aria-hidden="true">238</span>             <span class="k">if</span> <span class="n">B</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">239</span>                 <span class="n">q2</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">H</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">240</span>                 <span class="n">k2</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">241</span>                 <span class="n">v2</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">HKV</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">242</span>                 <span class="n">t_fi</span> <span class="o">=</span> <span class="n">timeit</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">single_decode_with_kv_cache</span><span class="p">(</span><span class="n">q2</span><span class="p">,</span> <span class="n">k2</span><span class="p">,</span> <span class="n">v2</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">243</span>         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>                              <span class="c1"># noqa: BLE001</span>
+<span class="linenos" aria-hidden="true">244</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    (FlashInfer: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[</span><span class="mi">0</span><span class="p">][:</span><span class="mi">80</span><span class="p">]</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">245</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">246</span>         <span class="n">fi_s</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">t_fi</span><span class="si">:</span><span class="s2">&gt;14.4f</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">t_fi</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'—'</span><span class="si">:</span><span class="s2">&gt;14</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">247</span>         <span class="n">ratio</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">t_sdpa</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">t_fi</span><span class="si">:</span><span class="s2">&gt;7.2f</span><span class="si">}</span><span class="s2">×"</span> <span class="k">if</span> <span class="n">t_fi</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'—'</span><span class="si">:</span><span class="s2">&gt;7</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">248</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">H</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">HKV</span><span class="si">:</span><span class="s2">&gt;4</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">S</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">t_sdpa</span><span class="si">:</span><span class="s2">&gt;9.4f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">fi_s</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">ratio</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">249</span>         <span class="k">del</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
+<span class="linenos" aria-hidden="true">250</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">251</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  FlashInfer 的批量接口需要先 plan（建 block table 与调度），"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">252</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  单次调用的对比会低估它在服务里的价值。5.2/5.3 会在真实引擎里看。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">253</span> 
+<span class="linenos" aria-hidden="true">254</span> 
+<span class="linenos" aria-hidden="true">255</span> <span class="n">SECTIONS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"A"</span><span class="p">:</span> <span class="n">section_A</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">:</span> <span class="n">section_B</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">:</span> <span class="n">section_C</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">256</span>             <span class="s2">"D"</span><span class="p">:</span> <span class="n">section_D</span><span class="p">,</span> <span class="s2">"E"</span><span class="p">:</span> <span class="n">section_E</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">257</span> 
+<span class="linenos" aria-hidden="true">258</span> <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">259</span>     <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:]]</span> <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="n">SECTIONS</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">260</span>     <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">261</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">  SM </span><span class="si">{</span><span class="n">p</span><span class="o">.</span><span class="n">multi_processor_count</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">262</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"参照：只读 </span><span class="si">{</span><span class="n">PEAK_BW</span><span class="si">}</span><span class="s2"> / copy </span><span class="si">{</span><span class="n">PEAK_COPY</span><span class="si">}</span><span class="s2"> GB/s, bf16 </span><span class="si">{</span><span class="n">PEAK_TF</span><span class="si">}</span><span class="s2"> TFLOP/s "</span>
+<span class="linenos" aria-hidden="true">263</span>           <span class="sa">f</span><span class="s2">"(L1.1/L1.2 实测)  L2 </span><span class="si">{</span><span class="n">L2_MB</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> MiB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">264</span>     <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">265</span>         <span class="n">SECTIONS</span><span class="p">[</span><span class="n">s</span><span class="p">]()</span>
+<span class="linenos" aria-hidden="true">266</span>     <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">267</span>     <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 </pre></div>
 <div class="srcref"><code>labs/L3/decode_attention.py 全文（267 行）</code><a href="../code/labs/L3/decode_attention.py.html">在完整文件中打开 &rarr;</a></div></div></details>
 <p><strong>建议的消融</strong></p>
@@ -825,10 +830,10 @@ FlashInfer 在真实服务里的表现。</strong></p>
 <li><strong>只读的工作负载要用只读带宽做分母。</strong> 用 copy 带宽会得到 &gt;100% 的假象。</li>
 <li><strong>工作集掉进 L2 会伪造超线性收益。</strong> 本章第二节第一版就栽在这里。
    把"在 L2?"做成一列，比每次事后排查便宜。</li>
-<li><strong>decode 的算术强度是 1，与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 都无关。</strong> 不要指望通过调 kernel 走出带宽侧。</li>
+<li><strong>算术强度依赖假设。</strong> MHA、GQA、量化 KV 与多个 query 位置具有不同复用度。</li>
 <li><strong>"哪个 attention 实现最快"没有答案。</strong> 同一个库在 prefill 和 decode 上排名相反
    （FlashInfer：prefill 0.70×，decode 1.83×）。</li>
-<li><strong>框架层 gather 不是 paged attention。</strong> 本章测的 5× 是朴素实现的上界，
+<li><strong>框架层 gather 不是 paged attention。</strong> 本章测的 5× 是一个具体模拟实现的时间比，
    不是 vLLM 的代价。</li>
 <li><strong>单次调用的对比会低估需要 plan 的库。</strong> FlashInfer 的批量接口要先建调度状态。</li>
 <li><strong>MLA 的 57× 是按配置算的，不是实测。</strong> 投影回去的矩阵乘会不会吃掉收益，
@@ -845,7 +850,7 @@ FlashInfer 在真实服务里的表现。</strong></p>
 <p>prefill 时 Q 有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 行：同一块 KV 被 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 行 Q 复用，
 FLOP <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow></math></span> 而字节仍是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>S</mi><mi>D</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>，比值 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0002F;</mo><mn>2</mn></mrow></math></span>。</p>
 <p>一句话：<strong>复用度决定算术强度。</strong> decode 没有复用（batch 除外），
-所以它必然在带宽侧。</p>
+该简化模型提示较低算术强度，不能覆盖 GQA 复用、量化和提交开销等情况。</p>
 </details>
 <details>
 <summary>2. 你把 KV 头数从 8 降到 4，decode 却只快了 1.3 倍。可能是什么原因？</summary>
@@ -861,24 +866,12 @@ FLOP <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" 
 <p>本章实测在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x0003D;</mo><mn>32</mn></mrow></math></span>、kv_len=8192 下 8→4 是 4.50×→8.79×，即 1.95×，接近理论值。</p>
 </details>
 <details>
-<summary>3. B=1、H=8 只有 8 个并行单元，却跑满了 170 个 SM 的带宽。这说明什么？</summary>
-<p>说明这个 kernel <strong>沿 KV 长度也切分了</strong>（split-K / FlashDecoding）。</p>
-<p>如果并行度只来自 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span>，8 个单元最多占 8/170 = 4.7% 的 SM，
-带宽利用率不可能到 100.9%。</p>
-<p>同样的推理在 3.2 §1.1 用过一次（prefill 侧沿序列切分）。
-这是一个通用判据：<strong>用"并行单元数 ÷ SM 数"算出上界，
-如果实测超过这个上界，说明还有你没数到的切分维度。</strong></p>
+<summary>3. B=1、H=8 时测得较高带宽，能否直接证明采用了 split-K？</summary>
+<p>不能。它说明朴素的并行度模型可能不完整，但显存带宽不按“活跃 SM 数/总 SM 数”严格线性分配。应检查实际 kernel 符号、grid 和沿 KV 长度切分的代码；只靠带宽比例不能确定算法。</p>
 </details>
 <details>
-<summary>4. 为什么说 GQA "精确地压在瓶颈上"，而减少层数不是？</summary>
-<p>decode 的瓶颈是<strong>反复读取 KV cache</strong> 的带宽。KV 会被每一步 decode 读一遍，
-所以它的大小直接决定每步耗时和并发数。</p>
-<p>GQA 只压缩 KV 头数：KV 按比例缩小，而 <strong>query 头数、hidden_size、层数全不变</strong>，
-模型的主要参数量和表达能力保留在 query 侧。</p>
-<p>减少层数也能减 KV，但它同时减少了权重、减少了计算深度，
-把模型能力一起砍掉了。<strong>同样是"变小"，代价落在不同的地方。</strong></p>
-<p>判据：一个压缩手段好不好，看它压缩的维度和瓶颈维度的重合度，
-以及它在非瓶颈维度上损失了多少。</p>
+<summary>4. GQA 与减少层数，对资源和模型结构的影响有何不同？</summary>
+<p>GQA 固定 query 头数，减少 KV 头和 K/V 投影参数；减少层数则同时改变计算深度、权重和每请求状态。两者都可能影响质量，不能只按缓存压缩比例判断哪一个更好。容量可以按结构计算，性能与质量需要对应实验。</p>
 </details>
 <details>
 <summary>5. 有人报告"分页 KV 让 attention 慢 5 倍，所以 PagedAttention 不划算"。怎么反驳？</summary>
@@ -890,7 +883,7 @@ K/V 仍然只读一遍，不产生拷贝。5× 是"朴素实现"的代价，不�
 因此能容纳的并发请求数大幅上升（5.2）。
 attention 慢一点但并发翻几倍，整体吞吐是涨的。</p>
 <p><strong>这是一个典型的"测了错的东西然后推广结论"</strong>——
-和 2.7 §4.5 里我自己 <code>expandable_segments</code> 那次是同一类错误。</p>
+应始终区分框架层模拟与真实 kernel 的测量对象。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L3/3.2-flashattention-lineage.html">&#8592; 3.2 FlashAttention 1 → 2 → 3 → 4</a><a class="nav-next" href="../L3/3.4-sparse-linear-attention.html">3.4 稀疏、线性与混合架构 &#8594;</a></nav>
 </main>
 </body>
