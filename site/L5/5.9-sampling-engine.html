@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.9 采样引擎</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -25,7 +25,7 @@
 <li><a href="#5-token">5. 从概率分布抽一个 token</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 源码走读</a><ul>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
 <li><a href="#a-vllm-greedy">A. vLLM 将 greedy 与随机处理分开</a></li>
 <li><a href="#b">B. 相同接口会选择不同采样实现</a></li>
 <li><a href="#c-sglang">C. SGLang 把后端策略显式写在调用点</a></li>
@@ -64,7 +64,7 @@
 <li><a href="#5-token">5. 从概率分布抽一个 token</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 源码走读</a><ul>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
 <li><a href="#a-vllm-greedy">A. vLLM 将 greedy 与随机处理分开</a></li>
 <li><a href="#b">B. 相同接口会选择不同采样实现</a></li>
 <li><a href="#c-sglang">C. SGLang 把后端策略显式写在调用点</a></li>
@@ -97,16 +97,16 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
   <div class="mod-id">5.9</div>
   <h1>采样引擎</h1>
-  <p class="lede">比较 vLLM 与 SGLang 的过滤顺序、并列候选和 logprobs，保留数值差异及性能记录。</p>
-  <div class="chips"><span class="chip">实测机器 crater · RTX 5090 D · vLLM 0.29.0 · SGLang 0.5.19 · FlashInfer 0.6.18</span><span class="chip">数据日期 2026-09-11</span><span class="chip">前置 0.5 logits 到文本 · 4.2 数值系统 · 5.6 约束解码</span></div>
+  <p class="lede">比较 vLLM 与 SGLang 的采样顺序、并列候选和 logprobs 处理，分析数值与性能差异。</p>
+  <div class="chips"><span class="chip">实测机器 crater · RTX 5090 D · vLLM 0.29.0 · SGLang 0.5.19 · FlashInfer 0.6.18</span><span class="chip">前置 0.5 logits 到文本 · 4.2 数值系统 · 5.6 约束解码</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
-<p>采样引擎把一行 logits 变成一个 token。它还负责惩罚重复、裁剪候选、管理随机数，并按请求返回 logprobs。<strong>这些操作的顺序和数值边界都是接口语义，不能只对齐几个参数名。</strong></p>
+<p>采样引擎把一行 logits 变成一个 token。它还负责惩罚重复、裁剪候选、管理随机数，并按请求返回 logprobs。即使参数名称相同，处理顺序和边界条件不同也会改变结果。</p>
 <ol>
 <li>temperature、top-k、top-p、min-p 和三种重复惩罚分别改了什么，怎样自己实现？</li>
 <li>vLLM 与 SGLang 的处理顺序、并列值和返回概率有何差异？</li>
 <li>采样与 logprobs 在 GPU 和真实生成请求中分别花多少时间？</li>
 </ol>
-<p>本章运行了安装版本的真实采样函数、SGLang 的 CPU/GPU 路径及 vLLM 端到端生成。还有一项未解决结果：大 batch 的 Triton 过滤与排序参照出现单个候选 token 差异，原始失败和后续诊断都保留。</p>
+<p>实验覆盖采样函数、SGLang 的 CPU/GPU 路径及 vLLM 端到端生成。大 batch 下，Triton 过滤与排序参照仍有一个候选 token 的差异，原因尚未确定。</p>
 <h2 id="_2">心智模型</h2>
 <p>logits 是模型为词表中每个 token 输出的分数。概率分布由这些分数计算得到；修改分数或候选集合，都会改变采样分布。</p>
 <p>下图是本版本 vLLM 中随机采样的主线。左侧的 raw logprobs 从处理前的 logits 计算，右侧才是真正参与采样的分布。temperature 为 0 时走 greedy 分支，直接从惩罚后的 logits 选 argmax，不执行右侧随机过滤链。</p>
@@ -124,7 +124,7 @@
 <p>当 r&gt;1 时，两种符号的分数都下降。把负数也除以 r，反而会提高它。</p>
 <p>frequency penalty 按生成次数扣分，presence penalty 只看生成过没有：</p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msubsup><mi>z</mi><mi>i</mi><mi>&#x02032;</mi></msubsup><mo>&#x0003D;</mo><msubsup><mi>z</mi><mi>i</mi><mrow><mo stretchy="false">&#x00028;</mo><mi>r</mi><mo stretchy="false">&#x00029;</mo></mrow></msubsup><mo>&#x02212;</mo><mi>&#x003B1;</mi><msub><mi>c</mi><mi>i</mi></msub><mo>&#x02212;</mo><mi>&#x003B2;</mi><mrow><mn mathvariant="bold">1</mn></mrow><mo stretchy="false">[</mo><msub><mi>c</mi><mi>i</mi></msub><mo>&#x0003E;</mo><mn>0</mn><mo stretchy="false">]</mo><mo>&#x0002E;</mo></mrow></math></div></p>
-<p>这里 frequency/presence 的计数来自 output，repetition 的出现集合则包含 prompt 与 output。不能把同一份 history mask 塞给三个操作就认为语义相同。</p>
+<p>这里 frequency/presence 的计数来自 output，repetition 的出现集合则包含 prompt 与 output。三种操作需要按各自定义构造历史计数或出现标记。</p>
 <p>可核对的小例子：原始 logits 为 <code>[-1, 2, 1, 0.5]</code>，prompt ids 为 <code>[0,1]</code>，output ids 为 <code>[3,3,1]</code>，r=1.5、α=0.25、β=0.5。token 3 的计算是 <code>0.5/1.5 − 2×0.25 − 0.5</code>。完整向量与真实 GPU penalty 操作的结果在原始日志中。</p>
 <h3 id="3-top-ktop-pmin-p">3. top-k、top-p、min-p</h3>
 <p><strong>top-k</strong> 保留分数最高的候选。遇到第 k 名并列时，按“阈值”保留可能多于 k 个，按“位置”保留则恰好 k 个；本章确实测到了两种做法。</p>
@@ -172,7 +172,7 @@
 <p>原因是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>q</mi><mi>i</mi></msub><mo>&#x0002F;</mo><msub><mi>p</mi><mi>i</mi></msub></mrow></math></span> 服从速率为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>p</mi><mi>i</mi></msub></mrow></math></span> 的指数分布。其成为最小值的概率为：</p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msubsup><mo>&#x0222B;</mo><mn>0</mn><mo>&#x0221E;</mo></msubsup><msub><mi>p</mi><mi>i</mi></msub><msup><mi>e</mi><mrow><mo>&#x02212;</mo><msub><mi>p</mi><mi>i</mi></msub><mi>t</mi></mrow></msup><munder><mo>&#x0220F;</mo><mrow><mi>j</mi><mo>&#x02260;</mo><mi>i</mi></mrow></munder><msup><mi>e</mi><mrow><mo>&#x02212;</mo><msub><mi>p</mi><mi>j</mi></msub><mi>t</mi></mrow></msup><mspace width="0.167em" /><mi>d</mi><mi>t</mi><mo>&#x0003D;</mo><mfrac><mrow><msub><mi>p</mi><mi>i</mi></msub></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msub><mi>p</mi><mi>j</mi></msub></mrow></mfrac><mo>&#x0002E;</mo></mrow></math></div></p>
 <p>因此它与 categorical sampling 具有相同的理想分布，但随机数消耗顺序可以不同。相同 seed 不足以保证换后端后得到同一串 token；应分别测试分布正确性和同一路径的重复性。</p>
-<h2 id="_4">工程实现 · 源码走读</h2>
+<h2 id="_4">工程实现 · 源码解析</h2>
 <p>源码从 crater 已安装环境复制，SHA-256 在本章 manifest 中。以下路径均为相应 package 内的原始路径，行号对应快照，不混用网页最新版本。</p>
 <h3 id="a-vllm-greedy">A. vLLM 将 greedy 与随机处理分开</h3>
 <p><code>vllm/v1/sample/sampler.py:26–52</code> 直接列出处理顺序。先保存 raw logprobs，再执行白名单、bad words、影响 argmax 的 processor 与 penalties；随机分支随后做 temperature、min-p、top-k/top-p。</p>
@@ -474,7 +474,7 @@
 <span class="linenos" aria-hidden="true">61</span>     <span class="k">return</span> <span class="n">trace</span><span class="p">,</span> <span class="n">trace</span><span class="p">[</span><span class="s1">'processed_probs'</span><span class="p">]</span>
 </pre></div>
 <div class="srcref"><code>labs/L5/mini_sampler.py 第 22–61 行</code><a href="../code/labs/L5/mini_sampler.py.html#labs-L5-mini_sampler-py-L-22">在完整文件中打开 &rarr;</a></div></div>
-<p>运行入口里的检查覆盖负 logit 惩罚、重复计数、top-k 并列、greedy 和空候选集合。真实 vLLM GPU penalty 与同一小例子的参照向量也已对拍通过。</p>
+<p>运行入口里的检查覆盖负 logit 惩罚、重复计数、top-k 并列、greedy 和空候选集合。真实 vLLM GPU penalty 与同一小例子的参照向量也已对照验证通过。</p>
 <details class="fold srcfold"><summary>labs/L5/mini_sampler.py 全文（86 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 1</span> <span class="ch">#!/usr/bin/env python3</span>
 <span class="linenos" aria-hidden="true"> 2</span> <span class="sd">"""Transparent finite-vocabulary sampler; vLLM-style filter order.</span>
 <span class="linenos" aria-hidden="true"> 3</span> 

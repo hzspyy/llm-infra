@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.1 训练循环的系统视角</title>
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">7.1</div>
+  <div class="sidebar-title">训练循环的系统视角</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">问题</a></li>
+<li><a href="#_2">训练循环的关键路径</a><ul>
+<li><a href="#_3">单步拆解</a></li>
+<li><a href="#dataloader">DataLoader 流水与重叠</a></li>
+<li><a href="#_4">内存时间线</a></li>
+</ul>
+</li>
+<li><a href="#activation-checkpointing">Activation Checkpointing</a><ul>
+<li><a href="#_5">内存换时间</a></li>
+<li><a href="#transformers">Transformers 实现</a></li>
+</ul>
+</li>
+<li><a href="#_6">混合精度训练</a><ul>
+<li><a href="#fp16bf16-autocast">FP16/BF16 autocast</a></li>
+<li><a href="#gradient-scaling">Gradient Scaling</a></li>
+<li><a href="#_7">选择</a></li>
+</ul>
+</li>
+<li><a href="#_8">梯度累积</a></li>
+<li><a href="#_9">完整流水</a></li>
+<li><a href="#_10">监控与调优</a><ul>
+<li><a href="#_11">关键指标</a></li>
+<li><a href="#_12">调优策略</a></li>
+</ul>
+</li>
+<li><a href="#_13">总结</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">问题</a></li>
+<li><a href="#_2">训练循环的关键路径</a><ul>
+<li><a href="#_3">单步拆解</a></li>
+<li><a href="#dataloader">DataLoader 流水与重叠</a></li>
+<li><a href="#_4">内存时间线</a></li>
+</ul>
+</li>
+<li><a href="#activation-checkpointing">Activation Checkpointing</a><ul>
+<li><a href="#_5">内存换时间</a></li>
+<li><a href="#transformers">Transformers 实现</a></li>
+</ul>
+</li>
+<li><a href="#_6">混合精度训练</a><ul>
+<li><a href="#fp16bf16-autocast">FP16/BF16 autocast</a></li>
+<li><a href="#gradient-scaling">Gradient Scaling</a></li>
+<li><a href="#_7">选择</a></li>
+</ul>
+</li>
+<li><a href="#_8">梯度累积</a></li>
+<li><a href="#_9">完整流水</a></li>
+<li><a href="#_10">监控与调优</a><ul>
+<li><a href="#_11">关键指标</a></li>
+<li><a href="#_12">调优策略</a></li>
+</ul>
+</li>
+<li><a href="#_13">总结</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L7 · 训练与后训练基础设施</div>
+  <div class="mod-id">7.1</div>
+  <h1>训练循环的系统视角</h1>
+  <p class="lede">前反向内存曲线、activation checkpointing、梯度累积、混合精度与 loss scaling、优化器状态。</p>
+  
+</header><article class="prose"><h1 id="71">7.1 训练循环系统视角</h1>
+<p>推理是单步前向，训练是循环迭代：数据读取、前反向、优化器更新形成关键路径，activation checkpointing、混合精度和梯度累积改变内存与计算的平衡。本章从系统角度拆解训练循环的阶段、状态与重叠。</p>
+<h2 id="_1">问题</h2>
+<ol>
+<li>数据读取、H2D、前反向和优化器如何形成训练关键路径？</li>
+<li>activation checkpointing、混合精度和累积分别改变哪些状态？</li>
+<li>数据输入与 GPU 计算能重叠到什么程度？</li>
+</ol>
+<h2 id="_2">训练循环的关键路径</h2>
+<h3 id="_3">单步拆解</h3>
+<p>训练一步包含五个阶段：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">dataloader</span><span class="p">:</span>                <span class="c1"># 1. 数据准备</span>
+    <span class="n">inputs</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>           <span class="c1"># 2. H2D 传输</span>
+    <span class="n">outputs</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>             <span class="c1"># 3. 前向</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">criterion</span><span class="p">(</span><span class="n">outputs</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>                     <span class="c1"># 4. 反向</span>
+    <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>                    <span class="c1"># 5. 优化器</span>
+    <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+</code></pre></div>
+
+<p>在 SmolLM2-360M（batch_size=8, seq_len=512）上的单线程 baseline：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>耗时</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据准备</td>
+<td>0.05 ms</td>
+<td><code>__getitem__</code> 返回一个 batch</td>
+</tr>
+<tr>
+<td>H2D</td>
+<td>(包含在前向)</td>
+<td>小 batch 传输隐藏在前向启动</td>
+</tr>
+<tr>
+<td>前向</td>
+<td>47.3 ms</td>
+<td>包含 H2D、kernel launch、attention/MLP</td>
+</tr>
+<tr>
+<td>反向</td>
+<td>54.4 ms</td>
+<td>计算梯度、accumulate 到 <code>.grad</code></td>
+</tr>
+<tr>
+<td>优化器</td>
+<td>(包含在总时间)</td>
+<td>AdamW 更新参数</td>
+</tr>
+<tr>
+<td><strong>总计</strong></td>
+<td><strong>101.8 ms/step</strong></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>[实验: labs/L7/training_loop_systems.py, 配置: 单线程]</p>
+<p><strong>关键路径瓶颈</strong>：单线程数据准备在 GPU 计算期间空转，数据与计算串行。</p>
+<h3 id="dataloader">DataLoader 流水与重叠</h3>
+<p>PyTorch DataLoader 通过多进程 worker 和预取队列实现数据与计算重叠：</p>
+<ul>
+<li><code>num_workers &gt; 0</code>：独立进程并行调用 <code>__getitem__</code>。</li>
+<li><code>prefetch_factor</code>：每个 worker 提前准备几个 batch。</li>
+<li><code>pin_memory=True</code>：数据直接分配在 pinned memory，DMA 传输更快。</li>
+</ul>
+<p>四种配置对比（同一模型，10 steps 平均）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>num_workers</th>
+<th>pin_memory</th>
+<th>数据准备</th>
+<th>前向</th>
+<th>反向</th>
+<th>总计</th>
+<th>墙上时间</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单线程</td>
+<td>0</td>
+<td>False</td>
+<td>0.05 ms</td>
+<td>47.3 ms</td>
+<td>54.4 ms</td>
+<td>101.8 ms</td>
+<td>1.02 s</td>
+</tr>
+<tr>
+<td>2worker-nopin</td>
+<td>2</td>
+<td>False</td>
+<td>0.09 ms</td>
+<td>11.0 ms</td>
+<td>51.4 ms</td>
+<td>62.5 ms</td>
+<td>0.72 s</td>
+</tr>
+<tr>
+<td>2worker-pin</td>
+<td>2</td>
+<td>True</td>
+<td>0.08 ms</td>
+<td>10.2 ms</td>
+<td>51.9 ms</td>
+<td>62.2 ms</td>
+<td>0.71 s</td>
+</tr>
+<tr>
+<td>4worker-pin</td>
+<td>4</td>
+<td>True</td>
+<td>0.08 ms</td>
+<td>10.5 ms</td>
+<td>51.8 ms</td>
+<td>62.4 ms</td>
+<td>0.76 s</td>
+</tr>
+</tbody>
+</table>
+<p>[实验: labs/L7/training_loop_systems.py:exp1_dataloader_pipeline, 结果: results/crater/7.1/dataloader_pipeline.json]</p>
+<p><strong>核心发现</strong>：</p>
+<ol>
+<li><strong>前向时间从 47 ms 降至 10 ms</strong>：单线程时 CPU 数据准备阻塞下一 batch 的 H2D，GPU 空转；多 worker 时数据提前就绪，H2D 与上一 batch 的计算重叠。</li>
+<li><strong>反向时间稳定在 51 ms</strong>：反向不依赖下一 batch，worker 数量对反向无影响。</li>
+<li><strong>pin_memory 微弱收益</strong>：本实验数据量小（~2 MB/batch），DMA 收益不明显；大 batch 或高分辨率图像场景收益显著。</li>
+<li><strong>4 worker 无额外收益</strong>：数据准备已不是瓶颈，增加 worker 只增加进程开销。</li>
+</ol>
+<p><strong>流水原理</strong>：</p>
+<div class="highlight"><pre><span></span><code>时间轴（2 worker）:
+Step 0:  [前向] [反向]
+           ↓ H2D 重叠
+Step 1:   [Worker 0/1 准备 batch 1] ────→ [前向] [反向]
+                                          ↓ H2D 重叠
+Step 2:                                  [Worker 准备 batch 2] ────→ ...
+</code></pre></div>
+
+<p>数据准备与 GPU 计算并行，关键路径只包含计算部分。</p>
+<h3 id="_4">内存时间线</h3>
+<p>训练循环的 GPU 内存分配遵循固定节奏，以 SmolLM2-360M FP32 训练为例：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>分配内存</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0. 初始状态</td>
+<td>64 MB</td>
+<td>CUDA context</td>
+</tr>
+<tr>
+<td>1. 模型加载</td>
+<td>1445 MB</td>
+<td>权重（360M × 4 bytes）</td>
+</tr>
+<tr>
+<td>2. 优化器初始化</td>
+<td>1445 MB</td>
+<td>AdamW 未分配 momentum/variance，lazy init</td>
+</tr>
+<tr>
+<td>3. 数据 H2D</td>
+<td>1445 MB</td>
+<td>batch 小，内存增长不可见</td>
+</tr>
+<tr>
+<td>4. 前向</td>
+<td>4435 MB</td>
+<td><strong>激活值峰值</strong>：attention scores, MLP 中间态</td>
+</tr>
+<tr>
+<td>5. 反向开始</td>
+<td>3176 MB</td>
+<td>前向激活部分释放，梯度开始累积</td>
+</tr>
+<tr>
+<td>6. 反向结束（优化器前）</td>
+<td>5946 MB</td>
+<td><strong>训练峰值</strong>：权重 + 梯度 + optimizer states</td>
+</tr>
+<tr>
+<td>7. optimizer.step()</td>
+<td>5674 MB</td>
+<td>更新后，部分临时张量释放</td>
+</tr>
+<tr>
+<td>8. zero_grad()</td>
+<td>4215 MB</td>
+<td>梯度张量清零但未释放</td>
+</tr>
+<tr>
+<td>9. 下一 step</td>
+<td>4215 MB</td>
+<td>循环稳态内存</td>
+</tr>
+</tbody>
+</table>
+<p>[实验: labs/L7/training_loop_systems.py:exp4_memory_timeline, 结果: results/crater/7.1/memory_timeline.json]</p>
+<p><strong>峰值内存出现在优化器更新前</strong>：此时权重、梯度和 optimizer states（momentum、variance）同时驻留。实际峰值 5946 MB 包含：
+- 权重：1445 MB
+- 梯度：1445 MB
+- AdamW states：2890 MB（每个参数两个 FP32 state）
+- 残留激活：~166 MB</p>
+<p><strong>优化器 lazy 初始化</strong>：PyTorch AdamW 在第一次 <code>step()</code> 时才分配 momentum/variance，因此阶段 2 内存未变。</p>
+<h2 id="activation-checkpointing">Activation Checkpointing</h2>
+<h3 id="_5">内存换时间</h3>
+<p>前向保存所有激活值供反向使用，Transformer 每层保存 attention scores 和 MLP 中间态。Activation checkpointing（梯度检查点）只保存部分层的激活，反向时重新计算未保存层的前向。</p>
+<p>SmolLM2-360M 对比（batch_size=8, seq_len=512）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>前向</th>
+<th>反向</th>
+<th>总计</th>
+<th>前向后内存</th>
+<th>峰值内存</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无 checkpointing</td>
+<td>26.0 ms</td>
+<td>41.4 ms</td>
+<td>87.2 ms</td>
+<td>7241 MB</td>
+<td>7625 MB</td>
+</tr>
+<tr>
+<td>有 checkpointing</td>
+<td>26.0 ms</td>
+<td>58.9 ms</td>
+<td>105.0 ms</td>
+<td>4762 MB</td>
+<td>8698 MB</td>
+</tr>
+</tbody>
+</table>
+<p>[实验: labs/L7/training_loop_systems.py:exp2_activation_checkpointing, 结果: results/crater/7.1/activation_checkpointing.json]</p>
+<p><strong>权衡</strong>：
+- <strong>内存降低 34%</strong>：前向后内存从 7241 MB 降至 4762 MB，大部分激活未保存。
+- <strong>反向时间增加 42%</strong>：从 41.4 ms 增至 58.9 ms，需重算未保存层的前向。
+- <strong>峰值内存反增 14%</strong>：8698 MB，因为重算时前向激活与反向梯度同时存在。</p>
+<h3 id="transformers">Transformers 实现</h3>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForCausalLM</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+    <span class="s2">"HuggingFaceTB/SmolLM2-360M-Instruct"</span><span class="p">,</span>
+    <span class="n">torch_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span>
+<span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">gradient_checkpointing_enable</span><span class="p">()</span>  <span class="c1"># 启用 checkpointing</span>
+</code></pre></div>
+
+<p>Transformers 默认对每个 Transformer block 设置 checkpoint，即每层只保存输入和输出，中间的 attention/MLP 激活在反向时重算。</p>
+<p><strong>适用场景</strong>：
+- 激活值远大于模型参数（大 batch、长序列）。
+- GPU 内存受限，宁可牺牲 20-50% 速度换取内存。
+- 不适合推理（推理无反向）。</p>
+<h2 id="_6">混合精度训练</h2>
+<h3 id="fp16bf16-autocast">FP16/BF16 autocast</h3>
+<p>混合精度训练在前向和反向中使用 FP16/BF16 计算，参数和梯度更新仍用 FP32，平衡速度与精度。</p>
+<p>三种配置对比（SmolLM2-360M, batch_size=8, seq_len=512）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>前向</th>
+<th>反向</th>
+<th>优化器</th>
+<th>总计</th>
+<th>Loss</th>
+<th>梯度范数</th>
+<th>峰值内存</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32</td>
+<td>25.4 ms</td>
+<td>41.2 ms</td>
+<td>23.7 ms</td>
+<td>90.4 ms</td>
+<td>0.0013</td>
+<td>0.39</td>
+<td>7625 MB</td>
+</tr>
+<tr>
+<td>FP16+scaler</td>
+<td>17.0 ms</td>
+<td>23.8 ms</td>
+<td>6.2 ms</td>
+<td>46.9 ms</td>
+<td>1.85</td>
+<td>inf</td>
+<td>4660 MB</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td>14.2 ms</td>
+<td>23.8 ms</td>
+<td>23.5 ms</td>
+<td>61.5 ms</td>
+<td>0.22</td>
+<td>50.2</td>
+<td>7473 MB</td>
+</tr>
+</tbody>
+</table>
+<p>[实验: labs/L7/training_loop_systems.py:exp3_mixed_precision, 结果: results/crater/7.1/mixed_precision.json]</p>
+<p><strong>核心差异</strong>：</p>
+<ol>
+<li>
+<p><strong>FP16+scaler</strong>：
+   - <strong>速度最快</strong>：总时间 46.9 ms，前向提速 33%，反向提速 42%。
+   - <strong>数值不稳定</strong>：梯度范数 inf，loss 1.85（vs FP32 的 0.0013），需要 gradient scaling 和溢出检测。
+   - <strong>内存最低</strong>：4660 MB，FP16 激活占用减半。</p>
+</li>
+<li>
+<p><strong>BF16</strong>：
+   - <strong>速度折中</strong>：总时间 61.5 ms，前向提速 44%，但优化器仍 FP32 耗时未变。
+   - <strong>数值稳定</strong>：loss 0.22，梯度范数 50.2，无 inf/NaN。BF16 动态范围与 FP32 相同（8-bit exponent），不需要 gradient scaling。
+   - <strong>内存略降</strong>：7473 MB，接近 FP32。BF16 激活减半，但参数和 optimizer states 仍 FP32。</p>
+</li>
+</ol>
+<h3 id="gradient-scaling">Gradient Scaling</h3>
+<p>FP16 数值范围窄（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x000B1;</mi><mn>65504</mn></mrow></math></span>），小梯度易下溢至 0。Gradient scaling 在反向前将 loss 乘以 scale（如 65536），放大梯度防止下溢，optimizer.step() 前再除以 scale 恢复。</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">torch.cuda.amp</span><span class="w"> </span><span class="kn">import</span> <span class="n">autocast</span><span class="p">,</span> <span class="n">GradScaler</span>
+
+<span class="n">scaler</span> <span class="o">=</span> <span class="n">GradScaler</span><span class="p">()</span>
+<span class="n">optimizer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">)</span>
+
+<span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">dataloader</span><span class="p">:</span>
+    <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+    <span class="k">with</span> <span class="n">autocast</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">):</span>  <span class="c1"># 前向 FP16</span>
+        <span class="n">outputs</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="n">criterion</span><span class="p">(</span><span class="n">outputs</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span>
+
+    <span class="n">scaler</span><span class="o">.</span><span class="n">scale</span><span class="p">(</span><span class="n">loss</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>        <span class="c1"># loss *= scale, 反向</span>
+    <span class="n">scaler</span><span class="o">.</span><span class="n">unscale_</span><span class="p">(</span><span class="n">optimizer</span><span class="p">)</span>           <span class="c1"># 梯度 /= scale</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">clip_grad_norm_</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="mf">1.0</span><span class="p">)</span>  <span class="c1"># 裁剪前先 unscale</span>
+    <span class="n">scaler</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">optimizer</span><span class="p">)</span>               <span class="c1"># 更新（若无 inf/NaN）</span>
+    <span class="n">scaler</span><span class="o">.</span><span class="n">update</span><span class="p">()</span>                      <span class="c1"># 动态调整 scale</span>
+</code></pre></div>
+
+<p>实验中 FP16 的 scaler_scale=8192，说明训练初期梯度较大，scaler 自动降低了 scale（初始 65536）。</p>
+<p><strong>BF16 无需 scaling</strong>：BF16 指数位与 FP32 相同（8 bits），动态范围 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>38</mn></mrow></msup></mrow></math></span> 至 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mn>10</mn><mrow><mn>38</mn></mrow></msup></mrow></math></span>，小梯度不会下溢，直接训练即可。</p>
+<div class="highlight"><pre><span></span><code><span class="k">with</span> <span class="n">autocast</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">):</span>
+    <span class="n">outputs</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">criterion</span><span class="p">(</span><span class="n">outputs</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>  <span class="c1"># 无需 scaler</span>
+</code></pre></div>
+
+<h3 id="_7">选择</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>速度</th>
+<th>精度</th>
+<th>内存</th>
+<th>复杂度</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32</td>
+<td>基线</td>
+<td>最高</td>
+<td>最高</td>
+<td>低</td>
+<td>调试、小模型</td>
+</tr>
+<tr>
+<td>FP16+scaler</td>
+<td>最快</td>
+<td>需调试</td>
+<td>最低</td>
+<td>高</td>
+<td>对精度不敏感、内存受限</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td>快</td>
+<td>稳定</td>
+<td>中等</td>
+<td>低</td>
+<td>大多数训练（推荐）</td>
+</tr>
+</tbody>
+</table>
+<p>现代训练（Llama、GPT-4 风格）默认 BF16，速度与稳定性兼顾。FP16 主要用于推理或内存极限场景。</p>
+<h2 id="_8">梯度累积</h2>
+<p>当单 GPU 内存无法容纳大 batch 时，梯度累积将大 batch 拆分为多个小 mini-batch，累加梯度后一次更新。</p>
+<div class="highlight"><pre><span></span><code><span class="n">accumulation_steps</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+
+<span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">batch</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">dataloader</span><span class="p">):</span>
+    <span class="n">outputs</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">criterion</span><span class="p">(</span><span class="n">outputs</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span> <span class="o">/</span> <span class="n">accumulation_steps</span>  <span class="c1"># 归一化</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># 梯度累加到 .grad</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">accumulation_steps</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>等价性</strong>：4 × batch_size=8 累积 ≈ 1 × batch_size=32（数值上有微小差异，因 LayerNorm/BatchNorm 统计量按 mini-batch 计算）。</p>
+<p><strong>代价</strong>：
+- 墙上时间增加 4×（4 次前向反向 vs 1 次）。
+- 内存不降（峰值仍是单 mini-batch 的前向+反向+optimizer states），但允许用小 batch 模拟大 batch 的收敛效果。</p>
+<p>适用于大模型训练（如 7B+），其中 batch_size=1 已占满 GPU，需累积达到 effective batch_size=256。</p>
+<h2 id="_9">完整流水</h2>
+<p>综合应用 DataLoader 并行、BF16 和梯度累积的训练流水：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">torch.cuda.amp</span><span class="w"> </span><span class="kn">import</span> <span class="n">autocast</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">DataLoader</span>
+
+<span class="n">dataloader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span>
+    <span class="n">dataset</span><span class="p">,</span>
+    <span class="n">batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="n">pin_memory</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">prefetch_factor</span><span class="o">=</span><span class="mi">2</span>
+<span class="p">)</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">model</span><span class="o">.</span><span class="n">gradient_checkpointing_enable</span><span class="p">()</span>  <span class="c1"># 如果内存受限</span>
+<span class="n">optimizer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">)</span>
+
+<span class="n">accumulation_steps</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+
+<span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">batch</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">dataloader</span><span class="p">):</span>
+    <span class="n">inputs</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="s2">"input_ids"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">labels</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="s2">"labels"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="k">with</span> <span class="n">autocast</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">):</span>
+        <span class="n">outputs</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">labels</span><span class="o">=</span><span class="n">labels</span><span class="p">)</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">loss</span> <span class="o">/</span> <span class="n">accumulation_steps</span>
+
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">accumulation_steps</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">clip_grad_norm_</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="mf">1.0</span><span class="p">)</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>关键路径优化</strong>：
+- 数据准备与 GPU 计算并行（4 workers, prefetch=2）。
+- 前向反向用 BF16（速度 +40%，内存 -5~10%）。
+- Activation checkpointing 按需启用（内存 -34%，速度 -20%）。
+- 梯度累积模拟大 batch（effective_batch_size = 8 × 4 = 32）。</p>
+<h2 id="_10">监控与调优</h2>
+<h3 id="_11">关键指标</h3>
+<p>训练循环性能监控关注：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>工具</th>
+<th>目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Samples/sec</td>
+<td>训练日志</td>
+<td>数据吞吐</td>
+</tr>
+<tr>
+<td>GPU 利用率</td>
+<td><code>nvidia-smi dmon</code></td>
+<td>&gt; 90%（计算密集）</td>
+</tr>
+<tr>
+<td>内存峰值</td>
+<td><code>torch.cuda.max_memory_allocated()</code></td>
+<td>&lt; 显存 × 0.9</td>
+</tr>
+<tr>
+<td>DataLoader 队列</td>
+<td>自定义 profiling</td>
+<td>&gt; 0（数据不阻塞）</td>
+</tr>
+<tr>
+<td>梯度范数</td>
+<td>训练日志</td>
+<td>稳定，无 inf/NaN</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_12">调优策略</h3>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>原因</th>
+<th>解决</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU 利用率 &lt; 50%</td>
+<td>数据阻塞</td>
+<td>增加 num_workers, prefetch_factor</td>
+</tr>
+<tr>
+<td>内存 OOM</td>
+<td>激活值过大</td>
+<td>启用 checkpointing，减小 batch_size</td>
+</tr>
+<tr>
+<td>梯度 inf/NaN</td>
+<td>FP16 溢出</td>
+<td>切换 BF16，或调整 scaler 初始 scale</td>
+</tr>
+<tr>
+<td>速度慢但内存富余</td>
+<td>未用混合精度</td>
+<td>启用 BF16 autocast</td>
+</tr>
+<tr>
+<td>Loss 震荡</td>
+<td>Batch size 过小</td>
+<td>梯度累积增大 effective batch size</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_13">总结</h2>
+<p>训练循环的系统优化围绕<strong>数据-计算流水、内存-时间权衡和数值稳定性</strong>：</p>
+<ol>
+<li><strong>DataLoader 并行</strong>：2-4 worker + prefetch 将数据准备与 GPU 计算重叠，消除 CPU 阻塞。</li>
+<li><strong>Activation checkpointing</strong>：内存降低 34%，反向时间增加 42%，适合大 batch/长序列场景。</li>
+<li><strong>混合精度</strong>：BF16 是默认选择（速度 +40%，稳定性好）；FP16 更快但需 gradient scaling。</li>
+<li><strong>内存峰值</strong>：出现在优化器更新前，包含权重、梯度和 optimizer states。</li>
+<li><strong>梯度累积</strong>：小 batch 模拟大 batch，不降低内存峰值，但允许突破单 batch 内存限制。</li>
+</ol>
+<p>下一章进入分布式训练，将单机流水扩展到多 GPU 和多节点。</p></article><nav class="pagenav"><a class="nav-prev" href="../L7/7.0b-one-training-step.html">&#8592; 7.0b 一个 batch 的完整训练步：labels、loss、梯度、更新与恢复</a><a class="nav-next" href="../L7/7.2-training-parallelism.html">7.2 训练并行：ZeRO 到 zero-bubble &#8594;</a></nav>
+</main>
+</body>
+</html>

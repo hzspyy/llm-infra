@@ -3,22 +3,22 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>4.0 模型文件到底是什么：safetensors 字节布局与加载路径</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<title>4.0 模型文件：safetensors 布局与加载路径</title>
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
 <aside class="sidebar">
   <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">4.0</div>
-  <div class="sidebar-title">模型文件到底是什么：safetensors 字节布局与加载路径</div>
+  <div class="sidebar-title">模型文件：safetensors 布局与加载路径</div>
   <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">一 · 三段结构</a></li>
 <li><a href="#index">二 · 分片与 index</a><ul>
-<li><a href="#_3">发现一：分片会把一层切开</a></li>
+<li><a href="#_3">发现一：权重分片严格按体积切分，不遵循层级边界</a></li>
 <li><a href="#_4">定位一个具体张量</a></li>
 </ul>
 </li>
@@ -48,7 +48,7 @@
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">一 · 三段结构</a></li>
 <li><a href="#index">二 · 分片与 index</a><ul>
-<li><a href="#_3">发现一：分片会把一层切开</a></li>
+<li><a href="#_3">发现一：权重分片严格按体积切分，不遵循层级边界</a></li>
 <li><a href="#_4">定位一个具体张量</a></li>
 </ul>
 </li>
@@ -78,9 +78,9 @@
 <header class="page-head">
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L4 · 模型架构与数值</div>
   <div class="mod-id">4.0</div>
-  <h1>模型文件到底是什么：safetensors 字节布局与加载路径</h1>
-  <p class="lede">检查 safetensors 的头部、张量偏移、共享权重与量化清单，连接磁盘格式和加载路径。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen3-1.7B / Qwen3-8B / Qwen2.5-1.5B AWQ+GPTQ</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 0.4（词表与 tokenizer 文件）· 1.5（存储路径与 mmap）· 2.0（storage 与 stride）</span></div>
+  <h1>模型文件：safetensors 布局与加载路径</h1>
+  <p class="lede">从 safetensors 的文件头和张量偏移开始，解释权重文件如何加载成模型。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen3-1.7B / Qwen3-8B / Qwen2.5-1.5B AWQ+GPTQ</span><span class="chip">前置 0.4（词表与 tokenizer 文件）· 1.5（存储路径与 mmap）· 2.0（storage 与 stride）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>"模型权重"这个词太抽象。这一章把它落到字节上：</p>
 <ol>
@@ -89,9 +89,8 @@
 <li>"4 bit 量化模型"里，哪些部分真的是 4 bit？</li>
 </ol>
 <div class="admonition note">
-<p class="admonition-title">本章有两个&quot;文档说 A、文件里是 B&quot;的实测发现</p>
-<p>两个都是我先按教科书写法写好了叙述，然后被自己的实验输出打脸，
-回去查证之后改过来的。它们比格式说明本身更值得记。</p>
+<p class="admonition-title">配置声明需要与权重文件核对</p>
+<p>下面的两个例子说明，模型配置中的声明不一定与文件里保存的张量一一对应。加载行为还需要结合具体代码检查。</p>
 </div>
 <hr />
 <h2 id="_2">一 · 三段结构</h2>
@@ -130,9 +129,8 @@ model-00004-of-00005.safetensors   layers 27..35   另有 model.norm.weight
 model-00005-of-00005.safetensors   无 layer         另有 lm_head.weight
 </code></pre></div>
 
-<h3 id="_3">发现一：分片会把一层切开</h3>
-<p>不能假设一个模型层的权重一定保存在同一个分片中。
-但看那些范围——<strong>0..7 和 7..17 是重叠的</strong>。第 7 层在哪？</p>
+<h3 id="_3">发现一：权重分片严格按体积切分，不遵循层级边界</h3>
+<p>观察上述各分片的层号范围，会发现一个关键现象：分片 1 覆盖 0..7 层，而分片 2 覆盖 7..17 层——两者的范围在第 7 层发生了重叠。第 7 层的参数具体是如何分布的？</p>
 <div class="highlight"><pre><span></span><code>第 7 层的 11 个张量分布：{'2-of-00005.safetensors': 8, '1-of-00005.safetensors': 3}
   7.self_attn.q_proj.weight               1-of-00005.safetensors
   7.self_attn.k_proj.weight               1-of-00005.safetensors
@@ -142,9 +140,8 @@ model-00005-of-00005.safetensors   无 layer         另有 lm_head.weight
   ...
 </code></pre></div>
 
-<p><strong>q/k/v_proj 在第 1 个文件，其余 8 个在第 2 个。</strong> 分片纯粹按字节大小切，
-不管层的边界。所以"加载完一层就能开始算"需要跨文件协调，不是免费的。</p>
-<p>（这也解释了为什么第 5 个分片只有 1 个张量：切到最后剩下 <code>lm_head</code> 就单独成片。）</p>
+<p><code>q/k/v_proj</code> 落在第 1 个分片，而同属第 7 层的其余 8 个算子权重却落在了第 2 个分片。这说明大模型的权重分片纯粹按照单文件大小阈值（如 ~4 GB）机械切分，完全不考虑逻辑上的 Transformer 层级边界。因此，在流水线并行或边加载边初始化的场景中，试图按层流式加载权重必须处理跨文件的协调与同步开销。</p>
+<p>（这也顺带解释了为什么第 5 个分片只有 1 个张量：切分到最后剩余的 <code>lm_head</code> 单独构成了尾部分片。）</p>
 <h3 id="_4">定位一个具体张量</h3>
 <div class="highlight"><pre><span></span><code>model.layers.20.self_attn.q_proj.weight
   文件      model-00003-of-00005.safetensors
@@ -351,9 +348,7 @@ checkpoint 如果按某一种布局存，就绑死了一种部署方式。</p>
 <p>AWQ 和 GPTQ 同样是 4 bit、同样 group_size=128、
 同样存 qweight/scales/qzeros，<strong>但 qweight 的 shape 是转置的</strong>。
 这意味着两套反量化 kernel、两套加载路径、两套测试。</p>
-<p>这不是谁做错了，而是<strong>没有人在早期把它标准化</strong>。
-每个方法先有 kernel 再有格式，格式跟着 kernel 的最优访存布局走。
-等到要互通时，双方都已经有大量部署，改不动了。</p>
+<p>量化格式通常与 kernel 的数据布局相配套。不同实现即使使用相同位宽，也可能需要重新排列权重才能互通。</p>
 <p>设计原则：<strong>当一个领域的格式由"当前最优实现"倒推出来时，
 碎片化几乎是必然的。</strong> 要避免它，需要在性能还没定型的时候
 就先定一个稍微次优但中立的格式——而那个时机通常没人愿意付代价。</p>
@@ -726,12 +721,12 @@ python<span class="w"> </span>labs/L4/checkpoint_formats.py
    和 <code>safe_open</code> 读到的前 16 个 bf16 值手工比对。
    （<code>inspect_safetensors.py</code> 里有手算 bf16 的函数。）</li>
 <li>写一个 20 行的脚本，<strong>只用标准库</strong>列出任意 safetensors 的所有张量名和形状。
-   这能验证你真的理解了那三段结构。</li>
+   用它检查文件头、元数据和张量区的对应关系。</li>
 <li>把 AWQ 的 <code>qweight</code> 解包出来（每个 int32 含 8 个 4-bit），
    用 <code>scales</code>/<code>qzeros</code> 还原成 fp16，和未量化模型的对应权重比余弦相似度。
    <strong>这是理解量化格式最直接的一步</strong>，也是 4.3 的前置。</li>
 <li>检查你手上其它模型的 <code>tie_word_embeddings</code> 与实际张量列表是否一致——
-   本章找到两个不一致的例子，值得知道这有多普遍。</li>
+   比较声明与文件内容不一致时，加载器如何处理。</li>
 </ol>
 <hr />
 <h2 id="_8">九 · 陷阱</h2>

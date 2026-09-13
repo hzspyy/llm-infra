@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>1.5 网络与存储底座</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -25,7 +25,7 @@
 <li><a href="#read-mmap">read() 与 mmap 的加载路径对照</a></li>
 </ul>
 </li>
-<li><a href="#_6">工程实现 · 源码走读</a><ul>
+<li><a href="#_6">工程实现 · 源码解析</a><ul>
 <li><a href="#vllm-load-format">vLLM 的加载路径与 --load-format</a></li>
 <li><a href="#_7">服务模型名称与权重路径分别配置</a></li>
 </ul>
@@ -54,7 +54,7 @@
 <li><a href="#read-mmap">read() 与 mmap 的加载路径对照</a></li>
 </ul>
 </li>
-<li><a href="#_6">工程实现 · 源码走读</a><ul>
+<li><a href="#_6">工程实现 · 源码解析</a><ul>
 <li><a href="#vllm-load-format">vLLM 的加载路径与 --load-format</a></li>
 <li><a href="#_7">服务模型名称与权重路径分别配置</a></li>
 </ul>
@@ -74,21 +74,18 @@
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L1 · 硬件与操作系统底座</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L1 · 硬件与操作系统</div>
   <div class="mod-id">1.5</div>
   <h1>网络与存储底座</h1>
-  <p class="lede">沿权重加载路径比较存储读取、主机暂存和设备传输，区分带宽观测与路径推断。</p>
-  <div class="chips"><span class="chip">实测机器 crater (NVMe overlay) + worldvln (btrfs on loop, SeaweedFS/FUSE, RoCE 25 Gb/s)</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.3（PCIe 与 pinned 内存）· L1.4（驱动分层）</span></div>
+  <p class="lede">沿权重加载过程，分析存储读取、主机暂存和设备传输的路径与带宽。</p>
+  <div class="chips"><span class="chip">实测机器 crater (NVMe overlay) + worldvln (btrfs on loop, SeaweedFS/FUSE, RoCE 25 Gb/s)</span><span class="chip">前置 L1.3（PCIe 与 pinned 内存）· L1.4（驱动分层）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li>权重从磁盘到显存要过几段？<strong>每段各占多少时间</strong>？瓶颈在哪一段？</li>
 <li>为什么 <code>.to("cuda")</code> 加载模型只有 <strong>15 GB/s</strong>，而 <a class="xref" href="../L1/1.3-host-pcie-numa.html" title="主机侧：NUMA、PCIe 与 DMA">L1.3</a> 测出 PCIe 是 47 GB/s？</li>
-<li>GPUDirect Storage / GPUDirect RDMA <strong>在我这台机器上到底可不可用</strong>？（"库存在"不等于"能用"）</li>
+<li>如何确认当前机器能否使用 GPUDirect Storage 或 GPUDirect RDMA？</li>
 </ol>
-<p>加载权重不是一次文件读取。数据需要经过文件系统、主机内存和设备传输路径，
-期间还可能发生缺页、复制或格式转换。本章按这些步骤拆分耗时，
-比较“小张量传输较多”和“源内存未页锁定”两种候选解释。
-它们可以同时存在，不能仅因一种解释较符合数据，就排除其余开销。</p>
+<p>大模型权重的加载绝非简单的单一文件读取。数据必须穿透底层存储驱动、操作系统页缓存（Page Cache）、主机用户态内存以及 PCIe 总线，最终抵达 GPU 显存；整个链路中往往交织着缺页中断调页、内存格式转换以及非页锁定内存拷贝开销。本章将对权重加载的全链路耗时进行细粒度拆解，揭示冷启动瓶颈并厘清各阶段的物理制约。</p>
 <hr />
 <h2 id="_2">心智模型：沿权重的数据路径逐段检查</h2>
 <figure>
@@ -198,9 +195,7 @@
 <li>worldvln 本地：<strong>29 秒</strong></li>
 <li>worldvln 网络存储：<strong>107 秒</strong></li>
 </ul>
-<p>这些是按带宽换算的读取时间估计，不是 8B 模型的完整启动实测。还应注意，
-worldvln 的"本地盘"其实是
-<code>/dev/loop8</code> 上的 btrfs —— 容器镜像的循环设备，比裸 NVMe 慢一个数量级。</p>
+<p>上述时间是基于实测顺序读取带宽的理论下限推算。在实际系统中，worldvln 上的所谓“本地盘”并非物理裸 NVMe，而是挂载在 <code>/dev/loop8</code> 虚拟循环设备上的 btrfs 文件系统，其实际 I/O 效率较物理裸盘低了一个数量级。</p>
 <div class="admonition note">
 <p class="admonition-title">一个容易忽略的事实</p>
 <p><code>df -hT</code> 显示 worldvln 的 <code>/root/nfs</code> 是 <code>fuse.seaweedfs</code> —— <strong>不是 NFS，是 FUSE</strong>。
@@ -220,11 +215,11 @@ C3 主机内存 -&gt; 显存      230.4 ms  ( 14.94 GB/s)
 </code></pre></div>
 
 <div class="admonition warning">
-<p class="admonition-title">C1/C2 的分离是踩坑换来的</p>
-<p>第一版把 <code>safe_open(...).get_tensor(k)</code> 直接计时，测出<strong>冷加载 104 GB/s</strong>——
+<p class="admonition-title">mmap 建立映射与实际读取应分别计时</p>
+<p>直接对 <code>safe_open(...).get_tensor(k)</code> 计时，测出<strong>冷加载 104 GB/s</strong>——
 比任何磁盘都快。原因是 safetensors 返回的是<strong>建立在 mmap 之上的视图</strong>，
 调用它并不真的读字节。真正的磁盘读被推迟到后面 <code>.to("cuda")</code> 触碰内存的那一刻，
-于是 H2D 只测出 6.7 GB/s。<strong>两段时间串了台。</strong></p>
+于是 H2D 阶段只有 6.7 GB/s，因为这段计时还包含实际读取。</p>
 <p>一般规律：<strong>凡是 mmap，就要警惕"什么时候真的读"。</strong> 计时必须包含一次真实触碰。</p>
 </div>
 <h3 id="h2d">H2D 吞吐差异的两组诊断对照</h3>
@@ -291,18 +286,18 @@ DeepEP、NVSHMEM 等具体模式需要分别检查版本和要求，不能一并
 <p>因为它要的是<strong>按需</strong>：<code>safe_open(...).get_slice(name)</code> 能只读一个张量，
 而不把 3.44 GB 全读进来（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 原始现场 ①）。这对以下场景是必需的：</p>
 <ul>
-<li>只加载模型的一部分（PP 并行时每个 stage 只要自己那几层，<span class="xref pending" title="训练并行：ZeRO 到 zero-bubble（后续章节）">L7.2</span>）</li>
-<li>检查 shape/dtype 而不读数据（<a class="xref" href="../L4/4.0-checkpoint-format.html" title="模型文件到底是什么：safetensors 字节布局与加载路径">L4.0</a> 逐字节解析时用的就是这个）</li>
+<li>只加载模型的一部分（PP 并行时每个 stage 只要自己那几层，<a class="xref" href="../L7/7.2-training-parallelism.html" title="训练并行：ZeRO 到 zero-bubble">L7.2</a>）</li>
+<li>检查 shape/dtype 而不读数据（<a class="xref" href="../L4/4.0-checkpoint-format.html" title="模型文件：safetensors 布局与加载路径">L4.0</a> 逐字节解析时用的就是这个）</li>
 <li>多进程共享同一份权重的页缓存（TP 时 8 个进程读同一个文件，物理内存只占一份）</li>
 </ul>
 <p><strong>最后一条是关键</strong>：mmap 让多个 worker 进程天然共享页缓存。
 如果用 <code>read()</code>，8 路 TP 就要 8 份主机内存副本。</p>
 <hr />
-<h2 id="_6">工程实现 · 源码走读</h2>
+<h2 id="_6">工程实现 · 源码解析</h2>
 <h3 id="vllm-load-format">vLLM 的加载路径与 <code>--load-format</code></h3>
 <p>vLLM 的模型加载在 <code>model_executor/model_loader/</code> 下，默认走 safetensors + mmap。
 本章测出的 748 ms（3.44 GB）对应 <a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 里那个「一次性启动成本」的下半段。</p>
-<p>值得注意的是它提供了多种 <code>load_format</code>，每种对应本章的不同权衡：</p>
+<p>不同的 <code>load_format</code> 对应不同的加载方式：</p>
 <table>
 <thead>
 <tr>
@@ -385,7 +380,7 @@ ls<span class="w"> </span>/sys/kernel/mm/memory_peers/<span class="w"> </span><s
 </tr>
 </tbody>
 </table>
-<p>倒数第二行值得一试：它把 <a class="xref" href="../L1/1.3-host-pcie-numa.html" title="主机侧：NUMA、PCIe 与 DMA">L1.3</a>（主存带宽限制重叠）和本章（加载流水）串起来了。</p>
+<p>倒数第二项实验检查主存带宽是否限制加载流水的重叠收益，相关原理见 <a class="xref" href="../L1/1.3-host-pcie-numa.html" title="主机侧：NUMA、PCIe 与 DMA">L1.3</a>。</p>
 <hr />
 <h2 id="_9">原始现场</h2>
 <details>
@@ -509,12 +504,12 @@ $ ls /dev/nvidia-fs*
 </tr>
 <tr>
 <td><strong>模型格式的演化</strong></td>
-<td>safetensors 的 mmap 友好性是设计出来的（<a class="xref" href="../L4/4.0-checkpoint-format.html" title="模型文件到底是什么：safetensors 字节布局与加载路径">L4.0</a>）；GGUF 走另一条路（量化内嵌 + 单文件）；两者在加载路径上的取舍不同</td>
+<td>safetensors 的 mmap 友好性是设计出来的（<a class="xref" href="../L4/4.0-checkpoint-format.html" title="模型文件：safetensors 布局与加载路径">L4.0</a>）；GGUF 走另一条路（量化内嵌 + 单文件）；两者在加载路径上的取舍不同</td>
 </tr>
 </tbody>
 </table>
 <blockquote>
-<p>除本章实测外的内容来自各自文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+<p>除本章实测外的内容来自各自文档，<strong>尚未复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
 <h2 id="_11">陷阱</h2>
@@ -550,15 +545,13 @@ $ ls /dev/nvidia-fs*
 <li><strong>流式重叠</strong>：把读盘与 PCIe 传输流水化。上限是较慢的那段，
    在 NFS 上仍是 107 秒，<strong>基本无用</strong>。</li>
 </ol>
-<p><strong>关键判断：先看瓶颈在哪一段，再决定优化哪一段。</strong> 这里 95% 的时间在读盘，
-优化 PCIe 是白费力气。</p>
+<p>这里 95% 的时间用于读盘，仅优化 PCIe 对总时间的改善有限。</p>
 </details>
 <details>
 <summary>2. 为什么页缓存对 FUSE 的加速比（2.1×）远低于对 NVMe 的（3.8×）和 loop 设备的（9.2×）？</summary>
 <p>这些带宽差异不能单独确定原因。应检查是否使用 direct I/O、页缓存是否命中、
 请求大小、客户端缓存以及服务端状态。
-Linux 的 cached FUSE 模式允许从页缓存满足读取，因此旧稿中
-“每次 read 都经过用户态守护进程”的解释不成立。
+Linux 的 cached FUSE 模式允许从页缓存满足读取，不能假定每次 read 都经过用户态守护进程。
 参见 <a href="https://kernel.org/doc/html/latest/filesystems/fuse/fuse-io.html">Linux FUSE I/O 模式</a>。
 本组数据说明这条具体路径值得优化，不意味着所有 FUSE 文件系统预热收益都小。</p>
 </details>

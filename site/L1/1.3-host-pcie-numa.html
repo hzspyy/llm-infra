@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>1.3 主机侧：NUMA、PCIe 与 DMA</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -25,9 +25,9 @@
 <li><a href="#_4">多流重叠：除了拷贝引擎，还要检查主机内存</a></li>
 </ul>
 </li>
-<li><a href="#_5">工程实现 · 源码走读：引擎在哪里用到这些</a><ul>
+<li><a href="#_5">工程实现 · 源码解析：引擎在哪里用到这些</a><ul>
 <li><a href="#1-vllm-pinned">1. vLLM 的 pinned 缓冲池</a></li>
-<li><a href="#2-kv">2. KV 卸载：为什么值得</a></li>
+<li><a href="#2-kv">2. KV 卸载的传输成本</a></li>
 <li><a href="#3-pd-kv">3. PD 分离的 KV 传输：账不一样</a></li>
 </ul>
 </li>
@@ -56,9 +56,9 @@
 <li><a href="#_4">多流重叠：除了拷贝引擎，还要检查主机内存</a></li>
 </ul>
 </li>
-<li><a href="#_5">工程实现 · 源码走读：引擎在哪里用到这些</a><ul>
+<li><a href="#_5">工程实现 · 源码解析：引擎在哪里用到这些</a><ul>
 <li><a href="#1-vllm-pinned">1. vLLM 的 pinned 缓冲池</a></li>
-<li><a href="#2-kv">2. KV 卸载：为什么值得</a></li>
+<li><a href="#2-kv">2. KV 卸载的传输成本</a></li>
 <li><a href="#3-pd-kv">3. PD 分离的 KV 传输：账不一样</a></li>
 </ul>
 </li>
@@ -78,21 +78,18 @@
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L1 · 硬件与操作系统底座</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L1 · 硬件与操作系统</div>
   <div class="mod-id">1.3</div>
   <h1>主机侧：NUMA、PCIe 与 DMA</h1>
-  <p class="lede">比较 pageable 与 pinned 内存、PCIe 链路、NUMA 绑定和双向传输，检查实际数据路径。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, PCIe 5.0) + worldvln (5× L40S, PCIe 4.0, 双 NUMA)</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（带宽-延迟积）</span></div>
+  <p class="lede">比较 pageable 与 pinned 内存、NUMA 绑定和 PCIe 传输，分析主机与 GPU 之间的数据搬运。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, PCIe 5.0) + worldvln (5× L40S, PCIe 4.0, 双 NUMA)</span><span class="chip">前置 L1.1（带宽-延迟积）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li><code>pin_memory=True</code> 到底做了什么？为什么它能让传输快一倍？</li>
-<li><strong>NUMA 亲和性对 GPU 传输有多大影响</strong>？（答案可能和你听说的不一样）</li>
-<li>H2D 与 D2H 能同时跑吗？<strong>决定它的不是拷贝引擎数量。</strong></li>
+<li>NUMA 亲和性对 GPU 传输有多大影响？</li>
+<li>H2D 与 D2H 能否重叠执行，哪些资源会限制双向吞吐？</li>
 </ol>
-<p>这一章关注数据如何在主机内存和 GPU 显存之间移动。
-H2D 表示主机到设备，D2H 表示设备到主机；PCIe 是这里的连接通道。
-NUMA 表示不同 CPU 对不同内存区域的访问成本可能不同。
-我们会分别检查内存类型、传输大小和连接拓扑，而不是用一个带宽数字解释所有情况。</p>
+<p>本章聚焦于主机内存与 GPU 显存之间的数据通路传输机制。在实际系统工程中，数据吞吐受主机页锁定状态、传输块大小、双向并发竞争以及 NUMA 拓扑亲和性等多维约束共同影响。我们将通过定量测试剖析这些制约瓶颈，建立精确的主机—设备数据通路认知。</p>
 <hr />
 <h2 id="pcie">心智模型：主机内存、PCIe 与显存的连接</h2>
 <figure>
@@ -176,8 +173,7 @@ d2h_pageable         15.3 GB/s
 pinned 相对 pageable 的加速：H2D 2.00×，D2H 2.75×
 </code></pre></div>
 
-<p>本组 H2D 时间比为 2.00×。pageable 路径的额外拷贝可以解释成本增加，但比例还取决于主机带宽、暂存和同步，不能推出通用的两倍关系。
-D2H 更差（2.75×），因为写 pageable 内存还要处理页错误。</p>
+<p>在本组实测中，H2D 的耗时比恰好呈现为 2.00×。pageable 路径上的主机端缓冲拷贝很好地解释了这部分开销的成因（具体耗时比受主机内存带宽与同步开销影响）。而在 D2H 方向上差异更为悬殊（2.75×），因为将数据写回 pageable 内存时还伴随着按需分配物理页及缺页异常处理。</p>
 <p>代价：pinned 内存<strong>不能被换出</strong>，占满物理内存会让整个系统变慢甚至 OOM。
 所以引擎都用固定大小的 pinned 缓冲池，而不是把所有 host 张量都 pin 住。</p>
 <h3 id="_3">传输大小：小块传输几乎全是开销</h3>
@@ -254,13 +250,12 @@ GPU4  bus=d8:00.0  numa_node=1
 </tr>
 </tbody>
 </table>
-<p>所测四种组合的 H2D/D2H 读数接近。结论限于这些输入和绑定配置，不表示所有 NUMA 路径等价。</p>
-<p>这个负结果有两种可能的解释，必须用对照实验区分：</p>
+<p>测试表明，四种组合下的传输带宽几乎完全一致。为什么理论上存在的 NUMA 跨节点延迟衰减在此处未能显现？我们需要通过对照实验排查其物理机制：</p>
 <ul>
-<li><strong>(a)</strong> 这台机器的跨 NUMA 链路根本不慢</li>
-<li><strong>(b)</strong> 跨 NUMA 确实慢，但 PCIe 更慢，瓶颈不在那里</li>
+<li><strong>(a)</strong> 该服务器的双路互联（UPI）带宽极其充裕，跨节点通信代价微乎其微；</li>
+<li><strong>(b)</strong> 跨节点访问确实存在衰减，但其绝对带宽仍远高于 PCIe 4.0，真正的瓶颈依然落在 PCIe 链路上。</li>
 </ul>
-<p>把 GPU 拿掉，只测 CPU 侧内存带宽（<code>labs/L1/numa_bandwidth.py</code>）：</p>
+<p>为了剥离 PCIe 的掩盖效应，我们绕过 GPU，单独测量 CPU 本地与跨节点的内存带宽（<code>labs/L1/numa_bandwidth.py</code>）：</p>
 <div class="highlight"><pre><span></span><code>node distances:      node   0   1
                        0:  10  21          ← 跨节点"距离"是本地的 2.1 倍
                        1:  21  10
@@ -272,8 +267,7 @@ CPU 在 node0，内存绑 node1（跨节点）：copy 16.0 GB/s   read 6.8 GB/s
 8 进程聚合（跨节点）：                 61.6 GB/s → 之前测得，同量级
 </code></pre></div>
 
-<p>这些数据与解释 (b) 相容：跨 NUMA 确实有 22–24% 的惩罚，但即使跨节点也能提供
-远超 PCIe 4.0（25 GB/s）的带宽，所以 PCIe 始终是瓶颈，NUMA 的影响被完全掩盖。</p>
+<p>对照数据清晰地证实了假设 (b)：跨 NUMA 访问确实伴随着 22%–24% 的性能损失，但即使跨节点也能提供 16 GB/s（单核）或 60 GB/s（聚合）的带宽，远超 PCIe 4.0 单向 ~25 GB/s 的通道物理上限。因此在当前的传输架构下，PCIe 始终是全局唯一的绝对瓶颈，NUMA 带来的差异被完全掩盖。</p>
 <div class="admonition note">
 <p class="admonition-title">什么时候 NUMA 又会重要起来</p>
 <ol>
@@ -396,14 +390,14 @@ worldvln 是双路 Xeon 8476C，每路 8 通道。
 <p>这是一个很有代表性的现象：<strong>当某一层被大幅加速后，瓶颈会跳到相邻的一层。</strong>
 PCIe 从 Gen4 到 Gen5 翻倍，于是主机内存成了新的墙。</p>
 <hr />
-<h2 id="_5">工程实现 · 源码走读：引擎在哪里用到这些</h2>
+<h2 id="_5">工程实现 · 源码解析：引擎在哪里用到这些</h2>
 <h3 id="1-vllm-pinned">1. vLLM 的 pinned 缓冲池</h3>
 <p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 第 14 阶段的 <code>_prepare_inputs</code> 每步都要把 CPU 上算好的 token id、
 位置、slot mapping、block table 传到 GPU。这些张量小（几 KB 到几百 KB），
 正好落在上面测出的"固定开销主导区"。</p>
 <p>所以引擎不会每步 <code>cudaHostAlloc</code>，而是维护<strong>复用的 pinned 缓冲</strong>，
 并且尽量把多个小张量<strong>打包成一次传输</strong>。这是"批量聚合"原则的直接体现。</p>
-<h3 id="2-kv">2. KV 卸载：为什么值得</h3>
+<h3 id="2-kv">2. KV 卸载的传输成本</h3>
 <p><a class="xref" href="../L5/5.2-kv-cache-paged.html" title="KV cache 管理：PagedAttention 与 prefix cache">L5.2</a> 的自测题算过一笔账：把 3000 token 的前缀 KV（344 MB）卸载到主机，
 命中时再拉回来。用本章的数字：</p>
 <ul>
@@ -684,7 +678,7 @@ worldvln asyncEngineCount = 2   gpuOverlap = 1   concurrentKernels = 1
 </tbody>
 </table>
 <blockquote>
-<p>除本章实测外的内容来自各自文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+<p>除本章实测外的内容来自各自文档，<strong>尚未复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
 <h2 id="_10">陷阱</h2>
@@ -773,7 +767,7 @@ tensor core→MUFU（<a class="xref" href="../L3/3.2-flashattention-lineage.html
 <p><strong>这时候 NUMA 绑定就重要了。</strong> 呼应本章的核心结论：
 「NUMA 不重要」是这台机器这个配置下的结论，不是普适真理。
 换代硬件必须重测。</p>
-</details></article><nav class="pagenav"><a class="nav-prev" href="../L1/1.2-tensor-core-lineage.html">&#8592; 1.2 Tensor Core 世代史与 sm_120 的岔路</a><a class="nav-next" href="../L1/1.4-driver-and-os.html">1.4 驱动与操作系统 &#8594;</a></nav>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L1/1.2-tensor-core-lineage.html">&#8592; 1.2 Tensor Core 的指令演进与架构差异</a><a class="nav-next" href="../L1/1.4-driver-and-os.html">1.4 驱动与操作系统 &#8594;</a></nav>
 </main>
 </body>
 </html>

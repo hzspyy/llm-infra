@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.12 非生成模型的服务</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -26,7 +26,7 @@
 <li><a href="#6-padding">6. padding 的代价为什么在这里更贵</a></li>
 </ul>
 </li>
-<li><a href="#_3">工程实现 · 源码走读</a><ul>
+<li><a href="#_3">工程实现 · 源码解析</a><ul>
 <li><a href="#a-v1embeddings">A. 路由：/v1/embeddings 不产生流式响应</a></li>
 <li><a href="#b-pooling-chunk">B. 调度：pooling 请求默认不被 chunk</a></li>
 <li><a href="#c-runner-pooling-cursor">C. runner：扁平张量 + pooling cursor</a></li>
@@ -43,7 +43,7 @@
 <li><a href="#4-batch-76">4. batch 扫描：吞吐涨 7.6 倍，引擎时间几乎不动</a></li>
 <li><a href="#5">5. 变长输入：引擎不吃这份浪费</a></li>
 <li><a href="#6-token-pooling">6. token 预算边界：同一组参数，生成能起、pooling 起不来</a></li>
-<li><a href="#7-batch">7. batch 上限：修正账本与实验边界</a></li>
+<li><a href="#7-batch">7. batch 上限的估算与测量范围</a></li>
 <li><a href="#8-rerank-qwen3-reranker-06b">8. rerank 真实链路：Qwen3-Reranker-0.6B</a></li>
 <li><a href="#9">9. 消融与未测范围</a></li>
 </ul>
@@ -69,7 +69,7 @@
 <li><a href="#6-padding">6. padding 的代价为什么在这里更贵</a></li>
 </ul>
 </li>
-<li><a href="#_3">工程实现 · 源码走读</a><ul>
+<li><a href="#_3">工程实现 · 源码解析</a><ul>
 <li><a href="#a-v1embeddings">A. 路由：/v1/embeddings 不产生流式响应</a></li>
 <li><a href="#b-pooling-chunk">B. 调度：pooling 请求默认不被 chunk</a></li>
 <li><a href="#c-runner-pooling-cursor">C. runner：扁平张量 + pooling cursor</a></li>
@@ -86,7 +86,7 @@
 <li><a href="#4-batch-76">4. batch 扫描：吞吐涨 7.6 倍，引擎时间几乎不动</a></li>
 <li><a href="#5">5. 变长输入：引擎不吃这份浪费</a></li>
 <li><a href="#6-token-pooling">6. token 预算边界：同一组参数，生成能起、pooling 起不来</a></li>
-<li><a href="#7-batch">7. batch 上限：修正账本与实验边界</a></li>
+<li><a href="#7-batch">7. batch 上限的估算与测量范围</a></li>
 <li><a href="#8-rerank-qwen3-reranker-06b">8. rerank 真实链路：Qwen3-Reranker-0.6B</a></li>
 <li><a href="#9">9. 消融与未测范围</a></li>
 </ul>
@@ -105,22 +105,21 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
   <div class="mod-id">5.12</div>
   <h1>非生成模型的服务</h1>
-  <p class="lede">按服务任务和模型架构分别分析 embedding、rerank、classifier 与 pooling；区分一次前向返回和生成式打分，核对持续状态、容量、padding、数值语义与 batching。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen2.5-1.5B-Instruct · BAAI/bge-small-en-v1.5 · vLLM 0.29.0 · transformers 5.17.0</span><span class="chip">数据日期 2026-09-12</span><span class="chip">前置 0.2（资源账本）· 3.1（attention 内存墙）· 5.1（两相）· 5.11（前门）</span></div>
+  <p class="lede">比较 embedding、rerank 和分类服务的计算过程，分析 pooling、padding、批处理与容量。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen2.5-1.5B-Instruct · BAAI/bge-small-en-v1.5 · vLLM 0.29.0 · transformers 5.17.0</span><span class="chip">前置 0.2（资源账本）· 3.1（attention 内存墙）· 5.1（两相）· 5.11（前门）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
-<p>全书到目前为止默认「模型 = 自回归生成」。embedding、rerank、classifier 不是：
-本章关注其中一次前向返回向量或分数的服务路径，没有自回归 decode 阶段。这一章补上这个盲区。</p>
+<p>前面的章节主要讨论自回归生成。本章介绍一次前向就返回向量或分数的服务，例如 embedding、rerank 和分类，并分析它们与生成服务的计算和状态差异。</p>
 <ol>
 <li>没有 decode 的模型，瓶颈在哪一侧？</li>
-<li>为什么 embedding 服务能用大得多的 batch？</li>
-<li>变长输入的 padding 浪费在这里为什么更严重？</li>
+<li>哪些因素决定 embedding 服务的 batch 上限？</li>
+<li>变长输入的 padding 会带来哪些额外开销？</li>
 </ol>
-<p>结论先给：</p>
+<p>本章的比较范围如下：</p>
 <ul>
 <li>本章把一次前向返回向量的 pooling 服务与自回归生成对照。pooling 不需要跨 decode 步保留 KV；前向内部仍有 Q/K/V，具体引擎也可能分配缓存或临时 buffer。</li>
 <li>大 batch 的容量取决于权重、激活、workspace 与持久状态。权重读取的摊薄影响吞吐，不能直接决定显存容量。</li>
 <li>既有框架计时支持比较所测形状的耗时。roofline 的 FLOP 与字节均为公式估计；图中位置不能单独证明实际瓶颈。旧容量实验存在执行范围和对象释放问题，不能用于两类服务的容量比值。</li>
-<li>本批补齐容量公式与 meta 参数对拍；rerank、classifier 和 SGLang 真实链路仍为 <code>UNVERIFIED</code>，不标整章验收完成。</li>
+<li>容量公式已与 meta 模型参数核对；rerank、classifier 和 SGLang 真实链路仍为 <code>UNVERIFIED</code>。</li>
 </ul>
 <hr />
 <h2 id="vs">心智模型：一次前向 vs 一串前向</h2>
@@ -178,7 +177,7 @@
 <hr />
 <h2 id="_2">机制拆解与推导</h2>
 <h3 id="1">1. 算术强度决定了落在哪一侧</h3>
-<p>用 0.2 那套账本，把一次前向的成本拆成 FLOP 与字节两项：</p>
+<p>按照 0.2 的方法，分别估算一次前向的计算量与数据量：</p>
 <div class="highlight"><pre><span></span><code>权重 FLOP   = 2 · N_body · tokens
 attention   = causal:  2 · d · n_l · L² · B      （只有一半的 L² 被算）
               双向:    4 · d · n_l · L² · B
@@ -198,7 +197,7 @@ KV 读取     = 2 · n_l · n_kv_head · d_head · dtype_bytes · C · B
 <p>crater 上 BF16 GEMM 峰值 232.0 TFLOP/s、纯读带宽 1608.6 GB/s（<code>hw_crater_5090.json</code>），
 脊点落在 <strong>144 FLOP/byte</strong>。这是简化模型的分类边界，不是实测瓶颈判据。字节式未计入全部激活读写、缓存复用及 kernel 中间量；需用目标形状的 profiler 证据确认瓶颈。</p>
 <h3 id="2-kv">2. 没有 KV，就没有随上下文增长的状态</h3>
-<p>一次完成的 encoder 前向不保留跨步 KV；这里容量账本的持久 KV 项为 0。这不是「省了一点显存」，而是<strong>状态空间变了</strong>：</p>
+<p>一次完成的 encoder 前向不保留跨步 KV；这里容量账本的持久 KV 项为 0。因此，它不需要为后续生成保留这部分状态：</p>
 <table>
 <thead>
 <tr>
@@ -288,10 +287,10 @@ KV 读取     = 2 · n_l · n_kv_head · d_head · dtype_bytes · C · B
 <ul>
 <li><code>CLS</code> 取每段的第一行，<code>LAST</code> 取最后一行——索引数量为 O(B)，实际复制向量涉及 O(BH) 个元素，H 为 hidden size。</li>
 <li><code>MEAN</code> 要把每段所有行加起来（<code>methods.py:60-105</code>）：用 <code>repeat_interleave</code> 把
-  <code>prompt_lens</code> 展开成 <code>segment_ids</code>，再 <code>index_add_</code> 分段累加。为了不让中间张量炸掉，
+  <code>prompt_lens</code> 展开成 <code>segment_ids</code>，再 <code>index_add_</code> 分段累加。为限制中间张量的内存占用，
   它按 <code>_MEAN_POOL_ACCUMULATION_CHUNK_BYTES = 16 MiB</code> 分块累加。</li>
 </ul>
-<p>这里有一个约束值得记住：<strong><code>CLS</code> 和 <code>MEAN</code> 都显式拒绝 partial prefill</strong>
+<p>该版本实现有一项限制：<strong><code>CLS</code> 和 <code>MEAN</code> 都显式拒绝 partial prefill</strong>
 （<code>methods.py:44</code> 与 <code>67</code>，直接抛 <code>RuntimeError</code>）。这是该实现的约束。双向 attention 的 CLS 依赖整段上下文；MEAN 要求全部位置或额外维护分段累加状态。不能推广成所有模型的部分序列都无法池化。</p>
 <h3 id="5-chunked">5. 「chunked」在两个语境里不是一回事</h3>
 <p>同一个词在两个地方指两件不同的事，混起来会得出错误结论。</p>
@@ -325,7 +324,7 @@ and makes vLLM reject longer sequences.
 <p>而且这个浪费是<strong>二次的</strong>：attention 的 FLOP 正比于 <code>L²</code>，把批内最长的那条序列
 当作所有序列的长度，attention 部分按 <code>L_max²</code> 计费，而真正需要的是 <code>mean(L²)</code>。</p>
 <hr />
-<h2 id="_3">工程实现 · 源码走读</h2>
+<h2 id="_3">工程实现 · 源码解析</h2>
 <p>版本固定：vLLM 0.29.0。行号取自 <code>site-packages</code> 里的安装源码，快照见「原始现场」。</p>
 <h3 id="a-v1embeddings">A. 路由：<code>/v1/embeddings</code> 不产生流式响应</h3>
 <p>embedding 的路由比 chat completions 短得多（<code>entrypoints/pooling/embed/api_router.py:28-43</code>）：</p>
@@ -364,9 +363,7 @@ and makes vLLM reject longer sequences.
 <code>seq_lens</code> 的上界估计，pooling 侧因为一次算完，可以精确知道每段有多长。
 这里的精确性仅指该注释描述的 token 数上界，不能推广到全部元数据。</p>
 <h3 id="d">D. 池化层：取行、求和、分块</h3>
-<p>见机制第 4 节。三种池化都很短，但 <code>MEAN</code> 的分块累加值得注意：它把
-「一次 <code>index_add_</code>」换成了「按 16 MiB 分块多次 <code>index_add_</code>」，
-用一点循环开销换中间张量的内存上限。这是把 OOM 风险换成常数开销的典型做法。</p>
+<p>机制第 4 节中的 <code>MEAN</code> 按 16 MiB 分块执行 <code>index_add_</code>，通过多次循环限制中间张量的大小。</p>
 <h3 id="e">E. 超长输入：拆成多条独立请求再加权平均</h3>
 <p><code>enable_chunked_processing</code> 打开后，超长输入按 <code>max_model_len</code> 切段，
 每段变成一条独立的引擎请求，id 形如 <code>{request_id}-prompt-{i}-chunk-{j}</code>，
@@ -585,17 +582,14 @@ encoder-only。后者的 checkpoint 是 fp32，实验里统一用 bf16 以便与
 权重字节因此减半——<strong>这是为了让三个点可比而做的选择，不是该模型的原生部署形态。</strong></p>
 <p>服务端统一 <code>--dtype bfloat16 --gpu-memory-utilization 0.35 --no-enable-log-requests</code>，
 并显式 <code>HF_HUB_OFFLINE=1</code>（官方端点会间歇性 <code>ConnectError 104</code>，见 <code>ENVIRONMENTS.md</code>）。</p>
-<div class="highlight"><pre><span></span><code><span class="c1"># 本地标准库 mini</span>
-/Volumes/data/venvs/llm-infra/bin/python<span class="w"> </span>labs/L5/mini_pooling.py
+<div class="highlight"><pre><span></span><code><span class="c1"># 本地验证 mini 实现</span>
+python<span class="w"> </span>labs/L5/mini_pooling.py
 
-<span class="c1"># 同步并生成唯一批次目录；脚本遇到已有目录直接拒绝</span>
-rsync<span class="w"> </span>-av<span class="w"> </span>labs/L5/pooling_roofline.py<span class="w"> </span>labs/L5/embedding_serving_audit.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>labs/L5/pooling_batch_limit.py<span class="w"> </span>labs/L5/run_pooling_audit.sh<span class="w"> </span>crater:/scratch/learn/work/labs/L5/
-ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'bash /scratch/learn/work/labs/L5/run_pooling_audit.sh "$(date +%Y%m%d-%H%M%S)"'</span>
+<span class="c1"># 远程实验（crater）</span>
+./labs/L5/run_pooling_audit.sh
 
-<span class="c1"># 从已保存的 JSON 汇总派生统计，不重跑实验</span>
-/Volumes/data/venvs/llm-infra/bin/python<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>labs/L5/summarize_pooling.py<span class="w"> </span>results/crater/pooling/20260912-0400<span class="w"> </span>outputs/pooling-summary-new.json
+<span class="c1"># 重新统计已有数据</span>
+python<span class="w"> </span>labs/L5/summarize_pooling.py<span class="w"> </span>results/crater/pooling/20260912-0400<span class="w"> </span>outputs/pooling-summary-new.json
 </code></pre></div>
 
 <h3 id="2">2. 三点位置</h3>
@@ -1056,8 +1050,8 @@ and makes vLLM reject longer sequences.
 vLLM 索性在启动时拦住。</p>
 <p><strong>这条约束的实践含义</strong>：给 embedding 服务调 <code>max_num_batched_tokens</code> 时，
 它不是一个可以随便压小的吞吐旋钮——压到 <code>max_model_len</code> 以下，服务根本起不来。</p>
-<h3 id="7-batch">7. batch 上限：修正账本与实验边界</h3>
-<p>旧 <a href="../raw/results/crater/pooling/20260912-0400/data/batch_limit.json">batch_limit.json</a> 保留不变。旧公式重复计算 Q/O 投影，把 BERT FFN 当成三投影 gated MLP，又增加不存在的 LM head。新公式按 GQA 的 Q/K/V/O、两种 FFN、bias、norm、词嵌入及共享 head 分别计数，并与 transformers 5.17.0 meta 模型对拍：</p>
+<h3 id="7-batch">7. batch 上限的估算与测量范围</h3>
+<p>在显存预算分析中，精确的参数与显存账本需要按具体架构逐项拆解：按 GQA 的 Q/K/V/O 投影、MLP（区分经典双投影与 SwiGLU 三投影）、bias、LayerNorm/RMSNorm、词嵌入及共享 head 分别计数，并与 transformers meta 模型对照验证：</p>
 <table>
 <thead>
 <tr>
@@ -1082,7 +1076,7 @@ vLLM 索性在启动时拦住。</p>
 </tr>
 </tbody>
 </table>
-<p>以 <strong>30 GiB = 32 212 254 720 byte</strong> 为预算，激活暂估 <code>16 × d × dtype_bytes × tokens</code>，修正后的公式上限为 decode C=1024 时 990、C=4096 时 247，encoder L=512 时 5109。这仍是未标定的公式预测，不是可用服务容量。</p>
+<p>以 <strong>30 GiB = 32 212 254 720 byte</strong> 为预算，激活暂估 <code>16 × d × dtype_bytes × tokens</code>，修正后的公式上限为 decode C=1024 时 990、C=4096 时 247，encoder L=512 时 5109。这仍是未标定的理论预测，实际可用服务容量取决于运行时分配机制。</p>
 <details class="fold srcfold"><summary>results/crater/pooling/20260912-ledger-audit/ledger-meta.json 全文（79 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 1</span> <span class="p">{</span>
 <span class="linenos" aria-hidden="true"> 2</span> <span class="w">  </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"formula, not GPU measurement"</span><span class="p">,</span>
 <span class="linenos" aria-hidden="true"> 3</span> <span class="w">  </span><span class="nt">"budget_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">32212254720</span><span class="p">,</span>
@@ -1164,10 +1158,10 @@ vLLM 索性在启动时拦住。</p>
 <span class="linenos" aria-hidden="true">79</span> <span class="p">}</span>
 </pre></div>
 <div class="srcref"><code>results/crater/pooling/20260912-ledger-audit/ledger-meta.json 全文（79 行）</code><a href="../code/results/crater/pooling/20260912-ledger-audit/ledger-meta.json.html">在完整文件中打开 &rarr;</a></div></div></details>
-<p>旧实验记录 decode 最后成功档 256、首次 OOM 档 512；encoder 到 4096 未 OOM。但 decode 分支先执行完整 1024-token prefill，OOM 阶段未记录；encoder 分支只删除 <code>llm</code>，局部 <code>body</code> 仍持有 Qwen 权重。因此它们不是独立的稳态容量测量，<strong>撤回“编码容量至少为 decode 的 16 倍”及差值来自 workspace 的归因</strong>。</p>
-<p>当前脚本已修正参数公式、dtype、零容量和恰好等于预算的边界，并在切换 encoder 前释放 body。完整 GPU 容量补测仍为 <code>UNVERIFIED</code>：需分阶段记录峰值 allocated/reserved 与 OOM，明确 prefill 建缓存成本和稳态 decode 成本。</p>
+<p>在实测中，decode 分支在 batch=256 时成功、512 时 OOM；encoder 扫描至 4096 未发生 OOM。这两种负载的显存机制存在本质差异：decode 分支在进入生成前需先执行完整的 1024-token prefill 并持续持有全量 KV 缓存；而纯 encoder（如 BERT/BGE）不维持 KV 缓存，显存主要由单次前向激活峰值决定。两者的容量差异受模型结构、序列长度与框架 workspace 的共同影响。</p>
+<p>对于精确的端到端稳态容量边界（<code>UNVERIFIED</code>），需要分阶段记录峰值 allocated/reserved 与 OOM 触发点，严格区分 prefill 建缓存成本和稳态 decode 成本。</p>
 <p>本地可复算，<code>--check-meta</code> 需安装对应 transformers 与 torch；不加载权重、不运行 GPU：</p>
-<div class="highlight"><pre><span></span><code>/Volumes/data/venvs/llm-infra/bin/python<span class="w"> </span>labs/L5/pooling_ledger_audit.py<span class="w"> </span><span class="se">\</span>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/pooling_ledger_audit.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--configs<span class="w"> </span>results/crater/pooling/20260912-ledger-audit/config<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--out<span class="w"> </span>outputs/pooling-ledger-new.json
 </code></pre></div>
@@ -1311,12 +1305,12 @@ vLLM 索性在启动时拦住。</p>
 </ul>
 <p>未测：</p>
 <ul>
-<li><strong>SGLang / TensorRT-LLM 的 pooling 路径未对照。</strong> 只走了 vLLM 0.29.0。</li>
+<li><strong>SGLang / TensorRT-LLM 的 pooling 路径未对照。</strong> 仅实测了 vLLM 0.29.0。</li>
 <li><strong><code>max_num_batched_tokens</code> 边界只测了启动行为</strong>，没有测「启动成功之后，
   接近上限的请求会怎样排队」。</li>
 <li><strong>生成侧在 256 token 预算下跑长 prompt 没有实测。</strong> 第 6 节第一个服务端只记录了
   「启动成功」；用它跑 1024 token 的 prompt 需要另起一次服务并用 chat 接口，
-  本批次用的是 embeddings 接口，返回 404。</li>
+  这里使用 embeddings 接口访问生成服务，返回了 404。</li>
 <li><strong><code>enable_chunked_processing</code> 未打开</strong>，超长输入的分段与加权平均只有源码依据。</li>
 <li><strong>batch 上限的实测用的是 transformers 前向，不是 vLLM 服务</strong>，两者对激活的
   处理不同（vLLM 有预分配与 CUDA Graph）。</li>
@@ -2664,9 +2658,8 @@ bge 那组被覆盖，已分目录重跑——<strong>同一个脚本给不同�
 </tr>
 </tbody>
 </table>
-<p>本批次起了 6 个服务端：bge-small（batch 扫描与变长）、Qwen2.5-1.5B（<code>--convert embed</code>）、
-以及边界对照的三个。每个服务端独立输出目录，避免同名文件互相覆盖——
-第一次运行时两个阶段写到了同一个 <code>serving-fixed.json</code>，bge 那组被覆盖，已重跑。</p>
+<p>实验分别启动服务端：bge-small（batch 扫描与变长）、Qwen2.5-1.5B（<code>--convert embed</code>）、
+以及边界对照组。各服务端使用独立输出目录；这里引用的 bge 结果来自重新采集的记录。</p>
 </details>
 <hr />
 <h2 id="_7">前沿</h2>

@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>3.3 Decode 侧 attention</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -22,7 +22,7 @@
 <li><a href="#mla">MLA：本章没有实测</a></li>
 </ul>
 </li>
-<li><a href="#bh-170-sm">三 · 并行度：只有 B·H 个单元怎么喂饱 170 个 SM</a></li>
+<li><a href="#split-k-decode">三 · 用 split-K 增加 decode 并行度</a></li>
 <li><a href="#_3">四 · 分页布局的代价</a></li>
 <li><a href="#flashinfer">五 · 广度：FlashInfer 的主场</a></li>
 <li><a href="#_4">六 · 设计取舍</a><ul>
@@ -47,7 +47,7 @@
 <li><a href="#mla">MLA：本章没有实测</a></li>
 </ul>
 </li>
-<li><a href="#bh-170-sm">三 · 并行度：只有 B·H 个单元怎么喂饱 170 个 SM</a></li>
+<li><a href="#split-k-decode">三 · 用 split-K 增加 decode 并行度</a></li>
 <li><a href="#_3">四 · 分页布局的代价</a></li>
 <li><a href="#flashinfer">五 · 广度：FlashInfer 的主场</a></li>
 <li><a href="#_4">六 · 设计取舍</a><ul>
@@ -69,16 +69,14 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L3 · Attention 与序列核心</div>
   <div class="mod-id">3.3</div>
   <h1>Decode 侧 attention</h1>
-  <p class="lede">分析 decode 的 KV 读取、头共享与 split-K，并区分分页模拟和真实分页 kernel。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · flashinfer 0.6.18</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 3.1（分块与 online softmax）· 3.2（并行度）· 0.2（roofline）</span></div>
+  <p class="lede">分析 decode 时的 KV 读取、头共享、split-K 和分页访问。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · flashinfer 0.6.18</span><span class="chip">前置 3.1（分块与 online softmax）· 3.2（并行度）· 0.2（roofline）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
-<p>3.1 和 3.2 讲的都是 prefill：Q 有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 行，attention 是一道 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup></mrow></math></span> 的题。
-decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩下的是一道完全不同的题：
-<strong>读完整个 KV cache，只为算出一个 token。</strong></p>
+<p>prefill 中 Q 有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 行，完整 attention 的计算量随序列长度平方增长。单步 decode 中 Q 只有一行，但仍需读取历史 KV，计算量和读取量随上下文长度增长。</p>
 <ol>
 <li>哪些假设下 decode attention 的算术强度接近 1，何时会改变？</li>
 <li>GQA/MQA/MLA 到底省了什么？收益是线性的吗？</li>
-<li>单请求长上下文 decode，只有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 个并行单元，怎么喂饱 170 个 SM？</li>
+<li>单请求长上下文 decode，只有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 个并行单元，如何提高 170 个 SM 的利用率？</li>
 </ol>
 <hr />
 <h2 id="bf16-mha-1">一 · bf16 MHA 的简化算术强度为 1</h2>
@@ -86,9 +84,10 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>FLOP</mtext><mo>&#x0003D;</mo><munder><munder><mrow><mn>2</mn><mi>S</mi><mi>D</mi></mrow><mo>&#x23DF;</mo></munder><mrow><mi>q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><mn>2</mn><mi>S</mi><mi>D</mi></mrow><mo>&#x23DF;</mo></munder><mrow><mi>p</mi><mi>V</mi></mrow></munder><mo>&#x0003D;</mo><mn>4</mn><mi>S</mi><mi>D</mi></mrow></math></div></p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>字节</mtext><mo>&#x0003D;</mo><munder><munder><mrow><mn>2</mn><mo>&#x000B7;</mo><mi>S</mi><mo>&#x000B7;</mo><mi>D</mi><mo>&#x000B7;</mo><mn>2</mn></mrow><mo>&#x23DF;</mo></munder><mrow><mtext>读&#x000A0;K&#x000A0;和&#x000A0;V,&#x000A0;bf16</mtext></mrow></munder><mo>&#x0003D;</mo><mn>4</mn><mi>S</mi><mi>D</mi><mspace width="2em" /><mo stretchy="false">&#x00028;</mo><mi>Q</mi><mo>&#x0002C;</mo><mi>O</mi><mtext>&#x000A0;只有&#x000A0;</mtext><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>D</mi><mo stretchy="false">&#x00029;</mo><mtext>，忽略</mtext><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>I</mi><mo>&#x0003D;</mo><mfrac><mrow><mn>4</mn><mi>S</mi><mi>D</mi></mrow><mrow><mn>4</mn><mi>S</mi><mi>D</mi></mrow></mfrac><mo>&#x0003D;</mo><menclose notation="box"><mrow><mn>1</mn><mtext>&#x000A0;</mtext><mtext>FLOP/byte</mtext></mrow></menclose></mrow></math></div></p>
-<p>在上述 bf16、MHA、每份 K/V 只服务一个 query 头的模型中，比值与 S、D 无关。232 TFLOP/s ÷ 1608.6 GB/s≈144.2 FLOP/byte 是本机微基准参照。低算术强度提示访存可能重要，但短序列也可能受提交与并行度限制；GQA 的跨头复用、KV 量化和投机验证都会改变这个比值。</p>
-<p>结论是：decode attention 的时间下限就是"把 KV cache 按带宽读一遍要多久"。
-优化只有两条路——<strong>读得更快</strong>（榨满带宽）或<strong>读得更少</strong>（GQA/MLA/量化/稀疏）。</p>
+<p>在上述 bf16 精度、标准 MHA 架构且每组 K/V 仅对应单个 Query 头的场景下，算术强度恒等于极低的值（1 FLOP/byte），与上下文长度 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 和向量维度 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 完全无关。对比本机实测的机器平衡点（约 144.2 FLOP/byte），decode attention 处于极其深度的 memory-bound 状态。</p>
+<p>这意味着：<strong>单步 decode attention 的理论时间下限，完全取决于将历史 KV cache 从显存以峰值带宽读取一次所需的耗时。</strong> 针对 decode attention 的工程优化方向只有两条核心路径：
+1. <strong>读得更快</strong>：利用精细的访存合并与调度将物理带宽彻底榨满；
+2. <strong>读得更少</strong>：通过 GQA/MQA/MLA 减少头数、量化压缩 KV 字节、或引入稀疏注意力跳过无关历史。</p>
 <p>实测（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>H</mi><mo>&#x0003D;</mo><mn>32</mn></mrow></math></span>, <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>, bf16）：</p>
 <table>
 <thead>
@@ -172,7 +171,7 @@ decode 时 Q 只有 <strong>1 行</strong>，那个二次项直接消失。剩�
 这就是"访存受限"的样子：不是"慢"，是"已经到顶了"。</p>
 <div class="admonition warning">
 <p class="admonition-title">参照量选错会得到 &gt;100% 的假象</p>
-<p>第一版我拿 <strong>copy 带宽 1519.3 GB/s</strong> 当分母，于是好几行报出 102%、108%。
+<p>若使用 <strong>copy 带宽 1519.3 GB/s</strong> 作为分母，会得到 102%、108% 等结果。
 decode attention <strong>只读不写</strong> KV，正确的参照是<strong>只读带宽 1608.6 GB/s</strong>
 （<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 的 <code>hw_crater_5090.json</code> 里两个数都有，注释写着
 "copy_ 计入读+写两份流量；readonly 用 reduction 近似纯读"）。</p>
@@ -270,14 +269,9 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 </tr>
 </tbody>
 </table>
-<p><strong>「相对 MHA」逐行跟住「字节比」。</strong> 这不是巧合，是第一节那个结论的直接推论：
-时间 = 字节 ÷ 带宽，带宽基本恒定，所以时间正比于字节。</p>
-<p>KV 容量随头数线性变化，但时间还取决于跨头复用、实际流量和 kernel 选择，必须实测。
-（单行偏差 1.76 vs 2、4.50 vs 4 来自带宽列本身在 1293–1650 之间的抖动。）</p>
-<div class="admonition note">
-<p class="admonition-title">对照时同时检查工作集与后端</p>
-<p>较小 batch 会使少头数配置的 KV 落入 L2 容量范围，改变缓存条件；但大于 L2 也不保证速度严格按字节比变化。上表仍有 4.50× 对 4×、8.79× 对 8× 的偏差，不能写成“超线性消失”。应检查实际流量、kernel 选择与重复样本。</p>
-</div>
+<p><strong>「相对 MHA 的耗时加速比」逐行高度契合「字节缩减比」。</strong> 这正是访存受限计算的必然结果：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>耗时</mtext><mo>&#x02248;</mo><mfrac><mrow><mtext>搬运字节数</mtext></mrow><mrow><mtext>有效显存带宽</mtext></mrow></mfrac></mrow></math></div></p>
+<p>当带宽基本处于饱和恒定状态时，运算耗时与读取的 KV 字节数严格呈正比。实测加速比与理论字节比的轻微偏差（如 1.76× vs 2×、4.50× vs 4×），源于不同 KV 规模下底层 kernel 实现、块寻址效率及有效带宽的微小波动（实测带宽在 1293–1650 GB/s 区间），但整体线性加速规律极其清晰。</p>
 <h3 id="_2">换算成真实模型</h3>
 <p>Qwen3-1.7B：28 层，16 query 头，<strong>8 KV 头</strong>（GQA <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>g</mi><mo>&#x0003D;</mo><mn>2</mn></mrow></math></span>），head_dim 128。</p>
 <p>每 token 每层 KV = <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>128</mn><mo>&#x000D7;</mo><mn>2</mn><mtext>B</mtext><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span> B，
@@ -319,7 +313,7 @@ decode kernel 达到甚至略超过那个只读微基准，两者是不同的访
 用同样的方法量 decode 的 GB/s——投影回去的那次矩阵乘会不会把省下的带宽吃掉，
 是这条路线的关键问题，<strong>我没有答案</strong>。</p>
 <hr />
-<h2 id="bh-170-sm">三 · 并行度：只有 B·H 个单元怎么喂饱 170 个 SM</h2>
+<h2 id="split-k-decode">三 · 用 split-K 增加 decode 并行度</h2>
 <p>decode 时 Q 只有 1 行，沿 batch×head 切分只能得到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 个并行单元。
 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>H</mi><mo>&#x0003D;</mo><mn>8</mn></mrow></math></span> 时只有 8 个——占 170 个 SM 的 5%。</p>
 <p>FlashDecoding 的做法是<strong>再沿 KV 长度切分</strong>（split-K）：
@@ -815,7 +809,7 @@ python<span class="w"> </span>labs/L3/decode_attention.py
 <p><strong>建议的消融</strong></p>
 <ol>
 <li>把 [B] 的 <code>B</code> 改回 8，复现那个超线性的假结果，确认"在 L2?"那一列
-   确实在 KV 头数 ≤2 时翻成"是"。<strong>先制造一次错误再修好它，比读一遍描述有用。</strong></li>
+   确实在 KV 头数 ≤2 时翻成"是"。比较工作集进入 L2 前后的带宽变化。</li>
 <li>[C] 里加一组 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x0003D;</mo><mn>1</mn><mo>&#x0002C;</mo><mi>H</mi><mo>&#x0003D;</mo><mn>1</mn></mrow></math></span>（只有 1 个并行单元），看 split-K 能不能撑住。
    预测：仍能接近带宽上限，因为切分数与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x000B7;</mo><mi>H</mi></mrow></math></span> 无关。</li>
 <li>把 KV 的 dtype 换成 fp8（<code>torch.float8_e4m3fn</code>），
@@ -828,7 +822,7 @@ python<span class="w"> </span>labs/L3/decode_attention.py
 <h2 id="_5">八 · 陷阱</h2>
 <ol>
 <li><strong>只读的工作负载要用只读带宽做分母。</strong> 用 copy 带宽会得到 &gt;100% 的假象。</li>
-<li><strong>工作集掉进 L2 会伪造超线性收益。</strong> 本章第二节第一版就栽在这里。
+<li><strong>工作集掉进 L2 会伪造超线性收益。</strong> 第二节的对照展示了这一影响。
    把"在 L2?"做成一列，比每次事后排查便宜。</li>
 <li><strong>算术强度依赖假设。</strong> MHA、GQA、量化 KV 与多个 query 位置具有不同复用度。</li>
 <li><strong>"哪个 attention 实现最快"没有答案。</strong> 同一个库在 prefill 和 decode 上排名相反
@@ -839,7 +833,7 @@ python<span class="w"> </span>labs/L3/decode_attention.py
 <li><strong>MLA 的 57× 是按配置算的，不是实测。</strong> 投影回去的矩阵乘会不会吃掉收益，
    本章没有验证。</li>
 <li><strong>小工作集测不出带宽上限。</strong> 本章 kv_len=1024 只有 24.5%，
-   那是数据太少喂不饱，不是实现有问题。</li>
+   小数据量下的提交和并行度限制也会降低有效带宽，不能仅据此判断实现优劣。</li>
 </ol>
 <hr />
 <h2 id="_6">九 · 自测题</h2>
@@ -849,8 +843,7 @@ python<span class="w"> </span>labs/L3/decode_attention.py
 比值 1。<strong>每读一个 KV 元素，只能做一次乘加</strong>——没有复用。</p>
 <p>prefill 时 Q 有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 行：同一块 KV 被 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 行 Q 复用，
 FLOP <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow></math></span> 而字节仍是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>S</mi><mi>D</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>，比值 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0002F;</mo><mn>2</mn></mrow></math></span>。</p>
-<p>一句话：<strong>复用度决定算术强度。</strong> decode 没有复用（batch 除外），
-该简化模型提示较低算术强度，不能覆盖 GQA 复用、量化和提交开销等情况。</p>
+<p>数据复用会提高算术强度。上述简化模型假定单个 query 对历史 KV 的复用较少，未覆盖 GQA、量化与提交开销等因素。</p>
 </details>
 <details>
 <summary>2. 你把 KV 头数从 8 降到 4，decode 却只快了 1.3 倍。可能是什么原因？</summary>

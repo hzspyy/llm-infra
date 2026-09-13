@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.10 LoRA 多租户服务</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -24,7 +24,7 @@
 <li><a href="#4">4. 换入成本应分层测量</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 源码走读</a><ul>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
 <li><a href="#a-adapter">A. 调度器先保证这一轮容得下所有 adapter</a></li>
 <li><a href="#b-cpu-gpu">B. CPU 缓存和 GPU 槽位分别管理</a></li>
 <li><a href="#c-id-metadata">C. 逻辑 ID 先转槽位，再整理分组 metadata</a></li>
@@ -40,7 +40,7 @@
 <li><a href="#2-8">2. 吞吐在 8 个槽位的边界出现拐点</a></li>
 <li><a href="#3_1">3. 槽位命中与换入不是同一条路径</a></li>
 <li><a href="#4-gpu-trace-kernel">4. GPU trace 确认真正执行低秩 kernel</a></li>
-<li><a href="#5">5. 旧混批对拍与失败路径</a></li>
+<li><a href="#5">5. 旧混批对照验证与失败路径</a></li>
 </ul>
 </li>
 <li><a href="#_6">原始现场</a></li>
@@ -62,7 +62,7 @@
 <li><a href="#4">4. 换入成本应分层测量</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 源码走读</a><ul>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
 <li><a href="#a-adapter">A. 调度器先保证这一轮容得下所有 adapter</a></li>
 <li><a href="#b-cpu-gpu">B. CPU 缓存和 GPU 槽位分别管理</a></li>
 <li><a href="#c-id-metadata">C. 逻辑 ID 先转槽位，再整理分组 metadata</a></li>
@@ -78,7 +78,7 @@
 <li><a href="#2-8">2. 吞吐在 8 个槽位的边界出现拐点</a></li>
 <li><a href="#3_1">3. 槽位命中与换入不是同一条路径</a></li>
 <li><a href="#4-gpu-trace-kernel">4. GPU trace 确认真正执行低秩 kernel</a></li>
-<li><a href="#5">5. 旧混批对拍与失败路径</a></li>
+<li><a href="#5">5. 旧混批对照验证与失败路径</a></li>
 </ul>
 </li>
 <li><a href="#_6">原始现场</a></li>
@@ -95,16 +95,16 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
   <div class="mod-id">5.10</div>
   <h1>LoRA 多租户服务</h1>
-  <p class="lede">一个 base 模型 + N 个 adapter 同时服务（S-LoRA / punica 路线）：按请求选 adapter、同一 batch 里混不同 adapter、adapter 的显存与换入换出。</p>
-  <div class="chips"><span class="chip">实测机器 crater · RTX 5090 D · vLLM 0.29.0 · SGLang 0.5.19</span><span class="chip">数据日期 2026-09-11 / 2026-09-12</span><span class="chip">前置 4.1 Transformer 解剖 · 5.3 调度 · 5.4 执行层</span></div>
+  <p class="lede">让多个请求共享基础模型、使用不同 LoRA adapter，分析批处理、显存占用和 adapter 换入换出。</p>
+  <div class="chips"><span class="chip">实测机器 crater · RTX 5090 D · vLLM 0.29.0 · SGLang 0.5.19</span><span class="chip">前置 4.1 Transformer 解剖 · 5.3 调度 · 5.4 执行层</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
-<p><strong>多 LoRA 服务共享一份 base 权重，但不共享每个请求的 adapter 身份。</strong> 真正困难的部分，是把请求身份、GPU 权重槽位和这一轮的 token 行对应起来，并在容量不足时正确等待或换入。</p>
+<p>多 LoRA 服务让请求共享基础模型，并分别使用各自的 adapter。引擎需要将请求、GPU 权重槽位和 token 行对应起来，在槽位不足时安排等待或换入。</p>
 <ol>
 <li>一个 batch 混入不同 adapter，怎样实现共享 base GEMM 与逐行低秩增量？</li>
 <li>adapter 的逻辑身份、CPU 缓存、GPU 槽位和 KV cache 怎样保持一致？</li>
 <li>adapter 数量从 1 增到 64 时，吞吐下降来自 kernel，还是调度容量？</li>
 </ol>
-<p>本章用随机生成的 adapter 验证系统机制，不评价微调质量。实测的核心结论是：<strong>固定 8 个 GPU adapter 槽位时，8→9 个 adapter 让这组等长请求从一轮拆成两轮，端到端耗时接近翻倍。</strong> 这不是“第九个 adapter 触发了某种 GPU 硬件极限”。</p>
+<p>本章用随机生成的 adapter 验证系统机制，不评价微调质量。实测的核心结论是：<strong>固定 8 个 GPU adapter 槽位时，8→9 个 adapter 让这组等长请求从一轮拆成两轮，端到端耗时接近翻倍。</strong> 这里限制并行执行的是配置的槽位数。</p>
 <h2 id="_2">心智模型</h2>
 <p>adapter 是附加在 base 模型上的小权重集合。请求携带逻辑 ID；worker 把它映射到可复用的物理槽位。低秩 kernel 读取的是槽位，不应拿外部 ID 直接当数组下标。</p>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 310" width="100%" role="img" aria-label="请求身份经槽位映射控制低秩分支，与共享 base GEMM 相加">
@@ -168,7 +168,7 @@
 <h3 id="4">4. 换入成本应分层测量</h3>
 <p>文件解析、CPU 缓存命中、CPU→GPU 复制、目标槽位清零、mapping 更新是不同阶段。若 CPU 权重已经存在，传输部分可用 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0002F;</mo><msub><mi>B</mi><mrow><mi>H</mi><mn>2</mn><mi>D</mi></mrow></msub></mrow></math></span> 作理想化预测，但实测的整个 <code>activate_adapter</code> 还包括 Python 调度与多层小复制，不能反过来当成 PCIe 峰值带宽。</p>
 <p>是否驻留可按预期复用次数分析：若保留该 adapter 节省的累计换入时间大于其挤占 KV 或其他 adapter 所增加的等待代价，保留才有意义。这是设计分析；本章没有拟合线上到达过程，也没有得出通用驻留阈值。</p>
-<h2 id="_4">工程实现 · 源码走读</h2>
+<h2 id="_4">工程实现 · 源码解析</h2>
 <p>以下行号均对应本地保存的安装版本快照，SHA-256 见 manifest。vLLM 实验为 0.29.0，模型 revision 为 <code>70d244cc86ccca08cf5af4e1e306ecf908b1ad5e</code>。SGLang 对照来自既有 0.5.19 环境，不把其 kernel 小实验当作整套引擎性能。</p>
 <h3 id="a-adapter">A. 调度器先保证这一轮容得下所有 adapter</h3>
 <p><code>vllm/v1/core/sched/scheduler.py:817–830</code> 在接纳 waiting 请求前检查 <code>scheduled_loras</code>。达到槽位上限后，使用新 adapter 的请求被暂时跳过；使用已选 adapter 的请求仍有机会进入本轮。</p>
@@ -229,7 +229,7 @@
 <span class="linenos" aria-hidden="true">184</span>         <span class="p">)</span>
 </pre></div>
 <div class="srcref"><code>results/crater/lora/20260911-1110/source/vllm/layers/base_linear.py 第 174–184 行</code><a href="../code/results/crater/lora/20260911-1110/source/vllm/layers/base_linear.py.html#results-crater-lora-20260911-1110-source-vllm-layers-base_linear-py-L-174">在完整文件中打开 &rarr;</a></div></div>
-<p>清零不是多余操作。rank 较大的旧 adapter 被 rank 较小的新 adapter 替换时，未覆盖的尾部不能继续参与计算。QKV 与 merged linear 覆盖了具体的 <code>set_lora</code> 实现；通用 linear 的这段不能代替所有 packed 布局的走读。</p>
+<p>清零不是多余操作。rank 较大的旧 adapter 被 rank 较小的新 adapter 替换时，未覆盖的尾部不能继续参与计算。QKV 与 merged linear 覆盖了具体的 <code>set_lora</code> 实现；通用 linear 的这段分析不能代替所有 packed 布局的实现细节。</p>
 <h3 id="c-id-metadata">C. 逻辑 ID 先转槽位，再整理分组 metadata</h3>
 <p><code>punica_wrapper/utils.py:91–111</code> 建立反向表。正 ID 映射到 GPU slot；base 请求映射到内部哨兵 -1。入口处的 0 与 kernel 中的 -1 不是同一层接口。</p>
 <div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 91</span>     <span class="c1"># Build a reverse lookup (LoRA id -&gt; index) once instead of repeatedly</span>
@@ -303,7 +303,7 @@
 <span class="linenos" aria-hidden="true">267</span>         <span class="p">)</span>
 </pre></div>
 <div class="srcref"><code>results/crater/lora/20260911-1110/source/vllm/punica_wrapper/punica_gpu.py 第 245–267 行</code><a href="../code/results/crater/lora/20260911-1110/source/vllm/punica_wrapper/punica_gpu.py.html#results-crater-lora-20260911-1110-source-vllm-punica_wrapper-punica_gpu-py-L-245">在完整文件中打开 &rarr;</a></div></div>
-<p>本章旧实验的真实 QKV 入口打印了：</p>
+<p>在 <code>max_loras=2, max_lora_rank=16</code> 配置下，真实 QKV 入口张量形态实测如下：</p>
 <table>
 <thead>
 <tr>
@@ -340,7 +340,7 @@
 </tr>
 </tbody>
 </table>
-<p>这是旧实验的 <code>max_loras=2,max_lora_rank=16</code>，不是后文扫描的 8 槽位、rank 上限 8。q_proj adapter 文件中的 <code>[8,2048]</code> 也不等于 GPU packed QKV 所有预分配张量的 shape。完整插桩保留了其他被包装 linear 层，不能据“有包装”就断定每一层都有非零 adapter 权重。</p>
+<p>需要注意该组参数对应双槽位配置（不同于后文基准测试中的 8 槽位、rank 上限 8）。q_proj adapter 文件中的 <code>[8,2048]</code> 也不等于 GPU packed QKV 所有预分配张量的物理 shape。完整插桩保留了其他被包装的 linear 层，不能仅凭存在包装就断定每一层都包含非零 adapter 权重。</p>
 <h3 id="e-sglang-rank">E. SGLang 显式描述分段与每槽 rank</h3>
 <p>SGLang <code>srt/lora/backend/triton_backend.py:74–98</code> 调用真实 <code>sgemm_lora_a_fwd</code> / <code>sgemm_lora_b_fwd</code>。<code>LoRABatchInfo</code> 带有分段边界、权重槽位、每槽 rank、scaling 和可选 permutation。</p>
 <div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">74</span>     <span class="k">def</span><span class="w"> </span><span class="nf">run_lora_a_sgemm</span><span class="p">(</span>
@@ -378,7 +378,7 @@ X = [6, 64]; A = [3, 16, 64]; B = [3, 48, 16]
 low = [6, 16]; Y = [6, 48]
 </code></pre></div>
 
-<p>rank 数组按槽位索引，不按 segment 序号索引。因此第一段用 slot 1 的 rank 8；第二段用 slot 0 的 rank 0，增量应为零。与 FP32 dense 参照的最大绝对误差为 <code>2.5033950805664062e-05</code>，base 行确实为零。输入权重为 FP16；这不是逐位相等，也不是 vLLM 与 SGLang 的端到端对拍。</p>
+<p>rank 数组按槽位索引，不按 segment 序号索引。因此第一段用 slot 1 的 rank 8；第二段用 slot 0 的 rank 0，增量应为零。与 FP32 dense 参照的最大绝对误差为 <code>2.5033950805664062e-05</code>，base 行确实为零。输入权重为 FP16；这不是逐位相等，也不是 vLLM 与 SGLang 的端到端对照验证。</p>
 <h3 id="f-adapter-prefix-cache-key">F. adapter 身份还进入 prefix cache key</h3>
 <p>本版本 vLLM 的 <code>v1/core/kv_cache_utils.py:542–554</code> 返回 <code>lora_name</code> 作为额外 hash key，并非 <code>lora_int_id</code>：</p>
 <div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">542</span> <span class="k">def</span><span class="w"> </span><span class="nf">_gen_lora_extra_hash_keys</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">Request</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
@@ -422,7 +422,7 @@ low = [6, 16]; Y = [6, 48]
 </tr>
 <tr>
 <td>Python 逐行 LoRA</td>
-<td>状态清楚、便于对拍</td>
+<td>状态清楚、便于对照验证</td>
 <td>小调用多；本章 mini 不代表 GPU kernel 性能</td>
 </tr>
 <tr>
@@ -433,7 +433,7 @@ low = [6, 16]; Y = [6, 48]
 <tr>
 <td>SGLang 分段 backend</td>
 <td>显式传递边界、rank、缩放与 permutation</td>
-<td>分段整理及 backend 约束；本章仅真实 kernel 对拍</td>
+<td>分段整理及 backend 约束；本章仅真实 kernel 对照验证</td>
 </tr>
 </tbody>
 </table>
@@ -452,7 +452,7 @@ low = [6, 16]; Y = [6, 48]
 <span class="linenos" aria-hidden="true">23</span>     <span class="k">return</span> <span class="n">y</span>
 </pre></div>
 <div class="srcref"><code>labs/L5/mini_lora.py 第 15–23 行</code><a href="../code/labs/L5/mini_lora.py.html#labs-L5-mini_lora-py-L-15">在完整文件中打开 &rarr;</a></div></div>
-<p>本例输出是 <code>[[5.0,7.0],[5.0,3.0],[4.5,4.5]]</code>。对拍只覆盖这里给出的精确小数输入；脚本不是通用的 shape 校验库，也不模拟 GPU 分组调度。最后打印的 adapter groups 用来说明如何从逐行写法走向分段 GEMM。</p>
+<p>本例输出是 <code>[[5.0,7.0],[5.0,3.0],[4.5,4.5]]</code>。对照验证只覆盖这里给出的精确小数输入；脚本不是通用的 shape 校验库，也不模拟 GPU 分组调度。最后打印的 adapter groups 用来说明如何从逐行写法走向分段 GEMM。</p>
 <details class="fold srcfold"><summary>labs/L5/mini_lora.py 全文（47 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 1</span> <span class="ch">#!/usr/bin/env python3</span>
 <span class="linenos" aria-hidden="true"> 2</span> <span class="sd">"""Two adapters in one tiny batch; standard-library reference implementation."""</span>
 <span class="linenos" aria-hidden="true"> 3</span> <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
@@ -502,7 +502,7 @@ low = [6, 16]; Y = [6, 48]
 <span class="linenos" aria-hidden="true">47</span>     <span class="nb">print</span><span class="p">(</span><span class="s1">'adapter_groups ='</span><span class="p">,</span><span class="n">groups</span><span class="p">)</span>
 </pre></div>
 <div class="srcref"><code>labs/L5/mini_lora.py 全文（47 行）</code><a href="../code/labs/L5/mini_lora.py.html">在完整文件中打开 &rarr;</a></div></div></details>
-<p>真正的分段 GPU 对拍见下面的 probe。第 24–28 行逐段建立 FP32 参照，同时检查 base 行。</p>
+<p>真正的分段 GPU 对照验证见下面的 probe。第 24–28 行逐段建立 FP32 参照，同时检查 base 行。</p>
 <details class="fold srcfold"><summary>labs/L5/sglang_lora_kernel_probe.py 全文（33 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 1</span> <span class="ch">#!/usr/bin/env python3</span>
 <span class="linenos" aria-hidden="true"> 2</span> <span class="sd">"""Actual SGLang Triton segmented low-rank GEMMs against a dense reference."""</span>
 <span class="linenos" aria-hidden="true"> 3</span> <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
@@ -542,18 +542,17 @@ low = [6, 16]; Y = [6, 48]
 <h3 id="1_1">1. 环境、输入与可复现命令</h3>
 <p>新增扫描在 crater 的 RTX 5090 D 上运行。torch 2.13.0、CUDA 13.0、Triton 3.7.1、vLLM 0.29.0、transformers 5.17.0。GPU 运行前后均为 1 MiB、利用率 0%，计算进程列表为空，退出码 0。环境完整记录见原始现场。</p>
 <p>输入固定为 64 个相同的 10-token prompt，各输出 16 token，总输出 1024 token。adapter 仅修改每层 q_proj，rank 8，BF16，种子为 <code>2000+id</code>，alpha=rank。使用 eager、关闭 prefix cache、<code>max_model_len=256</code>、<code>max_num_seqs=64</code>、<code>max_num_batched_tokens=2048</code>、8 个 GPU 槽位、64 个 CPU cache 项。显存配置 0.60 是本实验选择，不是全项目上限。</p>
-<div class="highlight"><pre><span></span><code><span class="c1"># 本地标准库 mini</span>
-/Users/nyxri/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3<span class="w"> </span>labs/L5/mini_lora.py
+<div class="highlight"><pre><span></span><code><span class="c1"># 本地验证 mini 实现</span>
+python<span class="w"> </span>labs/L5/mini_lora.py
 
-<span class="c1"># 同步并生成唯一批次目录；脚本遇到已有目录直接拒绝</span>
-rsync<span class="w"> </span>-av<span class="w"> </span>labs/L5/lora_scaling_audit.py<span class="w"> </span>labs/L5/run_lora_scaling_audit.sh<span class="w"> </span>crater:/scratch/learn/work/labs/L5/
-ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'bash /scratch/learn/work/labs/L5/run_lora_scaling_audit.sh "$(date +%Y%m%d-%H%M%S)"'</span>
+<span class="c1"># 远程实验（crater）</span>
+./labs/L5/run_lora_scaling_audit.sh
 
-<span class="c1"># 对本章已保存的原始数据重算调度统计，不重跑 GPU</span>
-/Users/nyxri/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3<span class="w"> </span>labs/L5/summarize_lora_scaling.py<span class="w"> </span>results/crater/lora/20260912-0010/data
+<span class="c1"># 重新统计已有数据</span>
+python<span class="w"> </span>labs/L5/summarize_lora_scaling.py<span class="w"> </span>results/crater/lora/20260912-0010/data
 </code></pre></div>
 
-<p>实际长任务在 tmux 中运行。运行器加载 <code>/scratch/learn/env.sh</code>，检查 GPU 占用，记录脚本快照、输出与退出码。64 份小 adapter 留在远端实验目录；本地保留配置、种子、shape、文件哈希和生成代码，不复制 base 模型。</p>
+<p>实际长任务在 tmux 中运行。运行器加载实验环境配置，检查 GPU 占用，记录脚本快照、输出与退出码。64 份小 adapter 留在远端实验目录；本地保留配置、种子、shape、文件哈希和生成代码，不复制 base 模型。</p>
 <p>每档先预热两次；五轮测量循环调整档位顺序，每个计时样本前再预热一次。每次计时前后同步 GPU。普通计时关闭插桩采集，但空的 hook 包装仍在；时间包含离线 generate 调度、必要的 adapter 换入和输出整理，不含引擎初始化，不是 HTTP 吞吐，也不是单 kernel 时间。</p>
 <h3 id="2-8">2. 吞吐在 8 个槽位的边界出现拐点</h3>
 <p>下表从 <code>summary.json</code> 取值，显示时四舍五入到三位小数。吞吐计算为 <code>1024 / (wall_ms / 1000)</code>；原始五次样本在 <code>timings.json</code>。M 是实际执行中的 token 行数，不是 adapter 数。</p>
@@ -697,7 +696,7 @@ ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'bash 
 </table>
 <p>两者合计 <code>28549.198999999026</code> μs；所有 CUDA device event 累计 <code>93234.68699999717</code> μs。这是 profiler 中的事件时间之和，不是端到端墙钟占比，不包含排队、CPU 空隙，也不能替代未插桩的 <code>221.47243656218052</code> ms。</p>
 <p>分析脚本重新读取原始 trace，核对 LoRA kernel 名称和调用次数一致。shrink 与 expand 相差 16 次的具体来源未定位；不据此推断“每层正好一对”，需进一步按层标记和调用关联。旧目录名 <code>trace/</code> 只保存 Python 插桩；新增 <code>mixed8.trace.json</code> 才是 GPU profiler trace。</p>
-<h3 id="5">5. 旧混批对拍与失败路径</h3>
+<h3 id="5">5. 旧混批对照验证与失败路径</h3>
 <p>既有 8 请求×24 输出 token 实验在 <code>max_loras=2,max_cpu_loras=3,max_lora_rank=16</code> 下验证零 B adapter 与 base 的 greedy token 一致，并记录混批与分开运行的结果。随机非零 adapter 是否改变输出只能按该输入判断，不能用来评价训练效果。</p>
 <p>其三档中位耗时为 base <code>178.892</code> ms、单 adapter <code>318.707</code> ms、双 adapter <code>317.972</code> ms，数字来自旧 <code>derived.json</code>。base 档仍是已启用 LoRA 的同一个引擎，不是另建未启用 LoRA 的服务。该实验包含 logprobs，batch、长度和 rank 上限也与新增扫描不同，不能横向计算统一加速比。</p>
 <p>注入 rank 32 的 adapter 后，loader 抛出 <code>LoRA rank 32 is greater than max_lora_rank 16.</code>。捕获异常后再发合法请求，旧离线运行仍失败，退出码 1。<strong>异常被捕获不等于引擎状态已恢复。</strong></p>
@@ -3457,7 +3456,7 @@ ERROR 09-11 07:46:30 [dump_input.py:79] Dumping scheduler output for model execu
 <li><code>[1,0,1,-1]</code>。7 在 slot 1，9 在 slot 0，base 用内部哨兵 -1。</li>
 <li>请求接纳受不同 adapter 数限制。本章等长突发负载从 16 个执行步变为 32 个，后轮还伴随换入和较小 batch；9 不是硬件阈值。</li>
 <li>metadata、分组、额外发射、小 GEMM 利用率、读写低秩 buffer、槽位加载与排队。FLOPs 不能单独决定 wall time。</li>
-<li>除检查错误类型，还要再发合法请求，检查完成、输出、请求表、KV 与槽位账，以及后续多轮运行。旧实验第二次 generate 仍失败，因此不能宣称恢复通过。</li>
+<li>除检查错误类型外，还必须继续发起后续合法请求，严格校验其执行完成状态、文本输出、调度请求表、KV 缓存及槽位生命周期账本。若后续请求未能正确完成，则不能判定异常已安全恢复。</li>
 </ol>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.9-sampling-engine.html">&#8592; 5.9 采样引擎</a><a class="nav-next" href="../L5/5.11-api-protocol-layer.html">5.11 API 与协议层 &#8594;</a></nav>
 </main>

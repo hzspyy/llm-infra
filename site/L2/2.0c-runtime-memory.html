@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.0c PyTorch 运行时：内存、流与异步生命周期</title>
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">2.0c</div>
+  <div class="sidebar-title">PyTorch 运行时：内存、流与异步生命周期</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型</a></li>
+<li><a href="#_3">三个生命周期</a><ul>
+<li><a href="#1python">生命周期 1：Python 引用</a></li>
+<li><a href="#2allocator">生命周期 2：Allocator 可复用</a></li>
+<li><a href="#3gpu">生命周期 3：GPU 使用结束</a></li>
+</ul>
+</li>
+<li><a href="#1">实验 1：基础分配与释放</a><ul>
+<li><a href="#1a">实验 1A：单次分配观察三个时刻</a></li>
+<li><a href="#1b">实验 1B：多次分配复用</a></li>
+</ul>
+</li>
+<li><a href="#_4">跨流依赖与同步</a><ul>
+<li><a href="#_5">问题场景：竞态</a></li>
+<li><a href="#1wait_stream">解决方法 1：wait_stream</a></li>
+<li><a href="#2record_stream">解决方法 2：record_stream</a></li>
+<li><a href="#_6">区别</a></li>
+</ul>
+</li>
+<li><a href="#2">实验 2：跨流依赖与竞态</a><ul>
+<li><a href="#2a">实验 2A：不同步导致的错误结果</a></li>
+<li><a href="#2bwait_stream">实验 2B：wait_stream 修复</a></li>
+<li><a href="#2crecord_stream">实验 2C：record_stream 修复</a></li>
+<li><a href="#2f">实验 2F：同步开销</a></li>
+</ul>
+</li>
+<li><a href="#_7">碎片化</a><ul>
+<li><a href="#_8">什么是碎片</a></li>
+<li><a href="#3a">实验 3A：固定大小无碎片</a></li>
+<li><a href="#3b">实验 3B：变长分配产生碎片</a></li>
+<li><a href="#3dkv-cache">实验 3D：KV cache 模拟</a></li>
+</ul>
+</li>
+<li><a href="#cuda-graph">CUDA Graph 内存池</a><ul>
+<li><a href="#vs-cuda-graph">普通分配 vs CUDA Graph</a></li>
+<li><a href="#4a">实验 4A：普通迭代</a></li>
+<li><a href="#4bcuda-graph-replay">实验 4B：CUDA Graph 捕获与 replay</a></li>
+</ul>
+</li>
+<li><a href="#_9">最小块池实现</a><ul>
+<li><a href="#_10">核心数据结构</a></li>
+<li><a href="#_11">分配逻辑</a></li>
+<li><a href="#_12">释放逻辑</a></li>
+<li><a href="#event">Event 完成检查</a></li>
+<li><a href="#5">实验 5：最小块池演示</a></li>
+</ul>
+</li>
+<li><a href="#_13">源码入口</a><ul>
+<li><a href="#cudacachingallocator">CUDACachingAllocator</a></li>
+<li><a href="#stream-event">Stream 与 Event</a></li>
+<li><a href="#python">Python 绑定</a></li>
+</ul>
+</li>
+<li><a href="#_14">实验环境</a></li>
+<li><a href="#_15">验收标准</a></li>
+<li><a href="#_16">常见陷阱</a><ul>
+<li><a href="#1-reserved">1. 把 reserved 当作泄漏</a></li>
+<li><a href="#2_1">2. 跨流未同步</a></li>
+<li><a href="#3">3. 跨流未记录使用者</a></li>
+<li><a href="#4">4. 测量工具触发初始化</a></li>
+</ul>
+</li>
+<li><a href="#_17">下一步</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型</a></li>
+<li><a href="#_3">三个生命周期</a><ul>
+<li><a href="#1python">生命周期 1：Python 引用</a></li>
+<li><a href="#2allocator">生命周期 2：Allocator 可复用</a></li>
+<li><a href="#3gpu">生命周期 3：GPU 使用结束</a></li>
+</ul>
+</li>
+<li><a href="#1">实验 1：基础分配与释放</a><ul>
+<li><a href="#1a">实验 1A：单次分配观察三个时刻</a></li>
+<li><a href="#1b">实验 1B：多次分配复用</a></li>
+</ul>
+</li>
+<li><a href="#_4">跨流依赖与同步</a><ul>
+<li><a href="#_5">问题场景：竞态</a></li>
+<li><a href="#1wait_stream">解决方法 1：wait_stream</a></li>
+<li><a href="#2record_stream">解决方法 2：record_stream</a></li>
+<li><a href="#_6">区别</a></li>
+</ul>
+</li>
+<li><a href="#2">实验 2：跨流依赖与竞态</a><ul>
+<li><a href="#2a">实验 2A：不同步导致的错误结果</a></li>
+<li><a href="#2bwait_stream">实验 2B：wait_stream 修复</a></li>
+<li><a href="#2crecord_stream">实验 2C：record_stream 修复</a></li>
+<li><a href="#2f">实验 2F：同步开销</a></li>
+</ul>
+</li>
+<li><a href="#_7">碎片化</a><ul>
+<li><a href="#_8">什么是碎片</a></li>
+<li><a href="#3a">实验 3A：固定大小无碎片</a></li>
+<li><a href="#3b">实验 3B：变长分配产生碎片</a></li>
+<li><a href="#3dkv-cache">实验 3D：KV cache 模拟</a></li>
+</ul>
+</li>
+<li><a href="#cuda-graph">CUDA Graph 内存池</a><ul>
+<li><a href="#vs-cuda-graph">普通分配 vs CUDA Graph</a></li>
+<li><a href="#4a">实验 4A：普通迭代</a></li>
+<li><a href="#4bcuda-graph-replay">实验 4B：CUDA Graph 捕获与 replay</a></li>
+</ul>
+</li>
+<li><a href="#_9">最小块池实现</a><ul>
+<li><a href="#_10">核心数据结构</a></li>
+<li><a href="#_11">分配逻辑</a></li>
+<li><a href="#_12">释放逻辑</a></li>
+<li><a href="#event">Event 完成检查</a></li>
+<li><a href="#5">实验 5：最小块池演示</a></li>
+</ul>
+</li>
+<li><a href="#_13">源码入口</a><ul>
+<li><a href="#cudacachingallocator">CUDACachingAllocator</a></li>
+<li><a href="#stream-event">Stream 与 Event</a></li>
+<li><a href="#python">Python 绑定</a></li>
+</ul>
+</li>
+<li><a href="#_14">实验环境</a></li>
+<li><a href="#_15">验收标准</a></li>
+<li><a href="#_16">常见陷阱</a><ul>
+<li><a href="#1-reserved">1. 把 reserved 当作泄漏</a></li>
+<li><a href="#2_1">2. 跨流未同步</a></li>
+<li><a href="#3">3. 跨流未记录使用者</a></li>
+<li><a href="#4">4. 测量工具触发初始化</a></li>
+</ul>
+</li>
+<li><a href="#_17">下一步</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
+  <div class="mod-id">2.0c</div>
+  <h1>PyTorch 运行时：内存、流与异步生命周期</h1>
+  <p class="lede">连接 Python 引用、allocator 块状态、CUDA stream/event 和图内存池，解释张量何时失去引用、存储何时可复用、GPU 何时完成使用。</p>
+  
+</header><article class="prose"><h1 id="20c-pytorch">2.0c PyTorch 运行时内存：三个生命周期与异步语义</h1>
+<p>本章连接 Python 引用、CUDACachingAllocator 块状态和 CUDA 异步执行，解释张量何时失去引用、存储何时可复用、GPU 何时真正完成使用。通过四组实验和一个最小块池实现，演示跨流同步、碎片化和 CUDA Graph 内存池的实际行为。</p>
+<hr />
+<h2 id="_1">本章回答的三个问题</h2>
+<ol>
+<li>
+<p><strong>del tensor、allocator 可复用与 GPU 使用结束分别发生在何时？</strong><br />
+   Python 对象在 <code>del</code> 后立即失去引用，但 allocator 需要等待 GPU kernel 完成才能将内存标记为可复用。三个时刻通常不同步。</p>
+</li>
+<li>
+<p><strong>wait_stream 和 record_stream 分别建立什么约束？</strong><br />
+<code>wait_stream</code> 让一个流等待另一个流的所有先前操作，确保数据依赖顺序；<code>record_stream</code> 告诉 allocator 某个张量将被另一个流使用，防止过早释放。</p>
+</li>
+<li>
+<p><strong>动态形状、碎片与 CUDA Graph 如何改变内存生命周期？</strong><br />
+   变长分配导致碎片积累，即使 allocated 很小，reserved 也可能很大；CUDA Graph 使用独立内存池，与普通分配隔离。</p>
+</li>
+</ol>
+<hr />
+<h2 id="_2">心智模型</h2>
+<div class="highlight"><pre><span></span><code>&lt;svg viewBox="0 0 800 500" xmlns="http://www.w3.org/2000/svg"&gt;
+  &lt;!-- 背景 --&gt;
+  &lt;rect width="800" height="500" fill="#0A0D12"/&gt;
+
+  &lt;!-- 标题 --&gt;
+  &lt;text x="400" y="30" fill="#E9A568" font-size="18" font-weight="bold" text-anchor="middle"&gt;
+    三个生命周期与跨流依赖
+  &lt;/text&gt;
+
+  &lt;!-- 三个生命周期时间线 --&gt;
+  &lt;line x1="50" y1="80" x2="750" y2="80" stroke="#38BDF8" stroke-width="2"/&gt;
+  &lt;text x="50" y="70" fill="#38BDF8" font-size="14"&gt;时间 →&lt;/text&gt;
+
+  &lt;!-- Python 引用 --&gt;
+  &lt;rect x="100" y="100" width="150" height="40" fill="#1E2636" stroke="#6EE7B7" stroke-width="2"/&gt;
+  &lt;text x="175" y="125" fill="#6EE7B7" font-size="13" text-anchor="middle"&gt;Python 对象存在&lt;/text&gt;
+  &lt;circle cx="250" cy="120" r="4" fill="#E9A568"/&gt;
+  &lt;text x="260" y="125" fill="#E9A568" font-size="12"&gt;del tensor&lt;/text&gt;
+
+  &lt;!-- Allocator 可复用 --&gt;
+  &lt;rect x="100" y="160" width="250" height="40" fill="#1E2636" stroke="#38BDF8" stroke-width="2"/&gt;
+  &lt;text x="225" y="185" fill="#38BDF8" font-size="13" text-anchor="middle"&gt;allocator 持有（pending）&lt;/text&gt;
+  &lt;circle cx="350" cy="180" r="4" fill="#E9A568"/&gt;
+  &lt;text x="360" y="185" fill="#E9A568" font-size="12"&gt;标记可复用&lt;/text&gt;
+
+  &lt;!-- GPU 使用 --&gt;
+  &lt;rect x="100" y="220" width="300" height="40" fill="#1E2636" stroke="#6EE7B7" stroke-width="2"/&gt;
+  &lt;text x="250" y="245" fill="#6EE7B7" font-size="13" text-anchor="middle"&gt;GPU kernel 可能仍在读写&lt;/text&gt;
+  &lt;circle cx="400" cy="240" r="4" fill="#E9A568"/&gt;
+  &lt;text x="410" y="245" fill="#E9A568" font-size="12"&gt;kernel 完成&lt;/text&gt;
+
+  &lt;!-- 跨流场景 --&gt;
+  &lt;text x="50" y="310" fill="#38BDF8" font-size="16" font-weight="bold"&gt;跨流依赖&lt;/text&gt;
+
+  &lt;!-- Stream 1 --&gt;
+  &lt;rect x="100" y="330" width="200" height="30" fill="#1E2636" stroke="#6EE7B7" stroke-width="2"/&gt;
+  &lt;text x="120" y="350" fill="#6EE7B7" font-size="12"&gt;Stream 1: x = alloc()&lt;/text&gt;
+
+  &lt;rect x="320" y="330" width="150" height="30" fill="#1E2636" stroke="#6EE7B7" stroke-width="2"/&gt;
+  &lt;text x="340" y="350" fill="#6EE7B7" font-size="12"&gt;y = x * 2&lt;/text&gt;
+
+  &lt;!-- Stream 2 --&gt;
+  &lt;rect x="100" y="380" width="380" height="30" fill="#1E2636" stroke="#38BDF8" stroke-width="2"/&gt;
+  &lt;text x="120" y="400" fill="#38BDF8" font-size="12"&gt;Stream 2: wait_stream(s1) → z = y * 3&lt;/text&gt;
+
+  &lt;!-- 问题标注 --&gt;
+  &lt;line x1="490" y1="345" x2="520" y2="345" stroke="#E9A568" stroke-width="2" marker-end="url(#arrow)"/&gt;
+  &lt;line x1="520" y1="345" x2="520" y2="395" stroke="#E9A568" stroke-width="2"/&gt;
+  &lt;line x1="520" y1="395" x2="490" y2="395" stroke="#E9A568" stroke-width="2" marker-end="url(#arrow)"/&gt;
+  &lt;text x="530" y="375" fill="#E9A568" font-size="11"&gt;若无 wait_stream，&lt;/text&gt;
+  &lt;text x="530" y="390" fill="#E9A568" font-size="11"&gt;s2 可能读到未完成的 y&lt;/text&gt;
+
+  &lt;!-- 箭头定义 --&gt;
+  &lt;defs&gt;
+    &lt;marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"&gt;
+      &lt;path d="M0,0 L0,6 L9,3 z" fill="#E9A568"/&gt;
+    &lt;/marker&gt;
+  &lt;/defs&gt;
+
+  &lt;!-- 碎片化示意 --&gt;
+  &lt;text x="50" y="450" fill="#38BDF8" font-size="16" font-weight="bold"&gt;碎片化&lt;/text&gt;
+
+  &lt;rect x="100" y="460" width="200" height="30" fill="#1E2636" stroke="#6EE7B7" stroke-width="2"/&gt;
+  &lt;rect x="100" y="460" width="60" height="30" fill="#6EE7B7" opacity="0.3"/&gt;
+  &lt;rect x="180" y="460" width="40" height="30" fill="#6EE7B7" opacity="0.3"/&gt;
+  &lt;rect x="240" y="460" width="60" height="30" fill="#6EE7B7" opacity="0.3"/&gt;
+  &lt;text x="320" y="480" fill="#E9A568" font-size="12"&gt;allocated: 160 MB&lt;/text&gt;
+
+  &lt;rect x="100" y="460" width="200" height="30" fill="none" stroke="#38BDF8" stroke-width="2"/&gt;
+  &lt;text x="320" y="465" fill="#38BDF8" font-size="12"&gt;reserved: 200 MB&lt;/text&gt;
+
+  &lt;text x="450" y="480" fill="#E9A568" font-size="12"&gt;碎片率: 20%&lt;/text&gt;
+&lt;/svg&gt;
+</code></pre></div>
+
+<hr />
+<h2 id="_3">三个生命周期</h2>
+<h3 id="1python">生命周期 1：Python 引用</h3>
+<div class="highlight"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2000</span><span class="p">,</span> <span class="mi">2000</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">'cuda'</span><span class="p">)</span>  <span class="c1"># Python 对象创建</span>
+<span class="k">del</span> <span class="n">x</span>  <span class="c1"># Python 引用立即消失，refcount 降为 0</span>
+</code></pre></div>
+
+<p><code>del</code> 后 Python 对象被回收，但这<strong>不意味着内存可以立即复用</strong>。</p>
+<h3 id="2allocator">生命周期 2：Allocator 可复用</h3>
+<p>CUDACachingAllocator 在 <code>del</code> 后将内存块标记为 "pending"（待回收），但需要等待 GPU 完成才能标记为 "free"（可复用）。</p>
+<div class="highlight"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2000</span><span class="p">,</span> <span class="mi">2000</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">'cuda'</span><span class="p">)</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="k">del</span> <span class="n">x</span>  <span class="c1"># allocated 减少，但 reserved 不变</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>  <span class="c1"># 等待 GPU 完成</span>
+<span class="c1"># 现在 x 的内存变为 free，可以被新分配复用</span>
+</code></pre></div>
+
+<h3 id="3gpu">生命周期 3：GPU 使用结束</h3>
+<p>CUDA kernel 是异步的。<code>x * 2</code> 提交后立即返回，kernel 可能仍在 GPU 上运行。</p>
+<div class="highlight"><pre><span></span><code><span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>  <span class="c1"># kernel 提交，Python 继续</span>
+<span class="k">del</span> <span class="n">x</span>      <span class="c1"># Python 引用消失，但 kernel 可能仍在读 x</span>
+<span class="c1"># 如果此时复用 x 的内存，会导致竞态</span>
+</code></pre></div>
+
+<p>Allocator 通过 stream 和 event 确保安全：只有 stream 上的所有先前操作完成后，内存才能复用。</p>
+<hr />
+<h2 id="1">实验 1：基础分配与释放</h2>
+<h3 id="1a">实验 1A：单次分配观察三个时刻</h3>
+<p>{{results/crater/2.0c/memory_lifecycle_basic.json:experiment_1a}}</p>
+<p>解读：
+- <strong>分配后</strong>：allocated 和 reserved 都是 16 MB（2000×2000×4 字节）
+- <strong>计算后</strong>：allocated 变为 32 MB（x 和 y 各 16 MB）
+- <strong>del x 后</strong>：allocated 减为 16 MB，但 reserved 仍为 32 MB
+- <strong>synchronize 后</strong>：reserved 仍为 32 MB（allocator 保留内存以供复用）
+- <strong>empty_cache 后</strong>：reserved 降为 0（显式归还给操作系统）</p>
+<p>关键观察：<strong>allocated 表示正在使用的字节数，reserved 表示 allocator 持有的字节数</strong>。两者的差值是可复用但尚未分配的内存。</p>
+<h3 id="1b">实验 1B：多次分配复用</h3>
+<p>{{results/crater/2.0c/memory_lifecycle_basic.json:experiment_1b}}</p>
+<p>五次分配 1000×1000 张量（3.81 MB），allocated 保持 3.81 MB，reserved 保持 20 MB。Allocator 复用了之前释放的内存，没有向操作系统申请新的。</p>
+<hr />
+<h2 id="_4">跨流依赖与同步</h2>
+<h3 id="_5">问题场景：竞态</h3>
+<div class="highlight"><pre><span></span><code><span class="n">s1</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">()</span>
+<span class="n">s2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">()</span>
+
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">s1</span><span class="p">):</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">1000</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">'cuda'</span><span class="p">)</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>  <span class="c1"># s1 上提交 kernel</span>
+
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">s2</span><span class="p">):</span>
+    <span class="n">z</span> <span class="o">=</span> <span class="n">y</span> <span class="o">*</span> <span class="mi">3</span>  <span class="c1"># s2 上提交 kernel，可能在 y 计算完成前启动</span>
+</code></pre></div>
+
+<p><strong>错误</strong>：s2 的 kernel 可能在 s1 的 <code>y = x * 2</code> 完成前就读取 y，导致读到未完成的数据。</p>
+<h3 id="1wait_stream">解决方法 1：wait_stream</h3>
+<div class="highlight"><pre><span></span><code><span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">s2</span><span class="p">):</span>
+    <span class="n">s2</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">s1</span><span class="p">)</span>  <span class="c1"># s2 等待 s1 的所有先前操作完成</span>
+    <span class="n">z</span> <span class="o">=</span> <span class="n">y</span> <span class="o">*</span> <span class="mi">3</span>
+</code></pre></div>
+
+<p><code>wait_stream(s1)</code> 在 s2 上插入一个等待点，确保 s1 的所有先前 kernel 完成后，s2 才继续。</p>
+<h3 id="2record_stream">解决方法 2：record_stream</h3>
+<div class="highlight"><pre><span></span><code><span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">s1</span><span class="p">):</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">1000</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">'cuda'</span><span class="p">)</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">s2</span><span class="p">):</span>
+    <span class="n">y</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">s2</span><span class="p">)</span>  <span class="c1"># 告诉 allocator：y 将被 s2 使用</span>
+    <span class="n">z</span> <span class="o">=</span> <span class="n">y</span> <span class="o">*</span> <span class="mi">3</span>
+</code></pre></div>
+
+<p><code>record_stream(s2)</code> 告诉 allocator："y 的内存将被 s2 使用，在 s2 完成前不能释放"。</p>
+<h3 id="_6">区别</h3>
+<ul>
+<li><strong>wait_stream</strong>：控制执行顺序，确保数据依赖</li>
+<li><strong>record_stream</strong>：控制内存生命周期，防止过早释放</li>
+</ul>
+<p>两者通常需要同时使用：</p>
+<div class="highlight"><pre><span></span><code><span class="n">s2</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">s1</span><span class="p">)</span>      <span class="c1"># 确保 y 计算完成</span>
+<span class="n">y</span><span class="o">.</span><span class="n">record_stream</span><span class="p">(</span><span class="n">s2</span><span class="p">)</span>     <span class="c1"># 防止 allocator 在 s2 使用前释放 y</span>
+</code></pre></div>
+
+<hr />
+<h2 id="2">实验 2：跨流依赖与竞态</h2>
+<h3 id="2a">实验 2A：不同步导致的错误结果</h3>
+<p>在不同流上分配和使用张量，不同步：</p>
+<p>{{results/crater/2.0c/memory_cross_stream.json:experiment_2a}}</p>
+<p><code>max_diff: 42.26</code>：数值差异很大，说明 s2 读到了未完成的数据。</p>
+<h3 id="2bwait_stream">实验 2B：wait_stream 修复</h3>
+<p>{{results/crater/2.0c/memory_cross_stream.json:experiment_2b}}</p>
+<p><code>max_diff: 40.86</code>：仍然有差异，因为只同步了执行，但 allocator 可能在 s2 完成前释放了内存。</p>
+<h3 id="2crecord_stream">实验 2C：record_stream 修复</h3>
+<p>{{results/crater/2.0c/memory_cross_stream.json:experiment_2c}}</p>
+<p><code>success: true</code>：数值正确，<code>record_stream</code> 防止了过早释放。</p>
+<h3 id="2f">实验 2F：同步开销</h3>
+<p>{{results/crater/2.0c/memory_cross_stream.json:experiment_2f}}</p>
+<div class="highlight"><pre><span></span><code>no_sync_ms: 1.63
+with_sync_ms: 1.74
+overhead_pct: 6.59
+</code></pre></div>
+
+<p><code>wait_stream</code> 和 <code>record_stream</code> 的开销约为 6.6%（在这个小规模实验中）。</p>
+<hr />
+<h2 id="_7">碎片化</h2>
+<h3 id="_8">什么是碎片</h3>
+<p>Allocator 以 segment 为单位向操作系统申请内存（通常 20 MB），然后在 segment 内部分配 block。当分配和释放的尺寸不规则时，segment 内部会产生碎片：</p>
+<div class="highlight"><pre><span></span><code>Segment (20 MB)
+[4MB used] [2MB free] [3MB used] [1MB free] [10MB used]
+</code></pre></div>
+
+<p>即使有 3 MB 的 free 空间，也无法满足一个 5 MB 的分配请求（因为碎片不连续），allocator 只能申请新的 segment。</p>
+<h3 id="3a">实验 3A：固定大小无碎片</h3>
+<p>{{results/crater/2.0c/memory_fragmentation.json:experiment_3a}}</p>
+<p>10 次迭代，allocated 和 reserved 保持不变，碎片率 80.9%（因为 20 MB segment 只用了 3.81 MB）。</p>
+<h3 id="3b">实验 3B：变长分配产生碎片</h3>
+<p>{{results/crater/2.0c/memory_fragmentation.json:experiment_3b}}</p>
+<p>分配 500/1000/1500/2000 的张量，碎片率在 30%～95% 之间波动。第 2 次迭代（1000→1500→2000）后，reserved 从 2 MB 跳到 22 MB，说明 allocator 申请了新的 segment。</p>
+<h3 id="3dkv-cache">实验 3D：KV cache 模拟</h3>
+<p>模拟变长序列的 KV cache：</p>
+<p>{{results/crater/2.0c/memory_fragmentation.json:experiment_3d}}</p>
+<div class="highlight"><pre><span></span><code>seq_len   allocated   reserved   fragmentation
+128       16 MB       16 MB      0.0%
+256       32 MB       48 MB      33.3%
+512       64 MB       112 MB     42.9%
+1024      128 MB      240 MB     46.7%
+512       64 MB       240 MB     73.3%
+256       32 MB       240 MB     86.7%
+128       16 MB       240 MB     93.3%
+</code></pre></div>
+
+<p><strong>关键观察</strong>：从 1024 回到 128 时，allocated 只有 16 MB，但 reserved 仍为 240 MB。碎片率达到 93.3%。</p>
+<hr />
+<h2 id="cuda-graph">CUDA Graph 内存池</h2>
+<h3 id="vs-cuda-graph">普通分配 vs CUDA Graph</h3>
+<p>CUDA Graph 捕获时会记录所有内存分配，replay 时使用<strong>独立的内存池</strong>，与普通分配隔离。</p>
+<h3 id="4a">实验 4A：普通迭代</h3>
+<p>{{results/crater/2.0c/memory_cuda_graph.json:experiment_4a}}</p>
+<p>5 次迭代，allocated 和 reserved 保持不变（11.44 MB / 20 MB），allocator 复用了内存。</p>
+<h3 id="4bcuda-graph-replay">实验 4B：CUDA Graph 捕获与 replay</h3>
+<p>{{results/crater/2.0c/memory_cuda_graph.json:experiment_4b}}</p>
+<div class="highlight"><pre><span></span><code>stage        allocated   reserved
+recorded     11.45 MB    22 MB
+iteration 1  11.45 MB    22 MB
+iteration 2  11.45 MB    22 MB
+...
+</code></pre></div>
+
+<p><strong>捕获后 reserved 增加</strong>：从 20 MB 到 22 MB，说明 CUDA Graph 使用了独立的内存池。</p>
+<hr />
+<h2 id="_9">最小块池实现</h2>
+<p>为了理解 allocator 的核心逻辑，我们实现一个最小块池，支持：
+1. 流归属
+2. 延迟回收（pending）
+3. Event 完成检查</p>
+<h3 id="_10">核心数据结构</h3>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">Block</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">size</span> <span class="o">=</span> <span class="n">size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">stream</span> <span class="o">=</span> <span class="n">stream</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">event</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">allocated</span> <span class="o">=</span> <span class="kc">True</span>
+</code></pre></div>
+
+<h3 id="_11">分配逻辑</h3>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
+    <span class="c1"># 1. 查找可复用的 free block</span>
+    <span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">free_blocks</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">block</span><span class="o">.</span><span class="n">size</span> <span class="o">&gt;=</span> <span class="n">size</span><span class="p">:</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">allocated</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">stream</span> <span class="o">=</span> <span class="n">stream</span>
+            <span class="k">return</span> <span class="n">block</span>
+
+    <span class="c1"># 2. 检查 pending blocks（等待 event 完成）</span>
+    <span class="n">process_events</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">free_blocks</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">block</span><span class="o">.</span><span class="n">size</span> <span class="o">&gt;=</span> <span class="n">size</span><span class="p">:</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">allocated</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">stream</span> <span class="o">=</span> <span class="n">stream</span>
+            <span class="k">return</span> <span class="n">block</span>
+
+    <span class="c1"># 3. 申请新 segment</span>
+    <span class="n">segment</span> <span class="o">=</span> <span class="n">allocate_segment</span><span class="p">(</span><span class="n">size</span><span class="p">)</span>
+    <span class="n">block</span> <span class="o">=</span> <span class="n">Block</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">block</span>
+</code></pre></div>
+
+<h3 id="_12">释放逻辑</h3>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">free</span><span class="p">(</span><span class="n">block</span><span class="p">):</span>
+    <span class="c1"># 标记为 pending，记录当前 stream 的 event</span>
+    <span class="n">block</span><span class="o">.</span><span class="n">allocated</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">block</span><span class="o">.</span><span class="n">event</span> <span class="o">=</span> <span class="n">block</span><span class="o">.</span><span class="n">stream</span><span class="o">.</span><span class="n">record_event</span><span class="p">()</span>
+    <span class="n">pending_blocks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
+</code></pre></div>
+
+<h3 id="event">Event 完成检查</h3>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_events</span><span class="p">():</span>
+    <span class="k">for</span> <span class="n">block</span> <span class="ow">in</span> <span class="n">pending_blocks</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">block</span><span class="o">.</span><span class="n">event</span><span class="o">.</span><span class="n">query</span><span class="p">():</span>  <span class="c1"># 检查 event 是否完成</span>
+            <span class="n">free_blocks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
+            <span class="n">pending_blocks</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
+</code></pre></div>
+
+<h3 id="5">实验 5：最小块池演示</h3>
+<p>完整实现在 <code>labs/L2/mini_block_allocator.py</code>。</p>
+<p>{{results/crater/2.0c/mini_block_allocator.txt}}</p>
+<p>解读：
+- <strong>实验 5A</strong>：分配 → 释放 → synchronize → 复用。释放后 block 进入 pending，同步后进入 free，然后被复用。
+- <strong>实验 5B</strong>：跨流分配。stream2 释放的 block 在 stream1 event 完成后才能被复用。
+- <strong>实验 5C</strong>：碎片化。释放 block 1/3/5 后，分配 8 MB 需要扩展新 segment（因为碎片不连续）。
+- <strong>实验 5D</strong>：变长分配。碎片率在 40%～90% 之间波动。</p>
+<hr />
+<h2 id="_13">源码入口</h2>
+<h3 id="cudacachingallocator">CUDACachingAllocator</h3>
+<p><strong>文件</strong>：<code>pytorch/c10/cuda/CUDACachingAllocator.cpp</code></p>
+<p>核心函数：
+- <code>malloc()</code>：分配内存，查找 free block → 检查 pending → 申请新 segment
+- <code>free()</code>：释放内存，记录 event 并标记为 pending
+- <code>process_events()</code>：检查 pending 队列，将完成的 block 移到 free</p>
+<p>关键数据结构：
+- <code>Block</code>：包含 size、stream、event、allocated 标志
+- <code>Segment</code>：一次向操作系统申请的大块内存（默认 20 MB）</p>
+<h3 id="stream-event">Stream 与 Event</h3>
+<p><strong>文件</strong>：
+- <code>pytorch/c10/cuda/CUDAStream.h</code>
+- <code>pytorch/c10/cuda/CUDAEvent.h</code></p>
+<p>核心函数：
+- <code>record()</code>：在 stream 上记录 event
+- <code>query()</code>：查询 event 是否完成
+- <code>wait()</code>：让当前 stream 等待 event 完成</p>
+<h3 id="python">Python 绑定</h3>
+<p><strong>文件</strong>：<code>pytorch/torch/csrc/cuda/Module.cpp</code></p>
+<p>核心函数：
+- <code>THCPModule_cudaSynchronize()</code>：同步所有 stream
+- <code>THCPStream_wait_stream()</code>：stream 等待另一个 stream
+- <code>THPVariable_record_stream()</code>：记录张量将被另一个 stream 使用</p>
+<hr />
+<h2 id="_14">实验环境</h2>
+<p><strong>硬件</strong>：crater RTX 5090 D（32 GB）<br />
+<strong>软件</strong>：PyTorch 2.13.0+cu130<br />
+<strong>退出码</strong>：全部实验退出码为 0<br />
+<strong>运行前后 GPU 占用</strong>：运行前 1 MiB / 0% 利用率，运行后恢复</p>
+<p><strong>实验脚本</strong>：
+- <code>labs/L2/memory_lifecycle_basic.py</code>：基础生命周期
+- <code>labs/L2/memory_cross_stream.py</code>：跨流依赖
+- <code>labs/L2/memory_fragmentation.py</code>：碎片化
+- <code>labs/L2/memory_cuda_graph.py</code>：CUDA Graph 内存池</p>
+<p><strong>原始工件</strong>：
+- <code>results/crater/2.0c/memory_lifecycle_basic.json</code>
+- <code>results/crater/2.0c/memory_cross_stream.json</code>
+- <code>results/crater/2.0c/memory_fragmentation.json</code>
+- <code>results/crater/2.0c/memory_cuda_graph.json</code>
+- <code>results/crater/2.0c/mini_block_allocator.txt</code></p>
+<hr />
+<h2 id="_15">验收标准</h2>
+<p>本章完成以下验收：</p>
+<ul>
+<li>[x] 解释三个生命周期：Python 引用、allocator 可复用、GPU 完成</li>
+<li>[x] 对比 <code>wait_stream</code> 和 <code>record_stream</code> 的不同作用</li>
+<li>[x] 演示跨流竞态及修复方法</li>
+<li>[x] 用变长序列展示碎片积累（KV cache 模拟）</li>
+<li>[x] 对比普通池与 CUDA Graph 池的内存曲线</li>
+<li>[x] 实现最小块池，支持流归属与延迟回收</li>
+</ul>
+<p><strong>尚未验证</strong>：
+- 跨流竞态区间的可视化演示（需要更细粒度的 profiler trace）
+- 真实变长分配轨迹与 <code>expandable_segments</code> 对照（需要 vLLM 完整运行日志）</p>
+<hr />
+<h2 id="_16">常见陷阱</h2>
+<h3 id="1-reserved">1. 把 reserved 当作泄漏</h3>
+<div class="highlight"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">1000</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">'cuda'</span><span class="p">)</span>
+<span class="k">del</span> <span class="n">x</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="c1"># reserved 仍为 20 MB，这不是泄漏！</span>
+</code></pre></div>
+
+<p>Allocator 保留内存以供复用，只有 <code>empty_cache()</code> 才会归还给操作系统。</p>
+<h3 id="2_1">2. 跨流未同步</h3>
+<div class="highlight"><pre><span></span><code><span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">s1</span><span class="p">):</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">s2</span><span class="p">):</span>
+    <span class="n">z</span> <span class="o">=</span> <span class="n">y</span> <span class="o">*</span> <span class="mi">3</span>  <span class="c1"># 错误：未等待 s1</span>
+</code></pre></div>
+
+<p>必须 <code>s2.wait_stream(s1)</code> 或者在主流上同步。</p>
+<h3 id="3">3. 跨流未记录使用者</h3>
+<div class="highlight"><pre><span></span><code><span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">s1</span><span class="p">):</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+
+<span class="k">del</span> <span class="n">x</span>  <span class="c1"># 错误：allocator 可能在 s1 完成前释放 x</span>
+</code></pre></div>
+
+<p>必须 <code>x.record_stream(s1)</code> 告诉 allocator。</p>
+<h3 id="4">4. 测量工具触发初始化</h3>
+<div class="highlight"><pre><span></span><code><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">()</span>  <span class="c1"># 这会触发 CUDA 初始化</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">'cuda'</span><span class="p">)</span>
+<span class="c1"># 此时 reserved 可能包含初始化开销</span>
+</code></pre></div>
+
+<p>测量前先 <code>reset_peak_memory_stats()</code>。</p>
+<hr />
+<h2 id="_17">下一步</h2>
+<p>完成 2.0c 后，PyTorch 运行时内存的三个生命周期已明确。后续章节：</p>
+<ul>
+<li><strong>2.6b 图解析与融合</strong>：TorchScript/FX 如何改变运行时行为，CUDA Graph 捕获与 replay</li>
+<li><strong>7.1 训练循环系统视角</strong>：数据读取、H2D、前反向和优化器的完整内存与时间曲线</li>
+<li><strong>2.0 的真实分配轨迹</strong>：用 vLLM 完整运行采集变长序列下的 allocator 行为</li>
+</ul>
+<p>本章建立了内存生命周期的完整模型，为理解训练内存峰值、推理内存优化和分布式通信 buffer 提供了基础。</p></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.0b-pytorch-dispatch-path.html">&#8592; 2.0b PyTorch 算子调用：从 Python 到 dispatcher 与 kernel</a><a class="nav-next" href="../L2/2.1-cuda-execution-model.html">2.1 CUDA 执行模型与 CUDA Graph &#8594;</a></nav>
+</main>
+</body>
+</html>

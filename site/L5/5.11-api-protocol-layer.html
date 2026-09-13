@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.11 API 与协议层</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -25,7 +25,7 @@
 <li><a href="#5-tokenization">5. tokenization 的成本不在总量，在它跑在哪</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 源码走读</a><ul>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
 <li><a href="#a-vllm">A. vLLM：应用怎么搭起来，中间件顺序是什么</a></li>
 <li><a href="#b-vllm-streamingresponse">B. vLLM：路由函数把生成器交给 StreamingResponse</a></li>
 <li><a href="#c-vllmkeep-alive-asyncio">C. vLLM：keep-alive 注释与它绕开的 asyncio 陷阱</a></li>
@@ -69,7 +69,7 @@
 <li><a href="#5-tokenization">5. tokenization 的成本不在总量，在它跑在哪</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 源码走读</a><ul>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
 <li><a href="#a-vllm">A. vLLM：应用怎么搭起来，中间件顺序是什么</a></li>
 <li><a href="#b-vllm-streamingresponse">B. vLLM：路由函数把生成器交给 StreamingResponse</a></li>
 <li><a href="#c-vllmkeep-alive-asyncio">C. vLLM：keep-alive 注释与它绕开的 asyncio 陷阱</a></li>
@@ -107,20 +107,19 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
   <div class="mod-id">5.11</div>
   <h1>API 与协议层</h1>
-  <p class="lede">引擎的前门：OpenAI 兼容层、SSE streaming、请求生命周期、tokenization 会不会成为 CPU 瓶颈。5.8 讲失败路径，这一章讲那些路径跑在什么之上。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen3-1.7B · vLLM 0.29.0 · SGLang 0.5.19 · uvicorn 0.52.4 · starlette 1.6.0</span><span class="chip">数据日期 2026-09-12</span><span class="chip">前置 0.1（请求全链路）· 5.3（调度）· 5.7（nanoserve）· 5.8（失败路径）</span></div>
+  <p class="lede">介绍 OpenAI 兼容 API、SSE 流式输出与请求处理流程，分析 tokenization 的 CPU 开销。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen3-1.7B · vLLM 0.29.0 · SGLang 0.5.19 · uvicorn 0.52.4 · starlette 1.6.0</span><span class="chip">前置 0.1（请求全链路）· 5.3（调度）· 5.7（nanoserve）· 5.8（失败路径）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
-<p>前面十二章都在引擎内部。这一章退到引擎门口，看请求进来和 token 出去的那一段。</p>
+<p>本章介绍推理引擎的 API 层：HTTP 请求如何进入调度器，生成的 token 如何以流式响应返回客户端。</p>
 <ol>
 <li>一个 HTTP 请求到进入 scheduler，中间经过哪些层？每层花多少时间？</li>
 <li>streaming 的每个 chunk 是怎么产生和推出去的？一个 token 对应几个字节？</li>
 <li>tokenization 在高并发下会不会成为瓶颈？</li>
 </ol>
-<p>结论先给：<strong>前门在端到端时延里占比很小，但它的位置决定了两件大事</strong>——它决定了谁会被别人的
-工作阻塞，也决定了 token 以什么粒度离开进程。本章实测 24 token 的流式请求：客户端墙钟
+<p>API 层的工作量通常小于模型前向，但共享事件循环中的阻塞仍会影响其他请求。本章实测 24 token 的流式请求：客户端墙钟
 77.75 ms，其中引擎推理 76.32 ms，进程内前端 0.79 ms、进程外 0.63 ms，非推理部分合计 1.84%。
 但把 tokenizer 放回事件循环，一个 16k token 的请求会让<strong>所有</strong>在跑的请求停顿 11.4 ms——
-正好等于它自己的编码耗时。</p>
+与该请求的编码耗时接近。</p>
 <hr />
 <h2 id="_2">心智模型：两道进程边界，三层分帧</h2>
 <figure>
@@ -202,8 +201,8 @@
 vLLM 注册中间件的顺序（<code>entrypoints/serve/middleware/register.py:19-75</code>）是
 CORS → 鉴权 → request-id → 扩缩容状态，最后才是用户通过 <code>--middleware</code> 传入的。
 Starlette 的 <code>add_middleware</code> 是<strong>后加的先执行</strong>，所以列表顺序和实际执行顺序相反。
-中间件越多，每个请求的固定开销越大，而且<strong>流式响应也走完整条链</strong>——返回
-<code>StreamingResponse</code> 不代表绕过了中间件。</p>
+中间件越多，每个请求的固定开销越大，而且<strong>流式响应同样会经历整条中间件链</strong>——返回
+<code>StreamingResponse</code> 并不代表能够绕过中间件。</p>
 <h3 id="2-sse-chunked">2. SSE 是叠在 chunked 上的第二层分帧</h3>
 <p>一个流式响应在 HTTP/1.1 上同时有两层分帧。外层是传输层的 chunked：
 <code>长度(十六进制) CRLF 负载 CRLF</code>，最后以 <code>0 CRLF CRLF</code> 结束。内层是 SSE 的事件：
@@ -322,7 +321,7 @@ vLLM 的 <code>FastIncrementalDetokenizer</code> 用 tokenizers 库的 <code>Dec
 本章实测同一份 16k token 输入，in-loop 编码 11.0 ms，<code>to_thread</code> 后服务端侧变成 31.7 ms——
 多出来的部分是「等事件循环腾出手」。<strong>保护了别人，自己变慢。</strong></p>
 <hr />
-<h2 id="_4">工程实现 · 源码走读</h2>
+<h2 id="_4">工程实现 · 源码解析</h2>
 <p>版本固定：vLLM 0.29.0、SGLang 0.5.19。行号取自 <code>site-packages</code> 里的安装源码。</p>
 <h3 id="a-vllm">A. vLLM：应用怎么搭起来，中间件顺序是什么</h3>
 <p><code>build_app()</code> 只做四件事（<code>entrypoints/launchers/app.py:19-56</code>）：建 <code>FastAPI</code>、
@@ -421,7 +420,7 @@ yield "data: [DONE]\n\n"
 <span class="linenos" aria-hidden="true">65</span>             <span class="k">await</span> <span class="n">generator</span><span class="o">.</span><span class="n">aclose</span><span class="p">()</span>
 </pre></div>
 <div class="srcref"><code>results/crater/api/20260912-0325/source/vllm/entrypoints/openai/sse_keep_alive.py 第 36–65 行</code><a href="../code/results/crater/api/20260912-0325/source/vllm/entrypoints/openai/sse_keep_alive.py.html#results-crater-api-20260912-0325-source-vllm-entrypoints-openai-sse_keep_alive-py-L-36">在完整文件中打开 &rarr;</a></div></div></details>
-<p>这段代码值得逐行读，因为它绕开了两个 asyncio 的坑：</p>
+<p>这段代码处理了两个 asyncio 问题：</p>
 <ul>
 <li><code>asyncio</code> 不允许对同一个异步生成器并发调用 <code>__anext__</code>，所以必须<strong>保留一个 task</strong>，
   不能每轮重新创建；</li>
@@ -489,7 +488,7 @@ yield "data: [DONE]\n\n"
 <span class="linenos" aria-hidden="true">798</span>                             <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 </pre></div>
 <div class="srcref"><code>results/crater/api/20260912-0325/source/vllm/v1/engine/async_llm.py 第 772–798 行</code><a href="../code/results/crater/api/20260912-0325/source/vllm/v1/engine/async_llm.py.html#results-crater-api-20260912-0325-source-vllm-v1-engine-async_llm-py-L-772">在完整文件中打开 &rarr;</a></div></div></details>
-<p>这段代码里有两个设计决定值得记：切片是为了「不要一次占住事件循环太久」（注释原文），
+<p>这里包含两个设计选择：切片是为了「不要一次占住事件循环太久」（注释原文），
 每个切片之间 <code>await asyncio.sleep(0)</code> 让出；<code>reqs_to_abort</code> 是 core 反过来要求前端取消的请求。
 <strong>HTTP 层从不直接碰调度器</strong>——它只会往队列里放和从队列里取。这条边界的代价是 IPC 和序列化，
 收益是 HTTP 层的抖动不会传进调度，core 崩了前端还能报错而不是一起挂。</p>
@@ -525,7 +524,7 @@ yield b"data: [DONE]\n\n"
 return StreamingResponse(..., background=_global_state.tokenizer_manager.create_abort_task(obj))
 </code></pre></div>
 
-<p>三处和 vLLM 不同，都值得记：</p>
+<p>与 vLLM 相比，有三处差异：</p>
 <ul>
 <li>字节直接用 <code>dumps_json</code> 拼，不经过字符串再编码；</li>
 <li>断连的清理挂在 <code>StreamingResponse(background=...)</code> 上，由 <code>create_abort_task</code> 负责，
@@ -593,7 +592,7 @@ return StreamingResponse(..., background=_global_state.tokenizer_manager.create_
 Rust tokenizer 默认不释放 GIL，多开线程预期不会并行——<strong>这一点本章没有单独实测</strong>，
 只是解释源码为什么这样写。</p>
 <p>默认值是关的（<code>srt/server_args.py:3507-3520</code>，<code>enable_dynamic_batch_tokenizer = False</code>），
-要用得显式打开。<strong>默认关掉这件事本身就是一条工程信息</strong>：动态批有 2 ms 的攒批延迟，
+要用得显式打开。启用前需要考虑攒批开销：动态批有 2 ms 的攒批延迟，
 低并发下这笔延迟换不到批量收益。</p>
 <h3 id="h-detokenize">H. 两边的增量 detokenize 都在处理同一个问题：半个字符</h3>
 <p>SGLang 的 <code>DecodeStatus</code> 带两个游标（<code>srt/managers/detokenizer_manager.py:75-81</code>）：
@@ -621,7 +620,7 @@ engine core 只管调度和前向；SGLang 把 detokenize 又拆了一个进程�
 前者要求「请求体已经被读完」，因为装饰器会消费掉后续消息来找断连
 （<code>entrypoints/serve/utils/api_utils.py:51-71</code> 的注释明确写了这条前提）；
 后者挂在响应对象上，天然知道流什么时候结束。两种都能用，
-但<strong>装饰器版本不安全</strong>——把它用到没读完 body 的路由上会丢数据。</p>
+使用装饰器时必须满足上述前提，否则可能丢失尚未读取的请求体数据。</p>
 <hr />
 <h2 id="sse">工程实现 · 最小 SSE 编解码</h2>
 <p><code>mini_sse.py</code> 只有两个函数加两个测试。解码器吃 body 字节，编码器负责拼事件。</p>
@@ -826,17 +825,14 @@ transformers 5.17.0。GPU 运行前后均为 1 MiB、利用率 0%，计算进程
 <code>prefill</code> 塌到接近 0，把运行段的构成扭曲掉。</p>
 <p>输入固定为同一条 96 字符的英文 prompt，<code>max_tokens=24</code>、<code>temperature=0</code>、
 <code>stream=true</code>、<code>ignore_eos=true</code>，所以每条请求生成的 token 数完全确定。</p>
-<div class="highlight"><pre><span></span><code><span class="c1"># 本地标准库 mini</span>
-/Users/nyxri/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3<span class="w"> </span>labs/L5/mini_sse.py
+<div class="highlight"><pre><span></span><code><span class="c1"># 本地验证 mini 实现</span>
+python<span class="w"> </span>labs/L5/mini_sse.py
 
-<span class="c1"># 同步并生成唯一批次目录；脚本遇到已有目录直接拒绝</span>
-rsync<span class="w"> </span>-av<span class="w"> </span>labs/L5/api_layer_audit.py<span class="w"> </span>labs/L5/sse_head_of_line.py<span class="w"> </span>labs/L5/mini_sse.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>labs/L5/run_api_layer_audit.sh<span class="w"> </span>crater:/scratch/learn/work/labs/L5/
-ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'bash /scratch/learn/work/labs/L5/run_api_layer_audit.sh "$(date +%Y%m%d-%H%M%S)"'</span>
+<span class="c1"># 远程实验（crater）</span>
+./labs/L5/run_api_layer_audit.sh
 
-<span class="c1"># 对已保存的原始字节流重算派生统计，不重跑实验</span>
-/Users/nyxri/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>labs/L5/summarize_api_layer.py<span class="w"> </span>results/crater/api/20260912-0325/data
+<span class="c1"># 重新统计已有数据</span>
+python<span class="w"> </span>labs/L5/summarize_api_layer.py<span class="w"> </span>results/crater/api/20260912-0325/data
 </code></pre></div>
 
 <p>HTTP 客户端自己用 <code>socket</code> 写，因为要拿到<strong>未经解析的字节</strong>。用 <code>requests</code> 或
@@ -959,7 +955,7 @@ ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'bash 
 </tbody>
 </table>
 <p>四段相加 <code>0.79 + 0.005 + 76.32 + 0.63 = 77.75</code>，与客户端墙钟 77.75 ms 完全吻合。
-<strong>这不是巧合，是分解闭合</strong>——四段恰好覆盖从 <code>sendall</code> 到最后一个字节的全部时间，
+四段覆盖了从 <code>sendall</code> 到收到最后一个字节的时间，
 没有重叠也没有遗漏。</p>
 <p>结论：24 token 的短请求里，HTTP 与协议层合计 <strong>1.84%</strong>，推理占 98.2%。
 <code>prefill</code> 只有 4.41 ms 而 <code>decode</code> 71.91 ms，说明 24 个 token 里绝大多数时间
@@ -1054,13 +1050,13 @@ ssh<span class="w"> </span>crater<span class="w"> </span><span class="s1">'bash 
 </table>
 <p>三点读数：</p>
 <ul>
-<li><strong>排队时间始终接近 0。</strong> vLLM 默认 <code>max_num_seqs</code> 远大于 32，请求一进来就能上车，
+<li><strong>排队时间始终接近 0。</strong> vLLM 默认 <code>max_num_seqs</code> 远大于 32，请求可以直接进入执行，
   所以瓶颈不是准入，而是 batch 变大后每个 decode step 变长（71.77 → 84.81 ms）。</li>
 <li><strong>进程外段随并发上升：0.85 → 1.63 → 4.15 ms。</strong> 32 条流同时在事件循环里做
-  detokenize 和 SSE 编码，前端才开始显形。它在低并发时不到 1 ms，
+  detokenize 和 SSE 编码，前端开销随之增加。它在低并发时不到 1 ms，
   所以只测单请求是看不到这一段的。</li>
 <li><strong>TTFT 最大从 7.5 ms 涨到 28.7 ms，比均值涨得猛。</strong> 首 token 要等 prefill 排进一个
-  iteration，而 iteration 的长度随 batch 增长；已经上车的请求感知不到这段。</li>
+  iteration，而 iteration 的长度随 batch 增长；已开始执行的请求不再经历这段等待。</li>
 </ul>
 <p><strong>前门的占比随负载上升。</strong> 按「客户端均值 − inference」算，非推理部分从并发 1 的
 2.8% 涨到并发 32 的 10.2%。这不是「HTTP 层变慢了」，而是推理段被 batch 摊薄、
@@ -1185,7 +1181,7 @@ p50 分别是 131.4、105.3、105.6 ms，TTFT 最大分别是 54.7、27.0、28.7
 <li><strong><code>to_thread</code> 组没有尖峰</strong>，尽管它的编码耗时反而更长（31.7 ms）。它保护了别人，
   自己却多等了 20 ms——多出来的正是「线程干完了，但事件循环还在忙」的那一段。</li>
 </ul>
-<p>同一个负载走完整的生成路径（B 也是一条真实请求，prompt 同样是 16k token）时，
+<p>当同一个负载执行完整的端到端生成路径（B 也是一条真实请求，prompt 同样是 16k token）时，
 A 的最大间隔在两种写法下分别是 373.4 ms 和 373.9 ms，<strong>没有区别</strong>。
 因为 B 的 prefill 要占 47 个 chunked prefill 步，引擎侧的负载才是主导，
 tokenization 的 11 ms 被淹没了。<strong>这条对照说明：只有当引擎侧的扰动小于 tokenization
@@ -1216,7 +1212,7 @@ TTFT 最大 1 483 ms，20 条流里有 7 条各收到一条注释。</p>
 </ul>
 <p>未测：</p>
 <ul>
-<li><strong>SGLang 端的完整对照未跑。</strong> 本章的 SGLang 只做了源码走读，
+<li><strong>SGLang 端的完整对照未跑。</strong> 本章对 SGLang 仅做了源码剖析，
   <code>AsyncDynamicbatchTokenizer</code> 的实际收益没有实测，标 <code>UNVERIFIED</code>。</li>
 <li><strong>keep-alive 的间隔与代理行为未对照。</strong> 本章只抓到「间隔 1 秒 + 强排队」
   这一种条件下的注释，注释频率与排队时长的定量关系、以及真实反向代理
@@ -1243,11 +1239,9 @@ TTFT 最大 1 483 ms，20 条流里有 7 条各收到一条注释。</p>
 <li>keep-alive 对照批次：<a href="../raw/results/crater/api/20260912-0325/data-keepalive2/audit.json">data-keepalive2/audit.json</a>；第一次尝试（6 并发，排队不足 1 秒，注释数为 0）在 <a href="../raw/results/crater/api/20260912-0325/data-keepalive/audit.json">data-keepalive/</a></li>
 <li>事件循环对照的 6 组原始结果：<a href="../raw/results/crater/api/20260912-0325/data/hol-tokenize-inloop-b1000.json">hol-tokenize-inloop-b1000.json</a>、<a href="../raw/results/crater/api/20260912-0325/data/hol-tokenize-thread-b1000.json">hol-tokenize-thread-b1000.json</a>、<a href="../raw/results/crater/api/20260912-0325/data/hol-tokenize-inloop-b4.json">hol-tokenize-inloop-b4.json</a>、<a href="../raw/results/crater/api/20260912-0325/data/hol-tokenize-thread-b4.json">hol-tokenize-thread-b4.json</a>、<a href="../raw/results/crater/api/20260912-0325/data/hol-generate-inloop-b1000.json">hol-generate-inloop-b1000.json</a>、<a href="../raw/results/crater/api/20260912-0325/data/hol-generate-thread-b1000.json">hol-generate-thread-b1000.json</a></li>
 <li>vLLM 服务端日志：<a href="../raw/results/crater/api/20260912-0325/server-main.log">server-main.log</a>、<a href="../raw/results/crater/api/20260912-0325/server-keepalive2.log">server-keepalive2.log</a></li>
-<li>本批次实际执行的运行器：<a href="../raw/results/crater/api/20260912-0325/run_audit_only.sh">run_audit_only.sh</a>（主审计）、<a href="../raw/results/crater/api/20260912-0325/run_hol_only.sh">run_hol_only.sh</a>（事件循环对照）、<a href="../raw/results/crater/api/20260912-0325/run_keepalive2.sh">run_keepalive2.sh</a>（keep-alive）</li>
+<li>实验运行脚本：<a href="../raw/results/crater/api/20260912-0325/run_audit_only.sh">run_audit_only.sh</a>（主审计）、<a href="../raw/results/crater/api/20260912-0325/run_hol_only.sh">run_hol_only.sh</a>（事件循环对照）、<a href="../raw/results/crater/api/20260912-0325/run_keepalive2.sh">run_keepalive2.sh</a>（keep-alive）</li>
 </ul>
-<p>目录里的 <code>*.snapshot</code> 是产出该批工件时所用的脚本副本。本批次中途修过
-<code>api_layer_audit.py</code>（补并发均值与进程外段），快照已更新为最终版本；
-6 组事件循环对照由 <code>sse_head_of_line.py</code> 在修改之后运行，快照与产物一致。</p>
+<p>目录中的 <code>*.snapshot</code> 保存了生成这些结果所用的脚本。<code>api_layer_audit.py</code> 记录并发均值与进程外耗时，<code>sse_head_of_line.py</code> 生成 6 组事件循环对照。</p>
 <p><strong>本章引用的引擎源码全部快照在 <code>results/crater/api/20260912-0325/source/</code> 下</strong>
 （入口示例：<a href="../raw/results/crater/api/20260912-0325/source/vllm/entrypoints/openai/sse_keep_alive.py">sse_keep_alive.py</a>、
 <a href="../raw/results/crater/api/20260912-0325/source/vllm/v1/engine/async_llm.py">async_llm.py</a>）。
@@ -2612,7 +2606,7 @@ TTFT 最大 1 483 ms，20 条流里有 7 条各收到一条注释。</p>
 </tr>
 </tbody>
 </table>
-<p>本批次两个服务端各启动一次（主审计 8100、keep-alive 对照 8101），
+<p>两个服务端各启动一次（主审计 8100、keep-alive 对照 8101），
 <code>api_layer_audit.py</code> 一次运行内完成原始字节流抓取、层间分解、tokenization 曲线
 和并发三档。事件循环对照在 nanoserve 上另起 6 个进程，每个进程重新加载模型与
 tokenizer，互不共享状态。</p>
@@ -2647,7 +2641,7 @@ tokenizer，互不共享状态。</p>
    各引擎不同。</li>
 <li>以为「生成 N 个 token」就一定有 N 个 SSE 事件。增量 detokenizer 会扣住
    不完整的 UTF-8 前缀。</li>
-<li>以为返回 <code>StreamingResponse</code> 就绕过了中间件。它照样走完整条链。</li>
+<li>误以为返回 <code>StreamingResponse</code> 就能绕过中间件。它同样需要逐层经过整条中间件处理链。</li>
 <li>只测 tokenization 的单次耗时，不看它阻塞了谁。0.6 µs/token 看起来很便宜，
    放在事件循环里就变成了别人的延迟。</li>
 <li>把 keep-alive 注释当成数据。它是注释，客户端必须忽略，但它占带宽。</li>

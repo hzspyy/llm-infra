@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.4 优化阶梯 II：逐步实现 GEMM</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -27,7 +27,7 @@
 <li><a href="#v6-cublas">一个意外的发现：v6 与 cuBLAS 逐位相同</a></li>
 </ul>
 </li>
-<li><a href="#gemm">工程实现 · 源码走读：真实 GEMM 里的这些手段</a><ul>
+<li><a href="#gemm">工程实现 · 源码解析：真实 GEMM 里的这些手段</a><ul>
 <li><a href="#1-cutlass-kernel">1. CUTLASS kernel 名里的每一段</a></li>
 <li><a href="#2-tile-128128">2. 为什么 tile 是 128×128 而不是别的</a></li>
 <li><a href="#3-llm-gemm">3. LLM 里的 GEMM 形状很特殊</a></li>
@@ -60,7 +60,7 @@
 <li><a href="#v6-cublas">一个意外的发现：v6 与 cuBLAS 逐位相同</a></li>
 </ul>
 </li>
-<li><a href="#gemm">工程实现 · 源码走读：真实 GEMM 里的这些手段</a><ul>
+<li><a href="#gemm">工程实现 · 源码解析：真实 GEMM 里的这些手段</a><ul>
 <li><a href="#1-cutlass-kernel">1. CUTLASS kernel 名里的每一段</a></li>
 <li><a href="#2-tile-128128">2. 为什么 tile 是 128×128 而不是别的</a></li>
 <li><a href="#3-llm-gemm">3. LLM 里的 GEMM 形状很特殊</a></li>
@@ -86,17 +86,14 @@
   <div class="mod-id">2.4</div>
   <h1>优化阶梯 II：逐步实现 GEMM</h1>
   <p class="lede">从朴素 GEMM 到分块和 Tensor Core，结合源码、布局与计时分析优化取舍。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88 · cuBLAS</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（内存层次、bank 冲突）· L1.2（tensor core 峰值）· L2.1（占用率）· L2.3（向量化）</span></div>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88 · cuBLAS</span><span class="chip">前置 L1.1（内存层次、bank 冲突）· L1.2（tensor core 峰值）· L2.1（占用率）· L2.3（向量化）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li>GEMM 从 naive 推到接近硬件上限，<strong>每一步各贡献多少倍</strong>？哪一步最关键？</li>
 <li>为什么"加共享内存分块"这个教科书第一优化，在本机只带来 <strong>1.2 倍</strong>？</li>
 <li>我手写的 tensor core GEMM 只有 cuBLAS 的 41%。<strong>差距在哪一件事上</strong>？</li>
 </ol>
-<p>GEMM 是通用矩阵乘法。以 C = A × B 为例，每个输出元素都要沿 K 维累加乘积。
-优化的核心问题是：同一份 A、B 数据能在片上复用多少次，
-以及线程如何分工才能减少搬运、同步和等待。
-本章保留 fp32 和 bf16 两条实现路线，分别观察分块、寄存器和共享内存布局的作用。</p>
+<p>通用矩阵乘法（GEMM）是深度学习大模型计算中占据最高算力比重的核心算子。对于矩阵乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi><mo>&#x0003D;</mo><mi>A</mi><mo>&#x000D7;</mo><mi>B</mi></mrow></math></span>，优化的本质是在有限的片上高速缓存（SRAM/寄存器）容量内，追求数据复用率与计算强度的最大化。本章从最基础的朴素实现出发，同步展开 CUDA Core（fp32）与 Tensor Core（bf16）两条演化阶梯，实测分块编排、寄存器外积累加、共享内存避免 bank 冲突等核心优化手段的真实收益，彻底打通算子优化的思维脉络。</p>
 <hr />
 <h2 id="_2">心智模型：把数据从"远"搬到"近"，然后尽量多用几次</h2>
 <figure>
@@ -185,9 +182,7 @@
 <p>A 和 B 各 64 MB，而本机 <strong>L2 有 96 MB</strong>（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测）。
 v0 里那些"重复读全局内存"的操作，绝大部分命中 L2 而不是显存——
 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测 L2 带宽 5.5 TB/s，是显存的 3.3 倍。</p>
-<p><strong>共享内存分块真正的价值不是"省显存带宽"（L2 已经省了），
-而是为下一步（寄存器分块）提供一个可控的数据布局。</strong>
-它本身不是目的。</p>
+<p><strong>共享内存分块真正的工程价值在于提供结构可控的高速数据交换中枢，为后续更关键的寄存器级分块与外积复用奠定基础。</strong> 它本身只是通向计算密集区间的踏板，而非优化的终点。</p>
 <div class="admonition note">
 <p class="admonition-title">这一条同样是&quot;教科书结论过时了&quot;</p>
 <p>和 <a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的 warp shuffle 一样：那些优化写于 L2 只有 1–2 MB 的年代。
@@ -220,7 +215,7 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 <p><a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 里向量化是最关键的一步（2 倍），这里只有 1.13 倍（46.7 → 52.6）。</p>
 <p>因为<strong>瓶颈不同</strong>：<a class="xref" href="../L2/2.3-memory-bound-ladder.html" title="优化阶梯 I：memory-bound 算子">L2.3</a> 的归约完全 memory-bound，向量化直接提高在途字节；
 这里已经是 compute-bound，访存不是瓶颈，向量化只是顺带减少了指令数。</p>
-<p><strong>同一个手段在不同瓶颈下的收益完全不同</strong> —— 这是本站反复出现的主题。</p>
+<p>同一种优化的收益取决于当前的主要开销。</p>
 <h3 id="v5-v6bank-62">v5 → v6：bank 冲突值 62%</h3>
 <p>换成 bf16 + tensor core（WMMA API）：<strong>89.2 TFLOPS</strong>，
 但只有 tensor core 峰值的 35.4%，也只有 cuBLAS bf16（218.6）的 <strong>41%</strong>。</p>
@@ -248,7 +243,7 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 让访问模式在任何 stride 下都均匀分布到 32 个 bank，而且<strong>不浪费共享内存</strong>
 （padding 会浪费 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mi>A</mi><mi>D</mi><mo>&#x0002F;</mo><mo stretchy="false">&#x00028;</mo><mi>B</mi><mi>K</mi><mo>&#x0002B;</mo><mi>P</mi><mi>A</mi><mi>D</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mn>20</mn><mi>&#x00025;</mi></mrow></math></span> 的空间）。</p>
 <p>CUTLASS 的 <code>Swizzle&lt;B, M, S&gt;</code> 模板、以及 CuTe 的 layout algebra，
-本质上就是在描述这类地址变换。<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a> 会看它们的写法。</p>
+本质上就是在描述这类地址变换。<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="CUDA 与 kernel DSL 对比">L2.5</a> 会看它们的写法。</p>
 </div>
 <h3 id="cublas-34">还差 cuBLAS 34%：剩下的是什么</h3>
 <p>v6 到 cuBLAS 之间还有 1.51 倍。已知的差距来源：</p>
@@ -294,7 +289,7 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 </tbody>
 </table>
 <p><strong>这是一条可以继续走下去的路</strong>，但每一步的收益递减而复杂度递增。
-到 66% 已经足够理解机制；再往上就是 CUTLASS 的领域了（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）。</p>
+到 66% 已经足够理解机制；再往上就是 CUTLASS 的领域了（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="CUDA 与 kernel DSL 对比">L2.5</a>）。</p>
 <h3 id="v6-cublas">一个意外的发现：v6 与 cuBLAS 逐位相同</h3>
 <p>误差列显示 v5/v6 相对 cuBLAS bf16 的误差是 <strong>0.00e+00</strong>。
 这太整齐了，专门验证了一次（1024³）：</p>
@@ -313,7 +308,7 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 <a class="xref" href="../L4/4.2-numerics.html" title="数值系统与确定性">L4.2</a> 将继续区分：一个样本输出一致、同一实现重复运行一致、
 以及 batch 改变后仍一致。这是三种不同的要求。</p>
 <hr />
-<h2 id="gemm">工程实现 · 源码走读：真实 GEMM 里的这些手段</h2>
+<h2 id="gemm">工程实现 · 源码解析：真实 GEMM 里的这些手段</h2>
 <h3 id="1-cutlass-kernel">1. CUTLASS kernel 名里的每一段</h3>
 <p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 抓到的 vLLM bf16 GEMM：</p>
 <div class="highlight"><pre><span></span><code>cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8
@@ -413,7 +408,7 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 这能解释行首分布发生了什么变化，但 WMMA 的实际访存还取决于线程与元素映射，
 不能仅凭行首地址宣布全部冲突消失。完整访问模式应结合生成指令和计数器检查。</p>
 <p><strong>(4) 验证必须对着 cuBLAS，而且误差度量要选对</strong></p>
-<p>第一版用逐元素相对误差，测出 9.47e-03，看着像出了大错。
+<p>逐元素相对误差为 9.47e-03，但这一指标在参考值接近零时容易放大差异。
 实际上是 K=4096 的随机矩阵乘结果在 0 附近震荡，
 <strong>单点相对误差因为抵消（cancellation）而虚高</strong>。</p>
 <p>改成相对 RMS 误差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo fence="false" stretchy="false">&#x02016;</mo><mi>g</mi><mi>o</mi><mi>t</mi><mo>&#x02212;</mo><mi>r</mi><mi>e</mi><mi>f</mi><mo fence="false" stretchy="false">&#x02016;</mo><mo>&#x0002F;</mo><mo fence="false" stretchy="false">&#x02016;</mo><mi>r</mi><mi>e</mi><mi>f</mi><mo fence="false" stretchy="false">&#x02016;</mo></mrow></math></span> 后是 1.19e-06 —— 正常的 fp32 舍入。</p>
@@ -465,7 +460,7 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 </tr>
 </tbody>
 </table>
-<p>第一行是本章最值得亲手做的：一个常数改回 0，性能掉 38%。</p>
+<p>第一项实验将该常数改回 0；现有测量中性能下降了 38%。</p>
 <hr />
 <h2 id="_6">原始现场</h2>
 <details>
@@ -535,8 +530,8 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 "GPU 结果不可复现"不是必然的，它取决于分块策略是否固定。</p>
 </details>
 <details>
-<summary>④ 第一版的误差度量为什么会误导</summary>
-<p>第一版用逐元素相对误差：</p>
+<summary>④ 逐元素相对误差在零附近的局限</summary>
+<p>逐元素相对误差的定义为：</p>
 <div class="highlight"><pre><span></span><code><span class="kt">double</span><span class="w"> </span><span class="n">d</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">fabs</span><span class="p">(</span><span class="n">got</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">ref</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
 <span class="kt">double</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">fabs</span><span class="p">(</span><span class="n">ref</span><span class="p">[</span><span class="n">i</span><span class="p">])</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mf">1e-6</span><span class="p">;</span>
 <span class="n">maxrel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">max</span><span class="p">(</span><span class="n">maxrel</span><span class="p">,</span><span class="w"> </span><span class="n">d</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">s</span><span class="p">);</span>
@@ -577,7 +572,7 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 </tr>
 <tr>
 <td><strong>XOR swizzle</strong></td>
-<td>比 padding 更彻底且不浪费空间。CUTLASS 的 <code>Swizzle&lt;B,M,S&gt;</code>、CuTe 的 layout algebra（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）</td>
+<td>比 padding 更彻底且不浪费空间。CUTLASS 的 <code>Swizzle&lt;B,M,S&gt;</code>、CuTe 的 layout algebra（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="CUDA 与 kernel DSL 对比">L2.5</a>）</td>
 </tr>
 <tr>
 <td><strong>split-K / stream-K</strong></td>
@@ -593,7 +588,7 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 </tr>
 <tr>
 <td><strong><code>kind::mxf8f6f4</code> 指令族</strong></td>
-<td><a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 留下的开放问题。cuBLAS fp8 达到 1501 FLOP/clk/SM 而 <code>m16n8k32</code> 上限只有 1022 —— 本章仍未测<span class="unverified">未实测</span></td>
+<td><a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a> 留下的开放问题。cuBLAS fp8 达到 1501 FLOP/clk/SM 而 <code>m16n8k32</code> 上限只有 1022 —— 本章仍未测<span class="unverified">未实测</span></td>
 </tr>
 </tbody>
 </table>
@@ -691,7 +686,7 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 <p>理由：</p>
 <ol>
 <li><strong>收益最大。</strong> CUTLASS 的 kernel 名里 <code>x3</code> 表示 3 段流水
-   （<a class="xref" href="../L2/2.2-toolchain-ptx-sass.html" title="编译工具链：nvcc → PTX → SASS">L2.2</a> 走读过）。当前 v6 是"加载 → 同步 → 计算 → 同步"的严格串行，
+   （<a class="xref" href="../L2/2.2-toolchain-ptx-sass.html" title="编译工具链：nvcc → PTX → SASS">L2.2</a> 解析过）。当前 v6 是"加载 → 同步 → 计算 → 同步"的严格串行，
    加载阶段 tensor core 完全空闲。双缓冲能把这两段重叠。</li>
 <li><strong>资源允许。</strong> <code>-Xptxas -v</code> 实测 v6 只用了 18944 B 共享内存，
    翻倍到 37.9 KB 仍远低于 99 KB 上限（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a>）。寄存器 128 个也有余量。</li>
@@ -747,7 +742,7 @@ cuBLAS 检测到 M 很小，切换到了专门的 GEMV kernel。</p>
 - 提高数值精度（fp32 累加已经是标配，再往上代价很大）</p>
 <p><strong>本章的实测给了这个问题一个具体的锚点</strong>：
 分块一致时可以做到逐位相同，所以这是<strong>工程可解</strong>的，不是物理限制。</p>
-</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.3-memory-bound-ladder.html">&#8592; 2.3 优化阶梯 I：memory-bound 算子</a><a class="nav-next" href="../L2/2.5-kernel-dsl-shootout.html">2.5 现代 kernel 编写栈横评 &#8594;</a></nav>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.3-memory-bound-ladder.html">&#8592; 2.3 优化阶梯 I：memory-bound 算子</a><a class="nav-next" href="../L2/2.5-kernel-dsl-shootout.html">2.5 CUDA 与 kernel DSL 对比 &#8594;</a></nav>
 </main>
 </body>
 </html>

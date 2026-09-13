@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.1 CUDA 执行模型与 CUDA Graph</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -24,7 +24,7 @@
 <li><a href="#_4">尾效应：耗时是阶梯，不是斜线</a></li>
 </ul>
 </li>
-<li><a href="#grid">工程实现 · 源码走读：引擎在哪里对齐 grid</a><ul>
+<li><a href="#grid">工程实现 · 源码解析：引擎在哪里对齐 grid</a><ul>
 <li><a href="#1-vllm-reshape_and_cache_flash">1. vLLM 的 reshape_and_cache_flash</a></li>
 <li><a href="#2-flashattention-tile-scheduler">2. FlashAttention 的 tile scheduler</a></li>
 <li><a href="#3-cudaoccupancymaxactiveblockspermultiprocessor">3. cudaOccupancyMaxActiveBlocksPerMultiprocessor</a></li>
@@ -54,7 +54,7 @@
 <li><a href="#_4">尾效应：耗时是阶梯，不是斜线</a></li>
 </ul>
 </li>
-<li><a href="#grid">工程实现 · 源码走读：引擎在哪里对齐 grid</a><ul>
+<li><a href="#grid">工程实现 · 源码解析：引擎在哪里对齐 grid</a><ul>
 <li><a href="#1-vllm-reshape_and_cache_flash">1. vLLM 的 reshape_and_cache_flash</a></li>
 <li><a href="#2-flashattention-tile-scheduler">2. FlashAttention 的 tile scheduler</a></li>
 <li><a href="#3-cudaoccupancymaxactiveblockspermultiprocessor">3. cudaOccupancyMaxActiveBlocksPerMultiprocessor</a></li>
@@ -80,7 +80,7 @@
   <div class="mod-id">2.1</div>
   <h1>CUDA 执行模型与 CUDA Graph</h1>
   <p class="lede">通过分支、驻留资源、多流和线程块扫描，理解 CUDA 执行与并行度约束。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（内存层次与 Little&#x27;s Law）· L1.4（launch 路径）</span></div>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88</span><span class="chip">前置 L1.1（内存层次与 Little&#x27;s Law）· L1.4（launch 路径）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li>warp 分支发散的代价是不是"N 路发散就慢 N 倍"？实测和理论差多少，为什么？</li>
@@ -153,9 +153,7 @@ occupancy（占用率）描述常驻 warp 数相对于硬件上限的比例，
 <hr />
 <h2 id="_3">机制拆解</h2>
 <h3 id="602-8">分支发散：实测 6.02×，理论 8×</h3>
-<p>理解分支发散时，可以先看同一 warp 中哪些线程在执行哪条路径。
-不同路径可能需要分开发射，并用活跃掩码控制参与线程。
-现代 GPU 的独立线程调度不能简单等同于“32 个线程始终共用一个程序计数器”。</p>
+<p>在 SIMT 执行模型中，同一 warp 的 32 个线程由同一个 warp 调度器驱动。当遇到条件分支且线程走向不同分支路径时，硬件必须依次执行各分支路径，并通过活跃线程掩码（active mask）或谓词寄存器屏蔽非目标线程。现代 Volta 及更新架构引入了独立线程调度（Independent Thread Scheduling），使线程具备各自的调用栈与程序计数器，但底层执行单元依然遵循锁步发射原理。</p>
 <p>实验：让每条分支做<strong>完全相同</strong>的工作量（一条 <code>fmaf</code>），唯一的区别是有几条路：</p>
 <div class="highlight"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">branch</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="mi">32</span><span class="p">)</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">ways</span><span class="p">;</span><span class="w">      </span><span class="c1">// ways=1 时全 warp 走同一条</span>
 <span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">iters</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">it</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
@@ -288,7 +286,7 @@ occupancy（占用率）描述常驻 warp 数相对于硬件上限的比例，
 
 <p>一个 warp 自己就能填满 FMA 流水线，不需要别的 warp 来接力。</p>
 <p>顺带一个数字：<strong>116 TFLOPS 是 CUDA core 的 FP32 吞吐</strong>。
-对照 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 测出的 tensor core bf16 251.9 TFLOPS —— <strong>tensor core 快 2.2 倍</strong>。
+对照 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a> 测出的 tensor core bf16 251.9 TFLOPS —— <strong>tensor core 快 2.2 倍</strong>。
 核算一下：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>170</mn><mtext>&#x000A0;</mtext><mtext>SM</mtext><mo>&#x000D7;</mo><mn>128</mn><mtext>&#x000A0;</mtext><mtext>FP32&#x000A0;单元</mtext><mo>&#x000D7;</mo><mn>2</mn><mtext>&#x000A0;</mtext><mtext>FLOP</mtext><mo>&#x000D7;</mo><mn>2.9</mn><mtext>&#x000A0;</mtext><mtext>GHz</mtext><mo>&#x0003D;</mo><mn>126</mn></mrow></math></span> TFLOPS，
 实测 116 = <strong>92%</strong>，对得上。</p>
 <div class="admonition warning">
@@ -357,11 +355,9 @@ blocks    波数    耗时 ms    每 block 摊销 µs
 3061      3.00      3.271        1.07    ← 又一个
 </code></pre></div>
 
-<p><strong>1020 → 1021 只多了 1 个 block，耗时涨了 17%。</strong>
-新增 block 需要等某个 SM 释放足够资源后才能开始。
-这里的“波”是分析并发容量的模型，不是所有 block 之间存在全局屏障。</p>
-<p>而 1018 / 1019 / 1020 三者耗时几乎相同（1.074 / 1.075 / 1.080）——
-这三个相邻配置未显示明显的时间增长，不能据此认为增加 block 没有成本。</p>
+<p><strong>1020 → 1021 仅仅增加了 1 个 block，整体耗时却跳增了 17%。</strong>
+在硬件调度中，当首批 1020 个 block 刚好占满全卡 170 个 SM 时，第 1021 个 block 必须等待某个 SM 执行完毕并释放资源后才能被调度。此时全卡 170 个 SM 中只有 1 个 SM 在忙碌，其余 169 个 SM 全部处于闲置空等状态——这正是 GPU 计算中经典的<strong>尾效应（tail effect）</strong>。</p>
+<p>而在同一波次内部（如 1018 → 1020），由于未饱和的 SM 拥有空闲并发槽位，增加少量 block 可以被并发吞吐完全吸收，耗时几乎保持水平（1.074 ms vs 1.080 ms）。这一现象揭示了网格规模（grid size）设计的核心准则：<strong>尽量让总 block 数接近或整除单波容量，避免因为多出几个零散 block 而拖累整批执行的尾延迟。</strong></p>
 <p>这解释了三件事：</p>
 <ol>
 <li><strong>grid 要按「SM 数 × 每 SM 可驻留 block 数」对齐。</strong>
@@ -373,7 +369,7 @@ blocks    波数    耗时 ms    每 block 摊销 µs
    GPU 大部分 SM 空着。这是 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 里"算力利用率不到 6%"的另一个侧面。</li>
 </ol>
 <hr />
-<h2 id="grid">工程实现 · 源码走读：引擎在哪里对齐 grid</h2>
+<h2 id="grid">工程实现 · 源码解析：引擎在哪里对齐 grid</h2>
 <h3 id="1-vllm-reshape_and_cache_flash">1. vLLM 的 <code>reshape_and_cache_flash</code></h3>
 <p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 trace 里这个 kernel 每步调用 28 次（每层一次）。
 它的 grid 是<strong>按 token 数</strong>决定的：batch=1 时只有 1 个 block，
@@ -382,7 +378,7 @@ blocks    波数    耗时 ms    每 block 摊销 µs
 但<strong>launch 次数</strong>却是大头（<a class="xref" href="../L1/1.4-driver-and-os.html" title="驱动与操作系统">L1.4</a> 测出 444 次 × 2.68 µs = 1.19 ms）。
 <strong>问题不在 kernel 慢，在 kernel 太多太小。</strong></p>
 <h3 id="2-flashattention-tile-scheduler">2. FlashAttention 的 tile scheduler</h3>
-<p><a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 走读过 <code>Flash_fwd_kernel_traits&lt;128, 64, 128, 4&gt;</code>。
+<p><a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 解析过 <code>Flash_fwd_kernel_traits&lt;128, 64, 128, 4&gt;</code>。
 grid 维度是 <code>(ceil(seqlen_q / 64), batch, heads)</code>。</p>
 <p>对 Qwen3-1.7B、seqlen=1024、batch=1：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x02308;</mi><mn>1024</mn><mo>&#x0002F;</mo><mn>64</mn><mi>&#x02309;</mi><mo>&#x000D7;</mo><mn>1</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x0003D;</mo><mn>256</mn></mrow></math></span> 个 block。
 不能用前一个测试 kernel 的 1020-block 容量评估这个 attention kernel。
@@ -475,7 +471,7 @@ grid 维度是 <code>(ceil(seqlen_q / 64), batch, heads)</code>。</p>
 </tr>
 </tbody>
 </table>
-<p>第二行是本章最值得亲手做的一个实验：它让你对"编译器会做什么"有实感。</p>
+<p>第二项实验用于比较修改前后的编译结果。</p>
 <hr />
 <h2 id="_7">原始现场</h2>
 <details>
@@ -523,7 +519,7 @@ grid 维度是 <code>(ceil(seqlen_q / 64), batch, heads)</code>。</p>
 <p>原始文件：<code>results/crater/exec_model_5090.txt</code></p>
 </details>
 <details>
-<summary>② <code>-Xptxas -v</code> 的输出：寄存器与共享内存的真相</summary>
+<summary>② <code>-Xptxas -v</code> 的输出：寄存器与共享内存用量</summary>
 <div class="highlight"><pre><span></span><code>ptxas info    : Used 12 registers, used 0 barriers, 49152 bytes smem
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 16 registers, used 0 barriers, 49152 bytes smem
@@ -564,10 +560,10 @@ nvml, nvptxcompiler, nvrtc, nvtx, nvvm, opencl, profiler, sanitizer
 
 <p><strong>没有 nsight-compute / nsight-systems。</strong> 它们要通过 NVIDIA 的官方安装包
 （.run / apt / 独立下载）获得，pip 装不了。</p>
-<p>所以本站的 <a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a>（Profiling）会建立在<strong>可用的手段</strong>上：
+<p><a class="xref" href="../L2/2.6-profiling.html" title="GPU 性能分析">L2.6</a>（Profiling）将介绍以下测量方法：
 <code>-Xptxas -v</code>、<code>clock64()</code> 在 kernel 内计时、torch profiler 的 kernel 时间与计数、
 以及贯穿全站的 roofline 分析。这些可用于定位部分提交、布局与同步问题；
-ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</strong>，会在 <a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 里说明它补的是哪一块。</p>
+ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</strong>，会在 <a class="xref" href="../L2/2.6-profiling.html" title="GPU 性能分析">L2.6</a> 里说明它补的是哪一块。</p>
 </details>
 <hr />
 <h2 id="_8">前沿</h2>
@@ -581,11 +577,11 @@ ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</str
 <tbody>
 <tr>
 <td><strong>Thread Block Cluster（Hopper 起）</strong></td>
-<td>在 grid 与 block 之间新增一层"cluster"，同 cluster 的 block 可以访问彼此的共享内存（DSMEM）。等于把本章的"一波"概念显式化，并让 tile 可以更大。<strong>sm_120 不支持</strong>（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a>）</td>
+<td>在 grid 与 block 之间新增一层"cluster"，同 cluster 的 block 可以访问彼此的共享内存（DSMEM）。等于把本章的"一波"概念显式化，并让 tile 可以更大。<strong>sm_120 不支持</strong>（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a>）</td>
 </tr>
 <tr>
 <td><strong>Cluster Launch Control（Blackwell）</strong></td>
-<td>让 kernel 在运行时动态获取下一批 tile，硬件层面的 persistent kernel。<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a> 前沿提到的 sm_120 NVFP4 GEMM 达到 80% 效率就用了它</td>
+<td>让 kernel 在运行时动态获取下一批 tile，硬件层面的 persistent kernel。<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a> 前沿提到的 sm_120 NVFP4 GEMM 达到 80% 效率就用了它</td>
 </tr>
 <tr>
 <td><strong>persistent kernel + 软件流水</strong></td>
@@ -606,7 +602,7 @@ ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</str
 </tbody>
 </table>
 <blockquote>
-<p>除本章实测外的内容来自各自文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+<p>除本章实测外的内容来自各自文档，<strong>尚未复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
 <h2 id="_9">陷阱</h2>
@@ -696,7 +692,7 @@ compute-bound 就会变得和 memory-bound 一样依赖占用率。
 那只会让编译器 spill 得更多。<code>__launch_bounds__</code> 是告诉编译器
 "我需要这个占用率"，编译器会为此牺牲寄存器，是<strong>用 spill 换占用率</strong>。
 按本章的结论，本机 2 block/SM 就够了，<strong>没必要为占用率牺牲寄存器</strong>。</p>
-</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.0b-pytorch-dispatch-path.html">&#8592; 2.0b PyTorch 算子调用：从 Python 到 dispatcher 与 kernel</a><a class="nav-next" href="../L2/2.2-toolchain-ptx-sass.html">2.2 编译工具链：nvcc → PTX → SASS &#8594;</a></nav>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.0c-runtime-memory.html">&#8592; 2.0c PyTorch 运行时：内存、流与异步生命周期</a><a class="nav-next" href="../L2/2.2-toolchain-ptx-sass.html">2.2 编译工具链：nvcc → PTX → SASS &#8594;</a></nav>
 </main>
 </body>
 </html>

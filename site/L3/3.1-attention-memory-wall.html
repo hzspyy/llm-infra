@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>3.1 从 attention 数学到内存墙</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -17,10 +17,10 @@
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#ss">一 · 那个 S×S 有多大</a></li>
-<li><a href="#_2">二 · 内存墙：为什么这不是"多用点显存"而已</a><ul>
+<li><a href="#_2">二 · 中间矩阵的存储与搬运成本</a><ul>
 <li><a href="#flop">FLOP</a></li>
 <li><a href="#dram">DRAM 流量</a></li>
-<li><a href="#_3">简化流量模型下的算术强度</a></li>
+<li><a href="#_3">理论算术强度对比</a></li>
 <li><a href="#_4">实测</a></li>
 </ul>
 </li>
@@ -31,7 +31,7 @@
 </ul>
 </li>
 <li><a href="#v">四 · 把 V 的加权和也放进同一遍</a></li>
-<li><a href="#sdpa">五 · 自己写一遍，与 SDPA 对拍</a></li>
+<li><a href="#sdpa">五 · 自己写一遍，与 SDPA 对照验证</a></li>
 <li><a href="#sdpa_1">六 · SDPA 背后有几个后端</a></li>
 <li><a href="#_5">七 · 设计取舍</a><ul>
 <li><a href="#71">7.1 为什么是"重排求值顺序"，而不是"近似"</a></li>
@@ -50,10 +50,10 @@
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#ss">一 · 那个 S×S 有多大</a></li>
-<li><a href="#_2">二 · 内存墙：为什么这不是"多用点显存"而已</a><ul>
+<li><a href="#_2">二 · 中间矩阵的存储与搬运成本</a><ul>
 <li><a href="#flop">FLOP</a></li>
 <li><a href="#dram">DRAM 流量</a></li>
-<li><a href="#_3">简化流量模型下的算术强度</a></li>
+<li><a href="#_3">理论算术强度对比</a></li>
 <li><a href="#_4">实测</a></li>
 </ul>
 </li>
@@ -64,7 +64,7 @@
 </ul>
 </li>
 <li><a href="#v">四 · 把 V 的加权和也放进同一遍</a></li>
-<li><a href="#sdpa">五 · 自己写一遍，与 SDPA 对拍</a></li>
+<li><a href="#sdpa">五 · 自己写一遍，与 SDPA 对照验证</a></li>
 <li><a href="#sdpa_1">六 · SDPA 背后有几个后端</a></li>
 <li><a href="#_5">七 · 设计取舍</a><ul>
 <li><a href="#71">7.1 为什么是"重排求值顺序"，而不是"近似"</a></li>
@@ -85,13 +85,11 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L3 · Attention 与序列核心</div>
   <div class="mod-id">3.1</div>
   <h1>从 attention 数学到内存墙</h1>
-  <p class="lede">推导 online softmax 和分块 attention，比较中间存储、数值误差与实际执行成本。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · CUDA 13.0</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 0.0（attention 的最小实现）· 0.2（roofline 与机器平衡点）· 2.3（访存阶梯）</span></div>
+  <p class="lede">推导 online softmax 和分块 attention，分析中间张量、数值误差与执行成本。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · CUDA 13.0</span><span class="chip">前置 0.0（attention 的最小实现）· 0.2（roofline 与机器平衡点）· 2.3（访存阶梯）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>0.0 里我们手写过一次 attention：算 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup></mrow></math></span>、加因果 mask、softmax、乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi></mrow></math></span>。
-那份代码是对的，而且所有真实实现都必须给出和它一样的结果。
-但没有人在生产里那样写。原因不是它慢在算术上，而是它<strong>必须把一个
-<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 的矩阵写进显存再读回来</strong>。</p>
+这份实现直接保存中间矩阵，便于理解和验证，但会把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 的矩阵写入显存再读回。分块 attention 可以减少这部分存储和搬运。</p>
 <ol>
 <li>那个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 到底多大？它让朴素实现在什么规模上失效？</li>
 <li>softmax 必须先看完整行才能归一化——怎么可能分块？</li>
@@ -102,7 +100,7 @@
 <p>分块 attention（FlashAttention 的核心）<strong>不是一个近似算法</strong>。
 它是同一个数学表达式的另一种求值顺序，结果在浮点误差内相同。
 本章会把这一点从代数推到实测：自己写一个分块版本，
-和 PyTorch 的 SDPA 逐元素对拍。</p>
+和 PyTorch 的 SDPA 逐元素对照验证。</p>
 </div>
 <hr />
 <h2 id="ss">一 · 那个 S×S 有多大</h2>
@@ -177,7 +175,7 @@
 <p>注意"朴素峰值"比"S×S 一份"还大一倍多：因为 softmax 的输入 <code>s</code> 和输出 <code>p</code>
 同时活着，是两份 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span>。</p>
 <hr />
-<h2 id="_2">二 · 内存墙：为什么这不是"多用点显存"而已</h2>
+<h2 id="_2">二 · 中间矩阵的存储与搬运成本</h2>
 <p>显存不够只是表面。真正的问题是<strong>算术强度</strong>（每搬一字节能做多少次浮点运算），
 这是 0.2 里那条 roofline 的横轴。</p>
 <h3 id="flop">FLOP</h3>
@@ -185,41 +183,13 @@
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>Q</mi><msup><mi>K</mi><mo>&#x022A4;</mo></msup><mi>:</mi><mtext>&#x000A0;</mtext><mn>2</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi><mspace width="2em" /><mi>P</mi><mi>V</mi><mi>:</mi><mtext>&#x000A0;</mtext><mn>2</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi><mspace width="2em" /><mtext>合计</mtext><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow></math></div></p>
 <p>（因果 mask 只需算下三角，实际约一半。）</p>
 <h3 id="dram">DRAM 流量</h3>
-<p><strong>朴素实现</strong>（保守估计，只数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 那几趟）：</p>
-<table>
-<thead>
-<tr>
-<th>动作</th>
-<th>字节</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>写 <code>s</code></td>
-<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn></mrow></math></span></td>
-</tr>
-<tr>
-<td>读 <code>s</code>（softmax 求 max 与求和）</td>
-<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>2</mn></mrow></math></span> 趟</td>
-</tr>
-<tr>
-<td>写 <code>p</code></td>
-<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn></mrow></math></span></td>
-</tr>
-<tr>
-<td>读 <code>p</code>（做 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>P</mi><mi>V</mi></mrow></math></span>）</td>
-<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>S</mi><mn>2</mn></msup><mo>&#x000B7;</mo><mn>2</mn></mrow></math></span></td>
-</tr>
-</tbody>
-</table>
-<p>表中五次读写合计为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>10</mn><msup><mi>S</mi><mn>2</mn></msup></mrow></math></span> 字节。后面的旧脚本使用 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>12</mn><msup><mi>S</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>6</mn><mi>S</mi><mi>D</mi></mrow></math></span> 的六遍流量模型；该模型需额外假定一次同规模读写，不能称为由此表推导的实测 DRAM 流量。</p>
-<p><strong>分块实现</strong>不把完整 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 中间矩阵写回显存，但不代表 Q/K/V/O 必然各读写一次。片上容量有限，不同 query tile 可能重复加载 K/V；真实流量取决于 tile、循环和缓存。</p>
-<h3 id="_3">简化流量模型下的算术强度</h3>
-<p>若沿用旧脚本的六遍中间矩阵流量假设，朴素实现为</p>
-<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>I</mi><mrow><mi>n</mi><mi>a</mi><mi>i</mi><mi>v</mi><mi>e</mi></mrow></msub><mo>&#x0003D;</mo><mfrac><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow><mrow><mn>12</mn><msup><mi>S</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>6</mn><mi>S</mi><mi>D</mi></mrow></mfrac><mo>&#x0002E;</mo></mrow></math></div></p>
-<p>若进一步假设 Q/K/V/O 各过一遍，非因果 attention 的理想模型为</p>
-<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>I</mi><mrow><mi>i</mi><mi>d</mi><mi>e</mi><mi>a</mi><mi>l</mi></mrow></msub><mo>&#x0003D;</mo><mfrac><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow><mrow><mn>8</mn><mi>S</mi><mi>D</mi></mrow></mfrac><mo>&#x0003D;</mo><mi>S</mi><mo>&#x0002F;</mo><mn>2</mn><mo>&#x0002E;</mo></mrow></math></div></p>
-<p>前者是特定操作分解的估计，后者是理想化的最少流量参照，都不是硬件计数器读数。因果计算和实际分块的流量需另算。分块的核心收益是避免完整打分矩阵落显存，而不是保证实际算术强度总为 S/2。</p>
+<h3 id="_3">理论算术强度对比</h3>
+<p>在朴素实现中，完整的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 打分矩阵必须频繁写回 DRAM 并多次重读（包括寻找行最大值、指数与求和归一化、以及与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi></mrow></math></span> 矩阵相乘）。结合 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><mo>&#x0002C;</mo><mi>K</mi><mo>&#x0002C;</mo><mi>V</mi></mrow></math></span> 的基础搬运，总访存量呈现强烈的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 依赖，导致其理论算术强度迅速饱和：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>I</mi><mrow><mtext>naive</mtext></mrow></msub><mo>&#x02248;</mo><mfrac><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow><mrow><mn>12</mn><msup><mi>S</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>6</mn><mi>S</mi><mi>D</mi></mrow></mfrac><mo>&#x02248;</mo><mfrac><mrow><mi>D</mi></mrow><mrow><mn>3</mn></mrow></mfrac><mspace width="1em" /><mo stretchy="false">&#x00028;</mo><mtext>当&#x000A0;</mtext><mi>S</mi><mo>&#x0226B;</mo><mi>D</mi><mo stretchy="false">&#x00029;</mo></mrow></math></div></p>
+<p>即使取 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>128</mn></mrow></math></span>，其算术强度上限也仅约为 42 FLOP/byte，远低于 RTX 5090 D 的机器平衡点（153 FLOP/byte），因而不可避免地深陷 memory-bound 泥潭。</p>
+<p>而在分块实现（如 FlashAttention）中，算法利用在线 softmax 技术将计算限制在片上共享内存内完成，彻底消除了向 DRAM 回写 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 完整中间矩阵的开销。在理想的数据流模型下，主要的 DRAM 访问仅为读取 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><mo>&#x0002C;</mo><mi>K</mi><mo>&#x0002C;</mo><mi>V</mi></mrow></math></span> 以及回写输出 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span>（各 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>S</mi><mi>D</mi></mrow></math></span> 字节），其理想算术强度跃升为：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>I</mi><mrow><mtext>flash,&#x000A0;ideal</mtext></mrow></msub><mo>&#x0003D;</mo><mfrac><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow><mrow><mn>8</mn><mi>S</mi><mi>D</mi></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><mi>S</mi></mrow><mrow><mn>2</mn></mrow></mfrac></mrow></math></div></p>
+<p>算术强度随序列长度 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 呈线性增长！当 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span> 时，理论强度高达 2048 FLOP/byte，彻底跨过平衡点进入 compute-bound 区间。虽然实际工程中受分块重复加载与共享内存容量约束，真实强度会有所折损，但消除 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 显存落盘所释放的性能红利，正是分块 attention 相比朴素实现带来数量级加速的本质原因。</p>
 <h3 id="_4">实测</h3>
 <table>
 <thead>
@@ -294,7 +264,7 @@
 <p>数学上，给所有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi></mrow></math></span> 减去同一个常数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>c</mi></mrow></math></span>，结果不变：</p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub><mo>&#x02212;</mo><mi>c</mi></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>j</mi></msub><mo>&#x02212;</mo><mi>c</mi></mrow></msup></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub></mrow></msup><mo>&#x0002F;</mo><msup><mi>e</mi><mrow><mi>c</mi></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>j</mi></msub></mrow></msup><mo>&#x0002F;</mo><msup><mi>e</mi><mrow><mi>c</mi></mrow></msup></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>i</mi></msub></mrow></msup></mrow><mrow><msub><mo>&#x02211;</mo><mi>j</mi></msub><msup><mi>e</mi><mrow><msub><mi>x</mi><mi>j</mi></msub></mrow></msup></mrow></mfrac></mrow></math></div></p>
 <p>分子分母的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mi>c</mi></msup></mrow></math></span> 约掉了。所以减常数是<strong>恒等变换，不是近似</strong>。</p>
-<p>但在浮点里，不减就会炸。实测：</p>
+<p>在浮点计算中，不减最大值可能溢出。实测如下：</p>
 <div class="highlight"><pre><span></span><code>x 最大    10.0   exp(x) = [22026.46484375, 8103.083984375, 2980.9580078125]
                     朴素 softmax = [0.6652409434318542, 0.2447284758090973, 0.09003057330846786]
                     减最大值后   = [0.665241, 0.244728, 0.090031]
@@ -397,7 +367,7 @@ max|err| = 1.490e-08
 <p><strong>峰值额外存储：一块的打分 + <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>m</mi></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>l</mi></mrow></math></span> 各一个标量 + <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi></mrow></math></span> 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 个数。
 与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 无关。</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span> 变成 100 万也是这么多。</p>
 <hr />
-<h2 id="sdpa">五 · 自己写一遍，与 SDPA 对拍</h2>
+<h2 id="sdpa">五 · 自己写一遍，与 SDPA 对照验证</h2>
 <p>把上面的东西写成多头版本（<code>labs/L3/online_softmax.py</code> 的 <code>flash_like</code>），
 只用基本张量运算，不调任何 attention 库：</p>
 <div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">190</span>     <span class="k">def</span><span class="w"> </span><span class="nf">flash_like</span><span class="p">(</span><span class="n">Q</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span> <span class="n">V</span><span class="p">,</span> <span class="n">block</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
@@ -872,8 +842,7 @@ python<span class="w"> </span>labs/L3/attention_memory.py
    如果你测出来误差远大于这个，是实现错了，不是"分块的固有误差"。</li>
 <li><strong>算加速比要说明 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span>。</strong> 本章从 3.2×（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mrow><mo>&#x0003D;</mo></mrow><mn>512</mn></mrow></math></span>）到 12.3×（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mrow><mo>&#x0003D;</mo></mrow><mn>8192</mn></mrow></math></span>），
    引用单个数字没有意义。</li>
-<li><strong>因果 attention 的 FLOP 是满 attention 的一半。</strong> 我第一版忘了除 2，
-   算出 393 TFLOP/s——超过这张卡实测的 232 上限。
+<li><strong>统计因果 attention 的 FLOP 时，应按实际计算区域计数。</strong> 若沿用完整矩阵的计算量，这组结果会被高估为 393 TFLOP/s，超过该卡的 232 TFLOP/s 实测参照。
    <strong>凡是算出来超过 roofline 的数字，先查自己的公式。</strong></li>
 <li><strong><code>torch.cuda.max_memory_allocated()</code> 测的是 PyTorch 的 allocated，
    不是 reserved</strong>（2.0 §4.3）。测峰值前要 <code>reset_peak_memory_stats()</code>。</li>
@@ -883,7 +852,6 @@ python<span class="w"> </span>labs/L3/attention_memory.py
 <details>
 <summary>1. 为什么不能把分块 attention 的算术强度一律写成 S/2？</summary>
 <p>S/2 来自非因果 FLOP 为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4</mn><msup><mi>S</mi><mn>2</mn></msup><mi>D</mi></mrow></math></span>、Q/K/V/O 各读写一次共 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>8</mn><mi>S</mi><mi>D</mi></mrow></math></span> 字节的理想假设。实际 kernel 的片上容量有限，query tile 可能重复读取 K/V，因果 mask 也改变工作量。因此需要注明模型，实际 DRAM 流量需计数器验证。</p>
-<p>下表的两列强度是旧脚本公式值，不是直接测量；计时与内存记录仍保留。</p>
 </details>
 <details>
 <summary>2. 修正因子 <code>exp(m_old - m_new)</code> 为什么可以提到求和外面？为什么它永远不会放大？</summary>

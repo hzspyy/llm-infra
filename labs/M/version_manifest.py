@@ -9,6 +9,7 @@ import torch
 import subprocess
 import json
 import sys
+import platform
 from pathlib import Path
 
 
@@ -23,12 +24,8 @@ def capture_environment():
             "cuda_available": torch.cuda.is_available(),
         },
         "python": {
-            "version": subprocess.check_output(
-                ["python3", "--version"], text=True
-            ).strip(),
-            "executable": subprocess.check_output(
-                ["which", "python3"], text=True
-            ).strip(),
+            "version": platform.python_version(),
+            "executable": sys.executable,
         },
         "source_locations": {
             "torch_package": str(Path(torch.__file__).parent),
@@ -37,18 +34,8 @@ def capture_environment():
         },
     }
 
-    # 尝试获取 git 提交（如果是从源码安装）
-    try:
-        torch_path = Path(torch.__file__).parent.parent
-        git_hash = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=torch_path,
-            text=True,
-            stderr=subprocess.DEVNULL
-        ).strip()
-        manifest["pytorch"]["source_commit"] = git_hash
-    except:
-        manifest["pytorch"]["source_commit"] = "N/A (wheel install)"
+    # 使用构建记录，避免把包目录的祖先仓库提交误当 PyTorch 提交。
+    manifest["pytorch"]["source_commit"] = torch.version.git_version
 
     # CUDA 设备信息（如果可用）
     if torch.cuda.is_available():

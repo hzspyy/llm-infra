@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.8 把一个算子接进 PyTorch：注册、分发、backward 与 compile</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -69,8 +69,8 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L2 · GPU 编程与算子工程</div>
   <div class="mod-id">2.8</div>
   <h1>把一个算子接进 PyTorch：注册、分发、backward 与 compile</h1>
-  <p class="lede">为自定义 kernel 注册 schema、fake 与 autograd，检查梯度、图捕获及融合边界。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · CUDA 13.0</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 2.0（dispatcher 与 DispatchKeySet）· 2.2（工具链）· 2.6b / 2.7（编译器栈）</span></div>
+  <p class="lede">为自定义 kernel 注册 schema、fake 实现和梯度，使其支持 autograd 与 torch.compile。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · CUDA 13.0</span><span class="chip">前置 2.0（dispatcher 与 DispatchKeySet）· 2.2（工具链）· 2.6b / 2.7（编译器栈）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>L2 到这里已经会写 kernel（2.1–2.5）、会看编译器（2.6b、2.7）、
 会读 dispatcher（2.0）。这一章把它们接起来：<strong>把一个自己写的 CUDA kernel
@@ -128,7 +128,7 @@ aten::add.Tensor             存在
 
 <div class="admonition warning">
 <p class="admonition-title">explain() 报 0 次断裂，不等于全部被捕获</p>
-<p>这是本章最值得记的一条方法。断裂计数只统计"捕获过程中被打断"的次数；
+<p>断裂计数只统计捕获过程中被打断的次数；
 如果不支持的调用恰好在区域<strong>开头</strong>，Dynamo 直接从它之后开始，
 计数是 0，但你的算子完全在编译范围之外。</p>
 <p>判据有两个，都比 <code>explain</code> 的计数可靠：
@@ -201,9 +201,9 @@ CompositeExplicitAutograd[alias]: registered at .../custom_ops.py:1104 :: (none)
 调用时会报错提示你还没写。接下来两节就是补这两个。</p>
 <hr />
 <h2 id="fakemeta">三 · fake（meta）函数：不执行也要知道形状</h2>
-<p><code>torch.compile</code> 在追踪时不执行真实计算，它用 FakeTensor 走一遍，
+<p><code>torch.compile</code> 在追踪时不执行真实计算，而是用 FakeTensor 进行符号推导，
 只关心形状和 dtype（2.0 §3.3 里 <code>Meta</code> 键上注册了 1614 个算子，比 CUDA 还多）。
-你的算子没有 meta 实现，这一步就走不下去：</p>
+若自定义算子缺少 meta 实现，追踪过程便会直接报错：</p>
 <div class="highlight"><pre><span></span><code>TorchRuntimeError
   RuntimeError when making fake tensor call
     Explanation: Dynamo failed to run FX node with fake tensors:
@@ -378,11 +378,11 @@ Inductor 自己生成的走 C；<code>torch.library.triton_op</code> 是一条�
 grid 只有 4096 个 block，且每行只有一个 block 在做归约——
 2.3 里讲的两段式切分我只做了 block 内那一段。Inductor 生成的版本
 按 <code>size_hints={'x': 512, 'r0_': 8192}</code> 两级切分（2.7 §3），并行度更高。</p>
-<p>真实世界里值得写的例子有共同特征：
+<p>自定义 kernel 通常用于以下情况：
 <strong>编译器表达不出来的算法</strong>（FlashAttention 的在线 softmax + 分块）、
-<strong>特殊指令</strong>（tcgen05、FP4，<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 世代史与 sm_120 的岔路">L1.2</a>）、
+<strong>特殊指令</strong>（tcgen05、FP4，<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a>）、
 <strong>融合了编译器不会跨越的边界</strong>（PagedAttention 跨 block table 的 gather）。
-"我觉得手写会更快"通常不是。</p>
+是否更快仍需与现有实现比较。</p>
 <h3 id="63-schemafake-autograd">6.3 schema、fake 与 autograd 各自负责不同契约</h3>
 <p><code>custom_op</code> → <code>register_fake</code> → <code>register_autograd</code>，
 对应三个不同的 dispatch key：<code>CompositeExplicitAutograd</code> → <code>Meta</code> → <code>Autograd</code>。
@@ -868,7 +868,7 @@ python<span class="w"> </span>labs/L2/custom_op.py
    比只跑 gradcheck 覆盖面大。</li>
 <li>把 <code>register_fake</code> 里的 <code>x.new_empty(x.shape[0])</code> 故意写成
    <code>x.new_empty(x.shape[0] + 1)</code>，看错误在哪一层被发现——
-   注意 eager 完全正常，只有编译路径会炸。</li>
+   注意 eager 完全正常，编译路径才会报错。</li>
 </ol>
 <hr />
 <h2 id="_6">八 · 陷阱</h2>
@@ -946,7 +946,7 @@ autograd 图是断的——它前面的所有参数<strong>收不到梯度</stro
 </ul>
 <p>最危险的是第三种，其次是完全不注册（第一节那种：悄悄留在图外，也不报错）。</p>
 <p>一般规律：一个失败越晚被发现、越不产生显式信号，就越贵。
-注册这件事的价值一半在功能，一半在把静默失败变成显式失败。</p>
+完整的注册和检查有助于尽早发现这些不一致。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.7-compiler-stack.html">&#8592; 2.7 PyTorch 编译器：捕获、分图与代码生成</a><a class="nav-next" href="../L3/3.1-attention-memory-wall.html">3.1 从 attention 数学到内存墙 &#8594;</a></nav>
 </main>
 </body>

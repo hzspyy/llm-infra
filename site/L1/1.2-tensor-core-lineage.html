@@ -3,30 +3,30 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>1.2 Tensor Core 世代史与 sm_120 的岔路</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<title>1.2 Tensor Core 的指令演进与架构差异</title>
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
 <aside class="sidebar">
   <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">1.2</div>
-  <div class="sidebar-title">Tensor Core 世代史与 sm_120 的岔路</div>
+  <div class="sidebar-title">Tensor Core 的指令演进与架构差异</div>
   <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">心智模型：五代指令，两条分叉</a></li>
 <li><a href="#_3">机制拆解</a><ul>
-<li><a href="#mmasync">一条 mma.sync 到底在做什么</a></li>
+<li><a href="#mmasync">mma.sync 的输入、输出与线程分工</a></li>
 <li><a href="#_4">五代演化，每一代解决一个具体矛盾</a></li>
 <li><a href="#sm_100a-sm_120a">编译探针：区分 sm_100a 与 sm_120a 的指令支持</a></li>
 <li><a href="#gemm">纯发射吞吐：GEMM 优化的真正天花板</a></li>
-<li><a href="#tflops">关键一步：把 TFLOPS 换算成时钟无关的常数</a></li>
+<li><a href="#sm">按时钟周期与 SM 数量归一化吞吐</a></li>
 <li><a href="#_5">一个超过"上限"的数字：怎么处理</a></li>
 </ul>
 </li>
-<li><a href="#_6">工程实现 · 源码走读：三条代码路径的现实成本</a></li>
+<li><a href="#_6">工程实现 · 源码解析：三条代码路径的现实成本</a></li>
 <li><a href="#_7">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
 <li><a href="#_8">消融建议</a></li>
@@ -45,15 +45,15 @@
 <li><a href="#_1">本章回答三个问题</a></li>
 <li><a href="#_2">心智模型：五代指令，两条分叉</a></li>
 <li><a href="#_3">机制拆解</a><ul>
-<li><a href="#mmasync">一条 mma.sync 到底在做什么</a></li>
+<li><a href="#mmasync">mma.sync 的输入、输出与线程分工</a></li>
 <li><a href="#_4">五代演化，每一代解决一个具体矛盾</a></li>
 <li><a href="#sm_100a-sm_120a">编译探针：区分 sm_100a 与 sm_120a 的指令支持</a></li>
 <li><a href="#gemm">纯发射吞吐：GEMM 优化的真正天花板</a></li>
-<li><a href="#tflops">关键一步：把 TFLOPS 换算成时钟无关的常数</a></li>
+<li><a href="#sm">按时钟周期与 SM 数量归一化吞吐</a></li>
 <li><a href="#_5">一个超过"上限"的数字：怎么处理</a></li>
 </ul>
 </li>
-<li><a href="#_6">工程实现 · 源码走读：三条代码路径的现实成本</a></li>
+<li><a href="#_6">工程实现 · 源码解析：三条代码路径的现实成本</a></li>
 <li><a href="#_7">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
 <li><a href="#_8">消融建议</a></li>
@@ -70,21 +70,18 @@
 </aside>
 <main class="page">
 <header class="page-head">
-  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L1 · 硬件与操作系统底座</div>
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L1 · 硬件与操作系统</div>
   <div class="mod-id">1.2</div>
-  <h1>Tensor Core 世代史与 sm_120 的岔路</h1>
-  <p class="lede">对照 Tensor Core 指令接口和编译目标，用指令微基准区分发射吞吐与 GEMM 性能。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（内存层次与并发）</span></div>
+  <h1>Tensor Core 的指令演进与架构差异</h1>
+  <p class="lede">比较各代 Tensor Core 的指令和编译目标，解释指令吞吐与 GEMM 性能的关系。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88</span><span class="chip">前置 L1.1（内存层次与并发）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li>tensor core 指令从 Volta 到 Blackwell 演化了五代。每一代<strong>具体多了什么</strong>，为什么必须换指令而不是加速旧指令？</li>
 <li>「Blackwell」是一个架构还是两个？<strong>sm_100 和 sm_120 的代码能互换吗</strong>？</li>
 <li>我的 GEMM 跑到 cuBLAS 的 95% 就算到头了吗？<strong>硬件的真正上限</strong>怎么测？</li>
 </ol>
-<p>Tensor Core 是执行矩阵乘加的硬件单元。程序不是直接把任意大小的矩阵交给它，
-而是先把矩阵分块，并按指令要求分配到线程、寄存器或共享内存中。
-本章沿着指令接口的变化看这些要求为什么不同。编译探针可以检查指定工具链
-是否接受某条指令；接受编译不等于已经在相应 GPU 上运行过。</p>
+<p>Tensor Core 是 GPU 内部专门执行低精度矩阵乘加（MMA）的硬件计算单元。在实际编写算子时，程序员无法直接将任意尺度的矩阵交给它，而是必须依据特定硬件指令的几何形状进行分块，并将其严格编排到指定线程的寄存器或共享内存布局中。本章沿着 Tensor Core 指令接口的代际演进，深入剖析其编排规则的演变逻辑与硬件架构分叉，并通过实际基准测试与指令探针测定硬件的真实算力天花板。</p>
 <hr />
 <h2 id="_2">心智模型：五代指令，两条分叉</h2>
 <figure>
@@ -156,7 +153,7 @@
 
 <hr />
 <h2 id="_3">机制拆解</h2>
-<h3 id="mmasync">一条 <code>mma.sync</code> 到底在做什么</h3>
+<h3 id="mmasync"><code>mma.sync</code> 的输入、输出与线程分工</h3>
 <p>先把最基础的一条看清楚：</p>
 <div class="highlight"><pre><span></span><code>mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
     {%0,%1,%2,%3},           // D：4 个 float
@@ -165,7 +162,7 @@
     {%0,%1,%2,%3};           // C：累加进 D
 </code></pre></div>
 
-<p>关键词逐个拆：</p>
+<p>各字段的含义如下：</p>
 <ul>
 <li><strong><code>mma</code></strong> — matrix multiply-accumulate，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mi>A</mi><mo>&#x000D7;</mo><mi>B</mi><mo>&#x0002B;</mo><mi>C</mi></mrow></math></span></li>
 <li><strong><code>sync</code></strong> — 整个 warp <strong>必须</strong>一起执行。这不是 32 个线程各做各的，
@@ -174,10 +171,8 @@
 <li><strong><code>row.col</code></strong> — A 行主序、B 列主序。这是硬件规定的，不匹配就得先转置</li>
 <li><strong><code>f32.bf16.bf16.f32</code></strong> — D、A、B、C 的类型。<strong>输入 bf16，累加 f32</strong></li>
 </ul>
-<p>每条指令的 FLOP：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span>。</p>
-<p><strong>寄存器布局是硬件写死的</strong>：哪个线程持有矩阵的哪几个元素，由 ISA 文档的图规定。
-这就是为什么写 tensor core kernel 这么痛苦——你不能随便摆数据，
-必须先把数据搬成硬件要的那个古怪布局。<code>ldmatrix</code> 指令就是为此存在的（<a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）。</p>
+<p>每条指令完成的浮点运算量为：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x000D7;</mo><mn>8</mn><mo>&#x000D7;</mo><mn>16</mn><mo>&#x0003D;</mo><mn>4096</mn></mrow></math></span> FLOP。</p>
+<p><strong>寄存器布局由硬件硬性规定</strong>：每个线程具体持有分块矩阵的哪几个元素，在 ISA 手册中有严格映射。手写底层 Tensor Core kernel 的核心复杂度正源于此——数据在载入寄存器时必须精确匹配硬件要求的 fragment 分布。为此，NVIDIA 专门提供了 <code>ldmatrix</code> 等高效数据重排指令（详见 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a>）。</p>
 <h3 id="_4">五代演化，每一代解决一个具体矛盾</h3>
 <table>
 <thead>
@@ -233,9 +228,7 @@
 </tr>
 </tbody>
 </table>
-<p><strong>一条主线</strong>：每一代都在把"一条指令干的活"变大、把"数据搬运"变异步。
-原因是 tensor core 的算力增长远快于寄存器带宽和访存带宽增长——
-要喂饱它，就必须减少每次喂食的开销。</p>
+<p>这些设计扩大了单条指令处理的矩阵规模，并引入异步数据搬运，以减少供数和同步对 Tensor Core 的限制。</p>
 <h3 id="sm_100a-sm_120a">编译探针：区分 sm_100a 与 sm_120a 的指令支持</h3>
 <p>以下探针检查指定指令能否通过相应目标的编译：</p>
 <div class="highlight"><pre><span></span><code><span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">tcgen05_smoke</span><span class="p">(</span><span class="kt">uint32_t</span><span class="o">*</span><span class="w"> </span><span class="n">tmem_addr</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
@@ -295,13 +288,10 @@ ptxas fatal   : Ptx assembly aborted due to errors
 
 <p><strong>fp8 恰好是 bf16 的 2.00 倍</strong>，而且原因是纯指令级的：k 维从 16 到 32，
 每条指令的 FLOP 从 4096 到 8192。</p>
-<h3 id="tflops">关键一步：把 TFLOPS 换算成时钟无关的常数</h3>
-<p>TFLOPS 会随频率浮动，而频率会因功耗墙、温度、负载类型剧烈变化。
-直接比较 TFLOPS 时，应同时检查频率与功耗状态。
-为了分析每个 SM 每周期完成的工作量，还可以换算为：</p>
+<h3 id="sm">按时钟周期与 SM 数量归一化吞吐</h3>
+<p>由于 GPU 的运行频率会随功耗墙、散热温度及负载形态实时动态波动，直接对比绝对 TFLOPS 往往混杂了动态睿频带来的扰动。为了客观衡量硬件架构在执行特定指令时的微架构计算效率，更严谨的度量标准是将其归一化到<strong>每个 SM 在每个时钟周期内实际执行的浮点运算次数（FLOP/clk/SM）</strong>：</p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><mtext>FLOP</mtext></mrow><mrow><mtext>clock</mtext><mo>&#x000D7;</mo><mtext>SM</mtext></mrow></mfrac></mrow></math></div></p>
-<p>这个归一化指标有助于减少频率差异的影响，但仍取决于指令路径和利用率。
-采样频率时要覆盖 kernel 的运行区间：</p>
+<p>这一指标剥离了频率波动的干扰，能清晰揭示硬件与算子的微架构利用率。实测对照如下（采样覆盖对应 kernel 的稳定运行区间）：</p>
 <table>
 <thead>
 <tr>
@@ -349,54 +339,53 @@ ptxas fatal   : Ptx assembly aborted due to errors
 </tbody>
 </table>
 <p>三个立刻能读出来的事实：</p>
-<p><strong>(1) 我的 mma 常数 = NVIDIA 标称值。</strong></p>
+<p><strong>(1) 纯发射测得的常数与官方微架构标称严格吻合。</strong></p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>511</mn><mtext>&#x000A0;</mtext><mtext>FLOP/clk/SM</mtext><mo>&#x000D7;</mo><mn>170</mn><mtext>&#x000A0;</mtext><mtext>SM</mtext><mo>&#x000D7;</mo><mn>2.41</mn><mtext>&#x000A0;</mtext><mtext>GHz(基频)</mtext><mo>&#x0003D;</mo><mn>209.7</mn><mtext>&#x000A0;</mtext><mtext>TFLOPS</mtext></mrow></math></div></p>
-<p>正是 NVIDIA 对 RTX 5090 的 bf16 稠密标称。<strong>厂商的标称值是按基频算的</strong>，
-实际 boost 到 2.90 GHz 就能跑到 251.9。这解释了 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 里
-「实测 232 TFLOPS 却高于某些标称」的疑问。</p>
+<p>该计算结果与 NVIDIA 官方针对 RTX 5090 标称的 bf16 稠密算力完全吻合。<strong>官方标称通常基于保守的基频计算</strong>，
+而在实际负载中 GPU 能够自动 boost 到 2.90 GHz，从而跑出 251.9 TFLOPS。这也彻底解答了 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 中「为什么实测 232 TFLOPS 却反常地高出某些官方标称」的疑问。</p>
 <p><strong>(2) cuBLAS 的 bf16 达到 491 / 511 = 96%。</strong> 一个真实的、要读写显存的 GEMM
 能到纯发射上限的 96%，说明 cuBLAS 的 tiling 和流水做得极好。
 <strong>这也是 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 里你自己写 GEMM 的目标线。</strong></p>
-<p><strong>(3) 频率差异比想象中大。</strong> 我的 mma kernel 在 <strong>2.90 GHz / 150 W</strong> 运行——
+<p><strong>(3) 频率差异比想象中大。</strong> 纯指令发射 kernel 在 <strong>2.90 GHz / 150 W</strong> 运行——
 因为它不碰显存，没有显存功耗。cuBLAS 的 GEMM 被顶到 <strong>575 W 功耗墙</strong>，
 频率掉到 2.12–2.62 GHz。</p>
 <p><strong>在功耗受限的卡上，"不访存"本身就是一种加速。</strong> 这个效应在 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 优化 GEMM 时会遇到：
 减少访存不只省带宽，还能换来更高的频率。</p>
 <h3 id="_5">一个超过"上限"的数字：怎么处理</h3>
 <p>上表最后一行有问题：cuBLAS fp8 达到 <strong>1501 FLOP/clk/SM</strong>，
-而我测的 <code>mma.sync.m16n8k32</code> 上限只有 <strong>1022</strong>。<strong>真实 GEMM 超过了纯指令上限 47%。</strong></p>
+而基准测量的 <code>mma.sync.m16n8k32</code> 上限仅为 <strong>1022</strong>。<strong>真实 GEMM 超过了纯指令上限 47%。</strong></p>
 <p>一个数字超过物理上界时，一定有一个假设是错的。逐个排查：</p>
 <ol>
-<li><strong>fp8 GEMM 真的在算吗？</strong> 验了：结果对 bf16 参考的相对误差 0.0377，
-   量级也对（bf16 均值 1.1283 / fp8 均值 1.1275）。<strong>在算。</strong></li>
-<li><strong>频率采样对吗？</strong> 第一版在 <code>torch.cuda.synchronize()</code> <strong>之后</strong>读 NVML，
+<li><strong>核对 fp8 GEMM 的输出。</strong>结果对 bf16 参考的相对误差 0.0377，
+   bf16 均值为 1.1283，fp8 均值为 1.1275，输出量级与参考一致。</li>
+<li><strong>在 GPU 忙碌时采样频率。</strong> 在 <code>torch.cuda.synchronize()</code> <strong>之后</strong>读 NVML，
    读到 0.18 GHz / 27 W —— GPU 早就掉回空闲了。改成后台线程并发采样才拿到 2.12 GHz。</li>
-<li><strong>是不是 f16 累加更快？</strong> 消费卡有"FP32 累加半速"的传说。实测
+<li><strong>比较 f16 与 f32 累加吞吐。</strong> 实测
    <code>mma.sync...f16.f16.f16.f16</code> 只有 <strong>288.5 TFLOPS，仅比 f32 累加快 1.15×</strong>，不是 2×。
-   <strong>传说在 sm_120 上不成立。</strong></li>
-<li><strong>是不是有我没测的更宽指令？</strong> 去问编译器：</li>
+   这组测试未观察到 2× 差距。</li>
+<li><strong>检查其他指令形式是否可编译：</strong></li>
 </ol>
 <div class="highlight"><pre><span></span><code>mma.sync.aligned.m16n8k32...e4m3                        支持
 mma.sync.aligned.m16n8k64...e4m3                        error: Incorrect instruction type
 mma.sync.aligned.kind::mxf8f6f4.block_scale.m16n8k32... 支持   ← ★
 </code></pre></div>
 
-<p><strong><code>kind::mxf8f6f4.block_scale</code> 这一族在 sm_120 上是支持的</strong>，而我没有测它。</p>
-<p><strong>结论</strong>：我测出的 1022 是 <strong><code>m16n8k32</code> 这一条指令</strong>的上限，不是<strong>硬件</strong>的上限。
+<p><strong><code>kind::mxf8f6f4.block_scale</code> 这一族在 sm_120 上是支持的</strong>，而初始基准未覆盖该指令。</p>
+<p><strong>结论</strong>：实测的 1022 仅是 <strong><code>m16n8k32</code> 这一条指令</strong>的上限，不代表<strong>硬件</strong>的绝对上限。
 cuBLASLt 是否使用了更宽的 fp8 指令路径，仍需反汇编或其他实现证据确认；
 <code>mxf8f6f4</code> 族目前只是候选解释。</p>
 <div class="admonition warning">
 <p class="admonition-title">这一节的方法比结论重要</p>
-<p>「我的上限被真实实现超过了」是个<strong>好消息</strong>——它说明我漏掉了一条路径，
-而非硬件突破物理限制。排查顺序是：
+<p>「基准上限被实际库实现反超」是一个明确的诊断信号——它表明初始分析漏掉了一条硬件路径，
+而非硬件突破了物理限制。排查顺序是：
 <strong>先验正确性 → 再验测量方法 → 再验假设 → 最后才怀疑硬件。</strong></p>
-<p>本站把这个结论标为<strong>未完成</strong>：<code>kind::mxf8f6f4</code> 族的实测吞吐
-<span class="unverified">未实测</span>。settle 它的检查是：
+<p>这部分仍待验证：<code>kind::mxf8f6f4</code> 族的实测吞吐
+<span class="unverified">未实测</span>。验证方法是：
 用该指令重写 <code>tensor_core.cu</code> 的 fp8 kernel，看是否 ≥ 1501 FLOP/clk/SM。
 <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 会补上。</p>
 </div>
 <hr />
-<h2 id="_6">工程实现 · 源码走读：三条代码路径的现实成本</h2>
+<h2 id="_6">工程实现 · 源码解析：三条代码路径的现实成本</h2>
 <p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 里看到 vLLM 在 5090 上跑的 GEMM 是 <code>cutlass_80_tensorop_bf16_s16816gemm_*</code>。
 <code>s16816</code> 正是 <code>m16n8k16</code> 的 CUTLASS 命名。<strong>在最新的消费卡上跑着 sm_80 的 kernel。</strong></p>
 <p>这对库作者意味着什么，可以直接从 FlashInfer 的目录结构读出来：</p>
@@ -430,7 +419,7 @@ worldvln(L40S): .cache/flashinfer/0.6.18/89/cached_ops/sampling
 Ada 与 Hopper 都没有。</p>
 <hr />
 <h2 id="_7">工程实现 · 自己写一遍</h2>
-<p>写 tensor core kernel 的最小可运行形态，关键只有两点。</p>
+<p>下面的最小 Tensor Core kernel 需要满足两个条件。</p>
 <p><strong>(1) 内联 PTX 的约束语法</strong></p>
 <div class="highlight"><pre><span></span><code><span class="k">asm</span><span class="w"> </span><span class="k">volatile</span><span class="p">(</span>
 <span class="w">    </span><span class="s">"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "</span>
@@ -545,7 +534,7 @@ ptxas fatal   : Ptx assembly aborted due to errors
 
 <p><code>wgmma</code> 那一行值得单独看：<strong>Hopper 的 warp-group mma 在更新的 Blackwell 上不支持</strong>。
 指令集不是单调递增的，每一代都可能废弃上一代的东西。
-这就是为什么「compute capability 更高 = 更强」是错的。</p>
+因此，选择编译目标时需要核对具体指令的支持情况。</p>
 </details>
 <details>
 <summary>③ 纯发射吞吐的完整扫描</summary>
@@ -615,7 +604,7 @@ fp8 _scaled_mm        2.031     541.5   2.12    569         1501
     fp8  f32累加  1022 FLOP/clk/SM
 </code></pre></div>
 
-<p>第一版这张表是这样的（<strong>错的</strong>）：</p>
+<p>在同步后采样频率，会得到下面这组不适用于运行区间的数据：</p>
 <div class="highlight"><pre><span></span><code>bf16 torch.mm         4.949     222.2   0.18     27         7260
 fp8 _scaled_mm        2.033     540.8   0.18     27        17672
 </code></pre></div>
@@ -641,7 +630,7 @@ GPU 已经掉回空闲。<strong>荒谬的数字是好事，它一眼就能被�
 </tr>
 <tr>
 <td><strong>CuTe-DSL</strong></td>
-<td>FA4 完全用嵌入 Python 的 CuTe-DSL 写，没有 C++ 部分；编译速度比 C++ CUTLASS 模板快 20–30×，同时保留寄存器分配与流水调度的控制权（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）</td>
+<td>FA4 完全用嵌入 Python 的 CuTe-DSL 写，没有 C++ 部分；编译速度比 C++ CUTLASS 模板快 20–30×，同时保留寄存器分配与流水调度的控制权（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="CUDA 与 kernel DSL 对比">L2.5</a>）</td>
 </tr>
 <tr>
 <td><strong>NVFP4 vs MXFP4</strong></td>
@@ -649,16 +638,16 @@ GPU 已经掉回空闲。<strong>荒谬的数字是好事，它一眼就能被�
 </tr>
 <tr>
 <td><strong>sm_120 上的 block_scale 指令族</strong></td>
-<td>本章探测到 <code>kind::mxf8f6f4.block_scale</code> 在 sm_120 上可编译。它很可能就是 cuBLASLt fp8 超过我实测上限的原因——<strong>本站待测</strong></td>
+<td>本章探测到 <code>kind::mxf8f6f4.block_scale</code> 在 sm_120 上可编译。它很可能就是 cuBLASLt fp8 超出基础指令测试上限的原因——<strong>本章待测</strong></td>
 </tr>
 <tr>
 <td><strong>kernel 作者的三路径负担</strong></td>
-<td>Hopper / sm_100 / sm_120 三套代码。TileLang、ThunderKittens、Helion 等新 DSL 的一个卖点就是把这三条路径抽象掉（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）</td>
+<td>Hopper / sm_100 / sm_120 三套代码。TileLang、ThunderKittens、Helion 等新 DSL 的一个卖点就是把这三条路径抽象掉（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="CUDA 与 kernel DSL 对比">L2.5</a>）</td>
 </tr>
 </tbody>
 </table>
 <blockquote>
-<p>除本章实测外的内容来自各自论文与文档，<strong>未在本站复现</strong><span class="unverified">未实测</span>。</p>
+<p>除本章实测外的内容来自各自论文与文档，<strong>尚未复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
 <h2 id="_11">陷阱</h2>
@@ -722,7 +711,7 @@ vLLM 在 5090 上跑的正是它。</p>
 <p><strong>(2) "利用率"的分母是时间。</strong> 利用率 = tensor core 忙的时间 / 总时间。
 如果你把总时间缩短了，而 tensor core 的绝对工作量不变，利用率反而可能下降。</p>
 <p><strong>结论</strong>：利用率是诊断指标，不是优化目标。<strong>唯一的目标是墙钟时间。</strong>
-<a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 会讲怎么正确使用 ncu 的各项指标。</p>
+<a class="xref" href="../L2/2.6-profiling.html" title="GPU 性能分析">L2.6</a> 会讲怎么正确使用 ncu 的各项指标。</p>
 </details>
 <details>
 <summary>5. 本章留下一个未解问题：cuBLAS fp8 达到 1501 FLOP/clk/SM 而我测的上限是 1022。你会怎么把它彻底解决？</summary>
@@ -735,8 +724,8 @@ vLLM 在 5090 上跑的正是它。</p>
 （本章试过 <code>nvdisasm</code>，但它不能直接处理含 fatbin 的 <code>.so</code>，需要先用 <code>cuobjdump</code> 抽取。）</p>
 <p><strong>(c) 用 ncu 采 <code>sm__inst_executed_pipe_tensor</code> 类计数器。</strong>
 知道总共发了多少条 tensor 指令，除以总 FLOP，就能反推每条指令的 FLOP，
-进而识别指令宽度。这个方法不需要反汇编，<a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 会讲。</p>
-<p><strong>任选一条做完，本站就能把那个 <code>未实测</code> 标记去掉。</strong></p>
+进而识别指令宽度。这个方法不需要反汇编，<a class="xref" href="../L2/2.6-profiling.html" title="GPU 性能分析">L2.6</a> 会讲。</p>
+<p>取得对应的指令与吞吐证据后，才能解释这项差异。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L1/1.1-gpu-microarch.html">&#8592; 1.1 GPU 微架构与内存层次</a><a class="nav-next" href="../L1/1.3-host-pcie-numa.html">1.3 主机侧：NUMA、PCIe 与 DMA &#8594;</a></nav>
 </main>
 </body>

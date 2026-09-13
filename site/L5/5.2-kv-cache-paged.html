@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.2 KV cache 管理：PagedAttention 与 prefix cache</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -23,7 +23,7 @@
 <li><a href="#_4">块哈希将前缀纳入缓存身份</a></li>
 </ul>
 </li>
-<li><a href="#_5">工程实现 · 源码走读</a><ul>
+<li><a href="#_5">工程实现 · 源码解析</a><ul>
 <li><a href="#a-vllm">A. vLLM：块哈希表 + 双向链表空闲池</a></li>
 <li><a href="#b-sglang">B. SGLang：基数树</a></li>
 <li><a href="#_6">设计取舍：块哈希与基数树</a></li>
@@ -59,7 +59,7 @@
 <li><a href="#_4">块哈希将前缀纳入缓存身份</a></li>
 </ul>
 </li>
-<li><a href="#_5">工程实现 · 源码走读</a><ul>
+<li><a href="#_5">工程实现 · 源码解析</a><ul>
 <li><a href="#a-vllm">A. vLLM：块哈希表 + 双向链表空闲池</a></li>
 <li><a href="#b-sglang">B. SGLang：基数树</a></li>
 <li><a href="#_6">设计取舍：块哈希与基数树</a></li>
@@ -91,8 +91,8 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
   <div class="mod-id">5.2</div>
   <h1>KV cache 管理：PagedAttention 与 prefix cache</h1>
-  <p class="lede">连接 block table、引用计数和前缀身份，比较 vLLM 块哈希与 SGLang 基数树。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D) · vLLM 0.29.0 · SGLang 0.5.19</span><span class="chip">数据日期 2026-09-09</span><span class="chip">前置 L0.2（KV 账本）· L0.1（调用栈第 10–11 阶段）</span></div>
+  <p class="lede">介绍 block table、引用计数和前缀缓存，比较 vLLM 的块哈希与 SGLang 的基数树。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D) · vLLM 0.29.0 · SGLang 0.5.19</span><span class="chip">前置 L0.2（KV 账本）· L0.1（调用栈第 10–11 阶段）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li>KV cache 为什么必须<strong>分页</strong>？不分页会发生什么，能量化吗？</li>
@@ -220,7 +220,7 @@ KV 也不同，必须进哈希（<span class="xref pending" title="VLM（一）�
 <strong>因为 PD 分离时，prefill 机器算出的块哈希必须和 decode 机器一致</strong>，
 否则 KV 传过去认不出来（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（后续章节）">L6.4</span>）。一个种子的设计，牵着整个分离架构。</p>
 <hr />
-<h2 id="_5">工程实现 · 源码走读</h2>
+<h2 id="_5">工程实现 · 源码解析</h2>
 <h3 id="a-vllm">A. vLLM：块哈希表 + 双向链表空闲池</h3>
 <p><strong>块的元数据</strong>（<code>v1/core/kv_cache_utils.py:166</code>）：</p>
 <div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">KVCacheBlock</span><span class="p">:</span>
@@ -287,8 +287,7 @@ blocks of a request.
             <span class="o">...</span>
 </code></pre></div>
 
-<p>那句注释 <code>we duplicated code a bit</code> 值得注意：<strong>为了少遍历一次列表而故意写重复代码</strong>。
-这不是坏品味，是热路径上的自觉取舍——这个函数每个 decode step 都会被调用。</p>
+<p>注释 <code>we duplicated code a bit</code> 说明，这里通过重复少量代码避免再次遍历列表；该函数在每个 decode step 中调用。</p>
 <p><code>_maybe_evict_cached_block</code> 做的是：这个块被重新分配前，如果它还挂在
 <code>cached_block_hash_to_block</code> 里（即"内容还在，只是没人引用"），
 就把哈希条目摘掉并发出淘汰事件。<strong>"空闲"和"已缓存"是两个正交状态</strong>：
@@ -471,7 +470,7 @@ blocks of a request.
                 <span class="bp">self</span><span class="o">.</span><span class="n">free</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">bid</span><span class="p">)</span>       <span class="c1"># 内容与哈希保留 → 之后仍可能被命中</span>
 </code></pre></div>
 
-<p>三处值得反复看的地方：</p>
+<p>以下三处决定了状态如何更新：</p>
 <ol>
 <li><strong><code>match</code> 里的 <code>break</code></strong>：前缀一旦断掉，后面就算内容相同也不能用——因为 KV 上下文相关。</li>
 <li><strong><code>free_blocks</code> 不清哈希</strong>：块归还到空闲链，但内容和哈希还留着。
@@ -515,7 +514,7 @@ blocks of a request.
 <p>以上保留初稿中的历史输出。左边三列来自 mini 模型，最右一列是离线调用耗时，
 不是引擎报告的块命中数。两组耗时相互重叠，尚不能从中分辨相邻块边界。
 修订后的脚本明确标注“预测”和“历史耗时”，不再输出“台阶验证成功”的结论。</p>
-<p>四个自测里最值得看的是第一个——它测的是<strong>正确性而不是性能</strong>：</p>
+<p>第一个测试检查缓存复用的正确性：</p>
 <div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_rolling_hash_prevents_wrong_reuse</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""B 的首块已缓存；只允许复用首块，不允许复用来自 A 的第二块。"""</span>
     <span class="n">pool</span> <span class="o">=</span> <span class="n">MiniBlockPool</span><span class="p">(</span><span class="n">num_blocks</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
@@ -529,10 +528,7 @@ blocks of a request.
     <span class="n">pool</span><span class="o">.</span><span class="n">free_blocks</span><span class="p">(</span><span class="n">rb</span><span class="p">[</span><span class="s2">"blocks"</span><span class="p">])</span>
 </code></pre></div>
 
-<p>为什么要先缓存 B 的首块？否则查询 B 时，首块未命中就会退出，
-测试根本到不了第二块。旧测试因此检不出“去掉 parent”的错误。
-修订后，正确实现只能复用 B 的首块；若只按块内容哈希，就会错误复用 A 的尾块。
-这才是一个真正检查上下文身份的测试。</p>
+<p>测试需要先缓存 B 的首块，使查询能够继续到第二块。正确实现只能复用 B 的首块；若只按块内容哈希、忽略 parent，就会错误复用 A 的尾块。</p>
 <hr />
 <h2 id="lab">动手 lab：比较前缀复用预测与调用耗时</h2>
 <div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/prefix_probe.py<span class="w"> </span>--model<span class="w"> </span><span class="nv">$MODEL</span><span class="w"> </span>--prefix-len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
@@ -682,14 +678,14 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 <div class="highlight"><pre><span></span><code>块大小 = 16 token；GPU 块数 = 4064
 </code></pre></div>
 
-<p>从 <code>llm.llm_engine.vllm_config.cache_config</code> 读出来的，不是我算的。
+<p>以下配置直接读取自 <code>llm.llm_engine.vllm_config.cache_config</code>。
 反推验证（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的账本）：</p>
 <div class="highlight"><pre><span></span><code>4064 块 × 16 token = 65,024 token 的 KV 容量
 65,024 × 114.69 KB = 7.46 GB
 预算 = 33.7 GB × 0.35 - 3.44 GB(权重) - 杂项 ≈ 7.5 GB   ✓
 </code></pre></div>
 
-<p><strong>账本和引擎对上了。</strong> 这种交叉验证要养成习惯——它同时检查了你的公式和你对配置的理解。</p>
+<p>公式估算与引擎配置一致，可用于核对参数含义和容量计算。</p>
 </details>
 <details>
 <summary>② 引擎暴露的 KV 指标全名</summary>
@@ -821,7 +817,7 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 </tbody>
 </table>
 <blockquote>
-<p>上表中除本章实测外的内容来自各自论文与源码，<strong>加速比未在本站复现</strong><span class="unverified">未实测</span>。</p>
+<p>上表中除本章实测外的内容来自各自论文与源码，<strong>加速比尚未复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
 <h2 id="_13">陷阱</h2>

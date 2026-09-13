@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.2 训练并行：ZeRO 到 zero-bubble</title>
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">7.2</div>
+  <div class="sidebar-title">训练并行：ZeRO 到 zero-bubble</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">为什么需要分布式通信</a></li>
+<li><a href="#_2">三个核心原语</a><ul>
+<li><a href="#all-reduce">all-reduce</a></li>
+<li><a href="#all-gather">all-gather</a></li>
+<li><a href="#reduce-scatter">reduce-scatter</a></li>
+</ul>
+</li>
+<li><a href="#_3">通信量与算法复杂度</a></li>
+<li><a href="#1">实验 1：三种操作的延迟与带宽对比</a></li>
+<li><a href="#2ring">实验 2：ring 算法的通信量验证</a></li>
+<li><a href="#3pcie-p2p">实验 3：PCIe 拓扑与 P2P 连接</a></li>
+<li><a href="#_4">通信量对训练吞吐的影响</a></li>
+<li><a href="#nccl">NCCL 内部实现要点</a></li>
+<li><a href="#_5">实验脚本</a></li>
+<li><a href="#_6">总结</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">为什么需要分布式通信</a></li>
+<li><a href="#_2">三个核心原语</a><ul>
+<li><a href="#all-reduce">all-reduce</a></li>
+<li><a href="#all-gather">all-gather</a></li>
+<li><a href="#reduce-scatter">reduce-scatter</a></li>
+</ul>
+</li>
+<li><a href="#_3">通信量与算法复杂度</a></li>
+<li><a href="#1">实验 1：三种操作的延迟与带宽对比</a></li>
+<li><a href="#2ring">实验 2：ring 算法的通信量验证</a></li>
+<li><a href="#3pcie-p2p">实验 3：PCIe 拓扑与 P2P 连接</a></li>
+<li><a href="#_4">通信量对训练吞吐的影响</a></li>
+<li><a href="#nccl">NCCL 内部实现要点</a></li>
+<li><a href="#_5">实验脚本</a></li>
+<li><a href="#_6">总结</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L7 · 训练与后训练基础设施</div>
+  <div class="mod-id">7.2</div>
+  <h1>训练并行：ZeRO 到 zero-bubble</h1>
+  <p class="lede">DP / ZeRO-1·2·3 / TP / PP(1F1B、interleaved、zero-bubble) / SP / CP / EP 与组合；5 卡 FSDP 实测。</p>
+  
+</header><article class="prose"><h1 id="72">7.2 分布式通信原语</h1>
+<h2 id="_1">为什么需要分布式通信</h2>
+<p>训练大模型时，单卡显存放不下完整的参数、梯度、优化器状态和激活。即使能放下，单卡算力也不够快。因此需要将模型切分到多张卡上，各自计算一部分，再通过通信将结果合并。</p>
+<p>通信的代价决定了并行能不能带来收益。本章先讲清楚三个核心通信原语的数学定义和实现差异，再测量真实硬件上的延迟和带宽，最后分析通信量如何影响训练吞吐。</p>
+<h2 id="_2">三个核心原语</h2>
+<h3 id="all-reduce">all-reduce</h3>
+<p><strong>定义</strong>：每个 rank 都有一个张量，最终每个 rank 都得到所有张量的归约结果（求和、最大值等）。</p>
+<div class="highlight"><pre><span></span><code>输入:  rank0: [1,2]   rank1: [3,4]   rank2: [5,6]   rank3: [7,8]
+输出:  rank0: [16,20] rank1: [16,20] rank2: [16,20] rank3: [16,20]
+</code></pre></div>
+
+<p><strong>用途</strong>：数据并行时，每个 rank 算出一部分样本的梯度，all-reduce 把所有梯度加起来，每个 rank 都拿到完整梯度去更新参数。</p>
+<h3 id="all-gather">all-gather</h3>
+<p><strong>定义</strong>：每个 rank 持有一个分片，最终每个 rank 都收集到所有分片拼成完整张量。</p>
+<div class="highlight"><pre><span></span><code>输入:  rank0: [1,2]   rank1: [3,4]   rank2: [5,6]   rank3: [7,8]
+输出:  rank0: [1,2,3,4,5,6,7,8]
+       rank1: [1,2,3,4,5,6,7,8]
+       rank2: [1,2,3,4,5,6,7,8]
+       rank3: [1,2,3,4,5,6,7,8]
+</code></pre></div>
+
+<p><strong>用途</strong>：FSDP 训练时，前向开始前把分片的参数拼回完整张量；TP 推理时把各 rank 的列分片拼成完整输出。</p>
+<h3 id="reduce-scatter">reduce-scatter</h3>
+<p><strong>定义</strong>：每个 rank 都有一个张量，归约后每个 rank 只保留自己对应的那一片。</p>
+<div class="highlight"><pre><span></span><code>输入:  rank0: [1,2,3,4]   rank1: [5,6,7,8]   rank2: [9,10,11,12]   rank3: [13,14,15,16]
+输出:  rank0: [28,32]     rank1: [36,40]     rank2: [44,48]        rank3: [52,56]
+       (所有输入在对应位置求和，然后每个 rank 取自己的分片)
+</code></pre></div>
+
+<p><strong>用途</strong>：FSDP 反向时，每个 rank 算出完整梯度，reduce-scatter 把梯度归约后分给对应的参数持有者。</p>
+<h2 id="_3">通信量与算法复杂度</h2>
+<p>假设有 N 个 rank，每个 rank 发送/接收 M 字节的数据。</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>朴素实现</th>
+<th>ring 算法</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all-reduce</td>
+<td>O(N·M)</td>
+<td>O((N-1)/N · M)</td>
+<td>ring: 每次传 1/N，传 N-1 次</td>
+</tr>
+<tr>
+<td>all-gather</td>
+<td>O(N·M)</td>
+<td>O((N-1)/N · M)</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>reduce-scatter</td>
+<td>O(N·M)</td>
+<td>O((N-1)/N · M)</td>
+<td>同上</td>
+</tr>
+</tbody>
+</table>
+<p><strong>朴素实现</strong>：每个 rank 都向其他所有 rank 发送完整数据，通信量是 O(N·M)。</p>
+<p><strong>ring 算法</strong>：把 N 个 rank 排成环，每次只向下一个 rank 传 1/N 的数据，传 N-1 轮。总通信量是 <code>2(N-1)/N · M</code>（reduce-scatter 阶段 + all-gather 阶段各一半）。</p>
+<p>当 N=4、M=256MB 时，ring all-reduce 的理论通信量是 <code>2×(4-1)/4×256 = 384 MB</code>。</p>
+<h2 id="1">实验 1：三种操作的延迟与带宽对比</h2>
+<p>在 worldvln（4×L40S，PCIe 连接）上测量不同大小张量的通信性能：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>张量大小(MB)</th>
+<th>延迟(ms)</th>
+<th>带宽(GB/s)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all-reduce</td>
+<td>1</td>
+<td>0.198</td>
+<td>7.92</td>
+</tr>
+<tr>
+<td>all-gather</td>
+<td>1</td>
+<td>0.366</td>
+<td>2.15</td>
+</tr>
+<tr>
+<td>reduce-scatter</td>
+<td>1</td>
+<td>0.379</td>
+<td>2.07</td>
+</tr>
+<tr>
+<td>all-reduce</td>
+<td>4</td>
+<td>0.689</td>
+<td>9.12</td>
+</tr>
+<tr>
+<td>all-gather</td>
+<td>4</td>
+<td>1.408</td>
+<td>2.23</td>
+</tr>
+<tr>
+<td>reduce-scatter</td>
+<td>4</td>
+<td>1.47</td>
+<td>2.14</td>
+</tr>
+<tr>
+<td>all-reduce</td>
+<td>16</td>
+<td>2.73</td>
+<td>9.22</td>
+</tr>
+<tr>
+<td>all-gather</td>
+<td>16</td>
+<td>5.538</td>
+<td>2.27</td>
+</tr>
+<tr>
+<td>reduce-scatter</td>
+<td>16</td>
+<td>5.943</td>
+<td>2.12</td>
+</tr>
+<tr>
+<td>all-reduce</td>
+<td>64</td>
+<td>10.841</td>
+<td>9.29</td>
+</tr>
+<tr>
+<td>all-gather</td>
+<td>64</td>
+<td>22.26</td>
+<td>2.26</td>
+</tr>
+<tr>
+<td>reduce-scatter</td>
+<td>64</td>
+<td>23.875</td>
+<td>2.11</td>
+</tr>
+<tr>
+<td>all-reduce</td>
+<td>256</td>
+<td>42.988</td>
+<td>9.37</td>
+</tr>
+<tr>
+<td>all-gather</td>
+<td>256</td>
+<td>88.906</td>
+<td>2.26</td>
+</tr>
+<tr>
+<td>reduce-scatter</td>
+<td>256</td>
+<td>95.801</td>
+<td>2.1</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键观察</strong>：</p>
+<ol>
+<li>
+<p><strong>all-reduce 比 all-gather/reduce-scatter 快 4 倍</strong>：256MB 时，all-reduce 43ms（9.37 GB/s），all-gather 89ms（2.26 GB/s）。原因：NCCL 的 ring all-reduce 实现把 reduce-scatter 和 all-gather 两阶段流水起来，通信和计算重叠；而单独的 all-gather 无法流水。</p>
+</li>
+<li>
+<p><strong>带宽随张量增大趋于稳定</strong>：小张量时延迟占主导（1MB 时 all-reduce 只有 7.92 GB/s），256MB 时达到 9.37 GB/s，接近 PCIe Gen4 ×16 的理论单向带宽（~16 GB/s，实际双向通信会降低）。</p>
+</li>
+<li>
+<p><strong>all-gather 和 reduce-scatter 性能相近</strong>：都是 2.1-2.3 GB/s，因为都是单阶段通信，无流水优化空间。</p>
+</li>
+</ol>
+<h2 id="2ring">实验 2：ring 算法的通信量验证</h2>
+<p>使用 256MB 张量在 4 卡上执行 ring all-reduce，测量实际延迟并与理论通信量对比：</p>
+<ul>
+<li><strong>测量延迟</strong>：42.631 ms</li>
+<li><strong>理论通信量</strong>：<code>2×(N-1)/N×M = 2×3/4×256 = 384 MB</code></li>
+<li><strong>实际带宽</strong>：<code>384 MB / 42.631 ms = 9.45 GB/s</code></li>
+</ul>
+<p>与实验 1 中 all-reduce 的 9.37 GB/s 一致，验证了 NCCL 确实使用了 ring 算法。</p>
+<p>ring 算法分两阶段：
+1. <strong>reduce-scatter</strong>：每个 rank 发送 3/4 的数据（每次传 1/4，传 3 轮），接收并归约
+2. <strong>all-gather</strong>：每个 rank 再发送 3/4 的数据，拼成完整结果</p>
+<p>总通信量 = <code>256×3/4×2 = 384 MB</code>，与理论计算吻合。</p>
+<h2 id="3pcie-p2p">实验 3：PCIe 拓扑与 P2P 连接</h2>
+<p>检测 worldvln 上 4×L40S 的互连拓扑：</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"devices"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"rank"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"device_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA L40S"</span><span class="p">,</span><span class="w"> </span><span class="nt">"capability"</span><span class="p">:</span><span class="w"> </span><span class="s2">"8.9"</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"rank"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"device_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA L40S"</span><span class="p">,</span><span class="w"> </span><span class="nt">"capability"</span><span class="p">:</span><span class="w"> </span><span class="s2">"8.9"</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"rank"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="nt">"device_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA L40S"</span><span class="p">,</span><span class="w"> </span><span class="nt">"capability"</span><span class="p">:</span><span class="w"> </span><span class="s2">"8.9"</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"rank"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="nt">"device_name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NVIDIA L40S"</span><span class="p">,</span><span class="w"> </span><span class="nt">"capability"</span><span class="p">:</span><span class="w"> </span><span class="s2">"8.9"</span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"p2p_matrix"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">],</span>
+<span class="w">    </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">],</span>
+<span class="w">    </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">],</span>
+<span class="w">    </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">]</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>P2P 矩阵全为 1 的含义</strong>：<code>cudaDeviceCanAccessPeer</code> 返回 true，表示 CUDA 驱动支持任意两卡之间的 P2P 内存访问。但这<strong>不代表有 NVLink</strong>——worldvln 使用 PCIe 连接，P2P 访问通过 PCIe 完成。</p>
+<p>验证无 NVLink：</p>
+<div class="highlight"><pre><span></span><code>nvidia-smi<span class="w"> </span>nvlink<span class="w"> </span>-s<span class="w">  </span><span class="c1"># 无输出 → 无 NVLink 通道</span>
+nvidia-smi<span class="w"> </span>topo<span class="w"> </span>-m<span class="w">    </span><span class="c1"># 显示 NODE/SYS（PCIe 连接），无 NV# 标记</span>
+</code></pre></div>
+
+<p>PCIe P2P 和 NVLink P2P 的区别：
+- <strong>PCIe P2P</strong>：带宽受限于 PCIe 总线（单向 ~16 GB/s），延迟 ~1-2 μs
+- <strong>NVLink P2P</strong>：带宽可达 900 GB/s（NVLink 4.0，18 条 link），延迟 ~0.5 μs</p>
+<p>本实验环境的 9.37 GB/s 带宽符合 PCIe Gen4 特征。</p>
+<h2 id="_4">通信量对训练吞吐的影响</h2>
+<p>以 GPT-3 175B 为例，使用数据并行在 1024 张 A100（80GB）上训练：</p>
+<p><strong>模型参数</strong>：
+- 参数量：175B（FP16 存储 = 350GB）
+- 每步梯度：350GB（与参数同大小）</p>
+<p><strong>通信分析</strong>：
+- 操作：all-reduce 梯度（350GB）
+- 理论通信量（ring）：<code>2×(1024-1)/1024×350 ≈ 699 GB</code>
+- NVLink 带宽：每卡 600 GB/s（NVSwitch 全连接）
+- 通信时间：<code>699 GB / 600 GB/s ≈ 1.16 s</code></p>
+<p><strong>计算时间</strong>：
+- A100 FP16 峰值：312 TFLOPS
+- 前向+反向 FLOPs：<code>6×175B×seq_len×batch_size</code>（假设 seq_len=2048，batch_size=1）
+  ≈ <code>6×175B×2048 = 2.15 PFLOPs</code>
+- 计算时间：<code>2.15 PFLOPs / 312 TFLOPS ≈ 6.9 s</code></p>
+<p><strong>吞吐分析</strong>：
+- 通信占比：<code>1.16 / (6.9 + 1.16) ≈ 14%</code>
+- 如果用 PCIe（9 GB/s）：通信时间变成 <code>699 / 9 ≈ 78 s</code>，通信占比 92%，吞吐崩溃</p>
+<p>结论：大模型训练必须用 NVLink/NVSwitch，PCIe 只能用于小规模实验。</p>
+<h2 id="nccl">NCCL 内部实现要点</h2>
+<p>NCCL（NVIDIA Collective Communications Library）是 PyTorch 分布式训练的默认通信后端。</p>
+<p><strong>关键优化</strong>：</p>
+<ol>
+<li>
+<p><strong>拓扑感知路由</strong>：根据 <code>nvidia-smi topo -m</code> 自动选择最优通信路径
+   - NVLink 优先
+   - 同 NUMA 节点的 PCIe 其次
+   - 跨 NUMA 最慢</p>
+</li>
+<li>
+<p><strong>流水执行</strong>：ring all-reduce 把 reduce-scatter 和 all-gather 拆成小块，流水传输和归约计算</p>
+</li>
+<li>
+<p><strong>GPU Direct RDMA</strong>：跨节点时，GPU 可直接通过 InfiniBand 读写远程 GPU 内存，绕过 CPU</p>
+</li>
+<li>
+<p><strong>多路并发</strong>：同时使用多条 NVLink 通道和多个 CUDA stream，饱和带宽</p>
+</li>
+</ol>
+<p><strong>与 Gloo 对比</strong>（实验未跑，引用已知结论）：
+- Gloo：CPU 实现，数据需先拷贝到 CPU，带宽 ~2-3 GB/s
+- NCCL：GPU 直连，带宽可达硬件上限（NVLink 600 GB/s，PCIe 9 GB/s）</p>
+<p>训练时始终用 NCCL，Gloo 只用于 CPU 任务或调试。</p>
+<h2 id="_5">实验脚本</h2>
+<p>三个实验分别对应：</p>
+<ol>
+<li><code>labs/L7/collectives_benchmark.py</code>：测量三种原语的延迟和带宽</li>
+<li><code>labs/L7/ring_algorithm.py</code>：验证 ring all-reduce 的通信量</li>
+<li><code>labs/L7/topology_detect.py</code>：检测 P2P 连接和拓扑</li>
+</ol>
+<p>运行方式：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 实验 1：通信原语对比</span>
+torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">4</span><span class="w"> </span>labs/L7/collectives_benchmark.py
+
+<span class="c1"># 实验 2：ring 算法验证</span>
+torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">4</span><span class="w"> </span>labs/L7/ring_algorithm.py
+
+<span class="c1"># 实验 3：拓扑检测</span>
+torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">4</span><span class="w"> </span>labs/L7/topology_detect.py
+</code></pre></div>
+
+<p>结果保存在 <code>results/worldvln/7.2/</code>。</p>
+<h2 id="_6">总结</h2>
+<ol>
+<li><strong>all-reduce 是训练的核心通信原语</strong>，NCCL 的 ring 实现比朴素 all-gather/reduce-scatter 快 4 倍</li>
+<li><strong>通信量与卡数呈线性关系</strong>：N 卡时，ring 算法通信量是 <code>2(N-1)/N×M</code>，接近 2M</li>
+<li><strong>硬件互连决定训练规模上限</strong>：NVLink 可支持千卡训练，PCIe 只能用于小规模实验</li>
+<li><strong>NCCL 通过拓扑感知、流水和 GPU Direct RDMA 达到接近硬件带宽上限</strong></li>
+</ol>
+<p>下一章（7.3）将讲解数据并行、模型并行和流水并行如何组合这些通信原语，以及 FSDP 如何用 all-gather + reduce-scatter 替代 all-reduce 节省显存。</p></article><nav class="pagenav"><a class="nav-prev" href="../L7/7.1-training-loop-systems.html">&#8592; 7.1 训练循环的系统视角</a><a class="nav-next" href="../M/M1-reading-large-codebase.html">M1 如何读一个十万行的混合代码库 &#8594;</a></nav>
+</main>
+</body>
+</html>

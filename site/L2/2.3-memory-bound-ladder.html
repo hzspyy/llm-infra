@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.3 优化阶梯 I：memory-bound 算子</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -26,7 +26,7 @@
 <li><a href="#pytorch">在所测连续归约上比较 PyTorch 与专用实现</a></li>
 </ul>
 </li>
-<li><a href="#llm">工程实现 · 源码走读：LLM 里的归约在哪</a><ul>
+<li><a href="#llm">工程实现 · 源码解析：LLM 里的归约在哪</a><ul>
 <li><a href="#1-rmsnorm">1. RMSNorm 就是一个归约 + 逐元素</a></li>
 <li><a href="#2-fused_add_rms_norm">2. fused_add_rms_norm：融合掉一次往返</a></li>
 <li><a href="#3-attention-online-softmax">3. attention 里的 online softmax 也是归约</a></li>
@@ -58,7 +58,7 @@
 <li><a href="#pytorch">在所测连续归约上比较 PyTorch 与专用实现</a></li>
 </ul>
 </li>
-<li><a href="#llm">工程实现 · 源码走读：LLM 里的归约在哪</a><ul>
+<li><a href="#llm">工程实现 · 源码解析：LLM 里的归约在哪</a><ul>
 <li><a href="#1-rmsnorm">1. RMSNorm 就是一个归约 + 逐元素</a></li>
 <li><a href="#2-fused_add_rms_norm">2. fused_add_rms_norm：融合掉一次往返</a></li>
 <li><a href="#3-attention-online-softmax">3. attention 里的 online softmax 也是归约</a></li>
@@ -84,17 +84,14 @@
   <div class="mod-id">2.3</div>
   <h1>优化阶梯 I：memory-bound 算子</h1>
   <p class="lede">逐步实现连续归约，比较原子操作、分块、向量化与数值累加的代价。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88 · torch 2.13.0</span><span class="chip">数据日期 2026-09-10</span><span class="chip">前置 L1.1（带宽与 Little&#x27;s Law）· L2.1（占用率与尾效应）</span></div>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88 · torch 2.13.0</span><span class="chip">前置 L1.1（带宽与 Little&#x27;s Law）· L2.1（占用率与尾效应）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li>一个归约 kernel 从 naive 到打满带宽，<strong>每一步各贡献多少</strong>？</li>
 <li>教科书上的经典优化（warp shuffle、减少 barrier）在现代 GPU 上还有用吗？</li>
 <li>手写 kernel 能打过 PyTorch 吗？</li>
 </ol>
-<p>归约（reduction）是把一组数合并成一个结果，例如求和或求最大值。
-本章用连续 fp32 数组的求和作为例子，逐步改变线程分工和访存方式。
-在这里的规模与硬件上，v1–v3 的耗时接近，向量化版本的改进更明显。
-这不代表 shuffle 或 barrier 优化普遍无效；后面会说明为什么换一个归约规模后要重新判断。</p>
+<p>归约（reduction）是将张量元素按特定算子（如求和、求最大值）聚合成标量或低维结果的核心操作，也是典型的访存密集型（memory-bound）计算范式。本章以大规模连续 fp32 数组求和为例，从最原始的全局原子操作出发，沿经典优化阶梯逐级重构。我们将深入剖析不同优化手段在现代 GPU 架构下的真实增量与瓶颈迁移，并测定手写专用 kernel 对比框架通用算子的性能边界。</p>
 <hr />
 <h2 id="_2">心智模型：把大量局部和逐级合并</h2>
 <figure>
@@ -169,18 +166,11 @@
 <p>实测：<strong>82.897 ms，3.2 GB/s，只有带宽上限的 0.2%</strong>。</p>
 <p>慢的原因是所有线程争抢同一个地址，硬件必须把 6700 万次加法串行化。</p>
 <div class="admonition note">
-<p class="admonition-title">这个归因在 <a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 用计数器复核过，同时排除了一个竞争解释</p>
-<p>上面这句话是<strong>解释</strong>，不是观测——只看耗时无法区分「原子串行化」和
-「访存模式本身有问题」这两种可能。</p>
-<p><a class="xref" href="../L2/2.6-profiling.html" title="Profiling 工程学">L2.6</a> 在能读硬件计数器的机器上量了同一批 kernel：v0 的
-<code>sector/请求 = 4</code>（一个 warp 的 32 个连续 float = 128 B = 4 个 32 B sector），
-<strong>说明它的读取是完美合并的，一个 sector 都没浪费</strong>。
-排除访存模式之后，剩下的观察是 v0 的 L2 sector 数是其余各级的 <strong>9 倍</strong>，
-与「大量原子读-改-写打在同一地址」一致。</p>
-<p>需要注意这些计数器<strong>支持</strong>该解释，但没有把全部耗时定量归到这一项；
-<code>--set full</code> 显示 red_v0 的 <code>Issue Slots Busy</code> 只有 0.08%，即 warp 几乎发不出指令。</p>
+<p class="admonition-title">硬件性能计数器的交叉验证</p>
+<p>单凭宏观耗时增加，尚无法严格区分究竟是「全局原子锁冲突」还是「全局访存未合并」导致的性能劣化。</p>
+<p>在 <a class="xref" href="../L2/2.6-profiling.html" title="GPU 性能分析">L2.6</a> 中，我们通过底层硬件性能分析器（NCU）直接采集了该 kernel 的底层计数器：v0 的 <code>sector/request</code> 恒等于 4（即 32 个连续 float 严格合并为 128 字节单次全局内存事务），证实访存合并处于完美状态；而 v0 的 L2 缓存访问事务数是其余版本的 <strong>9 倍</strong>，直接印证了数千万次原子“读-改-写”指令在 L2 缓存控制器端口严重拥塞串行的物理事实。同时，其指令发射利用率（<code>Issue Slots Busy</code>）仅有 0.08%，说明几乎所有 warp 都阻塞在等待原子更新的完成队列中。</p>
 </div>
-<p>但更值得注意的是<strong>结果是错的</strong>：</p>
+<p>该实现还存在数值错误：</p>
 <div class="highlight"><pre><span></span><code>✗ 结果 16777216，应为 67108864（相对误差 75.0%）
 </code></pre></div>
 
@@ -259,7 +249,7 @@ warp 在等 <code>LDG</code> 返回的时候，那点同步开销根本不在关
 <p>这不是说 shuffle 没用——它在 <strong>compute-bound</strong> 或 <strong>归约维度很小</strong>
 （比如 RMSNorm 里对 2048 个元素归约）的场景下仍然重要。
 但对"扫一大块显存"这种任务，<strong>它优化的不是瓶颈</strong>。</p>
-<p>一般规律：<strong>优化之前先确认瓶颈在哪。</strong> 本站每一章都在做这件事。</p>
+<p>应根据测量确定主要开销，再选择优化方向。</p>
 </div>
 <h3 id="v4">v4：每次访存指令读取更多元素</h3>
 <div class="highlight"><pre><span></span><code><span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">red_v4</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">float4</span><span class="o">*</span><span class="w"> </span><span class="n">in</span><span class="p">,</span><span class="w"> </span><span class="kt">float</span><span class="o">*</span><span class="w"> </span><span class="n">out</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">n4</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
@@ -356,11 +346,11 @@ FADD 的延迟早就被访存延迟掩盖了。<strong>这组对照未观察到�
 额外的索引计算和分支。本章版本只支持连续 fp32 全归约。</p>
 <p>专用实现可以利用固定的输入条件减少通用处理开销。
 比较时应同时列出它不支持的情况；本例不能推出手写 kernel 普遍快于框架算子。</p>
-<p>最后一行值得单独看：<strong>fp64 累加慢 4.7 倍</strong>（301 vs 1431 GB/s）。
+<p>最后一行显示，<strong>fp64 累加慢 4.7 倍</strong>（301 vs 1431 GB/s）。
 读的字节数完全一样，但消费级 GPU 的 fp64 算力只有 fp32 的 1/64，
 这提示高精度累加可能改变主要成本；确定瓶颈仍需结合相应指令吞吐和计数器。<strong>精度不是免费的</strong>（<a class="xref" href="../L4/4.2-numerics.html" title="数值系统与确定性">L4.2</a> 会展开）。</p>
 <hr />
-<h2 id="llm">工程实现 · 源码走读：LLM 里的归约在哪</h2>
+<h2 id="llm">工程实现 · 源码解析：LLM 里的归约在哪</h2>
 <h3 id="1-rmsnorm">1. RMSNorm 就是一个归约 + 逐元素</h3>
 <p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的这段 kernel trace 中，累计有 952 次 <code>rms_norm_kernel</code> 调用
 （28 层 × 2 个 norm × 17 步）。RMSNorm 的定义：</p>
@@ -423,7 +413,7 @@ Volta 之后必须用带 <code>_sync</code> 后缀的版本——因为独立线
 </code></pre></div>
 
 <p><strong>这个骨架在几乎所有 LLM kernel 里都能见到</strong>（RMSNorm、softmax、LayerNorm）。
-值得背下来。</p>
+后续可用同样的结构分析这些归约算子。</p>
 <p><strong>验证不能省</strong>。本实验每个版本跑完都检查结果：</p>
 <div class="highlight"><pre><span></span><code><span class="kt">bool</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">fabs</span><span class="p">(</span><span class="n">got</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="p">(</span><span class="kt">float</span><span class="p">)</span><span class="n">n</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="kt">float</span><span class="p">)</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0.01f</span><span class="p">;</span>
 <span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">ok</span><span class="p">)</span><span class="w"> </span><span class="n">snprintf</span><span class="p">(</span><span class="n">note</span><span class="p">,</span><span class="w"> </span><span class="p">...,</span><span class="w"> </span><span class="s">"✗ 结果 %.0f，应为 %zu（相对误差 %.1f%%）"</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
@@ -473,8 +463,7 @@ python<span class="w"> </span>labs/L2/torch_reduce_ref.py<span class="w"> </span
 </tr>
 </tbody>
 </table>
-<p>第一行最值得做：它会让你意识到<strong>"最优 kernel"是相对于数据规模的</strong>，
-这也是 cuBLAS/cuDNN 要做 autotuning 的原因（<a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>）。</p>
+<p>第一项实验改变输入规模，检查最优 kernel 是否随之变化。这也是 autotuning 需要针对不同形状搜索的原因，见 <a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>。</p>
 <hr />
 <h2 id="_6">原始现场</h2>
 <details>
@@ -666,7 +655,7 @@ double 在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/Ma
 - vLLM 的 <code>rms_norm_kernel</code> 之所以快，是因为它只做 RMSNorm</p>
 <p><strong>代价是维护成本</strong>：每个专用 kernel 都要为每种 dtype、每种架构单独写和调优
 （<a class="xref" href="../L2/2.2-toolchain-ptx-sass.html" title="编译工具链：nvcc → PTX → SASS">L2.2</a> 实测 <code>libcublasLt.so</code> 里有 5000+ 个 cubin）。
-这就是 Triton / TileLang 这类 DSL 试图解决的问题（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="现代 kernel 编写栈横评">L2.5</a>）。</p>
+这就是 Triton / TileLang 这类 DSL 试图解决的问题（<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="CUDA 与 kernel DSL 对比">L2.5</a>）。</p>
 </details>
 <details>
 <summary>5. 如果输入是 bf16 而不是 fp32，本章的结论要怎么改？</summary>

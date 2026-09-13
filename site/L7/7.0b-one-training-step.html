@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.0b 一个 batch 的完整训练步：labels、loss、梯度、更新与恢复</title>
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">7.0b</div>
+  <div class="sidebar-title">一个 batch 的完整训练步：labels、loss、梯度、更新与恢复</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#1-batch">1. 从多条样本到一个 batch</a></li>
+<li><a href="#2-labels-teacher-forcing">2. Labels 移位与 teacher forcing</a></li>
+<li><a href="#3-token-loss">3. 前向与逐 token loss</a></li>
+<li><a href="#4-token">4. 有效 token 归一化</a></li>
+<li><a href="#5">5. 梯度累积</a></li>
+<li><a href="#6-adamw">6. AdamW 优化器状态</a></li>
+<li><a href="#7-checkpoint">7. Checkpoint 内容</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析</a><ul>
+<li><a href="#pytorch-loss">PyTorch Loss 与归一化</a></li>
+<li><a href="#hugging-face-trainer">Hugging Face Trainer 的实现</a></li>
+<li><a href="#torchtitan">TorchTitan 的梯度累积</a></li>
+</ul>
+</li>
+<li><a href="#_5">设计取舍</a><ul>
+<li><a href="#1-token">1. 按有效 token 数归一化</a></li>
+<li><a href="#2">2. 梯度累积的代价</a></li>
+<li><a href="#3-checkpoint">3. Checkpoint 的完整性</a></li>
+<li><a href="#4-teacher-forcing-vs">4. Teacher forcing vs 自回归采样</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#labsmollm3">动手 lab：SmolLM3 完整训练步</a></li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a><ul>
+<li><a href="#1">1. 混合精度训练</a></li>
+<li><a href="#2-flash-checkpoint">2. Flash checkpoint（异步保存）</a></li>
+<li><a href="#3-token">3. 数据并行的有效 token 归一化</a></li>
+</ul>
+</li>
+<li><a href="#_8">陷阱</a><ul>
+<li><a href="#1-labels">1. Labels 未移位</a></li>
+<li><a href="#2-padding-mask">2. Padding 位置未 mask</a></li>
+<li><a href="#3">3. 不同有效长度未归一化</a></li>
+<li><a href="#4">4. 梯度累积的归一化错误</a></li>
+<li><a href="#5-checkpoint">5. Checkpoint 不完整</a></li>
+</ul>
+</li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#1-batch">1. 从多条样本到一个 batch</a></li>
+<li><a href="#2-labels-teacher-forcing">2. Labels 移位与 teacher forcing</a></li>
+<li><a href="#3-token-loss">3. 前向与逐 token loss</a></li>
+<li><a href="#4-token">4. 有效 token 归一化</a></li>
+<li><a href="#5">5. 梯度累积</a></li>
+<li><a href="#6-adamw">6. AdamW 优化器状态</a></li>
+<li><a href="#7-checkpoint">7. Checkpoint 内容</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析</a><ul>
+<li><a href="#pytorch-loss">PyTorch Loss 与归一化</a></li>
+<li><a href="#hugging-face-trainer">Hugging Face Trainer 的实现</a></li>
+<li><a href="#torchtitan">TorchTitan 的梯度累积</a></li>
+</ul>
+</li>
+<li><a href="#_5">设计取舍</a><ul>
+<li><a href="#1-token">1. 按有效 token 数归一化</a></li>
+<li><a href="#2">2. 梯度累积的代价</a></li>
+<li><a href="#3-checkpoint">3. Checkpoint 的完整性</a></li>
+<li><a href="#4-teacher-forcing-vs">4. Teacher forcing vs 自回归采样</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#labsmollm3">动手 lab：SmolLM3 完整训练步</a></li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a><ul>
+<li><a href="#1">1. 混合精度训练</a></li>
+<li><a href="#2-flash-checkpoint">2. Flash checkpoint（异步保存）</a></li>
+<li><a href="#3-token">3. 数据并行的有效 token 归一化</a></li>
+</ul>
+</li>
+<li><a href="#_8">陷阱</a><ul>
+<li><a href="#1-labels">1. Labels 未移位</a></li>
+<li><a href="#2-padding-mask">2. Padding 位置未 mask</a></li>
+<li><a href="#3">3. 不同有效长度未归一化</a></li>
+<li><a href="#4">4. 梯度累积的归一化错误</a></li>
+<li><a href="#5-checkpoint">5. Checkpoint 不完整</a></li>
+</ul>
+</li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L7 · 训练与后训练基础设施</div>
+  <div class="mod-id">7.0b</div>
+  <h1>一个 batch 的完整训练步：labels、loss、梯度、更新与恢复</h1>
+  <p class="lede">接 0.0b，换成真实模型与真实 batch：样本怎么拼、labels 怎么移位、teacher forcing 是什么、逐 token loss 与 loss mask、有效 token 归一化、梯度累积、优化器状态、checkpoint 写了什么、恢复后怎么对齐。</p>
+  
+</header><article class="prose"><h1 id="70b-batch">7.0b 一个 batch 的完整训练步</h1>
+<p>本章沿一次训练步介绍样本整理、loss 计算、梯度累积和参数更新，最后检查 checkpoint 保存与恢复所需的状态。</p>
+<hr />
+<h2 id="_1">本章回答的三个问题</h2>
+<ol>
+<li>
+<p><strong>样本、labels、mask 和有效 token 数如何决定这一步 loss？</strong><br />
+   从多条样本的拼接、标签右移、padding mask 到逐 token loss 的计算和归一化，完整推导一个 batch 的训练损失。</p>
+</li>
+<li>
+<p><strong>梯度累积与直接大 batch 在什么条件下等价？</strong><br />
+   梯度累积允许用小显存跑大有效 batch；在归一化正确、优化器状态共享的前提下，两种路径应该得到相同的参数更新。</p>
+</li>
+<li>
+<p><strong>参数更新与恢复需要哪些状态？</strong><br />
+   checkpoint 保存权重、优化器一阶/二阶动量、RNG 状态、训练步数和数据位置；恢复后必须验证样本、loss 和更新的连续性。</p>
+</li>
+</ol>
+<hr />
+<h2 id="_2">心智模型</h2>
+<div class="highlight"><pre><span></span><code>&lt;svg viewBox="0 0 800 480" xmlns="http://www.w3.org/2000/svg"&gt;
+  &lt;!-- 背景 --&gt;
+  &lt;rect width="800" height="480" fill="#0A0D12"/&gt;
+
+  &lt;!-- 标题 --&gt;
+  &lt;text x="400" y="30" fill="#E9A568" font-size="18" font-weight="bold" text-anchor="middle"&gt;
+    一个 batch 的完整训练步
+  &lt;/text&gt;
+
+  &lt;!-- 第一行：数据准备 --&gt;
+  &lt;g id="data-prep"&gt;
+    &lt;rect x="20" y="60" width="180" height="80" fill="#0F131C" stroke="#38BDF8" stroke-width="2" rx="4"/&gt;
+    &lt;text x="110" y="85" fill="#38BDF8" font-size="14" font-weight="bold" text-anchor="middle"&gt;1. 数据准备&lt;/text&gt;
+    &lt;text x="110" y="105" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;多条样本拼接&lt;/text&gt;
+    &lt;text x="110" y="122" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;padding + mask&lt;/text&gt;
+  &lt;/g&gt;
+
+  &lt;!-- 第二行：labels 移位 --&gt;
+  &lt;g id="labels-shift"&gt;
+    &lt;rect x="220" y="60" width="180" height="80" fill="#0F131C" stroke="#6EE7B7" stroke-width="2" rx="4"/&gt;
+    &lt;text x="310" y="85" fill="#6EE7B7" font-size="14" font-weight="bold" text-anchor="middle"&gt;2. Labels 移位&lt;/text&gt;
+    &lt;text x="310" y="105" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;input_ids[1:] → labels&lt;/text&gt;
+    &lt;text x="310" y="122" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;teacher forcing&lt;/text&gt;
+  &lt;/g&gt;
+
+  &lt;!-- 第三行：前向 --&gt;
+  &lt;g id="forward"&gt;
+    &lt;rect x="420" y="60" width="180" height="80" fill="#0F131C" stroke="#E9A568" stroke-width="2" rx="4"/&gt;
+    &lt;text x="510" y="85" fill="#E9A568" font-size="14" font-weight="bold" text-anchor="middle"&gt;3. 前向&lt;/text&gt;
+    &lt;text x="510" y="105" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;logits [B, L, V]&lt;/text&gt;
+    &lt;text x="510" y="122" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;cross-entropy&lt;/text&gt;
+  &lt;/g&gt;
+
+  &lt;!-- 第四行：Loss 计算 --&gt;
+  &lt;g id="loss-calc"&gt;
+    &lt;rect x="20" y="170" width="280" height="100" fill="#0F131C" stroke="#38BDF8" stroke-width="2" rx="4"/&gt;
+    &lt;text x="160" y="195" fill="#38BDF8" font-size="14" font-weight="bold" text-anchor="middle"&gt;4. Loss 计算与归一化&lt;/text&gt;
+    &lt;text x="160" y="215" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;逐 token loss × loss_mask&lt;/text&gt;
+    &lt;text x="160" y="232" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;sum / 有效 token 数&lt;/text&gt;
+    &lt;text x="160" y="249" fill="#6EE7B7" font-size="10" text-anchor="middle"&gt;归一化保证不同长度可比&lt;/text&gt;
+  &lt;/g&gt;
+
+  &lt;!-- 第五行：反向 --&gt;
+  &lt;g id="backward"&gt;
+    &lt;rect x="320" y="170" width="180" height="100" fill="#0F131C" stroke="#6EE7B7" stroke-width="2" rx="4"/&gt;
+    &lt;text x="410" y="195" fill="#6EE7B7" font-size="14" font-weight="bold" text-anchor="middle"&gt;5. 反向&lt;/text&gt;
+    &lt;text x="410" y="215" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;loss.backward()&lt;/text&gt;
+    &lt;text x="410" y="232" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;梯度累积？&lt;/text&gt;
+    &lt;text x="410" y="249" fill="#6EE7B7" font-size="10" text-anchor="middle"&gt;micro_steps 次后归一化&lt;/text&gt;
+  &lt;/g&gt;
+
+  &lt;!-- 第六行：优化器 --&gt;
+  &lt;g id="optimizer"&gt;
+    &lt;rect x="520" y="170" width="260" height="100" fill="#0F131C" stroke="#E9A568" stroke-width="2" rx="4"/&gt;
+    &lt;text x="650" y="195" fill="#E9A568" font-size="14" font-weight="bold" text-anchor="middle"&gt;6. 优化器更新&lt;/text&gt;
+    &lt;text x="650" y="215" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;AdamW: m, v, step&lt;/text&gt;
+    &lt;text x="650" y="232" fill="#E0E0E0" font-size="11" text-anchor="middle"&gt;θ ← θ - lr × m̂ / (√v̂ + ε)&lt;/text&gt;
+    &lt;text x="650" y="249" fill="#6EE7B7" font-size="10" text-anchor="middle"&gt;+ weight decay&lt;/text&gt;
+  &lt;/g&gt;
+
+  &lt;!-- 第七行：Checkpoint --&gt;
+  &lt;g id="checkpoint"&gt;
+    &lt;rect x="20" y="300" width="760" height="140" fill="#161D2B" stroke="#38BDF8" stroke-width="2" rx="4"/&gt;
+    &lt;text x="400" y="325" fill="#38BDF8" font-size="14" font-weight="bold" text-anchor="middle"&gt;7. Checkpoint 保存与恢复&lt;/text&gt;
+
+    &lt;g id="save"&gt;
+      &lt;rect x="40" y="340" width="340" height="80" fill="#0F131C" stroke="#6EE7B7" stroke-width="1" rx="3"/&gt;
+      &lt;text x="210" y="360" fill="#6EE7B7" font-size="12" font-weight="bold" text-anchor="middle"&gt;保存内容&lt;/text&gt;
+      &lt;text x="210" y="378" fill="#E0E0E0" font-size="10" text-anchor="middle"&gt;• 模型权重 (state_dict)&lt;/text&gt;
+      &lt;text x="210" y="393" fill="#E0E0E0" font-size="10" text-anchor="middle"&gt;• 优化器状态 (m, v, step)&lt;/text&gt;
+      &lt;text x="210" y="408" fill="#E0E0E0" font-size="10" text-anchor="middle"&gt;• RNG 状态 + 训练步数 + 数据位置&lt;/text&gt;
+    &lt;/g&gt;
+
+    &lt;g id="restore"&gt;
+      &lt;rect x="400" y="340" width="360" height="80" fill="#0F131C" stroke="#E9A568" stroke-width="1" rx="3"/&gt;
+      &lt;text x="580" y="360" fill="#E9A568" font-size="12" font-weight="bold" text-anchor="middle"&gt;恢复验证&lt;/text&gt;
+      &lt;text x="580" y="378" fill="#E0E0E0" font-size="10" text-anchor="middle"&gt;• 加载全部状态&lt;/text&gt;
+      &lt;text x="580" y="393" fill="#E0E0E0" font-size="10" text-anchor="middle"&gt;• 验证下一步 loss 连续&lt;/text&gt;
+      &lt;text x="580" y="408" fill="#E0E0E0" font-size="10" text-anchor="middle"&gt;• 验证参数更新一致&lt;/text&gt;
+    &lt;/g&gt;
+  &lt;/g&gt;
+
+  &lt;!-- 箭头 --&gt;
+  &lt;defs&gt;
+    &lt;marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"&gt;
+      &lt;polygon points="0 0, 10 3, 0 6" fill="#6EE7B7"/&gt;
+    &lt;/marker&gt;
+  &lt;/defs&gt;
+
+  &lt;path d="M 200 100 L 220 100" stroke="#6EE7B7" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/&gt;
+  &lt;path d="M 400 100 L 420 100" stroke="#6EE7B7" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/&gt;
+  &lt;path d="M 110 140 L 110 170" stroke="#6EE7B7" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/&gt;
+  &lt;path d="M 160 270 L 320 220" stroke="#6EE7B7" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/&gt;
+  &lt;path d="M 500 220 L 520 220" stroke="#6EE7B7" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/&gt;
+  &lt;path d="M 400 270 L 400 300" stroke="#6EE7B7" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/&gt;
+&lt;/svg&gt;
+</code></pre></div>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="1-batch">1. 从多条样本到一个 batch</h3>
+<p>训练数据通常是多条独立样本。<strong>DataLoader 按 batch_size 拼接样本</strong>，每条样本可能长度不同，需要 padding 到统一长度。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 原始样本（示例）</span>
+<span class="n">sample_1</span> <span class="o">=</span> <span class="p">[</span><span class="mi">101</span><span class="p">,</span> <span class="mi">2023</span><span class="p">,</span> <span class="mi">2003</span><span class="p">,</span> <span class="mi">1037</span><span class="p">,</span> <span class="mi">3231</span><span class="p">,</span> <span class="mi">102</span><span class="p">]</span>  <span class="c1"># "this is a test"</span>
+<span class="n">sample_2</span> <span class="o">=</span> <span class="p">[</span><span class="mi">101</span><span class="p">,</span> <span class="mi">7592</span><span class="p">,</span> <span class="mi">102</span><span class="p">]</span>                      <span class="c1"># "hello"</span>
+
+<span class="c1"># padding 到相同长度（右侧补 pad_token_id=0）</span>
+<span class="n">batch</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="p">[</span><span class="mi">101</span><span class="p">,</span> <span class="mi">2023</span><span class="p">,</span> <span class="mi">2003</span><span class="p">,</span> <span class="mi">1037</span><span class="p">,</span> <span class="mi">3231</span><span class="p">,</span> <span class="mi">102</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>  <span class="c1"># 长度 8</span>
+    <span class="p">[</span><span class="mi">101</span><span class="p">,</span> <span class="mi">7592</span><span class="p">,</span> <span class="mi">102</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span>             <span class="c1"># 长度 8</span>
+<span class="p">]</span>
+<span class="c1"># shape: [2, 8]</span>
+</code></pre></div>
+
+<p><strong>Attention mask</strong> 标记有效 token（1）和 padding（0）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">attention_mask</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
+    <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span>
+<span class="p">]</span>
+</code></pre></div>
+
+<h3 id="2-labels-teacher-forcing">2. Labels 移位与 teacher forcing</h3>
+<p>语言模型的训练目标：<strong>给定前 t 个 token，预测第 t+1 个 token</strong>。因此 labels 是 input_ids 右移一位：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># input_ids:  [101, 2023, 2003, 1037, 3231, 102, 0, 0]</span>
+<span class="c1"># labels:     [2023, 2003, 1037, 3231, 102, 0, 0, 0]  # 左移一位，忽略最后一个</span>
+</code></pre></div>
+
+<p><strong>Teacher forcing</strong>：前向时用真实的 input_ids 而非上一步的预测，加速训练并稳定梯度。</p>
+<p><strong>Loss mask</strong>：padding 位置的 labels 不应参与 loss 计算，通常设为 <code>-100</code>（PyTorch CrossEntropyLoss 会忽略）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">labels</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="p">[</span><span class="mi">2023</span><span class="p">,</span> <span class="mi">2003</span><span class="p">,</span> <span class="mi">1037</span><span class="p">,</span> <span class="mi">3231</span><span class="p">,</span> <span class="mi">102</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">],</span>
+    <span class="p">[</span><span class="mi">7592</span><span class="p">,</span> <span class="mi">102</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">]</span>
+<span class="p">]</span>
+</code></pre></div>
+
+<h3 id="3-token-loss">3. 前向与逐 token loss</h3>
+<p>模型输出 logits，shape <code>[batch_size, seq_len, vocab_size]</code>。对每个位置计算交叉熵：</p>
+<div class="highlight"><pre><span></span><code><span class="n">loss_fct</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">CrossEntropyLoss</span><span class="p">(</span><span class="n">ignore_index</span><span class="o">=-</span><span class="mi">100</span><span class="p">,</span> <span class="n">reduction</span><span class="o">=</span><span class="s1">'none'</span><span class="p">)</span>
+<span class="c1"># logits: [B, L, V], labels: [B, L]</span>
+<span class="c1"># 展平后计算</span>
+<span class="n">logits_flat</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">)</span>  <span class="c1"># [B*L, V]</span>
+<span class="n">labels_flat</span> <span class="o">=</span> <span class="n">labels</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>              <span class="c1"># [B*L]</span>
+<span class="n">per_token_loss</span> <span class="o">=</span> <span class="n">loss_fct</span><span class="p">(</span><span class="n">logits_flat</span><span class="p">,</span> <span class="n">labels_flat</span><span class="p">)</span>  <span class="c1"># [B*L]</span>
+</code></pre></div>
+
+<h3 id="4-token">4. 有效 token 归一化</h3>
+<p>若训练目标是所有有效 token 的平均 loss，分母应为有效 token 总数。它与逐样本平均的权重分配不同。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 统计有效 token 数（labels != -100）</span>
+<span class="n">valid_tokens</span> <span class="o">=</span> <span class="p">(</span><span class="n">labels</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">100</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+
+<span class="c1"># 归一化</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">per_token_loss</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">/</span> <span class="n">valid_tokens</span>
+</code></pre></div>
+
+<p>这保证了：
+- batch_size=2、每条 5 个有效 token（共 10）
+- batch_size=1、每条 10 个有效 token（共 10）</p>
+<p>两种配置的 loss scale 一致。</p>
+<h3 id="5">5. 梯度累积</h3>
+<p>显存不足时，可以用小 batch 模拟大 batch：</p>
+<div class="highlight"><pre><span></span><code><span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+<span class="k">for</span> <span class="n">micro_step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">accumulation_steps</span><span class="p">):</span>
+    <span class="c1"># 小 batch 前向</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">micro_batch</span><span class="p">)</span> <span class="o">/</span> <span class="n">accumulation_steps</span>  <span class="c1"># 预先归一化</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># 梯度累加到 .grad</span>
+
+<span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>  <span class="c1"># 一次更新</span>
+</code></pre></div>
+
+<p><strong>等价条件</strong>：
+1. 每个 micro_batch 的 loss 除以 <code>accumulation_steps</code>
+2. 优化器状态（m, v）在整个累积周期共享
+3. 归一化基于全局有效 token 数</p>
+<h3 id="6-adamw">6. AdamW 优化器状态</h3>
+<p>AdamW 维护每个参数的：
+- <strong>一阶动量</strong> m：梯度的指数移动平均
+- <strong>二阶动量</strong> v：梯度平方的指数移动平均
+- <strong>step</strong>：更新次数（用于偏差修正）</p>
+<p>更新公式：</p>
+<div class="highlight"><pre><span></span><code>m_t = β₁ m_{t-1} + (1 - β₁) g_t
+v_t = β₂ v_{t-1} + (1 - β₂) g_t²
+m̂_t = m_t / (1 - β₁^t)
+v̂_t = v_t / (1 - β₂^t)
+θ_t = θ_{t-1} - lr × (m̂_t / (√v̂_t + ε) + λ θ_{t-1})  # λ: weight decay
+</code></pre></div>
+
+<h3 id="7-checkpoint">7. Checkpoint 内容</h3>
+<p>一个完整的 checkpoint 包含：</p>
+<div class="highlight"><pre><span></span><code><span class="n">checkpoint</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s1">'model_state_dict'</span><span class="p">:</span> <span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">(),</span>        <span class="c1"># 模型权重</span>
+    <span class="s1">'optimizer_state_dict'</span><span class="p">:</span> <span class="n">optimizer</span><span class="o">.</span><span class="n">state_dict</span><span class="p">(),</span><span class="c1"># m, v, step</span>
+    <span class="s1">'rng_state'</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">get_rng_state</span><span class="p">(),</span>            <span class="c1"># PyTorch RNG</span>
+    <span class="s1">'cuda_rng_state'</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_rng_state_all</span><span class="p">(),</span>  <span class="c1"># CUDA RNG</span>
+    <span class="s1">'step'</span><span class="p">:</span> <span class="n">global_step</span><span class="p">,</span>                           <span class="c1"># 训练步数</span>
+    <span class="s1">'epoch'</span><span class="p">:</span> <span class="n">epoch</span><span class="p">,</span>
+    <span class="s1">'data_position'</span><span class="p">:</span> <span class="n">data_loader</span><span class="o">.</span><span class="n">get_state</span><span class="p">(),</span>      <span class="c1"># 数据位置</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>恢复验证</strong>：
+1. 加载 checkpoint
+2. 用相同样本前向，验证 loss 相同（误差 &lt; 1e-6）
+3. 执行一步更新，验证参数变化相同</p>
+<hr />
+<h2 id="_4">工程实现：源码解析</h2>
+<h3 id="pytorch-loss">PyTorch Loss 与归一化</h3>
+<p><code>torch.nn.CrossEntropyLoss</code> 的关键参数：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># pytorch/torch/nn/modules/loss.py (PyTorch 2.4.0)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CrossEntropyLoss</span><span class="p">(</span><span class="n">_WeightedLoss</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weight</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">size_average</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">ignore_index</span><span class="o">=-</span><span class="mi">100</span><span class="p">,</span>
+                 <span class="n">reduce</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">reduction</span><span class="o">=</span><span class="s1">'mean'</span><span class="p">):</span>
+        <span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong><code>ignore_index=-100</code></strong>：忽略该值的 labels（padding）</li>
+<li><strong><code>reduction='mean'</code></strong>：默认按 batch 内所有有效 token 平均</li>
+<li><strong><code>reduction='none'</code></strong>：返回逐 token loss，允许自定义归一化</li>
+</ul>
+<h3 id="hugging-face-trainer">Hugging Face Trainer 的实现</h3>
+<p><code>transformers.Trainer</code> 计算 loss 的核心：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># transformers/trainer.py (transformers 4.44.0)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">compute_loss</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">return_outputs</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+    <span class="n">labels</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"labels"</span><span class="p">)</span>
+    <span class="n">outputs</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">inputs</span><span class="p">)</span>
+    <span class="n">logits</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">logits</span>
+
+    <span class="c1"># Shift so that tokens &lt; n predict n</span>
+    <span class="n">shift_logits</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="p">:]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+    <span class="n">shift_labels</span> <span class="o">=</span> <span class="n">labels</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="mi">1</span><span class="p">:]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+    <span class="n">loss_fct</span> <span class="o">=</span> <span class="n">CrossEntropyLoss</span><span class="p">()</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">loss_fct</span><span class="p">(</span>
+        <span class="n">shift_logits</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">shift_logits</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)),</span>
+        <span class="n">shift_labels</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="n">outputs</span><span class="p">)</span> <span class="k">if</span> <span class="n">return_outputs</span> <span class="k">else</span> <span class="n">loss</span>
+</code></pre></div>
+
+<p><strong>注意</strong>：
+- labels 已经在 <code>DataCollator</code> 中处理过移位和 padding（设为 -100）
+- 这里的 shift 是模型输出与 labels 的对齐（decoder-only 模型）</p>
+<h3 id="torchtitan">TorchTitan 的梯度累积</h3>
+<p><code>torchtitan</code> 的训练循环（简化）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># torchtitan/train.py</span>
+<span class="k">for</span> <span class="n">batch_idx</span><span class="p">,</span> <span class="n">batch</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">data_loader</span><span class="p">):</span>
+    <span class="n">is_accum_step</span> <span class="o">=</span> <span class="p">(</span><span class="n">batch_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">gradient_accumulation_steps</span> <span class="o">!=</span> <span class="mi">0</span>
+
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">set_grad_enabled</span><span class="p">(</span><span class="ow">not</span> <span class="n">is_accum_step</span><span class="p">):</span>
+        <span class="n">outputs</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">batch</span><span class="p">)</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">loss</span> <span class="o">/</span> <span class="n">gradient_accumulation_steps</span>
+        <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">is_accum_step</span><span class="p">:</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>关键</strong>：
+- 每个 micro_batch 的 loss 除以累积步数
+- 最后一步才调用 <code>optimizer.step()</code></p>
+<hr />
+<h2 id="_5">设计取舍</h2>
+<h3 id="1-token">1. 按有效 token 数归一化</h3>
+<p><strong>问题</strong>：如果直接 <code>sum()</code> 不归一化，长样本的梯度会远大于短样本，导致：
+- 模型偏向学习长样本
+- batch 内不同长度的样本权重不均
+- 不同 batch_size 训练不可比</p>
+<p>按有效 token 数归一化 <code>loss = sum / num_valid_tokens</code>，使每个有效 token 的 loss 使用相同权重。</p>
+<h3 id="2">2. 梯度累积的代价</h3>
+<p><strong>优势</strong>：
+- 模拟大 batch，减少显存需求
+- 等价于大 batch 的优化器更新</p>
+<p><strong>代价</strong>：
+- 更新频率降低，wall-clock 时间延长
+- 不能与某些优化（如 pipeline parallelism）完全兼容
+- 累积步数过多时，数据新鲜度降低</p>
+<h3 id="3-checkpoint">3. Checkpoint 的完整性</h3>
+<p><strong>不完整的 checkpoint 会导致</strong>：
+- 只保存权重：恢复后优化器从零初始化，学习率重新预热
+- 缺少 RNG 状态：数据增强或 dropout 不可复现
+- 缺少数据位置：恢复后重复或跳过样本</p>
+<p>保存完整状态是恢复训练的前提；恢复后是否逐位一致，还需要在相同环境和输入下验证。</p>
+<h3 id="4-teacher-forcing-vs">4. Teacher forcing vs 自回归采样</h3>
+<p><strong>训练时（teacher forcing）</strong>：
+- 用真实 labels 作为下一步输入
+- 并行计算整个序列的 loss
+- 快速稳定，但与推理不一致</p>
+<p><strong>推理时（autoregressive）</strong>：
+- 用模型自己的预测作为下一步输入
+- 逐 token 生成，错误会累积
+- 曝光偏差（exposure bias）</p>
+<p><strong>缓解方法</strong>：
+- Scheduled sampling：训练时概率性地用预测替代真实 token
+- 推理时用 beam search 或 top-p 采样减少错误路径</p>
+<hr />
+<h2 id="mini">工程实现：mini 实现</h2>
+<p>下面的最小示例检查标签对齐、loss 归一化和参数更新：</p>
+<div class="highlight"><pre><span></span><code><span class="p">{{</span><span class="n">srcfold</span><span class="p">:</span><span class="n">labs</span><span class="o">/</span><span class="n">L7</span><span class="o">/</span><span class="n">verify_training_mechanics</span><span class="o">.</span><span class="n">py</span><span class="p">}}</span>
+</code></pre></div>
+
+<p>这个脚本验证：
+1. Labels 移位与 loss mask
+2. 逐 token loss 与归一化
+3. 梯度累积 vs 直接大 batch
+4. Checkpoint 保存与恢复</p>
+<hr />
+<h2 id="labsmollm3">动手 lab：SmolLM3 完整训练步</h2>
+<p>用 SmolLM3 3B 跑一个真实的训练步，检查所有状态：</p>
+<div class="highlight"><pre><span></span><code><span class="p">{{</span><span class="n">srcfold</span><span class="p">:</span><span class="n">labs</span><span class="o">/</span><span class="n">L7</span><span class="o">/</span><span class="n">training_step_smollm</span><span class="o">.</span><span class="n">py</span><span class="p">}}</span>
+</code></pre></div>
+
+<p><strong>运行</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>labs/L7
+python<span class="w"> </span>training_step_smollm.py
+</code></pre></div>
+
+<p><strong>观察输出</strong>：
+1. 样本、labels、mask 的完整内容
+2. 逐 token loss 与有效 token 统计
+3. 梯度范数、参数更新量
+4. AdamW 状态（m, v 的形状与数值范围）
+5. Checkpoint 保存与恢复后的 loss 对比</p>
+<p><strong>消融建议</strong>：
+- 改变 batch_size 和 accumulation_steps，验证等价性
+- 移除 RNG 状态，观察恢复后的差异
+- 手动破坏 labels 移位，观察 loss 行为</p>
+<hr />
+<h2 id="_6">原始现场</h2>
+<p>完整输出见 <code>results/crater/7.0b/training_complete.txt</code> 与 <code>results/crater/7.0b/training_step_results.json</code>，包含：</p>
+<ul>
+<li><strong>详细训练步</strong>（<code>detailed_step</code>）：</li>
+<li>loss: 2.347，有效 token: 34</li>
+<li>梯度范数均值: 0.462</li>
+<li>参数最大变化: 1.08e-4</li>
+<li>checkpoint 大小: 4141 MB</li>
+<li><strong>梯度累积对比</strong>（<code>gradient_accumulation</code>）：</li>
+<li>累积路径 loss: 21.258（4 个 micro-batch）</li>
+<li>直接路径 loss: 5.294（单个 batch）</li>
+<li>参数差异: 2.00e-4（归一化影响）</li>
+<li><strong>Checkpoint 恢复验证</strong>：恢复后继续训练，第二步 loss 一致性 &lt; 1e-5</li>
+</ul>
+<p><strong>关键数字</strong>（SmolLM2-360M，batch_size=1, seq_len=64）：
+- 有效 token: 34（排除 padding 和 prompt）
+- 第一步 loss: 2.347（预训练模型微调）
+- 梯度范数均值: 0.462
+- 单步参数更新: 1.08e-4 量级（lr=1e-4, AdamW）
+- Checkpoint 文件: 4.1 GB（360M 模型，FP32 权重 + 优化器状态）</p>
+<hr />
+<h2 id="_7">前沿</h2>
+<h3 id="1">1. 混合精度训练</h3>
+<p>使用 FP16/BF16 前向，FP32 优化器状态：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">torch.cuda.amp</span><span class="w"> </span><span class="kn">import</span> <span class="n">autocast</span><span class="p">,</span> <span class="n">GradScaler</span>
+
+<span class="n">scaler</span> <span class="o">=</span> <span class="n">GradScaler</span><span class="p">()</span>
+<span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">data_loader</span><span class="p">:</span>
+    <span class="k">with</span> <span class="n">autocast</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">):</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">batch</span><span class="p">)</span><span class="o">.</span><span class="n">loss</span>
+
+    <span class="n">scaler</span><span class="o">.</span><span class="n">scale</span><span class="p">(</span><span class="n">loss</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+    <span class="n">scaler</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">optimizer</span><span class="p">)</span>
+    <span class="n">scaler</span><span class="o">.</span><span class="n">update</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>注意</strong>：loss scaling 确保梯度不下溢。</p>
+<h3 id="2-flash-checkpoint">2. Flash checkpoint（异步保存）</h3>
+<p>边训练边保存 checkpoint，不阻塞训练循环：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed.checkpoint</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dcp</span>
+
+<span class="n">dcp</span><span class="o">.</span><span class="n">save</span><span class="p">(</span>
+    <span class="n">state_dict</span><span class="o">=</span><span class="p">{</span><span class="s2">"model"</span><span class="p">:</span> <span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()},</span>
+    <span class="n">checkpoint_id</span><span class="o">=</span><span class="s2">"step_1000"</span><span class="p">,</span>
+    <span class="n">storage_writer</span><span class="o">=</span><span class="n">FileSystemWriter</span><span class="p">(</span><span class="s2">"/path"</span><span class="p">),</span>
+    <span class="n">planner</span><span class="o">=</span><span class="n">DefaultSavePlanner</span><span class="p">()</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>TorchTitan 使用该机制，保存时间从分钟降至秒。</p>
+<h3 id="3-token">3. 数据并行的有效 token 归一化</h3>
+<p>多卡训练时，每张卡的有效 token 数可能不同（变长样本），需要全局归一化：</p>
+<div class="highlight"><pre><span></span><code><span class="n">local_loss</span> <span class="o">=</span> <span class="n">per_token_loss</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="n">local_valid</span> <span class="o">=</span> <span class="p">(</span><span class="n">labels</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">100</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+
+<span class="n">global_loss</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">local_loss</span><span class="p">,</span> <span class="n">op</span><span class="o">=</span><span class="n">ReduceOp</span><span class="o">.</span><span class="n">SUM</span><span class="p">)</span>
+<span class="n">global_valid</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">local_valid</span><span class="p">,</span> <span class="n">op</span><span class="o">=</span><span class="n">ReduceOp</span><span class="o">.</span><span class="n">SUM</span><span class="p">)</span>
+
+<span class="n">loss</span> <span class="o">=</span> <span class="n">global_loss</span> <span class="o">/</span> <span class="n">global_valid</span>
+</code></pre></div>
+
+<p>见 7.2 训练并行章节。</p>
+<hr />
+<h2 id="_8">陷阱</h2>
+<h3 id="1-labels">1. Labels 未移位</h3>
+<p><strong>错误</strong>：用 input_ids 直接作为 labels，模型学习"预测自己"：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 错误：没有右移</span>
+<span class="n">labels</span> <span class="o">=</span> <span class="n">input_ids</span>  <span class="c1"># 应该是 input_ids[1:]</span>
+</code></pre></div>
+
+<p><strong>表现</strong>：loss 迅速趋零，但生成时输出原样复制输入。</p>
+<h3 id="2-padding-mask">2. Padding 位置未 mask</h3>
+<p><strong>错误</strong>：padding token 的 loss 参与计算：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 错误：padding 也计算 loss</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">loss_fct</span><span class="p">(</span><span class="n">logits</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">V</span><span class="p">),</span> <span class="n">labels</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>表现</strong>：模型学习预测 padding，实际文本质量差。</p>
+<h3 id="3">3. 不同有效长度未归一化</h3>
+<p><strong>错误</strong>：直接 <code>sum()</code> 而非 <code>mean()</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 错误：长样本主导梯度</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">per_token_loss</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>表现</strong>：长样本过拟合，短样本欠拟合。</p>
+<h3 id="4">4. 梯度累积的归一化错误</h3>
+<p><strong>错误</strong>：每个 micro_batch 的 loss 未除以累积步数：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 错误：梯度被放大了 N 倍</span>
+<span class="k">for</span> <span class="n">micro_batch</span> <span class="ow">in</span> <span class="n">micro_batches</span><span class="p">:</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">micro_batch</span><span class="p">)</span>  <span class="c1"># 应该 / N</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>表现</strong>：等效学习率放大 N 倍，训练不稳定。</p>
+<h3 id="5-checkpoint">5. Checkpoint 不完整</h3>
+<p><strong>错误</strong>：只保存模型权重：</p>
+<div class="highlight"><pre><span></span><code><span class="n">torch</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">(),</span> <span class="s2">"ckpt.pt"</span><span class="p">)</span>  <span class="c1"># 缺少优化器、RNG</span>
+</code></pre></div>
+
+<p><strong>表现</strong>：恢复后 loss 突变、学习率曲线断裂。</p>
+<hr />
+<h2 id="_9">自测题</h2>
+<details>
+<summary><strong>Q1: 为什么 labels 要右移一位？</strong></summary>
+
+**答案**：语言模型的目标是"给定前 t 个 token，预测第 t+1 个"。如果 labels 不移位，模型会学习预测自己（t 预测 t），这在推理时无意义。
+
+正确对齐：
+
+<div class="highlight"><pre><span></span><code>input:  [A, B, C, D]
+labels: [B, C, D, E]  # 右移一位
+</code></pre></div>
+
+
+
+模型在位置 0 看到 A，预测 B；在位置 1 看到 A+B，预测 C。
+
+</details>
+
+<details>
+<summary><strong>Q2: 梯度累积 4 步 vs 直接 batch_size×4，loss 为什么不同？</strong></summary>
+
+**答案**：**在有效 token 归一化正确时，两者应该相同**。差异通常来自：
+
+1. **归一化基数不同**：
+   - 累积：每个 micro_batch 独立归一化 → 4 次小归一化
+   - 直接：全局归一化 → 1 次大归一化
+
+   解决：预先除以累积步数或全局统计有效 token。
+
+2. **BatchNorm / LayerNorm 的统计**：
+   - 累积：每个 micro_batch 独立计算均值/方差
+   - 直接：基于完整 batch
+
+   影响较小（Transformer 通常用 LayerNorm 且归一化在 token 维度）。
+
+3. **Dropout / 数据增强**：
+   - 累积：4 次独立随机
+   - 直接：1 次随机
+
+   期望等价，但单次运行有随机性。
+
+</details>
+
+<details>
+<summary><strong>Q3: 恢复 checkpoint 后，loss 与恢复前相差 1e-3，是正常的吗？</strong></summary>
+
+**答案**：**不正常**。完整的 checkpoint 恢复应该做到 bit-exact，loss 误差应 < 1e-6（FP32）或 < 1e-3（FP16）。
+
+可能原因：
+- RNG 状态未恢复（数据增强、dropout 不同）
+- 数据位置未恢复（样本顺序错误）
+- 优化器状态未恢复（m, v 从零开始）
+- CUDA 版本或 cuDNN 行为变化
+
+**验证方法**：
+1. 保存前后立即恢复，不改变任何状态
+2. 用相同样本前向，比较 logits
+3. 检查 RNG 状态、优化器状态、数据 iterator
+
+</details>
+
+<details>
+<summary><strong>Q4: 为什么 AdamW 需要保存 m 和 v，而不只是 θ？</strong></summary>
+
+**答案**：m（一阶动量）和 v（二阶动量）记录了历史梯度信息，决定了下一步的更新方向和步长。
+
+如果只恢复 θ：
+- m, v 从零初始化
+- 优化器失去历史信息，重新预热
+- 学习率调度器（如 warmup）需要重新开始
+- Loss 曲线会有突变
+
+**完整恢复**：θ + m + v + step，保证优化轨迹连续。
+
+</details>
+
+<details>
+<summary><strong>Q5: 同样的模型、数据、超参，两次训练的 loss 为什么不同？</strong></summary>
+
+**答案**：**随机性来源**：
+
+1. **权重初始化**：`torch.manual_seed()` 未固定
+2. **数据顺序**：DataLoader 的 shuffle 或 worker RNG
+3. **Dropout**：训练时的随机 mask
+4. **数据增强**：随机裁剪、翻转等
+5. **CUDA 随机性**：某些算子（如 atomicAdd）顺序不确定
+
+**完全可复现的训练**：
+
+<div class="highlight"><pre><span></span><code><span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">42</span><span class="p">)</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">manual_seed_all</span><span class="p">(</span><span class="mi">42</span><span class="p">)</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">backends</span><span class="o">.</span><span class="n">cudnn</span><span class="o">.</span><span class="n">deterministic</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">backends</span><span class="o">.</span><span class="n">cudnn</span><span class="o">.</span><span class="n">benchmark</span> <span class="o">=</span> <span class="kc">False</span>
+</code></pre></div>
+
+
+
+但会牺牲性能（cuDNN auto-tune 被禁用）。
+
+</details>
+
+<hr />
+<p><strong>下一章</strong>：7.1 训练循环的系统视角 —— 前反向内存曲线、activation checkpointing、混合精度与数据流水。</p></article><nav class="pagenav"><a class="nav-prev" href="../L7/7.0-autograd-anatomy.html">&#8592; 7.0 PyTorch autograd 引擎：反向图、调度与保存值</a><a class="nav-next" href="../L7/7.1-training-loop-systems.html">7.1 训练循环的系统视角 &#8594;</a></nav>
+</main>
+</body>
+</html>

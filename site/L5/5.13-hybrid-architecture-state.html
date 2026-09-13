@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.13 混合架构的状态管理</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
@@ -25,7 +25,7 @@
 </ul>
 </li>
 <li><a href="#vllm">工程实现：vLLM 的混合缓存管理</a><ul>
-<li><a href="#_4">源码走读：状态分配与池化</a></li>
+<li><a href="#_4">源码解析：状态分配与池化</a></li>
 </ul>
 </li>
 <li><a href="#lab">动手 lab：检查混合架构的状态分布</a></li>
@@ -65,7 +65,7 @@
 </ul>
 </li>
 <li><a href="#vllm">工程实现：vLLM 的混合缓存管理</a><ul>
-<li><a href="#_4">源码走读：状态分配与池化</a></li>
+<li><a href="#_4">源码解析：状态分配与池化</a></li>
 </ul>
 </li>
 <li><a href="#lab">动手 lab：检查混合架构的状态分布</a></li>
@@ -99,26 +99,15 @@
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
   <div class="mod-id">5.13</div>
   <h1>混合架构的状态管理</h1>
-  <p class="lede">逐层管理 attention KV、recurrent state 与窗口状态，比较分配、前缀复用、快照和投机回滚；混合模型的容量与复制成本以实际状态布局为准。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · RecurrentGemma-2B · vLLM 0.29.0</span><span class="chip">数据日期 2026-09-12</span><span class="chip">前置 3.4（稀疏与线性 attention）· 5.2（KV 分页）· 5.5（投机解码）</span></div>
+  <p class="lede">管理混合模型中的 KV cache、循环状态和窗口状态，介绍前缀复用、快照及投机回滚。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · RecurrentGemma-2B · vLLM 0.29.0</span><span class="chip">前置 3.4（稀疏与线性 attention）· 5.2（KV 分页）· 5.5（投机解码）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
-<p>5.2 讲了 KV cache 的分页与前缀复用，5.5 讲了投机解码的状态回滚。
-这两章都默认每一层都产生 KV cache，而且 cache 的大小随上下文线性增长。</p>
-<p><strong>混合架构打破了这两个假设。</strong> RecurrentGemma、Mamba、Jamba 这类模型把部分层换成 RNN 或线性 attention：
-那些层不再有 KV cache，取而代之的是<strong>定长的 recurrent state</strong>。</p>
+<p>混合模型中的层不一定都保存 KV cache。循环层或线性 attention 可以使用定长状态，局部 attention 则保留窗口内的 KV。不同状态的更新方式，也决定了前缀复用和投机回滚的实现。</p>
 <ol>
 <li>混合模型里每层的「状态」分别是什么形状？</li>
 <li>定长状态还能不能做 prefix cache？为什么？</li>
 <li>投机解码验证失败时，recurrent state 怎么回滚？</li>
 </ol>
-<p>结论先给：</p>
-<ul>
-<li><strong>层级混合。</strong> RecurrentGemma-2B 的 26 层中，18 层是 recurrent（RNN Griffin），8 层是 local attention。每 3 层循环一次模式：<code>[recurrent, recurrent, attention]</code>。</li>
-<li><strong>状态形状差异。</strong> Recurrent 层的状态是定长的：<code>(batch, heads, conv_width, head_dim) = (B, 10, 4, 256)</code>，每层每 batch 固定 20 KB。Attention 层的 KV cache 是可变的：<code>(2, kv_heads, seq_len, head_dim) = (2, 1, L, 256)</code>，每层每 token 1 KB。</li>
-<li><strong>容量对照。</strong> Context 从 256 增长到 2048（7.95×），prefill 时间只增长 3.53×，说明<strong>固定状态占主导，KV 增长被摊薄</strong>。纯 attention 模型下这个比值接近 1:1。</li>
-<li><strong>前缀复用仍然有效。</strong> 相同前缀的后续请求比首次快 1.29×（时间减少 22.8%）。vLLM 的前缀哈希包含了 recurrent state，定长状态不妨碍复用。</li>
-<li><strong>投机回滚的代价不同。</strong> KV cache 回滚只需调整块引用；recurrent state 回滚需要恢复整块张量（360 KB/batch vs 按 token 计的 KV）。</li>
-</ul>
 <hr />
 <h2 id="_2">心智模型：两类状态的对照</h2>
 <svg viewBox="0 0 780 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="混合架构的状态分配">
@@ -476,7 +465,7 @@
 </ul>
 <hr />
 <h2 id="vllm">工程实现：vLLM 的混合缓存管理</h2>
-<h3 id="_4">源码走读：状态分配与池化</h3>
+<h3 id="_4">源码解析：状态分配与池化</h3>
 <p>vLLM 对混合架构的支持位于 <code>vllm/attention/backends/</code> 和 cache 管理层。
 以 RecurrentGemma 为例（vLLM 0.29.0）：</p>
 <p><strong>1. 层类型识别</strong></p>
@@ -744,7 +733,7 @@ Mamba 把序列建模完全线性化，没有 attention 层，状态大小完全
 <li>Batch 策略需要考虑 recurrent 层不参与权重摊薄的事实。</li>
 </ul>
 <p>下一步（L6）进入分布式：当模型跨卡分布时，recurrent state 的通信模式和 KV cache 完全不同——
-定长状态不能像 KV 一样分片传输，需要全量广播或点对点同步。</p></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.12-non-generative-serving.html">&#8592; 5.12 非生成模型的服务</a><a class="nav-next" href="../M/M1-reading-large-codebase.html">M1 如何读一个十万行的混合代码库 &#8594;</a></nav>
+定长状态不能像 KV 一样分片传输，需要全量广播或点对点同步。</p></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.12-non-generative-serving.html">&#8592; 5.12 非生成模型的服务</a><a class="nav-next" href="../L7/7.0-autograd-anatomy.html">7.0 PyTorch autograd 引擎：反向图、调度与保存值 &#8594;</a></nav>
 </main>
 </body>
 </html>

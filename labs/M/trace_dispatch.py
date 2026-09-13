@@ -48,7 +48,7 @@ def method_c_registration_lookup():
     print()
     print("预期看到：")
     print("  - func: linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor")
-    print("  - dispatch: 会列出 CPU/CUDA 等实现")
+    print("  - dispatch: 按固定源码与运行时注册表核对 composite 或专用实现")
     print()
 
 
@@ -60,7 +60,7 @@ if __name__ == "__main__":
     print("=== Summary ===")
     print("观察到：")
     print("  - Python 层看到 F.linear")
-    print("  - Dispatcher 层看到它分解成 t + addmm")
-    print("  - 真实 kernel 在 addmm 里")
+    print("  - Dispatcher 层看到它分解成 t + mm（本例无 bias）")
+    print("  - mm 是框架算子；具体底层 kernel 需另采运行轨迹")
     print()
     print("这就是「观察层次」：你在不同层看到不同的名字和粒度。")

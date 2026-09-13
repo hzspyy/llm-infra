@@ -287,7 +287,7 @@ def link_xrefs(html_text: str, *, depth: int) -> str:
     """在**已生成的 HTML** 上做替换，并且跳过 <code>/<pre>/<a> 内部。
 
     在 HTML 阶段做而不是 markdown 阶段，是为了能精确避开代码块——
-    源码走读里满是 `v1/core/...` 这类路径，误伤会很难看。
+    源码解析里满是 `v1/core/...` 这类路径，误伤会很难看。
     """
     up = "../" * depth
     # 把 <pre>...</pre>、<code>...</code>、<a ...>...</a> 整段挖出来保护
@@ -366,8 +366,6 @@ def build_module(mod: dict, prev_mod, next_mod, md: markdown.Markdown) -> bool:
     meta_bits = []
     if meta.get("machine"):
         meta_bits.append(f'<span class="chip">实测机器 {html.escape(meta["machine"])}</span>')
-    if meta.get("measured"):
-        meta_bits.append(f'<span class="chip">数据日期 {html.escape(meta["measured"])}</span>')
     if meta.get("deps"):
         meta_bits.append(f'<span class="chip">前置 {html.escape(meta["deps"])}</span>')
     meta_html = f'<div class="chips">{"".join(meta_bits)}</div>' if meta_bits else ""
@@ -578,15 +576,14 @@ def build_source_pages() -> list[tuple[Path, int]]:
                     f'<ul class="src-list">{rows}</ul></section>')
     total = sum(n for _, n in built)
     body = f"""<header class="hero">
-  <h1>全部源码</h1>
-  <p class="lede">{len(built)} 个文件，{total:,} 行。每个文件都可以逐行阅读，
-  行号是固定链接；正文里的节选都能跳到这里的对应行。</p>
+  <h1>源码与原始材料</h1>
+  <p class="lede">共 {len(built)} 个文件。点击文件名查看完整内容，点击行号获取对应位置的链接。</p>
 </header>
 {''.join(secs)}
 <p class="src-foot"><a href="../index.html">&#8592; 回到教程目录</a></p>"""
     ensure_dir(CODE_DIR)
     (CODE_DIR / "index.html").write_text(
-        page_shell(title="全部源码", depth=1, body=body,
+        page_shell(title="源码与原始材料", depth=1, body=body,
                    main_class="page page-wide"), encoding="utf-8")
     return built
 
@@ -667,7 +664,9 @@ def build_index(outline: dict, mods: list[dict]) -> None:
         "L2": "从 CUDA 执行模型到算子优化，再到编译器、性能分析与框架接入。",
         "L3": "推导 attention 的计算与存储成本，比较分块、分页和压缩状态。",
         "L4": "把配置、权重文件与模型计算对应起来，分析数值、量化和 MoE。",
-        "L5": "串起缓存、调度、执行、采样与失败处理，理解单机推理服务。",
+        "L5": "学习推理引擎如何管理缓存、安排请求、执行模型和处理故障。",
+        "L7": "从自动求导和一次参数更新开始，学习训练过程中的计算与内存管理。",
+        "M": "学习如何阅读大型代码库、设计实验和分析测量结果。",
     }
     sections, layer_links, roadmap = [], [], []
     for layer in outline["layers"]:
@@ -704,9 +703,9 @@ def build_index(outline: dict, mods: list[dict]) -> None:
     start = module_url(available[0]) if available else "#contents"
     body = f'''<header class="hero home-hero" id="top">
       <p class="eyebrow">原理 / 源码 / 可复现实验</p>
-      <h1>从模型计算<br>理解 AI 基础设施</h1>
-      <p class="lede">沿着一次模型请求，连接张量计算、GPU、算子与推理引擎。<br>
-      用推导解释机制，用代码检查细节，用实验判断代价。</p>
+      <h1>从模型计算到 AI 系统</h1>
+      <p class="lede">从一个小模型开始，学习它如何计算、如何训练，以及如何在 GPU 上高效运行。
+      教程包含原理推导、源码分析和实验，逐步介绍算子优化与推理服务。</p>
       <div class="hero-actions"><a class="primary-link" href="{start}">从最小模型开始 &#8594;</a>
       <a href="#contents">浏览全部 {len(available)} 章</a></div>
     </header>
@@ -714,28 +713,25 @@ def build_index(outline: dict, mods: list[dict]) -> None:
       <h2 id="paths-title">选择一条阅读路线</h2>
       <div class="path-grid">
         <a class="path-card" href="#L0"><span class="eyebrow">基础路线</span><h3>从计算到系统</h3>
-        <p>L0 → L1 → L2 → L3 → L4 → L5</p><small>逐层理解机制，适合完整学习。</small></a>
+        <p>L0 → L1 → L2 → L3 → L4 → L5</p><small>适合从头学习模型计算和 GPU 编程。</small></a>
         <a class="path-card" href="#L5"><span class="eyebrow">推理路线</span><h3>从请求到引擎</h3>
-        <p>L0 → L4 → L5，按需回看 L1–L3</p><small>先建立服务全貌，再补齐底层原理。</small></a>
+        <p>L0 → L4 → L5，按需回看 L1–L3</p><small>适合已有模型基础、想了解推理服务的读者。</small></a>
       </div>
     </section>
     <section class="contents-intro" id="contents"><p class="eyebrow">CONTENTS</p>
-      <h2>章节目录</h2><p>按层浏览，或直接选择一个问题开始阅读。</p>
+      <h2>章节目录</h2><p>可按顺序阅读，也可根据各章的前置知识选择主题。</p>
       <nav class="layer-jumps" aria-label="跳转到章节层">{nav}</nav>
     </section>
     {"".join(sections)}
     <section class="intro reader-guide" id="reading"><h2>阅读与复现</h2>
-      <p><b>只阅读，不需要 GPU。</b> 先看机制与推导，再按需展开源码和原始输出。
-      代码块下方的链接可打开完整文件；行号可用于定位和引用。</p>
-      <p><b>运行实验，从项目根目录开始。</b> 文中的 <code>python labs/…</code> 使用已激活的独立环境；
-      依赖版本、硬件和模型见各章说明。模型实验通常读取本地缓存，先设置自己的
-      <code>HF_HOME</code> 并准备匹配的模型快照。脚本若带有历史默认路径，应先按说明调整，不能直接套用他人的目录。</p>
-      <p><b>比较数字，先确认条件。</b> 公式估计不等于硬件读数；小规模对照不代表所有输入。
-      <code>UNVERIFIED</code> 表示相关路线尚未实测。机器别名仅标识原始记录的来源，不是阅读或复现所需的登录地址。</p>
-      <p>GPU 实验前检查设备占用并核算权重、KV 和临时空间；新结果使用新文件名，不覆盖原始材料。
-      <a href="code/index.html">打开源码与原始材料 &#8594;</a></p>
+      <p>阅读教程不需要 GPU。长代码和实验输出可以展开查看，也可以通过链接打开完整文件。</p>
+      <p>运行示例时，请在项目根目录使用已安装所需依赖的 Python 环境。
+      各章会注明硬件、软件版本和模型要求；模型与数据的路径按自己的环境设置。</p>
+      <p>实验结果只适用于注明的条件；<code>UNVERIFIED</code> 表示尚未实测。
+      复现时请将新结果另存，保留原始材料。</p>
+      <p><a href="code/index.html">查看源码与原始材料 &#8594;</a></p>
     </section>
-    <details class="roadmap"><summary>后续主题</summary><p>以下为课程范围预告，不属于上面的阅读目录。</p>
+    <details class="roadmap"><summary>后续主题</summary><p>以下章节尚未发布。</p>
       <ul>{"".join(roadmap)}</ul></details>
     <footer class="site-foot">AI Infra 教程 · {date.today().isoformat()} · 静态页面，可离线阅读</footer>'''
     page = page_shell(title=outline["title"], depth=0, body=body,

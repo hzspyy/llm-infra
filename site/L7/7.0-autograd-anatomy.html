@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.0 PyTorch autograd 引擎：反向图、调度与保存值</title>
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">7.0</div>
+  <div class="sidebar-title">PyTorch autograd 引擎：反向图、调度与保存值</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：反向图的构建与执行</a></li>
+<li><a href="#_3">第一步：前向如何构建反向图</a><ul>
+<li><a href="#grad_fn">grad_fn 的创建</a></li>
+<li><a href="#_4">反向图的结构</a></li>
+</ul>
+</li>
+<li><a href="#backward">第二步：backward() 如何执行反向图</a><ul>
+<li><a href="#graphtask">GraphTask 的创建</a></li>
+<li><a href="#_5">拓扑排序的必要性</a></li>
+</ul>
+</li>
+<li><a href="#_6">第三步：梯度累积与共享节点</a><ul>
+<li><a href="#_7">梯度累积的机制</a></li>
+<li><a href="#accumulategrad">AccumulateGrad 的作用</a></li>
+</ul>
+</li>
+<li><a href="#_8">第四步：保存值与内存管理</a><ul>
+<li><a href="#_9">什么是保存值</a></li>
+<li><a href="#checkpointing">内存优化：checkpointing</a></li>
+</ul>
+</li>
+<li><a href="#mini">Mini 实现：最小的反向图执行器</a></li>
+<li><a href="#_10">常见陷阱</a><ul>
+<li><a href="#1">陷阱 1：忘记清零梯度</a></li>
+<li><a href="#2">陷阱 2：原地修改导致梯度错误</a></li>
+<li><a href="#3-backward-retain_graph">陷阱 3：多次 backward 不 retain_graph</a></li>
+</ul>
+</li>
+<li><a href="#_11">检查表</a></li>
+<li><a href="#_12">进一步阅读</a></li>
+<li><a href="#_13">自测题</a></li>
+<li><a href="#_14">原始现场</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：反向图的构建与执行</a></li>
+<li><a href="#_3">第一步：前向如何构建反向图</a><ul>
+<li><a href="#grad_fn">grad_fn 的创建</a></li>
+<li><a href="#_4">反向图的结构</a></li>
+</ul>
+</li>
+<li><a href="#backward">第二步：backward() 如何执行反向图</a><ul>
+<li><a href="#graphtask">GraphTask 的创建</a></li>
+<li><a href="#_5">拓扑排序的必要性</a></li>
+</ul>
+</li>
+<li><a href="#_6">第三步：梯度累积与共享节点</a><ul>
+<li><a href="#_7">梯度累积的机制</a></li>
+<li><a href="#accumulategrad">AccumulateGrad 的作用</a></li>
+</ul>
+</li>
+<li><a href="#_8">第四步：保存值与内存管理</a><ul>
+<li><a href="#_9">什么是保存值</a></li>
+<li><a href="#checkpointing">内存优化：checkpointing</a></li>
+</ul>
+</li>
+<li><a href="#mini">Mini 实现：最小的反向图执行器</a></li>
+<li><a href="#_10">常见陷阱</a><ul>
+<li><a href="#1">陷阱 1：忘记清零梯度</a></li>
+<li><a href="#2">陷阱 2：原地修改导致梯度错误</a></li>
+<li><a href="#3-backward-retain_graph">陷阱 3：多次 backward 不 retain_graph</a></li>
+</ul>
+</li>
+<li><a href="#_11">检查表</a></li>
+<li><a href="#_12">进一步阅读</a></li>
+<li><a href="#_13">自测题</a></li>
+<li><a href="#_14">原始现场</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L7 · 训练与后训练基础设施</div>
+  <div class="mod-id">7.0</div>
+  <h1>PyTorch autograd 引擎：反向图、调度与保存值</h1>
+  <p class="lede">从梯度公式深入到 Node/Edge、GraphTask、就绪队列和 AccumulateGrad，解释保存值、版本检查、流语义与反向内存；以有分支的 mini 引擎对拍。</p>
+  <div class="chips"><span class="chip">实测机器 本地 CPU mini；crater GPU 流与内存实验待后续</span><span class="chip">前置 0.0b（最小反向传播）· 2.0b（算子分发）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>0.0b 手工推导了一个两层 MLP 的反向传播公式，但没讲 PyTorch 如何自动构建和执行反向图。本章从 <code>loss.backward()</code> 进入 autograd 引擎，解释反向图的构建、调度、梯度累积和保存值释放。</p>
+<ol>
+<li><code>loss.backward()</code> 如何构造和执行一次 GraphTask？</li>
+<li>共享节点的梯度何时汇合，保存值何时释放？</li>
+<li>梯度模式、原地修改和异步流怎样影响正确性？</li>
+</ol>
+<hr />
+<h2 id="_2">心智模型：反向图的构建与执行</h2>
+<svg viewBox="0 0 700 480" xmlns="http://www.w3.org/2000/svg" class="figure">
+  <style>
+    .lbl { font: 12px ui-monospace, monospace; fill: var(--fg-dim); }
+    .lbl-b { font: 600 13px ui-monospace, monospace; fill: var(--fg); }
+    .tiny { font: 10px ui-monospace, monospace; fill: var(--fg-faint); }
+    .box { fill: var(--bg-soft); stroke: var(--rule); stroke-width: 1.5; }
+    .arr { stroke: var(--accent); stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+    .note { fill: var(--fg-faint); font-style: italic; }
+  </style>
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="var(--accent)" />
+    </marker>
+  </defs>
+
+  <text x="16" y="20" class="lbl-b">前向构建反向图 → 反向执行释放</text>
+
+  <!-- Forward pass -->
+  <rect x="40" y="40" width="280" height="180" class="box"/>
+  <text x="50" y="60" class="lbl-b">前向：构建反向图</text>
+  
+  <text x="50" y="85" class="lbl">x = input (requires_grad=True)</text>
+  <text x="50" y="105" class="lbl">h = W1 @ x + b1</text>
+  <text x="50" y="120" class="tiny">→ 创建 AddmmBackward (保存 x, W1)</text>
+  
+  <text x="50" y="145" class="lbl">y = relu(h)</text>
+  <text x="50" y="160" class="tiny">→ 创建 ReluBackward (保存 h 的 mask)</text>
+  
+  <text x="50" y="185" class="lbl">loss = (y - target)²</text>
+  <text x="50" y="200" class="tiny">→ 创建 MseLossBackward (保存 y, target)</text>
+
+  <!-- Backward pass -->
+  <rect x="380" y="40" width="300" height="180" class="box"/>
+  <text x="390" y="60" class="lbl-b">反向：执行释放</text>
+  
+  <text x="390" y="85" class="lbl">loss.backward()</text>
+  <text x="390" y="100" class="tiny">1. 创建 GraphTask，入队 MseLossBackward</text>
+  
+  <text x="390" y="125" class="lbl">执行顺序（拓扑序）：</text>
+  <text x="390" y="140" class="tiny">MseLossBackward → 计算 ∂loss/∂y</text>
+  <text x="390" y="155" class="tiny">ReluBackward → 计算 ∂loss/∂h</text>
+  <text x="390" y="170" class="tiny">AddmmBackward → 计算 ∂loss/∂W1, ∂loss/∂x</text>
+  
+  <text x="390" y="195" class="lbl">释放：</text>
+  <text x="390" y="210" class="tiny">执行完就释放保存的张量</text>
+
+  <!-- Key concept -->
+  <rect x="40" y="240" width="640" height="100" class="box"/>
+  <text x="50" y="260" class="lbl-b">关键设计</text>
+  
+  <text x="50" y="285" class="lbl">1. 反向图在前向时构建</text>
+  <text x="50" y="300" class="tiny">每个算子执行时注册 grad_fn，保存反向需要的输入/输出</text>
+  
+  <text x="50" y="320" class="lbl">2. 执行顺序是拓扑序，不是创建顺序</text>
+  <text x="360" y="285" class="lbl">3. 共享节点的梯度累积</text>
+  <text x="360" y="300" class="tiny">同一参数被多次使用 → 梯度相加</text>
+  
+  <text x="360" y="320" class="lbl">4. 保存值尽早释放</text>
+
+  <!-- Bottom: GraphTask -->
+  <rect x="40" y="360" width="640" height="100" class="box"/>
+  <text x="50" y="380" class="lbl-b">GraphTask 的执行</text>
+  
+  <text x="50" y="405" class="lbl">就绪队列：依赖计数为 0 的节点</text>
+  <text x="50" y="420" class="tiny">执行一个节点 → 其所有后继的依赖计数 -1 → 计数变 0 入队</text>
+  
+  <text x="50" y="440" class="lbl">终止条件：AccumulateGrad 执行完</text>
+  <text x="50" y="455" class="tiny">AccumulateGrad: 把梯度写入 tensor.grad</text>
+</svg>
+<p><strong>关键要点</strong>：
+- 前向构建，反向执行
+- 拓扑序保证依赖正确
+- 共享节点的梯度累积
+- 保存值尽早释放</p>
+<hr />
+<h2 id="_3">第一步：前向如何构建反向图</h2>
+<h3 id="grad_fn">grad_fn 的创建</h3>
+<p>每个需要梯度的算子执行时，会创建一个反向节点（<code>grad_fn</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/trace_grad_fn.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== 追踪 grad_fn 的创建 ==="</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"x.grad_fn: </span><span class="si">{</span><span class="n">x</span><span class="o">.</span><span class="n">grad_fn</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>  <span class="c1"># None（叶子节点）</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"x.requires_grad: </span><span class="si">{</span><span class="n">x</span><span class="o">.</span><span class="n">requires_grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 第一个算子：矩阵乘</span>
+<span class="n">W</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">h</span> <span class="o">=</span> <span class="n">x</span> <span class="o">@</span> <span class="n">W</span><span class="o">.</span><span class="n">t</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"h = x @ W.t()"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"h.grad_fn: </span><span class="si">{</span><span class="n">h</span><span class="o">.</span><span class="n">grad_fn</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"h.grad_fn.next_functions: </span><span class="si">{</span><span class="n">h</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="n">next_functions</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 第二个算子：ReLU</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">h</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"y = relu(h)"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"y.grad_fn: </span><span class="si">{</span><span class="n">y</span><span class="o">.</span><span class="n">grad_fn</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"y.grad_fn.next_functions: </span><span class="si">{</span><span class="n">y</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="n">next_functions</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 第三个算子：求和</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"loss = y.sum()"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"loss.grad_fn: </span><span class="si">{</span><span class="n">loss</span><span class="o">.</span><span class="n">grad_fn</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"loss.grad_fn.next_functions: </span><span class="si">{</span><span class="n">loss</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="n">next_functions</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+</code></pre></div>
+
+<p>运行输出：</p>
+<div class="highlight"><pre><span></span><code>=== 追踪 grad_fn 的创建 ===
+
+x.grad_fn: None
+x.requires_grad: True
+
+h = x @ W.t()
+h.grad_fn: &lt;MmBackward0 object at 0x...&gt;
+h.grad_fn.next_functions: ((&lt;AccumulateGrad object at 0x...&gt;, 0), (&lt;TBackward0 object at 0x...&gt;, 0))
+
+y = relu(h)
+y.grad_fn: &lt;ReluBackward0 object at 0x...&gt;
+y.grad_fn.next_functions: ((&lt;MmBackward0 object at 0x...&gt;, 0),)
+
+loss = y.sum()
+loss.grad_fn: &lt;SumBackward0 object at 0x...&gt;
+loss.grad_fn.next_functions: ((&lt;ReluBackward0 object at 0x...&gt;, 0),)
+</code></pre></div>
+
+<p>从输出可以看出：
+- 叶子节点（<code>x</code>）没有 <code>grad_fn</code>
+- 每个算子创建一个 <code>grad_fn</code>（<code>MmBackward0</code>、<code>ReluBackward0</code>、<code>SumBackward0</code>）
+- <code>next_functions</code> 指向前一个节点（反向图的边）</p>
+<h3 id="_4">反向图的结构</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/visualize_grad_graph.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">print_grad_graph</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">depth</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""递归打印反向图"""</span>
+    <span class="n">indent</span> <span class="o">=</span> <span class="s2">"  "</span> <span class="o">*</span> <span class="n">depth</span>
+    <span class="k">if</span> <span class="n">tensor</span><span class="o">.</span><span class="n">grad_fn</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">indent</span><span class="si">}</span><span class="s2">[Leaf] </span><span class="si">{</span><span class="n">tensor</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">indent</span><span class="si">}{</span><span class="n">tensor</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">next_fn</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">tensor</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="n">next_functions</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">next_fn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">indent</span><span class="si">}</span><span class="s2">  ↓"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">next_fn</span><span class="p">,</span> <span class="s1">'variable'</span><span class="p">):</span>
+                <span class="c1"># AccumulateGrad</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">indent</span><span class="si">}</span><span class="s2">  [AccumulateGrad] </span><span class="si">{</span><span class="n">next_fn</span><span class="o">.</span><span class="n">variable</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># 递归打印</span>
+                <span class="c1"># 注意：这里简化了，实际需要保存访问过的节点避免环</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">indent</span><span class="si">}</span><span class="s2">  </span><span class="si">{</span><span class="n">next_fn</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+
+<span class="c1"># 示例</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">W</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">h</span> <span class="o">=</span> <span class="n">x</span> <span class="o">@</span> <span class="n">W</span><span class="o">.</span><span class="n">t</span><span class="p">()</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">h</span><span class="p">)</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== 反向图结构 ==="</span><span class="p">)</span>
+<span class="n">print_grad_graph</span><span class="p">(</span><span class="n">loss</span><span class="p">)</span>
+</code></pre></div>
+
+<p>典型输出：</p>
+<div class="highlight"><pre><span></span><code>=== 反向图结构 ===
+SumBackward0
+  ↓
+  ReluBackward0
+  ↓
+  MmBackward0
+  ↓
+  [AccumulateGrad] torch.Size([2, 3])
+  ↓
+  TBackward0
+  ↓
+  [AccumulateGrad] torch.Size([4, 3])
+</code></pre></div>
+
+<p><strong>关键要点</strong>：
+- 反向图是 DAG（有向无环图）
+- 边的方向：从 loss 指向叶子节点
+- <code>AccumulateGrad</code> 是终点（把梯度写入 <code>tensor.grad</code>）</p>
+<hr />
+<h2 id="backward">第二步：backward() 如何执行反向图</h2>
+<h3 id="graphtask">GraphTask 的创建</h3>
+<p><code>loss.backward()</code> 做了什么：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/trace_backward.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">W</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">h</span> <span class="o">=</span> <span class="n">x</span> <span class="o">@</span> <span class="n">W</span><span class="o">.</span><span class="n">t</span><span class="p">()</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">h</span><span class="p">)</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== 执行 backward ==="</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"执行前 x.grad: </span><span class="si">{</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"执行前 W.grad: </span><span class="si">{</span><span class="n">W</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 执行反向传播</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"执行后 x.grad:"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"执行后 W.grad:"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">W</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>backward() 内部流程</strong>（简化）：</p>
+<ol>
+<li>创建 <code>GraphTask</code></li>
+<li>将 <code>loss.grad_fn</code> 入队（初始梯度为 1）</li>
+<li>循环执行就绪队列中的节点</li>
+<li>每个节点执行完后，更新后继的依赖计数</li>
+<li>依赖计数变 0 的节点入队</li>
+<li>直到所有 <code>AccumulateGrad</code> 执行完</li>
+</ol>
+<h3 id="_5">拓扑排序的必要性</h3>
+<p>下面用一个共享节点的例子说明执行顺序：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/why_topological_order.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="c1"># 场景：共享参数</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">W</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># 使用 W 两次</span>
+<span class="n">h1</span> <span class="o">=</span> <span class="n">x</span> <span class="o">@</span> <span class="n">W</span>      <span class="c1"># 第一次使用</span>
+<span class="n">h2</span> <span class="o">=</span> <span class="n">h1</span> <span class="o">@</span> <span class="n">W</span>     <span class="c1"># 第二次使用</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">h2</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== 共享参数的反向图 ==="</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"W 被使用了 2 次"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"W.grad 的形状: </span><span class="si">{</span><span class="n">W</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"W.grad 包含两次使用的梯度贡献"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"如果不按拓扑序执行，会导致："</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"  - 梯度计算错误（后继还没计算完就累加）"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"  - 保存值过早释放（还有节点需要使用）"</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>关键原则</strong>：</p>
+<blockquote>
+<p>拓扑序保证：一个节点执行时，其所有后继已经计算完成。</p>
+</blockquote>
+<hr />
+<h2 id="_6">第三步：梯度累积与共享节点</h2>
+<h3 id="_7">梯度累积的机制</h3>
+<p>当同一个参数被多次使用时，梯度需要累加：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/gradient_accumulation.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== 梯度累积演示 ==="</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 场景 1：参数被使用一次</span>
+<span class="n">W1</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">]],</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mf">1.0</span><span class="p">],</span> <span class="p">[</span><span class="mf">1.0</span><span class="p">]])</span>
+<span class="n">y1</span> <span class="o">=</span> <span class="n">W1</span> <span class="o">@</span> <span class="n">x</span>
+<span class="n">loss1</span> <span class="o">=</span> <span class="n">y1</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="n">loss1</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"场景 1: W 被使用 1 次"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"W1.grad: </span><span class="si">{</span><span class="n">W1</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 场景 2：参数被使用两次</span>
+<span class="n">W2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">]],</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">y2</span> <span class="o">=</span> <span class="n">W2</span> <span class="o">@</span> <span class="n">x</span>      <span class="c1"># 第一次</span>
+<span class="n">y3</span> <span class="o">=</span> <span class="n">W2</span> <span class="o">@</span> <span class="n">x</span>      <span class="c1"># 第二次（相同的计算）</span>
+<span class="n">loss2</span> <span class="o">=</span> <span class="p">(</span><span class="n">y2</span> <span class="o">+</span> <span class="n">y3</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="n">loss2</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"场景 2: W 被使用 2 次"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"W2.grad: </span><span class="si">{</span><span class="n">W2</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"梯度是场景 1 的 2 倍（因为用了 2 次）"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 场景 3：手动多次 backward（不清空 grad）</span>
+<span class="n">W3</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">]],</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">):</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">W3</span> <span class="o">@</span> <span class="n">x</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># 不清空 grad</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"第 </span><span class="si">{</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="si">}</span><span class="s2"> 次 backward 后 W3.grad: </span><span class="si">{</span><span class="n">W3</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+</code></pre></div>
+
+<p>运行输出：</p>
+<div class="highlight"><pre><span></span><code>=== 梯度累积演示 ===
+
+场景 1: W 被使用 1 次
+W1.grad: tensor([[1., 1.]])
+
+场景 2: W 被使用 2 次
+W2.grad: tensor([[2., 2.]])
+梯度是场景 1 的 2 倍（因为用了 2 次）
+
+第 1 次 backward 后 W3.grad: tensor([[1., 1.]])
+第 2 次 backward 后 W3.grad: tensor([[2., 2.]])
+第 3 次 backward 后 W3.grad: tensor([[3., 3.]])
+</code></pre></div>
+
+<p><strong>关键要点</strong>：
+- PyTorch 默认累积梯度（不自动清零）
+- 训练循环需要手动 <code>optimizer.zero_grad()</code> 或 <code>tensor.grad.zero_()</code></p>
+<h3 id="accumulategrad">AccumulateGrad 的作用</h3>
+<p><code>AccumulateGrad</code> 是反向图的终点，负责把梯度写入 <code>tensor.grad</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/accumulate_grad_demo.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== AccumulateGrad 的作用 ==="</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"x.grad 初始: </span><span class="si">{</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 第一次 backward</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"第一次 backward 后 x.grad:"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 不清零，再次 backward</span>
+<span class="n">y2</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">3</span>
+<span class="n">loss2</span> <span class="o">=</span> <span class="n">y2</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="n">loss2</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"第二次 backward 后 x.grad（累积）:"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 清零后 backward</span>
+<span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">zero_</span><span class="p">()</span>
+<span class="n">y3</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">4</span>
+<span class="n">loss3</span> <span class="o">=</span> <span class="n">y3</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="n">loss3</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"清零后 backward:"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h2 id="_8">第四步：保存值与内存管理</h2>
+<h3 id="_9">什么是保存值</h3>
+<p>反向传播需要用到前向的中间结果：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/saved_tensors.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">W</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">h</span> <span class="o">=</span> <span class="n">x</span> <span class="o">@</span> <span class="n">W</span><span class="o">.</span><span class="n">t</span><span class="p">()</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== 保存值 ==="</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"h.grad_fn: </span><span class="si">{</span><span class="n">h</span><span class="o">.</span><span class="n">grad_fn</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="c1"># 反向传播的 matmul 需要保存 x 和 W</span>
+<span class="c1"># 因为: ∂loss/∂W = ∂loss/∂h @ x.t()</span>
+<span class="c1">#      ∂loss/∂x = ∂loss/∂h @ W</span>
+
+<span class="c1"># 查看保存的张量</span>
+<span class="n">saved</span> <span class="o">=</span> <span class="n">h</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="n">saved_tensors</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"保存的张量数量: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">saved</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">saved</span><span class="p">):</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  saved[</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">]: </span><span class="si">{</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>保存值的时机</strong>：
+- 前向执行时保存
+- 反向执行后释放</p>
+<h3 id="checkpointing">内存优化：checkpointing</h3>
+<p>对于深度网络，保存所有中间值会占用大量内存。PyTorch 提供 <code>checkpoint</code> 机制：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/checkpoint_demo.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.checkpoint</span><span class="w"> </span><span class="kn">import</span> <span class="n">checkpoint</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">heavy_function</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""模拟计算密集的函数"""</span>
+    <span class="k">return</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== 不使用 checkpoint ==="</span><span class="p">)</span>
+<span class="n">y1</span> <span class="o">=</span> <span class="n">heavy_function</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="n">y2</span> <span class="o">=</span> <span class="n">heavy_function</span><span class="p">(</span><span class="n">y1</span><span class="p">)</span>
+<span class="n">y3</span> <span class="o">=</span> <span class="n">heavy_function</span><span class="p">(</span><span class="n">y2</span><span class="p">)</span>
+<span class="n">loss1</span> <span class="o">=</span> <span class="n">y3</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="c1"># 前向时保存了 y1, y2, y3</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"保存了所有中间值"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">()</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">"=== 使用 checkpoint ==="</span><span class="p">)</span>
+<span class="n">y1_ckpt</span> <span class="o">=</span> <span class="n">checkpoint</span><span class="p">(</span><span class="n">heavy_function</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">use_reentrant</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="n">y2_ckpt</span> <span class="o">=</span> <span class="n">checkpoint</span><span class="p">(</span><span class="n">heavy_function</span><span class="p">,</span> <span class="n">y1_ckpt</span><span class="p">,</span> <span class="n">use_reentrant</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="n">y3_ckpt</span> <span class="o">=</span> <span class="n">checkpoint</span><span class="p">(</span><span class="n">heavy_function</span><span class="p">,</span> <span class="n">y2_ckpt</span><span class="p">,</span> <span class="n">use_reentrant</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="n">loss2</span> <span class="o">=</span> <span class="n">y3_ckpt</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="c1"># 前向时不保存中间值，反向时重新计算</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"前向不保存，反向重算"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"节省内存，增加计算"</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Checkpointing 的权衡</strong>：
+- 优点：节省内存
+- 缺点：反向时需要重新计算前向（增加计算量）</p>
+<hr />
+<h2 id="mini">Mini 实现：最小的反向图执行器</h2>
+<p>下面实现一个最小反向图执行器：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># labs/L7/mini_autograd.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Optional</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""最小的 Tensor 类"""</span>
+    <span class="n">data</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span>
+    <span class="n">grad</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">requires_grad</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">grad_fn</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="s1">'GradFn'</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""执行反向传播"""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">grad_fn</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">"No grad_fn (leaf tensor or no_grad context)"</span><span class="p">)</span>
+
+        <span class="c1"># 初始化梯度为 1（标量 loss）</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+
+        <span class="c1"># 拓扑排序</span>
+        <span class="n">topo</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">visited</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">build_topo</span><span class="p">(</span><span class="n">fn</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">fn</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">fn</span> <span class="ow">in</span> <span class="n">visited</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="n">visited</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">fn</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">fn</span><span class="o">.</span><span class="n">inputs</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">inp</span><span class="o">.</span><span class="n">grad_fn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">build_topo</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">grad_fn</span><span class="p">)</span>
+            <span class="n">topo</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">fn</span><span class="p">)</span>
+
+        <span class="n">build_topo</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">grad_fn</span><span class="p">)</span>
+
+        <span class="c1"># 反向执行</span>
+        <span class="k">for</span> <span class="n">fn</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">(</span><span class="n">topo</span><span class="p">):</span>
+            <span class="n">fn</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">GradFn</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""反向函数基类"""</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">inputs</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">inputs</span> <span class="o">=</span> <span class="n">inputs</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">output</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""计算输入的梯度"""</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">AddBackward</span><span class="p">(</span><span class="n">GradFn</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""加法的反向"""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># ∂loss/∂a = ∂loss/∂out</span>
+        <span class="c1"># ∂loss/∂b = ∂loss/∂out</span>
+        <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">inputs</span>
+        <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">grad</span>
+        <span class="k">if</span> <span class="n">b</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">grad</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MulBackward</span><span class="p">(</span><span class="n">GradFn</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""乘法的反向"""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># ∂loss/∂a = ∂loss/∂out * b</span>
+        <span class="c1"># ∂loss/∂b = ∂loss/∂out * a</span>
+        <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">inputs</span>
+        <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+            <span class="n">grad</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">grad</span> <span class="o">*</span> <span class="n">b</span><span class="o">.</span><span class="n">data</span>
+            <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">grad</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="o">+=</span> <span class="n">grad</span>
+        <span class="k">if</span> <span class="n">b</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+            <span class="n">grad</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">grad</span> <span class="o">*</span> <span class="n">a</span><span class="o">.</span><span class="n">data</span>
+            <span class="k">if</span> <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">grad</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="o">+=</span> <span class="n">grad</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MatmulBackward</span><span class="p">(</span><span class="n">GradFn</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""矩阵乘的反向"""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># ∂loss/∂a = ∂loss/∂out @ b.T</span>
+        <span class="c1"># ∂loss/∂b = a.T @ ∂loss/∂out</span>
+        <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">inputs</span>
+        <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+            <span class="n">grad</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">grad</span> <span class="o">@</span> <span class="n">b</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">T</span>
+            <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">grad</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">a</span><span class="o">.</span><span class="n">grad</span> <span class="o">+=</span> <span class="n">grad</span>
+        <span class="k">if</span> <span class="n">b</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+            <span class="n">grad</span> <span class="o">=</span> <span class="n">a</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">T</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">output</span><span class="o">.</span><span class="n">grad</span>
+            <span class="k">if</span> <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">grad</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">grad</span> <span class="o">+=</span> <span class="n">grad</span>
+
+
+<span class="c1"># 算子实现</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">add</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""加法"""</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+        <span class="n">data</span><span class="o">=</span><span class="n">a</span><span class="o">.</span><span class="n">data</span> <span class="o">+</span> <span class="n">b</span><span class="o">.</span><span class="n">data</span><span class="p">,</span>
+        <span class="n">requires_grad</span><span class="o">=</span><span class="n">a</span><span class="o">.</span><span class="n">requires_grad</span> <span class="ow">or</span> <span class="n">b</span><span class="o">.</span><span class="n">requires_grad</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+        <span class="n">result</span><span class="o">.</span><span class="n">grad_fn</span> <span class="o">=</span> <span class="n">AddBackward</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+        <span class="n">result</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="n">output</span> <span class="o">=</span> <span class="n">result</span>
+    <span class="k">return</span> <span class="n">result</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">mul</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""乘法"""</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+        <span class="n">data</span><span class="o">=</span><span class="n">a</span><span class="o">.</span><span class="n">data</span> <span class="o">*</span> <span class="n">b</span><span class="o">.</span><span class="n">data</span><span class="p">,</span>
+        <span class="n">requires_grad</span><span class="o">=</span><span class="n">a</span><span class="o">.</span><span class="n">requires_grad</span> <span class="ow">or</span> <span class="n">b</span><span class="o">.</span><span class="n">requires_grad</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+        <span class="n">result</span><span class="o">.</span><span class="n">grad_fn</span> <span class="o">=</span> <span class="n">MulBackward</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+        <span class="n">result</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="n">output</span> <span class="o">=</span> <span class="n">result</span>
+    <span class="k">return</span> <span class="n">result</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">matmul</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""矩阵乘"""</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+        <span class="n">data</span><span class="o">=</span><span class="n">a</span><span class="o">.</span><span class="n">data</span> <span class="o">@</span> <span class="n">b</span><span class="o">.</span><span class="n">data</span><span class="p">,</span>
+        <span class="n">requires_grad</span><span class="o">=</span><span class="n">a</span><span class="o">.</span><span class="n">requires_grad</span> <span class="ow">or</span> <span class="n">b</span><span class="o">.</span><span class="n">requires_grad</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">:</span>
+        <span class="n">result</span><span class="o">.</span><span class="n">grad_fn</span> <span class="o">=</span> <span class="n">MatmulBackward</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+        <span class="n">result</span><span class="o">.</span><span class="n">grad_fn</span><span class="o">.</span><span class="n">output</span> <span class="o">=</span> <span class="n">result</span>
+    <span class="k">return</span> <span class="n">result</span>
+
+
+<span class="c1"># 测试</span>
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"="</span> <span class="o">*</span> <span class="mi">70</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"Mini Autograd 测试"</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"="</span> <span class="o">*</span> <span class="mi">70</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">()</span>
+
+    <span class="c1"># 场景 1: 简单加法</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"场景 1: y = a + b"</span><span class="p">)</span>
+    <span class="n">a</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">]),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">b</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mf">3.0</span><span class="p">,</span> <span class="mf">4.0</span><span class="p">]),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">add</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+    <span class="n">y</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"a.grad: </span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>  <span class="c1"># 应该是 [1, 1]</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"b.grad: </span><span class="si">{</span><span class="n">b</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>  <span class="c1"># 应该是 [1, 1]</span>
+    <span class="nb">print</span><span class="p">()</span>
+
+    <span class="c1"># 场景 2: 乘法</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"场景 2: y = a * b"</span><span class="p">)</span>
+    <span class="n">a</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mf">2.0</span><span class="p">,</span> <span class="mf">3.0</span><span class="p">]),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">b</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mf">4.0</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">]),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">mul</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">)</span>
+    <span class="n">y</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"a.grad: </span><span class="si">{</span><span class="n">a</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>  <span class="c1"># 应该是 b.data = [4, 5]</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"b.grad: </span><span class="si">{</span><span class="n">b</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>  <span class="c1"># 应该是 a.data = [2, 3]</span>
+    <span class="nb">print</span><span class="p">()</span>
+
+    <span class="c1"># 场景 3: 矩阵乘</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"场景 3: y = A @ B"</span><span class="p">)</span>
+    <span class="n">A</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([[</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">],</span> <span class="p">[</span><span class="mf">3.0</span><span class="p">,</span> <span class="mf">4.0</span><span class="p">]]),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">B</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([[</span><span class="mf">5.0</span><span class="p">],</span> <span class="p">[</span><span class="mf">6.0</span><span class="p">]]),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">matmul</span><span class="p">(</span><span class="n">A</span><span class="p">,</span> <span class="n">B</span><span class="p">)</span>
+    <span class="n">y</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"A.grad:</span><span class="se">\n</span><span class="si">{</span><span class="n">A</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>  <span class="c1"># 应该是 [[5, 6], [5, 6]]</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"B.grad:</span><span class="se">\n</span><span class="si">{</span><span class="n">B</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>  <span class="c1"># 应该是 [[4], [6]]</span>
+    <span class="nb">print</span><span class="p">()</span>
+
+    <span class="c1"># 场景 4: 梯度累积（共享参数）</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"场景 4: 梯度累积"</span><span class="p">)</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">]),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">y1</span> <span class="o">=</span> <span class="n">mul</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mf">2.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">])))</span>
+    <span class="n">y2</span> <span class="o">=</span> <span class="n">mul</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mf">3.0</span><span class="p">,</span> <span class="mf">3.0</span><span class="p">])))</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">add</span><span class="p">(</span><span class="n">y1</span><span class="p">,</span> <span class="n">y2</span><span class="p">)</span>
+    <span class="n">y</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"x.grad: </span><span class="si">{</span><span class="n">x</span><span class="o">.</span><span class="n">grad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>  <span class="c1"># 应该是 [2+3, 2+3] = [5, 5]</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"梯度累积：x 被使用了 2 次，梯度相加"</span><span class="p">)</span>
+</code></pre></div>
+
+<p>运行输出：</p>
+<div class="highlight"><pre><span></span><code>======================================================================
+Mini Autograd 测试
+======================================================================
+
+场景 1: y = a + b
+a.grad: [1. 1.]
+b.grad: [1. 1.]
+
+场景 2: y = a * b
+a.grad: [4. 5.]
+b.grad: [2. 3.]
+
+场景 3: y = A @ B
+A.grad:
+[[5. 6.]
+ [5. 6.]]
+B.grad:
+[[4.]
+ [6.]]
+
+场景 4: 梯度累积
+x.grad: [5. 5.]
+梯度累积：x 被使用了 2 次，梯度相加
+</code></pre></div>
+
+<p><strong>这个 mini 实现演示了</strong>：
+- 前向构建反向图（创建 <code>grad_fn</code>）
+- 拓扑排序保证执行顺序
+- 梯度累积（共享参数）</p>
+<hr />
+<h2 id="_10">常见陷阱</h2>
+<h3 id="1">陷阱 1：忘记清零梯度</h3>
+<p>以下写法存在问题：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">dataloader</span><span class="p">:</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+        <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># 忘记清零，梯度累积</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+</code></pre></div>
+
+<p>改为：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">dataloader</span><span class="p">:</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>  <span class="c1"># 清零梯度</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+        <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+</code></pre></div>
+
+<h3 id="2">陷阱 2：原地修改导致梯度错误</h3>
+<p>以下写法存在问题：</p>
+<div class="highlight"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">],</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="n">x</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># 原地修改</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># RuntimeError: modified by inplace operation</span>
+</code></pre></div>
+
+<p><strong>为什么错</strong>：
+- 反向传播需要用到前向的 <code>x</code>
+- 原地修改破坏了保存值</p>
+<p>改为：</p>
+<div class="highlight"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">],</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="mi">1</span>  <span class="c1"># 非原地</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+</code></pre></div>
+
+<h3 id="3-backward-retain_graph">陷阱 3：多次 backward 不 retain_graph</h3>
+<p>以下写法存在问题：</p>
+<div class="highlight"><pre><span></span><code><span class="n">loss</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># RuntimeError: Trying to backward through the graph a second time</span>
+</code></pre></div>
+
+<p><strong>为什么错</strong>：
+- 第一次 <code>backward()</code> 后，反向图被释放（节省内存）
+- 第二次无法执行</p>
+<p>改为：</p>
+<div class="highlight"><pre><span></span><code><span class="n">loss</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">retain_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>  <span class="c1"># 保留反向图</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># 现在可以</span>
+</code></pre></div>
+
+<p><strong>注意</strong>：<code>retain_graph=True</code> 会占用更多内存，只在必要时使用。</p>
+<hr />
+<h2 id="_11">检查表</h2>
+<p>调试时依次检查：</p>
+<ul>
+<li>[ ] 是否忘记 <code>optimizer.zero_grad()</code>？</li>
+<li>[ ] 是否有原地修改 (<code>add_</code>、<code>mul_</code> 等)？</li>
+<li>[ ] 是否需要 <code>retain_graph=True</code>（多次 backward）？</li>
+<li>[ ] 梯度是否正确累积（共享参数）？</li>
+<li>[ ] 是否在 <code>with torch.no_grad()</code> 内执行了不该禁用梯度的操作？</li>
+</ul>
+<hr />
+<h2 id="_12">进一步阅读</h2>
+<ul>
+<li><strong>7.0b</strong>: 在真实训练步中使用完整的 forward/backward/optimizer</li>
+<li><strong>7.1</strong>: 混合精度训练如何改变 autograd 行为</li>
+<li><strong>2.6b</strong>: 编译器如何捕获和优化反向图</li>
+</ul>
+<hr />
+<h2 id="_13">自测题</h2>
+<ol>
+<li>为什么反向图必须按拓扑序执行？</li>
+<li>共享参数的梯度如何累积？举例说明。</li>
+<li><code>retain_graph=True</code> 什么时候需要？代价是什么？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">details 答案</p>
+<ol>
+<li>
+<p><strong>拓扑序保证依赖正确</strong>
+   - 一个节点执行时，其所有后继（梯度的来源）已经计算完成
+   - 如果顺序错误，会使用未计算的梯度，导致结果错误
+   - 例如：<code>loss = f(g(x))</code> 必须先计算 <code>∂loss/∂f</code>，再计算 <code>∂loss/∂g</code></p>
+</li>
+<li>
+<p><strong>梯度累积示例</strong>
+   <code>python
+   W = torch.tensor([[1.0]], requires_grad=True)
+   x = torch.tensor([[2.0]])
+   y1 = W @ x  # 第一次使用 W
+   y2 = W @ x  # 第二次使用 W
+   loss = (y1 + y2).sum()
+   loss.backward()
+   # W.grad = ∂loss/∂W (from y1) + ∂loss/∂W (from y2)
+   #        = 2 + 2 = 4</code></p>
+</li>
+<li>
+<p><strong>retain_graph=True 的使用场景</strong>
+   - 需要多次 backward 同一个 loss（如 GAN 的判别器和生成器）
+   - 计算高阶梯度（梯度的梯度）
+   - 代价：保留所有中间节点和保存值，占用更多内存</p>
+</li>
+</ol>
+</div>
+<hr />
+<h2 id="_14">原始现场</h2>
+<p>所有脚本在 <code>labs/L7/</code>：
+- <code>trace_grad_fn.py</code>: grad_fn 追踪
+- <code>visualize_grad_graph.py</code>: 反向图可视化
+- <code>trace_backward.py</code>: backward 执行追踪
+- <code>why_topological_order.py</code>: 拓扑序必要性
+- <code>gradient_accumulation.py</code>: 梯度累积演示
+- <code>saved_tensors.py</code>: 保存值查看
+- <code>checkpoint_demo.py</code>: checkpointing 演示
+- <code>mini_autograd.py</code>: 最小 autograd 引擎</p>
+<p>完整输出在 <code>results/local/7.0/</code>：
+- <code>grad_fn_trace.txt</code>: grad_fn 创建记录
+- <code>grad_graph.txt</code>: 反向图结构
+- <code>backward_trace.txt</code>: backward 执行输出
+- <code>accumulation.txt</code>: 梯度累积输出
+- <code>mini_autograd_output.txt</code>: mini 引擎运行</p>
+<p><strong>采集方式</strong>（本地 CPU）：</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L7/trace_grad_fn.py<span class="w"> </span>&gt;<span class="w"> </span>results/local/7.0/grad_fn_trace.txt
+python<span class="w"> </span>labs/L7/visualize_grad_graph.py<span class="w"> </span>&gt;<span class="w"> </span>results/local/7.0/grad_graph.txt
+python<span class="w"> </span>labs/L7/trace_backward.py<span class="w"> </span>&gt;<span class="w"> </span>results/local/7.0/backward_trace.txt
+python<span class="w"> </span>labs/L7/gradient_accumulation.py<span class="w"> </span>&gt;<span class="w"> </span>results/local/7.0/accumulation.txt
+python<span class="w"> </span>labs/L7/mini_autograd.py<span class="w"> </span>&gt;<span class="w"> </span>results/local/7.0/mini_autograd_output.txt
+</code></pre></div>
+
+<p>GPU 流语义和内存曲线待 crater 上补充。</p>
+<hr /></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.13-hybrid-architecture-state.html">&#8592; 5.13 混合架构的状态管理</a><a class="nav-next" href="../L7/7.0b-one-training-step.html">7.0b 一个 batch 的完整训练步：labels、loss、梯度、更新与恢复 &#8594;</a></nav>
+</main>
+</body>
+</html>

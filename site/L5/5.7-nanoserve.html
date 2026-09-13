@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>5.7 四家引擎架构对比 + 自建 nanoserve</title>
-<link rel="stylesheet" href="../assets/style.css?v=4a85d701">
-<link rel="stylesheet" href="../assets/code.css?v=4a85d701">
+<title>5.7 推理引擎架构对比与 nanoserve 实现</title>
+<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
 
 </head>
 <body>
 <aside class="sidebar">
   <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
   <div class="sidebar-id">5.7</div>
-  <div class="sidebar-title">四家引擎架构对比 + 自建 nanoserve</div>
+  <div class="sidebar-title">推理引擎架构对比与 nanoserve 实现</div>
   <nav class="toc" aria-label="本章目录"><div class="toc">
 <ul>
 <li><a href="#_1">本章回答三个问题</a></li>
@@ -22,7 +22,7 @@
 </ul>
 </li>
 <li><a href="#nanoserve">工程实现 · 自己写一遍：nanoserve 的六次迭代</a><ul>
-<li><a href="#1">迭代 1 · 一条请求走完全程</a></li>
+<li><a href="#1">迭代 1 · 单请求端到端执行</a></li>
 <li><a href="#2">迭代 2 · 连续批处理</a></li>
 <li><a href="#3-kv">迭代 3 · 分页 KV</a></li>
 <li><a href="#4">迭代 4 · 前缀复用</a></li>
@@ -61,7 +61,7 @@
 </ul>
 </li>
 <li><a href="#nanoserve">工程实现 · 自己写一遍：nanoserve 的六次迭代</a><ul>
-<li><a href="#1">迭代 1 · 一条请求走完全程</a></li>
+<li><a href="#1">迭代 1 · 单请求端到端执行</a></li>
 <li><a href="#2">迭代 2 · 连续批处理</a></li>
 <li><a href="#3-kv">迭代 3 · 分页 KV</a></li>
 <li><a href="#4">迭代 4 · 前缀复用</a></li>
@@ -96,9 +96,9 @@
 <header class="page-head">
   <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L5 · 单机推理引擎</div>
   <div class="mod-id">5.7</div>
-  <h1>四家引擎架构对比 + 自建 nanoserve</h1>
-  <p class="lede">并置引擎状态组织方式，逐步实现 nanoserve 的请求推进、分页、前缀复用和输出通道。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen3-1.7B · vLLM 0.29.0 · SGLang 0.5.19 · llama.cpp df03399b · TensorRT-LLM 7bbf99e5</span><span class="chip">数据日期 2026-09-11</span><span class="chip">前置 5.1（两相）· 5.2（分页与前缀）· 5.3（调度）· 5.4（执行层）· 4.1（手写 Qwen3 前向）</span></div>
+  <h1>推理引擎架构对比与 nanoserve 实现</h1>
+  <p class="lede">比较四种推理引擎，并实现一个支持请求调度、分页缓存、前缀复用和流式输出的 nanoserve。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen3-1.7B · vLLM 0.29.0 · SGLang 0.5.19 · llama.cpp df03399b · TensorRT-LLM 7bbf99e5</span><span class="chip">前置 5.1（两相）· 5.2（分页与前缀）· 5.3（调度）· 5.4（执行层）· 4.1（手写 Qwen3 前向）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>前面六章各自拆了一个部件。这一章把它们装到一起：<strong>一个能收 HTTP 请求、
 能同时服务多条请求、能复用前缀、能被取消的引擎，最少需要哪些状态？</strong></p>
@@ -226,8 +226,7 @@ failed to find free space in the KV cache, retrying with smaller batch size, off
 
 <h3 id="_4">四家逐层对比</h3>
 <p>固定版本：vLLM 0.29.0、SGLang 0.5.19（均为 crater 上安装的 wheel），
-llama.cpp <code>df03399b</code>、TensorRT-LLM <code>7bbf99e5</code>（2026-09-10 浅克隆到
-<code>/scratch/learn/opt/src/</code>，只读源码，未编译未运行）。</p>
+llama.cpp <code>df03399b</code>、TensorRT-LLM <code>7bbf99e5</code>（2026-09-10 获取源码快照，只读源码，未编译未运行）。</p>
 <table>
 <thead>
 <tr>
@@ -290,7 +289,7 @@ llama.cpp <code>df03399b</code>、TensorRT-LLM <code>7bbf99e5</code>（2026-09-1
 </tr>
 </tbody>
 </table>
-<p>三点值得单独说：</p>
+<p>实现中有三个细节：</p>
 <ul>
 <li><strong>只有 llama.cpp 把"复用"做在 slot 粒度上</strong>：它不切块，而是找一个"上次跑过相似 prompt"的 slot 接着用。
   这在 <code>n_parallel</code> 很小、请求高度相似时非常划算，而且实现极简；
@@ -511,7 +510,7 @@ python<span class="w"> </span>labs/L5/nanoserve/drive_server.py<span class="w"> 
 分页只体现在寻址上，不体现在 kernel 内部。3.3 量过这条路的代价上界。
 本章所有耗时数字都带着这个前提，不能拿去和真实引擎比。</p>
 </div>
-<h3 id="1">迭代 1 · 一条请求走完全程</h3>
+<h3 id="1">迭代 1 · 单请求端到端执行</h3>
 <p>引擎最小的样子：一个 <code>step()</code>，一条请求，四个状态。
 把预算压到 8 个 token，中间态就现形了（<code>s1_trajectory</code>）：</p>
 <table>
@@ -586,9 +585,7 @@ python<span class="w"> </span>labs/L5/nanoserve/drive_server.py<span class="w"> 
     <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_computed</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">output_ids</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span>
 </code></pre></div>
 
-<p>它要等下一步被喂进模型时才写进块池。少减这个 1，位置就整体串一格，
-模型照样跑、照样出 token，只是全错。第一版就是这么错的，症状是
-<code>all_ids[kv_len]</code> 越界。</p>
+<p>该 token 在下一步输入模型后才写入块池。少减 1 会导致位置错位，并可能使 <code>all_ids[kv_len]</code> 越界。</p>
 <p><strong>怎么检查这个最小实现</strong>：同一条 prompt、同样贪心，和 <code>transformers.generate</code> 逐 token 比：</p>
 <div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"s1_crosscheck"</span><span class="p">,</span><span class="w"> </span><span class="nt">"reference"</span><span class="p">:</span><span class="w"> </span><span class="s2">"transformers.generate greedy"</span><span class="p">,</span>
 <span class="w"> </span><span class="nt">"compared"</span><span class="p">:</span><span class="w"> </span><span class="mi">24</span><span class="p">,</span><span class="w"> </span><span class="nt">"identical"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"first_divergence"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
@@ -824,10 +821,10 @@ prefill 计算量降到 1/5，但 TTFT 只降了 17%——因为这个规模下
 </tr>
 </tbody>
 </table>
-<p><strong>这是一条干净的单调取舍</strong>：预算越大，长 prompt 越快算完（20 步 → 2 步），
+<p>这组数据中，预算越大，长 prompt 越快算完（20 步 → 2 步），
 但同批 decode 的那一步越慢（24.6 ms → 54.8 ms）。</p>
 <p>它对应的是真实系统里的 TPOT 抖动：一条长 prompt 进来，
-正在聊天的用户会看到吐字卡一下。卡多久由 <code>max_batched_tokens</code> 决定。
+客户端可能观察到输出间隔增大，token 预算会影响这种延迟。
 5.1 讲过为什么两相不能用一套参数——这里是那句话的可测版本。</p>
 <div class="admonition warning">
 <p class="admonition-title">这条曲线的形状取决于本实现</p>
@@ -1098,7 +1095,7 @@ HTTP 那条路上也验了同一件事：客户端读了 5 个 token 就关掉 s
 </code></pre></div>
 
 <p><code>sent_tokens: 18</code> 而客户端只收到 5 个 —— <strong>引擎跑在客户端前面 13 个 token</strong>，
-这 13 个的算力是白花的。5.8 会量这件事。</p>
+这些 token 未被客户端接收，相关取消开销见 5.8。</p>
 <p>每个阶段结束都跑一次 <code>leak_check()</code>，全部 <code>leaked: 0</code>。
 <strong>"跑完了"和"资源回来了"是两件事，必须分别断言。</strong></p>
 <details class="fold srcfold"><summary>labs/L5/nanoserve/engine.py 全文（401 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
@@ -1528,7 +1525,7 @@ HTTP 那条路上也验了同一件事：客户端读了 5 个 token 就关掉 s
 <p>反例是很容易写出来的：如果同时维护 <code>num_free</code> 计数器和 free 链表，
 两者就会在某条罕见路径上分叉，而且分叉之后系统还能跑很久才暴露。
 5.2 里 vLLM 的块池也是同一个选择：空闲链表就是空闲状态本身。</p>
-<p><strong>不变量应该由一份数据承担；派生字段只能是缓存，不能是真相。</strong></p>
+<p>块的归属由引用计数统一记录，其他字段只能保存可重建的派生信息。</p>
 <h3 id="3-token">3. token 预算控制本轮准入规模</h3>
 <p><code>_schedule()</code> 一共只有一个数：<code>max_batched_tokens</code>。
 decode 先占（它们已经拿着块了），剩下的给 prefill。</p>
@@ -2233,7 +2230,7 @@ KV         114688 B/token；256 块 × 16 token 的池子 = 469762048 B
 <h2 id="_10">陷阱</h2>
 <ol>
 <li><strong>最新采样的 token 通常尚未经过下一次前向。</strong> KV 长度应按已完成前向的位置计数；完整 prefill 后普通逐步生成可写为 prompt 长度加 output 长度减一，不能再加到已经包含输出的 <code>num_computed</code> 上。
-   少减这个 1 会让位置整体串一格，模型照样出 token，只是全错。</li>
+   少减 1 会造成位置错位，即使程序继续运行，输出也可能错误。</li>
 <li><strong>"跑完了"不等于"资源回来了"。</strong> 每条路径结束后都要断言块池回到初始状态。
    nanoserve 的 <code>leak_check()</code> 在六个阶段都跑，全部为 0。</li>
 <li><strong>复用来的块是只读共享的</strong>，复用只能停在块边界。整段 prompt 命中时
@@ -2241,7 +2238,7 @@ KV         114688 B/token；256 块 × 16 token 的池子 = 469762048 B
 <li><strong>TTFT 要区分冷热。</strong> 本章第一条 228 ms、之后 36.5 ms，差 6 倍全是预热。</li>
 <li><strong>端到端量的 token 间隔不是 TPOT。</strong> 内核缓冲会把多个 token 一起交付
    （本章前 7 个约 30 ms，之后掉到 0.0x ms）。</li>
-<li><strong>连续批处理主要买延迟，不一定买吞吐。</strong> 本章 n=8/16 时吞吐只差 4–5%，
+<li><strong>连续批处理对延迟与吞吐的收益不同。</strong> 本章 n=8/16 时吞吐只差 4–5%，
    因为 decode 在这个规模上是带宽受限的（5.1）。</li>
 <li><strong>有 slot 的引擎容量确定但利用率低，无 slot 的相反。</strong> 选哪个取决于
    你更怕"容量不确定"还是"显存浪费"。</li>
@@ -2268,8 +2265,7 @@ KV         114688 B/token；256 块 × 16 token 的池子 = 469762048 B
 <details>
 <summary>2. 为什么连续批处理在本章的吞吐上几乎没赢，延迟却赢了 1.14–1.44 倍？</summary>
 <p>因为这个规模的 decode 是<strong>带宽受限</strong>的（5.1、5.5 都测过）：
-batch 从 1 涨到 16，每步耗时几乎不变。所以"把 GPU 喂得更满"这件事
-在这里换不来多少吞吐——n=8 和 n=16 时吞吐比只有 1.04× 和 1.05×。</p>
+batch 从 1 涨到 16，每步耗时几乎不变。因此，这组测试中继续增加 batch 的吞吐收益有限——n=8 和 n=16 时吞吐比只有 1.04× 和 1.05×。</p>
 <p>延迟赢的是另一件事：<strong>静态批让后到的请求干等上一批跑完</strong>。
 本章实测最大延迟 313 vs 511 ms（n=4）、363 vs 521 ms（n=8）、423 vs 524 ms（n=16）。</p>
 <p>n=4 那一档吞吐也赢了 1.41×，原因不同：静态批多花了 18 个 step（48 vs 30），
