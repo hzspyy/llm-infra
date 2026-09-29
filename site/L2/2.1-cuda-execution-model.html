@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.1 CUDA 执行模型与 CUDA Graph</title>
-<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
-<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
 
 </head>
 <body>
@@ -22,6 +22,10 @@
 <li><a href="#1-2-2-6">占用率：1 → 2 有用，2 → 6 无用</a></li>
 <li><a href="#kernel-gpu">多流并发：只有 kernel 占不满 GPU 时才有意义</a></li>
 <li><a href="#_4">尾效应：耗时是阶梯，不是斜线</a></li>
+<li><a href="#block-sm">映射：一个 block 只落在一个 SM 上</a></li>
+<li><a href="#313233-127128129">尾元素：31/32/33 与 127/128/129 都要对上</a></li>
+<li><a href="#producerconsumer">共享内存 producer/consumer 的失败现场</a></li>
+<li><a href="#cuda-graph">CUDA Graph：捕获把什么固定下来</a></li>
 </ul>
 </li>
 <li><a href="#grid">工程实现 · 源码解析：引擎在哪里对齐 grid</a><ul>
@@ -52,6 +56,10 @@
 <li><a href="#1-2-2-6">占用率：1 → 2 有用，2 → 6 无用</a></li>
 <li><a href="#kernel-gpu">多流并发：只有 kernel 占不满 GPU 时才有意义</a></li>
 <li><a href="#_4">尾效应：耗时是阶梯，不是斜线</a></li>
+<li><a href="#block-sm">映射：一个 block 只落在一个 SM 上</a></li>
+<li><a href="#313233-127128129">尾元素：31/32/33 与 127/128/129 都要对上</a></li>
+<li><a href="#producerconsumer">共享内存 producer/consumer 的失败现场</a></li>
+<li><a href="#cuda-graph">CUDA Graph：捕获把什么固定下来</a></li>
 </ul>
 </li>
 <li><a href="#grid">工程实现 · 源码解析：引擎在哪里对齐 grid</a><ul>
@@ -80,7 +88,7 @@
   <div class="mod-id">2.1</div>
   <h1>CUDA 执行模型与 CUDA Graph</h1>
   <p class="lede">通过分支、驻留资源、多流和线程块扫描，理解 CUDA 执行与并行度约束。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88</span><span class="chip">前置 L1.1（内存层次与 Little&#x27;s Law）· L1.4（launch 路径）</span></div>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · CUDA 13.0.88 · driver 580.95.05</span><span class="chip">前置 L1.1（内存层次与 Little&#x27;s Law）· L1.4（launch 路径）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li>warp 分支发散的代价是不是"N 路发散就慢 N 倍"？实测和理论差多少，为什么？</li>
@@ -368,6 +376,213 @@ blocks    波数    耗时 ms    每 block 摊销 µs
 <li><strong>小 batch 推理为什么效率低</strong>：batch=1 时很多 kernel 的 grid 远小于一波，
    GPU 大部分 SM 空着。这是 <a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 里"算力利用率不到 6%"的另一个侧面。</li>
 </ol>
+<h3 id="block-sm">映射：一个 block 只落在一个 SM 上</h3>
+<p>把 <code>blockIdx</code>、<code>threadIdx</code> 和 <code>%smid</code> 一起打印出来（3 个 block × 48 线程）：</p>
+<div class="highlight"><pre><span></span><code>      block 0：48 个线程全在 SM 0（同 SM: 是）  尾 warp 活跃线程 = 16
+      block 1：48 个线程全在 SM 1（同 SM: 是）  尾 warp 活跃线程 = 16
+      block 2：48 个线程全在 SM 2（同 SM: 是）  尾 warp 活跃线程 = 16
+</code></pre></div>
+
+<p>两条可以直接用于估算的事实：</p>
+<ul>
+<li><strong>block 是 SM 的调度单位，不会被拆到两个 SM。</strong> 所以一个 block 内的线程可以
+  用共享内存和 <code>__syncthreads()</code> 通信；跨 block 就不行（见下一节的屏障作用域）。</li>
+<li><strong>block 内按 32 线程切 warp</strong>，48 线程 = 1 个满 warp + 1 个只有 16 个线程的尾 warp。
+  尾 warp 的 16 个线程照样占一个 warp 槽位、照样按 32 lane 发指令 ——
+  "48 个线程"实际消耗的资源和一个 64 线程 block 的 warp 数相同。</li>
+</ul>
+<h3 id="313233-127128129">尾元素：31/32/33 与 127/128/129 都要对上</h3>
+<p>尾 warp 与尾 block 的存在使"越界判断"成为正确性的一部分。用 <code>block=128</code>、
+<code>grid=ceil(n/128)</code> 的逐元素 kernel，对 16 个边界尺寸与 CPU 参照逐元素比较：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">n</th>
+<th style="text-align: right;">grid</th>
+<th style="text-align: center;">逐元素一致</th>
+<th style="text-align: right;">不一致个数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1 / 31 / 32 / 33</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: center;">是</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td style="text-align: right;">63 / 64 / 65</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: center;">是</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td style="text-align: right;">127 / 128</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: center;">是</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td style="text-align: right;">129 / 255 / 256</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: center;">是</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td style="text-align: right;">257</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: center;">是</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td style="text-align: right;">1023 / 1024</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: center;">是</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td style="text-align: right;">1025</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: center;">是</td>
+<td style="text-align: right;">0</td>
+</tr>
+</tbody>
+</table>
+<p><code>if (i &lt; n)</code> 这一行覆盖了尾 warp 的 16 个 lane 与尾 block 的 127 个线程。
+去掉它，结果<strong>在数值上看不出任何异常</strong>（越界写落在分配之外，读回来的前 n 个元素
+仍然正确），只有 compute-sanitizer 会报出来 —— 这正是下一节要展示的。</p>
+<p>元素数的台阶不只出现在 block 数上，也直接体现在一波的边界上。
+<code>block=256</code>、每个 block 固定工作量、<code>grid=ceil(n/256)</code>：</p>
+<div class="highlight"><pre><span></span><code>      n          grid         波数   耗时 ms    相对一波
+      261119     1020         1.00     1.087        1.00x
+      261120     1020         1.00     1.087        1.00x
+      261121     1021         2.00     1.266        1.17x   &lt;- 多一波
+      261376     1021         2.00     1.267        1.17x
+      261377     1022         2.00     1.266        1.17x
+</code></pre></div>
+
+<p><strong>元素数只多 1，grid 多 1 个 block，就跨进第二波。</strong> 第二波里只有那 1 个 block
+在跑，另外 169 个 SM 空等 —— 这就是 [E] 那个 17% 台阶在"元素数"坐标下的样子。
+所以对齐判据不只是"grid 是 SM 的整数倍"，而是
+<code>grid ≤ SM 数 × 每 SM 可驻留 block 数</code>。</p>
+<h3 id="producerconsumer">共享内存 producer/consumer 的失败现场</h3>
+<p>四类失败各有一个"错"版本与一个"对"版本，跑同一份输入。判据是<strong>数值</strong>与
+<strong>工具</strong>两条线：</p>
+<table>
+<thead>
+<tr>
+<th>案例</th>
+<th>数值证据（20 次重复）</th>
+<th>工具证据</th>
+<th>修复后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>缺 <code>__syncthreads</code> 的跨 warp 读写</td>
+<td>不一致 0/20（把第 0 个 warp 的写入延后放大窗口后仍是 0/20）</td>
+<td><code>racecheck</code> 报 <strong>40 hazards</strong></td>
+<td>加 <code>__syncthreads()</code> 后 <code>racecheck</code> <strong>0 hazards</strong></td>
+</tr>
+<tr>
+<td>shuffle 掩码写错（16 个 lane 执行却声明 32 个参与）</td>
+<td>与掩码语义不符 <strong>20/20</strong></td>
+<td><code>synccheck</code> 对这类不报（它查的是屏障）</td>
+<td>改成全 warp 执行 shuffle 后 <strong>0/20</strong></td>
+</tr>
+<tr>
+<td>去掉 <code>if (i &lt; n)</code> 的越界访问</td>
+<td>不一致 <strong>0</strong>（前 n 个元素完全正确）</td>
+<td><code>memcheck</code> 报 <strong>139 errors</strong></td>
+<td>加回判断后 0</td>
+</tr>
+<tr>
+<td>两条流之间缺事件依赖</td>
+<td>20 次里 <strong>1–2 次</strong>读到未完成的数据</td>
+<td>这类跨 kernel 顺序问题不在 <code>racecheck</code> 覆盖面内</td>
+<td>加 <code>cudaStreamWaitEvent</code> 后 0/20</td>
+</tr>
+</tbody>
+</table>
+<p>第一行是最值得记住的：<strong>数值一致不能证明没有竞态。</strong> 20 次全对，<code>racecheck</code>
+依然指出 40 处共享内存冒险 —— 它只是在等一个不同的调度时机。</p>
+<p>第三行说明越界写为什么危险：被越界写坏的是别人的内存，自己的结果看起来完全正确。</p>
+<p>第四行的 1–2/20 表明：竞态并非确定性每次触发，因此"单次运行未报错"绝非正确性证据；
+<code>racecheck</code> 这类工具的作用正是把概率性竞态转化为确定性违规报告。</p>
+<p>关于屏障的作用域：</p>
+<ul>
+<li><code>__syncthreads()</code> 是 <strong>block 级</strong>屏障，只对同一个 block 内的线程有效，
+  不会等其它 block。</li>
+<li><code>__syncwarp()</code> 是 <strong>warp 级</strong>的；掩码必须精确描述参与的 lane，
+  且调用点必须被掩码内的所有 lane 共同执行。</li>
+<li>block 之间没有廉价屏障。需要跨 block 同步时，要么拆成两个 kernel
+  （用 kernel 边界同步，5.4 的图执行就是这么做的），要么用 cooperative groups
+  的 grid 同步（要求 kernel 能整卡驻留，见 5.4 的 persistent 讨论）。</li>
+</ul>
+<p>发散屏障（只有一半线程执行 <code>__syncthreads()</code>）在 CUDA 里是未定义行为。
+本章实测里它既没有报错、也没有产生错误数值，<code>synccheck</code> 也报 0 errors ——
+<strong>未定义行为的典型表现就是"什么都没发生"。</strong> 这不能作为可以这么写的依据。</p>
+<h3 id="cuda-graph">CUDA Graph：捕获把什么固定下来</h3>
+<p>一次捕获、多次 replay 的成本与限制（crater 实测）：</p>
+<div class="highlight"><pre><span></span><code>    捕获 0.100 ms   实例化 0.067 ms   节点数 1
+    首次 launch 0.0203 ms   热 replay 0.0021 ms（100 次平均）
+    显存 free 变化 -2.0 MB
+</code></pre></div>
+
+<p>捕获与实例化是一次性成本；热 replay 比首次 launch 快约一个量级。
+真正的约束在"捕获冻结了什么"，逐个变量试一遍：</p>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>结果</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>输入的值（同一块内存）</td>
+<td>与新输入的不一致元素 = 0</td>
+<td><strong>合法</strong>。图固定的是地址，不是内容</td>
+</tr>
+<tr>
+<td>输入指针（换成另一块显存）</td>
+<td>结果仍写在旧地址；新地址 0 字节被写</td>
+<td><strong>非法</strong>。host 侧换个变量没有任何效果</td>
+</tr>
+<tr>
+<td>元素数（shape）</td>
+<td>前 100000 个元素正确，<code>[100000, 200000)</code> 全为 0</td>
+<td><strong>非法</strong>。grid 与 <code>n</code> 都被冻结在捕获时的值</td>
+</tr>
+<tr>
+<td>释放后重新分配</td>
+<td>图仍指旧地址，<code>memcheck</code> 报非法访问</td>
+<td><strong>非法</strong>。内存池复用只是让错误变得随机</td>
+</tr>
+<tr>
+<td>把 <code>n</code> 放进设备内存</td>
+<td>同一张图跑 n=1000/100000/200000/1048576，全部 0 不匹配</td>
+<td><strong>合法</strong>。这是动态尺寸的正解</td>
+</tr>
+</tbody>
+</table>
+<p>改 shape 有两条合法修法，实测都得到 0 不匹配：</p>
+<ol>
+<li><strong>重新捕获并实例化</strong>（新 n 一张新图）；</li>
+<li><strong><code>cudaGraphExecKernelNodeSetParams</code></strong> 就地改节点参数（同一张图，
+   只改 grid 与 <code>n</code>，不重新实例化）。</li>
+</ol>
+<p>链式 kernel 的成本对照（10 个 kernel）：</p>
+<div class="highlight"><pre><span></span><code>    CPU 侧提交：逐个 launch 0.023 ms   一次 replay 0.006 ms   (4.05 ×)
+    GPU 侧执行：逐个 launch 0.023 ms   一次 replay 0.010 ms   (2.22 ×)
+</code></pre></div>
+
+<p>replay 省下的是 CPU 侧的提交次数。GPU 时间也跟着降，是因为逐个 launch 之间存在
+CPU 提交间隙、GPU 在等命令；图把这些间隙填上了。<strong>这仍然不代表计算量减少</strong> ——
+图里该跑的 10 个 kernel 一个不少。2.6b 在真实引擎（vLLM + Qwen3-1.7B）上用 nsys
+数过同一件事：三种图模式下 GPU 上的 kernel 数几乎不变（14,003 → 12,147），
+变的只是 CPU 侧 launch 调用（14,003 → 863）。</p>
 <hr />
 <h2 id="grid">工程实现 · 源码解析：引擎在哪里对齐 grid</h2>
 <h3 id="1-vllm-reshape_and_cache_flash">1. vLLM 的 <code>reshape_and_cache_flash</code></h3>
@@ -435,11 +650,29 @@ grid 维度是 <code>(ceil(seqlen_q / 64), batch, heads)</code>。</p>
 更换 kernel 或编译器后，应重新计算该配置的可驻留 block 数。</p>
 <hr />
 <h2 id="lab">动手 lab</h2>
-<div class="highlight"><pre><span></span><code>nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-Xptxas<span class="w"> </span>-v<span class="w"> </span>-o<span class="w"> </span>exec_model<span class="w"> </span>labs/L2/exec_model.cu
+<p>三个实验，都是单文件、直接编译：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1) 执行模型：发散、占用率、多流、尾效应、映射与边界尺寸</span>
+nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-Xptxas<span class="w"> </span>-v<span class="w"> </span>-o<span class="w"> </span>exec_model<span class="w"> </span>labs/L2/exec_model.cu
 ./exec_model
+
+<span class="c1"># 2) 失败小例：缺屏障、错掩码、越界、跨流缺依赖（带 sanitizer 对照）</span>
+bash<span class="w"> </span>labs/L2/run_smem_failures.sh
+
+<span class="c1"># 3) CUDA Graph：捕获冻结了什么</span>
+bash<span class="w"> </span>labs/L2/run_graph_capture.sh
 </code></pre></div>
 
 <p><code>-Xptxas -v</code> 会打印每个 kernel 的寄存器与共享内存用量——这是判断占用率的第一手信息。</p>
+<p>原始输出：<code>results/crater/2.1/20260913-exec/</code>（<code>exec_model.txt</code>、<code>ptxas.txt</code>、
+<code>smem/</code>、<code>graph/</code>）。</p>
+<div class="admonition warning">
+<p class="admonition-title">compute-sanitizer 要用完整 redist</p>
+<p>wheel 里那份 <code>nvidia/cu13/bin/compute-sanitizer</code> 缺少注入库，跑起来会报
+<code>Target application terminated before first instrumented API call</code>。
+本章用的是完整 redist 解包版（<code>$ROOT/opt/sanitizer-redist/</code>），
+两个脚本已把 <code>SAN</code>/<code>SAN_LIB</code> 指过去；仍可用环境变量覆盖。
+差别见 ENVIRONMENTS.md 的工具安装段落。</p>
+</div>
 <h3 id="_6">消融建议</h3>
 <table>
 <thead>
@@ -466,8 +699,16 @@ grid 维度是 <code>(ceil(seqlen_q / 64), batch, heads)</code>。</p>
 <td>重叠倍数应该掉到 1×——满负载时多流无意义</td>
 </tr>
 <tr>
-<td>用 <code>compute-sanitizer ./exec_model</code> 跑一遍</td>
-<td>检查有没有越界访问、竞态。本机已装（<code>nvidia/cu13/bin/compute-sanitizer</code>）</td>
+<td>把 [F] 的 <code>if (i &lt; n)</code> 删掉再跑一次 <code>memcheck</code></td>
+<td>数值仍然全对，但 sanitizer 报出 127 个越界线程</td>
+</tr>
+<tr>
+<td>把失败小例的 <code>sync=1</code> 改回 0，再跑 <code>racecheck</code></td>
+<td>从 0 hazards 变成 40 hazards——数值却可能一直是对的</td>
+</tr>
+<tr>
+<td>把 <code>graph_capture</code> 的 C6 改成"直接换 host 侧指针"</td>
+<td>从 0 不匹配变成全部写进旧地址</td>
 </tr>
 </tbody>
 </table>
@@ -533,7 +774,7 @@ ptxas info    : Used 16 registers, used 0 barriers, 16384 bytes smem
 <ul>
 <li><strong><code>Used N registers</code></strong>：每线程用了多少寄存器。每 SM 的寄存器文件是 64K 个 32 位寄存器，
   所以最多能驻留 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>65536</mn><mo>&#x0002F;</mo><mi>N</mi></mrow></math></span> 个线程。本例只用 12–16 个，不是瓶颈。</li>
-<li><strong><code>bytes smem</code></strong>：静态共享内存。本例是我们故意加的旋钮。</li>
+<li><strong><code>bytes smem</code></strong>：静态共享内存。本例属于实验中受控注入的负载旋钮。</li>
 <li><strong><code>stack frame</code> / <code>spill stores</code> / <code>spill loads</code></strong>：<strong>寄存器溢出</strong>。
   全为 0 说明没溢出。一旦不为 0，说明寄存器不够用，变量被踢到 local memory
   （其实在显存里，延迟 929 周期——<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测），性能会断崖式下跌。</li>
@@ -546,10 +787,21 @@ ptxas info    : Used 16 registers, used 0 barriers, 16384 bytes smem
 <div class="highlight"><pre><span></span><code>ncu (Nsight Compute)      不可用   PyPI 上没有对应的包
 nsys (Nsight Systems)     不可用   同上
 nvprof                    不可用   已被 NVIDIA 废弃
-compute-sanitizer         可用     nvidia/cu13/bin/compute-sanitizer
+compute-sanitizer         可用     redist 解包版（见下）
 cuobjdump                 可用     triton/backends/nvidia/bin/cuobjdump
 nvdisasm                  可用     nvidia/cu13/bin/nvdisasm
 CUPTI 硬件计数器           不可用   torch profiler 的 profiler_metrics 在本 build 上取不到值
+</code></pre></div>
+
+<p><strong>wheel 自带的那份 compute-sanitizer 不能用</strong>：<code>nvidia/cu13/bin/compute-sanitizer</code>
+缺少注入库，任何目标都会报
+<code>Target application terminated before first instrumented API call</code>。
+从 NVIDIA 的 redist 取 <code>cuda_sanitizer_api-linux-x86_64-13.0.85-archive</code> 解包后，
+把 <code>LD_LIBRARY_PATH</code> 指向它的 <code>lib/</code> 即可正常出报告。
+本章的三个工具实测覆盖：</p>
+<div class="highlight"><pre><span></span><code>memcheck   越界读/写            oob 版本 139 errors，加回 i&lt;n 判断后 0
+racecheck  共享内存竞态         race 版本 40 hazards，加 __syncthreads 后 0
+synccheck  屏障用法             发散 __syncthreads 未报错（0 errors），见正文说明
 </code></pre></div>
 
 <p><code>cuda-toolkit</code> 这个 pip 包提供的 extras 全清单（<code>Provides-Extra</code>）：</p>
@@ -564,6 +816,71 @@ nvml, nvptxcompiler, nvrtc, nvtx, nvvm, opencl, profiler, sanitizer
 <code>-Xptxas -v</code>、<code>clock64()</code> 在 kernel 内计时、torch profiler 的 kernel 时间与计数、
 以及贯穿全站的 roofline 分析。这些可用于定位部分提交、布局与同步问题；
 ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</strong>，会在 <a class="xref" href="../L2/2.6-profiling.html" title="GPU 性能分析">L2.6</a> 里说明它补的是哪一块。</p>
+</details>
+<details>
+<summary>④ [F] 映射与边界尺寸</summary>
+<div class="highlight"><pre><span></span><code>3 个 block × 48 线程（= 1.5 个 warp/block）
+  block 0：48 个线程全在 SM 0（同 SM: 是）  尾 warp 活跃线程 = 16
+  block 1：48 个线程全在 SM 1（同 SM: 是）  尾 warp 活跃线程 = 16
+  block 2：48 个线程全在 SM 2（同 SM: 是）  尾 warp 活跃线程 = 16
+
+边界元素数正确性（block=128）：16 个尺寸（1/31/32/33/63/64/65/127/128/129/
+255/256/257/1023/1024/1025）逐元素与 CPU 参照比较，不一致个数全部为 0。
+
+元素数跨过一波边界（block=256，grid=ceil(n/256)，每个 block 固定工作量）
+  n          grid         波数   耗时 ms    相对一波
+  261119     1020         1.00     1.087        1.00x
+  261120     1020         1.00     1.087        1.00x
+  261121     1021         2.00     1.266        1.17x   &lt;- 多一波
+  261376     1021         2.00     1.267        1.17x
+  261377     1022         2.00     1.266        1.17x
+</code></pre></div>
+
+</details>
+<details>
+<summary>⑤ 失败小例的数值与 sanitizer 对照</summary>
+<div class="highlight"><pre><span></span><code>[1] 去掉 i &lt; n 判断后的越界写
+  [oob] guard=0  n=1025 grid=9  越界线程 = 127  不一致 = 0
+  [oob] guard=1  n=1025 grid=9  越界线程 = 127  不一致 = 0
+  memcheck：guard=0 报 139 errors；guard=1 报 0
+
+[2] 缺 __syncthreads 的跨 warp 读写（delay=1 只放大窗口，不改变对错）
+  [race] sync=0 delay=0  20 次里 0 次不一致
+  [race] sync=0 delay=1  20 次里 0 次不一致
+  [race] sync=1 delay=1  20 次里 0 次不一致
+  racecheck：buggy 40 hazards；加 __syncthreads 后 0 hazards
+
+[3] 发散的 shuffle 用错掩码
+  [mask] correct=0  20 次里 20 次结果与掩码语义不符
+  [mask] correct=1  20 次里 0 次结果与掩码语义不符
+
+[3b] 发散的 __syncthreads
+  [barrier] correct=0  同步返回=成功  写出值=63
+  [barrier] correct=1  同步返回=成功  写出值=63
+  synccheck：0 errors
+
+[4] 两条流之间缺事件依赖
+  [stream] use_event=0  20 次里 1 次读到未完成的数据
+  [stream] use_event=1  20 次里 0 次读到未完成的数据
+</code></pre></div>
+
+</details>
+<details>
+<summary>⑥ CUDA Graph 的捕获/replay 原始输出</summary>
+<div class="highlight"><pre><span></span><code>[C1] 捕获 0.100 ms  实例化 0.067 ms  节点数 1
+     首次 launch 0.0203 ms  热 replay 0.0021 ms（100 次平均）
+     显存 free 变化 -2.0 MB
+
+[C2] 改输入的值：与新输入的不一致元素 = 0
+[C3] 换输入指针：写进旧地址，新地址 0 字节被写
+[C4] 改元素数：前 100000 个正确，[100000,200000) 全为 0
+     重新捕获：0 不匹配；GraphExecKernelNodeSetParams：成功，0 不匹配
+[C5] 释放后 replay：memcheck 报 Invalid __global__ read/write
+[C6] 设备端 n：1000 / 100000 / 200000 / 1048576 全部 0 不匹配
+[C7] 10 个 kernel：CPU 提交 0.023 ms -&gt; 0.006 ms（4.05×）
+     GPU 执行 0.023 ms -&gt; 0.010 ms（2.22×）
+</code></pre></div>
+
 </details>
 <hr />
 <h2 id="_8">前沿</h2>
@@ -597,7 +914,7 @@ ncu 能多给的是<strong>硬件计数器级的指令混合与停顿原因</str
 </tr>
 <tr>
 <td><strong>绿色上下文 / MPS 分区</strong></td>
-<td>把 SM 划分给不同的上下文，让本章的"占不满 GPU"问题在多租户下有解（<span class="xref pending" title="编排：K8s / Ray / Slurm（后续章节）">L8.2</span>）</td>
+<td>把 SM 划分给不同的上下文，让本章的"占不满 GPU"问题在多租户下有解（<a class="xref" href="../L8/8.2-orchestration.html" title="编排：K8s / Ray / Slurm">L8.2</a>）</td>
 </tr>
 </tbody>
 </table>
@@ -617,7 +934,18 @@ compute-bound 的累加值不被使用，整个循环会被删掉。</p>
 <p><strong>5. 以为多流总是有用。</strong> 单个 kernel 已经占满 GPU 时，多流是净亏损（实测 0.96×）。</p>
 <p><strong>6. 忽略 <code>-Xptxas -v</code> 里的 spill。</strong> 寄存器溢出不报错，只会让 kernel 悄悄慢几倍。</p>
 <p><strong>7. 以为发散一定慢 N 倍。</strong> 短分支会被转成谓词执行，实测 8 路只慢 6.02×。
-但这不代表可以随便写发散——6 倍也是 6 倍。</p>
+但这不代表分支发散的影响可被忽略——6 倍的延迟退化依然是显著的性能瓶颈。</p>
+<p><strong>8. 拿"跑了几次都对"当竞态不存在。</strong> 缺 <code>__syncthreads</code> 的跨 warp 读写
+20 次全部通过数值检查，<code>racecheck</code> 仍报 40 处冒险。竞态只是还没等到那个调度时机。</p>
+<p><strong>9. 以为越界写会让自己的结果出错。</strong> 实测越界 127 个线程，前 n 个元素全部正确。
+坏掉的是别人的内存，只有 <code>memcheck</code> 会告诉你。</p>
+<p><strong>10. 捕获后的 CUDA Graph 不允许直接更改输入指针或形状参数。</strong> 图固定的是<strong>地址与 launch 配置</strong>：
+换指针 → 结果写进旧地址；换 shape → 新元素根本没人处理。
+合法修法只有重新捕获或 <code>cudaGraphExecKernelNodeSetParams</code>。</p>
+<p><strong>11. 发散执行 <code>__syncthreads()</code> 可能"什么都没发生"。</strong> 本章实测它既没报错
+也没有错误数值，<code>synccheck</code> 也报 0 errors。未定义行为不等于必然崩溃。</p>
+<p><strong>12. 工具报 0 不等于没有问题。</strong> <code>synccheck</code> 不管屏障之外的同步原语，
+<code>racecheck</code> 不管跨 kernel 的顺序。用哪个工具取决于你要证明什么。</p>
 <hr />
 <h2 id="_10">自测题</h2>
 <details>
@@ -675,7 +1003,7 @@ compute-bound 就会变得和 memory-bound 一样依赖占用率。
 - CPU 调度与 GPU 执行重叠（<a class="xref" href="../L5/5.4-execution-layer.html" title="执行层：CUDA Graph 与流水重叠">L5.4</a>）</p>
 </details>
 <details>
-<summary>5. 我写了一个 attention kernel，<code>-Xptxas -v</code> 显示 <code>Used 168 registers, 48 bytes spill stores</code>。该怎么办？</summary>
+<summary>5. 编译一个 attention kernel 时，<code>-Xptxas -v</code> 显示 <code>Used 168 registers, 48 bytes spill stores</code>。该如何处理？</summary>
 <p><strong>先确认 spill 有多严重，再决定。</strong></p>
 <p>48 字节的 spill 很少（大约 12 个寄存器），可能只在某个冷路径上。
 但 spill 写的是 <strong>local memory，物理上在显存里</strong>（<a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 实测延迟 929 周期），
@@ -690,8 +1018,35 @@ compute-bound 就会变得和 memory-bound 一样依赖占用率。
 </ol>
 <p><strong>不要用 <code>__launch_bounds__</code> 强行限制寄存器来"解决"它</strong>——
 那只会让编译器 spill 得更多。<code>__launch_bounds__</code> 是告诉编译器
-"我需要这个占用率"，编译器会为此牺牲寄存器，是<strong>用 spill 换占用率</strong>。
+指定特定占用率目标，编译器会为此牺牲寄存器，即<strong>以 local memory spill 为代价换取更高占用率</strong>。
 按本章的结论，本机 2 block/SM 就够了，<strong>没必要为占用率牺牲寄存器</strong>。</p>
+</details>
+<details>
+<summary>6. 一个 block 内的相邻访问 kernel 忘了写 <code>__syncthreads()</code>，跑 20 次数值全对，能上生产吗？</summary>
+<p>不能。本章实测这正是 racecheck 报 40 hazards 的那个 kernel：数值 0/20 不一致，
+工具报 40 处共享内存冒险。竞态是否触发取决于 warp 调度时机，
+"这次没撞上"和"不会撞上"是两件事。</p>
+<p>修法是进入读阶段前加一次 <code>__syncthreads()</code>，改完 racecheck 报 0 hazards。
+注意 <code>__syncthreads()</code> 是 <strong>block 级</strong>屏障：它保证同一 block 内所有线程都已写完后
+才继续，不会等其它 block；跨 block 的同步只能靠 kernel 边界或 cooperative groups。</p>
+</details>
+<details>
+<summary>7. 一张捕获好的 CUDA Graph，哪些变化可以直接用，哪些必须重新捕获或更新？</summary>
+<p>可以直接用：<strong>同一块内存里的值</strong>（图固定的是地址，不是内容）。</p>
+<p>必须重新捕获或用 <code>cudaGraphExecKernelNodeSetParams</code> 更新：<strong>shape /
+launch 配置</strong>（grid、<code>n</code>）。</p>
+<p>必须重新捕获：<strong>指针本身变了</strong>（另一块显存、重新分配）。本章实测换指针后
+结果仍然写进旧地址，新地址一个字节都没被写——<strong>不会报错，只会算错</strong>。</p>
+<p>想在不重捕获的前提下支持动态尺寸，正解是把尺寸放进设备内存、kernel 在设备端读：
+实测同一张图跑 n=1000/100000/200000/1048576 全部正确。</p>
+</details>
+<details>
+<summary>8. 一个 48 线程的 block，尾 warp 有几个活跃线程？这个 block 会不会跨两个 SM？为什么这决定了能用什么同步原语？</summary>
+<p>尾 warp 有 48 − 32 = <strong>16 个活跃线程</strong>（它仍然占一个 warp 槽位）。
+block 不会跨 SM：实测 3 个 block × 48 线程时，每个 block 的线程 <code>%smid</code> 完全相同。</p>
+<p>这决定了同步原语的选择：block 内可以用共享内存 + <code>__syncthreads()</code>；
+warp 内用 <code>__syncwarp(mask)</code>，掩码必须精确描述参与的 lane；
+block 之间没有廉价屏障，需要跨 block 就拆 kernel（用 kernel 边界同步）。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.0c-runtime-memory.html">&#8592; 2.0c PyTorch 运行时：内存、流与异步生命周期</a><a class="nav-next" href="../L2/2.2-toolchain-ptx-sass.html">2.2 编译工具链：nvcc → PTX → SASS &#8594;</a></nav>
 </main>
 </body>

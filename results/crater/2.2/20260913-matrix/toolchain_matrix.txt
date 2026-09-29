@@ -1,0 +1,114 @@
+############ 1. 制品矩阵：-O 级别 / fast-math / 目标架构
+变体                             cpp1       ptx        sass       regs     smem     spill 
+--------------------------------------------------------------------------------------------
+O0 (-O0 -Xptxas -O0)               1386491    9513       123077     30       1024     0     
+                                   sha256(cpp1/ptx/cubin)=0706c98baacd/e93f427b3ad2/2ddbb14a9b9f
+O2 (-O2 -Xptxas -O2)               1427094    9513       59141      37       1024     0     
+                                   sha256(cpp1/ptx/cubin)=d9f0fd8a7a0b/e93f427b3ad2/9804f7910c1e
+O3 (-O3 -Xptxas -O3)               1427094    9513       59141      37       1024     0     
+                                   sha256(cpp1/ptx/cubin)=d9f0fd8a7a0b/e93f427b3ad2/af5e4a372eeb
+O3fast (-O3 -Xptxas -O3 --use_fast_math) 1427094    9609       59141      37       1024     0     
+                                   sha256(cpp1/ptx/cubin)=d9f0fd8a7a0b/00e6745cef17/565b9357f33d
+
+############ 2. 目标架构：sm_120 vs sm_90（PTX 版本与 JIT）
+目标                         cubin      ptx        SASS 说明
+-----------------------------------------------------------------
+-arch=sm_120 | cubin=1 ptx=1 | 30104 字节
+-gencode=arch=compute_90,code=sm_90 | cubin=1 ptx=0 | 24168 字节
+-gencode=arch=compute_120,code=compute_120 | cubin=0 ptx=1 | 13912 字节
+  ⇒ 只有 PTX 的变体在首次加载时由驱动 JIT；这一点在 4 节用时间量出来。
+
+############ 3. 源码行 → SASS 指令数（-lineinfo + nvdisasm -gi）
+  按源码行的指令数（三个 kernel 合并统计，前 14 行）：
+    源码行 指令数
+    10       1
+    12       1
+    13       1
+    14       1
+    2        1
+    20       1
+    21       1
+    22       1
+    5        1
+    6        1
+    11       2
+    18       2
+    3        2
+    4        2
+  saxpy_kernel 只占 kernels.cu 的 2-5 行；出现更多行号是因为 -lineinfo
+  映射的是预处理后的行。没有被映射到的源码行即被优化掉或与相邻行合并。
+
+############ 4. fast-math 的数值代价（同一源文件，两个编译单元）
+    precise[0]=86.1946411  fast[0]=86.1946411
+    max |diff| = 1.526e-05   max rel = 2.977e-07
+  SASS 指令数：precise=360 fast=80
+  （同一个 .cu，只差 --use_fast_math：结果有差异，指令数也不同）
+
+############ 5. -Xptxas -v 原始日志（O3 变体）
+    ptxas info    : 0 bytes gmem
+    ptxas info    : Compiling entry function '_Z11gemm_kernelPKfS0_Pfiii' for 'sm_120'
+    ptxas info    : Function properties for _Z11gemm_kernelPKfS0_Pfiii
+        0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+    ptxas info    : Used 37 registers, used 0 barriers
+    ptxas info    : Compile time = 4.635 ms
+    ptxas info    : Compiling entry function '_Z13reduce_kernelPKfPfi' for 'sm_120'
+    ptxas info    : Function properties for _Z13reduce_kernelPKfPfi
+        0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+    ptxas info    : Used 12 registers, used 1 barriers, 1024 bytes smem
+    ptxas info    : Compile time = 2.015 ms
+    ptxas info    : Compiling entry function '_Z12saxpy_kernelPKfPfif' for 'sm_120'
+
+############ 6. unroll × 寄存器预算：时间 / 占用率 / spill 合并表
+  — memory-bound（1 GiB 流式读，UNROLL 个 float4/线程）—
+    unroll     MINB   regs     local(B)   occ blk   spill    GB/s         ms
+    ------------------------------------------------------------------------------------------
+    1          1      18       0          6         -        1695.1       0.6334
+    1          2      18       0          6         -        1697.3       0.6326
+    1          4      18       0          6         -        1697.4       0.6326
+    1          8      18       0          6         -        1698.0       0.6324
+    2          1      28       0          6         -        1694.2       0.6338
+    2          2      28       0          6         -        1695.9       0.6332
+    2          4      28       0          6         -        1694.2       0.6338
+    2          8      28       0          6         -        1696.4       0.6330
+    4          1      38       0          6         -        1687.9       0.6361
+    4          2      38       0          6         -        1687.5       0.6363
+    4          4      38       0          6         -        1689.3       0.6356
+    4          8      38       0          6         -        1689.4       0.6356
+    8          1      56       0          4         -        1699.1       0.6320
+    8          2      56       0          4         -        1698.9       0.6320
+    8          4      56       0          4         -        1700.1       0.6316
+    8          8      40       0          6         -        1688.5       0.6359
+    
+  — compute-bound（独立 FMA 链，MINB 压缩寄存器预算）—
+    [compute] 独立 FMA 链数 × 寄存器预算（iters=200000）
+    chains     MINB   regs     local(B)   occ blk   TFLOPS       每 SM 寄存器预算
+    ------------------------------------------------------------------------------------------
+    4          1      12       0          6         118.1        256
+    4          2      12       0          6         118.1        128
+    4          8      12       0          6         118.0        32
+    16         1      36       0          6         120.5        256
+    16         2      36       0          6         119.8        128
+    16         8      36       0          6         119.8        32
+    32         1      39       0          6         119.8        256
+    32         2      39       0          6         119.8        128
+    32         8      47       0          5         119.7        32
+    64         1      71       0          3         119.2        256
+    64         2      71       0          3         119.2        128
+    64         8      70       0          3         119.0        32
+
+  ptxas 报的 spill（按符号，只列非零）：
+  （完整日志：/scratch/learn/work/out/2.2/20260913-matrix/sweep.log）
+
+############ 7. -maxrregcount 硬上限：spill 与 TFLOPS 一起变
+  maxrregcount     regs     spill(B)   local(B)   occ blk    TFLOPS
+  --------------------------------------------------------------------------------
+  (默认)         79       0          0          3          119.7
+  32               32       1004       336        6          1.2
+  48               48       540        216        5          2.8
+  64               64       108        48         4          13.4
+  128              71       0          0          3          118.9
+  255              71       0          0          3          118.9
+  ⇒ __launch_bounds__ 只是目标，ptxas 可以选择不满足；-maxrregcount 是硬上限，
+     超了就只能 spill 到 local memory。
+
+所有产物在 /scratch/learn/work/out/2.2/20260913-matrix

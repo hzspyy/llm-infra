@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.2 KV cache 管理：PagedAttention 与 prefix cache</title>
-<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
-<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
 
 </head>
 <body>
@@ -31,20 +31,26 @@
 </li>
 <li><a href="#_7">工程实现 · 自己写一遍</a><ul>
 <li><a href="#_8">怎样检查这个最小实现</a></li>
+<li><a href="#_9">带分叉与写时复制的分页状态机</a></li>
 </ul>
 </li>
 <li><a href="#lab">动手 lab：比较前缀复用预测与调用耗时</a><ul>
 <li><a href="#a-vs">实验 A：命中 vs 未命中</a></li>
 <li><a href="#b">实验 B：共享前缀长度扫描</a></li>
 <li><a href="#token_1">逐请求命中 token 数与调用耗时</a></li>
-<li><a href="#_9">这条结果的工程含义</a></li>
-<li><a href="#_10">消融建议</a></li>
+<li><a href="#_10">这条结果的工程含义</a></li>
+<li><a href="#_11">逐请求命中账：块边界、相同后缀与中段改变</a></li>
+<li><a href="#sglang">同一扫描在 SGLang 上：页粒度决定命中量</a></li>
+<li><a href="#_12">容量拐点是阶跃的</a></li>
+<li><a href="#lru-lfuslru">驱逐策略：同负载下 LRU 与 LFU/SLRU 只在热点回访上分开</a></li>
+<li><a href="#_13">缓存与驱逐的作用域</a></li>
+<li><a href="#_14">消融建议</a></li>
 </ul>
 </li>
-<li><a href="#_11">原始现场</a></li>
-<li><a href="#_12">前沿</a></li>
-<li><a href="#_13">陷阱</a></li>
-<li><a href="#_14">自测题</a></li>
+<li><a href="#_15">原始现场</a></li>
+<li><a href="#_16">前沿</a></li>
+<li><a href="#_17">陷阱</a></li>
+<li><a href="#_18">自测题</a></li>
 </ul>
 </div>
 </nav>
@@ -67,20 +73,26 @@
 </li>
 <li><a href="#_7">工程实现 · 自己写一遍</a><ul>
 <li><a href="#_8">怎样检查这个最小实现</a></li>
+<li><a href="#_9">带分叉与写时复制的分页状态机</a></li>
 </ul>
 </li>
 <li><a href="#lab">动手 lab：比较前缀复用预测与调用耗时</a><ul>
 <li><a href="#a-vs">实验 A：命中 vs 未命中</a></li>
 <li><a href="#b">实验 B：共享前缀长度扫描</a></li>
 <li><a href="#token_1">逐请求命中 token 数与调用耗时</a></li>
-<li><a href="#_9">这条结果的工程含义</a></li>
-<li><a href="#_10">消融建议</a></li>
+<li><a href="#_10">这条结果的工程含义</a></li>
+<li><a href="#_11">逐请求命中账：块边界、相同后缀与中段改变</a></li>
+<li><a href="#sglang">同一扫描在 SGLang 上：页粒度决定命中量</a></li>
+<li><a href="#_12">容量拐点是阶跃的</a></li>
+<li><a href="#lru-lfuslru">驱逐策略：同负载下 LRU 与 LFU/SLRU 只在热点回访上分开</a></li>
+<li><a href="#_13">缓存与驱逐的作用域</a></li>
+<li><a href="#_14">消融建议</a></li>
 </ul>
 </li>
-<li><a href="#_11">原始现场</a></li>
-<li><a href="#_12">前沿</a></li>
-<li><a href="#_13">陷阱</a></li>
-<li><a href="#_14">自测题</a></li>
+<li><a href="#_15">原始现场</a></li>
+<li><a href="#_16">前沿</a></li>
+<li><a href="#_17">陷阱</a></li>
+<li><a href="#_18">自测题</a></li>
 </ul>
 </div>
 </nav>
@@ -92,11 +104,11 @@
   <div class="mod-id">5.2</div>
   <h1>KV cache 管理：PagedAttention 与 prefix cache</h1>
   <p class="lede">介绍 block table、引用计数和前缀缓存，比较 vLLM 的块哈希与 SGLang 的基数树。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D) · vLLM 0.29.0 · SGLang 0.5.19</span><span class="chip">前置 L0.2（KV 账本）· L0.1（调用栈第 10–11 阶段）</span></div>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D) 与 crater2 (RTX 5090) · vLLM 0.29.0 · SGLang 0.5.19</span><span class="chip">前置 L0.2（KV 账本）· L0.1（调用栈第 10–11 阶段）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <ol>
 <li>KV cache 为什么必须<strong>分页</strong>？不分页会发生什么，能量化吗？</li>
-<li>两个请求共享一段前缀时，KV 复用的<strong>粒度</strong>是什么？我能不能<strong>测</strong>出这个粒度？</li>
+<li>两个请求共享一段前缀时，KV 复用的<strong>粒度</strong>是什么？如何通过物理实验测出这一粒度？</li>
 <li>vLLM 的<strong>块哈希表</strong>和 SGLang 的<strong>基数树</strong>，各自换来了什么、放弃了什么？</li>
 </ol>
 <p>这一章把两个问题分开：分页解决 KV 放在哪里，前缀缓存解决哪些 KV 可以再次使用。
@@ -213,12 +225,66 @@ block table 记录逻辑块对应的物理块编号；哈希表或基数树帮�
 <p>为什么必须这样？因为 KV 是<strong>上下文相关</strong>的：同样 16 个 token，跟在不同前缀后面，
 算出来的 K/V 完全不同（attention 要看前面所有 token）。
 如果只哈希块内容，就会错误复用——<strong>这是正确性问题，不是优化问题</strong>。</p>
-<p><code>extra_keys</code> 是给多模态和 LoRA 用的：同样的 token id，配不同的图片或不同的 LoRA adapter，
-KV 也不同，必须进哈希（<span class="xref pending" title="VLM（一）：图像与视频预处理（后续章节）">L4.5</span> 会回到这里）。</p>
+<p><code>extra_keys</code> 是缓存身份的另一半。vLLM 0.29.0 的 <code>generate_block_hash_extra_keys</code>
+（<code>v1/core/kv_cache_utils.py:583</code>）把它拼成四类：</p>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>内容</th>
+<th>生效范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LoRA</td>
+<td><code>request.lora_request.lora_name</code>（<code>_gen_lora_extra_hash_keys</code>，<code>:541</code>）</td>
+<td>所有块</td>
+</tr>
+<tr>
+<td>多模态</td>
+<td><code>(mm_feature.identifier, offset − start_token_idx)</code>（<code>_gen_mm_extra_hash_keys</code>，<code>:470</code>）</td>
+<td>含该输入的块</td>
+</tr>
+<tr>
+<td><code>cache_salt</code></td>
+<td>请求带的隔离串（只在 <code>start_token_idx == 0</code> 时加入）</td>
+<td>第 0 块</td>
+</tr>
+<tr>
+<td><code>prompt_embeds</code></td>
+<td>每块嵌入的 sha256（<code>_gen_prompt_embeds_extra_hash_keys</code>，<code>:556</code>）</td>
+<td>有嵌入的块</td>
+</tr>
+</tbody>
+</table>
+<p><code>labs/L5/cache_key_identity.py</code> 直接用引擎自己的哈希器（<code>get_hash_fn_by_name</code> +
+<code>init_none_hash</code> + <code>get_request_block_hasher</code>）对同一串 token 逐字段做对照：</p>
+<div class="highlight"><pre><span></span><code>  用例                                      首个不同块      共有前缀块                          结论
+  LoRA 名字 A（其余不变）                             0          0                 进键：第 0 块即不同
+  LoRA 名字 A vs B                              0          0                  进键：名字不同即不同
+  同名 A、不同路径/权重                                —          6                   不进键：同名即同键
+  cache_salt = tenant-1                       0          0  进键：salt 只加在第 0 块，尾 5 块相同 0
+  temperature/top_p/seed 改变                   —          6                         不进键
+  同一块 token、不同父块哈希                            0          0                     进键：滚动哈希
+</code></pre></div>
+
+<p>三条读法：</p>
+<ol>
+<li><strong>进键的是 adapter 的"名字"，不是它的权重或 revision。</strong> 同一个名字换掉权重文件，
+   块哈希逐位不变——引擎会继续复用旧 adapter 算出的 KV。5.10 的实测与此一致：
+   同名热更新后请求仍命中旧前缀缓存，输出与旧版本相同。</li>
+<li><strong><code>cache_salt</code> 只加在第 0 块</strong>，但父链会让后面每一块都不同（上表"尾 5 块相同 0"）。
+   一行隔离串换来整条序列独立缓存，这是多租户隔离最省的实现。</li>
+<li><strong>采样参数不进键。</strong> <code>temperature/top_p/seed</code> 不改变 KV，只改变从 logits 到 token 的
+   那一步（5.9），所以同一 prompt 换采样参数仍能命中前缀缓存。</li>
+</ol>
+<p>模型权重与 revision 也不在键里。换模型要换引擎实例，进程内的块表本来就是空的，
+所以"同一引擎内改权重"不是这套缓存承诺支持的更新方式。</p>
 <p>还有一个细节：<code>NONE_HASH</code> 由一个可配置的 seed 派生，代码注释写着
 「Components that must agree on NONE_HASH across processes (the P2P tier…)」——
 <strong>因为 PD 分离时，prefill 机器算出的块哈希必须和 decode 机器一致</strong>，
-否则 KV 传过去认不出来（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（后续章节）">L6.4</span>）。一个种子的设计，牵着整个分离架构。</p>
+否则 KV 传过去认不出来（<a class="xref" href="../L6/6.4-pd-disaggregation.html" title="PD 分离：KV cache 成为数据平面">L6.4</a>）。一个种子的设计，牵着整个分离架构。</p>
 <hr />
 <h2 id="_5">工程实现 · 源码解析</h2>
 <h3 id="a-vllm">A. vLLM：块哈希表 + 双向链表空闲池</h3>
@@ -314,7 +380,7 @@ blocks of a request.
 <p><code>host_value</code> / <code>host_ref_counter</code> 那三行很关键：<strong>SGLang 的树节点原生支持把 KV 卸载到主机内存</strong>
 （<code>backuped</code> 属性、<code>protect_host()</code> / <code>release_host()</code>）。
 在 vLLM 里这是一个外挂的 connector 层；在 SGLang 里它长在数据结构上。
-这直接对应 <span class="xref pending" title="PD 分离：KV cache 成为数据平面（后续章节）">L6.4</span>「KV 作为数据平面」——树本身就是 HBM/DRAM 两级的目录。</p>
+这直接对应 <a class="xref" href="../L6/6.4-pd-disaggregation.html" title="PD 分离：KV cache 成为数据平面">L6.4</a>「KV 作为数据平面」——树本身就是 HBM/DRAM 两级的目录。</p>
 <p><strong>匹配前缀</strong>（<code>radix_cache.py:679</code>）：</p>
 <div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_match_prefix_helper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="n">TreeNode</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="n">RadixKey</span><span class="p">):</span>
     <span class="n">access_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
@@ -529,6 +595,33 @@ blocks of a request.
 </code></pre></div>
 
 <p>测试需要先缓存 B 的首块，使查询能够继续到第二块。正确实现只能复用 B 的首块；若只按块内容哈希、忽略 parent，就会错误复用 A 的尾块。</p>
+<h3 id="_9">带分叉与写时复制的分页状态机</h3>
+<p>上面的 mini 只验证块计数与哈希不变量，它不保存任何 KV 内容，于是回答不了：
+复用块里的<strong>内容</strong>是否等于重算出来的内容？分叉写入会不会污染父序列？
+<code>labs/L5/mini_paged_kv.py</code> 把内容补上——每个位置的值取该位置<strong>全部前缀 token</strong>
+的确定性函数（滚动链 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>v</mi><mi>p</mi></msub><mo>&#x0003D;</mo><mi>f</mi><mo stretchy="false">&#x00028;</mo><msub><mi>v</mi><mrow><mi>p</mi><mo>&#x02212;</mo><mn>1</mn></mrow></msub><mo>&#x0002C;</mo><msub><mi>t</mi><mi>p</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></math></span>），这正是 KV 的上下文相关性。
+于是可以和"无缓存参照"逐位置对拍：</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/mini_paged_kv.py<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;
+</code></pre></div>
+
+<p>它在 <code>mini_block_pool.py</code> 的块池上补了 <code>append</code> / <code>fork</code> / <code>evict</code> / 写时复制
+（COW），并把块表、refcount、有效槽位数逐块打印。四组结果：</p>
+<div class="highlight"><pre><span></span><code>[A] 单请求 2048 token：r0 复用 0 块 / 重算 2048；r1 复用 127 块 / 重算 16 token；
+    两轮内容对拍 2048 位置全部一致（块池原始语义下可复用 128 块，
+    "127" 是引擎 get_computed_blocks 的 num_tokens−1 约定）
+[B] 共享前缀 16/17/31 → 1 块、32/33 → 2 块、127 → 7 块、128/129 → 8 块，与 ⌊p/16⌋ 逐点一致；
+    中段第 96 个 token 改变 → 只复用断点前的 6 块
+[C] fork 后双方各写 4 个 token：分叉点块对齐时不需要复制；分叉点在不满块里时
+    发生 1 次 COW，两条序列的块分别有效，内容全部与参照一致
+    关闭 COW 的负结果：共享槽位被直接覆写，后写的那条序列第 70 个位置开始与参照不一致
+[D] 逐出顺序（6 块池、淘汰 2 块后前缀仍有 4 块命中）与容量效应：
+    工作集 14 块时，池 32/16 → 14 块/轮全部命中，池 12 → 6 块，池 10 → 4 块；
+    内容不一致始终为 0——淘汰只影响命中率，不影响正确性
+</code></pre></div>
+
+<p>[C] 的负结果值得单独记住：<strong>没有 COW 的分页实现不会立刻报错，只会静默算错。</strong>
+这也是"分叉"与"共享前缀"在实现上的分界线——前缀复用是只读共享，
+一旦某个共享块要被写入，必须先复制。</p>
 <hr />
 <h2 id="lab">动手 lab：比较前缀复用预测与调用耗时</h2>
 <div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/prefix_probe.py<span class="w"> </span>--model<span class="w"> </span><span class="nv">$MODEL</span><span class="w"> </span>--prefix-len<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
@@ -626,7 +719,7 @@ attention 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math
 <p>再看跨块的趋势：需重算 2048 → 1024 → 512 → 16 对应 36.8 → 22.6 → 13.1 → 7.9 ms。
 注意<strong>不是严格线性</strong>：因为新 token 仍要 attend 到全部 2048 的上下文，
 attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2-resource-ledger.html" title="资源账本：字节、FLOP 与 roofline">L0.2</a> 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 项）。</p>
-<h3 id="_9">这条结果的工程含义</h3>
+<h3 id="_10">这条结果的工程含义</h3>
 <p><strong>把变化的内容放在 prompt 末尾。</strong> 一个真实的例子：</p>
 <div class="highlight"><pre><span></span><code>❌  system: 当前时间 2026-09-09 17:36:21，用户 ID 8823...
     &lt;5000 token 的文档&gt;
@@ -640,7 +733,249 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 （滚动哈希，前缀一断全断）。TTFT 从 7.6 ms 变回 41 ms。</p>
 <p>这个例子说明前缀位置会影响复用机会，但这里没有对这两条具体文本请求做过对照。
 前面的 5.47× 来自另一组冷/热调用，不能直接作为这次 prompt 改写的收益。</p>
-<h3 id="_10">消融建议</h3>
+<h3 id="_11">逐请求命中账：块边界、相同后缀与中段改变</h3>
+<p>上面两张表都还带着"公式预测"的味道。<code>labs/L5/prefix_cache_scan.py</code> 把命中量直接读出来：
+命中 token 数与命中块数来自 <code>KVCacheManager.get_computed_blocks</code>（vLLM 0.29.0 返回
+<code>(blocks, num_local_cached_tokens, shared_prefix_boundary)</code>），首步调度 token 数来自
+<code>SchedulerOutput.num_scheduled_tokens</code>。</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/prefix_cache_scan.py<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;
+python<span class="w"> </span>labs/L5/prefix_eviction_scan.py<span class="w"> </span>--engine<span class="w"> </span>vllm<span class="w"> </span>--mode<span class="w"> </span>capacity<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;
+python<span class="w"> </span>labs/L5/prefix_eviction_scan.py<span class="w"> </span>--engine<span class="w"> </span>sglang<span class="w"> </span>--mode<span class="w"> </span>policy<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--policies<span class="w"> </span>lru,lfu,slru
+python<span class="w"> </span>labs/L5/prefix_scope_probe.py<span class="w"> </span>--tag<span class="w"> </span>&lt;机器&gt;<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;<span class="w"> </span>--prefix-len<span class="w"> </span><span class="m">512</span>
+</code></pre></div>
+
+<p><strong>块边界扫描</strong>（base 256 token 已缓存，新 prompt 前 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>p</mi></mrow></math></span> 个 token 与 base 相同）：</p>
+<div class="highlight"><pre><span></span><code>        共享前缀   命中token    命中块    预测块     首步调度     墙钟ms
+           0         0      0      0      256      7.2
+          15         0      0      0      256      7.1
+          16        16      1      1      240      7.0
+          17        16      1      1      240      7.1
+          31        16      1      1      240      7.1
+          32        32      2      2      224      7.4
+         127       112      7      7      144      6.3
+         128       128      8      8      128      6.2
+         129       128      8      8      128      5.8
+    命中块 == floor(共享/16) 的格数：11/11（不一致：[]）
+</code></pre></div>
+
+<p>11 个点全部落在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x0230A;</mi><mi>p</mi><mo>&#x0002F;</mo><mn>16</mn><mi>&#x0230B;</mi></mrow></math></span> 上，台阶精确。首步要算的 token 数同步下降
+（256 → 240 → … → 128）。注意"搬运字节"这一项在这里是 0：复用块按引用计数共享，
+不为前缀复用搬 KV；被省掉的是<strong>重算</strong>，即 <code>命中token × 114688 B</code> 的读取与计算。</p>
+<p><strong>相同后缀、不同前缀</strong>（后 128 token 逐 token 相同）：</p>
+<div class="highlight"><pre><span></span><code>    用例             命中token    命中块     首步调度     墙钟ms
+    同前缀                240     15       16      5.5
+    不同前缀                 0      0      256      7.1
+    中段改1个               64      4      192      6.4
+</code></pre></div>
+
+<p>"同前缀"这一行命中的 240 token 是 15 块（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>255</mn><mo>&#x0002F;</mo><mn>16</mn></mrow></math></span> 向下取整），印证了引擎侧的
+<code>num_tokens − 1</code> 约定：最后一个 token 必须重算才能出 logits。
+"不同前缀"直接掉到 0——后缀逐 token 相同也没用，滚动哈希让第 0 块就分道扬镳。
+"中段改 1 个"命中 4 块 = 断点前的 64 个 token，之后全部作废。</p>
+<p><strong>多会话共享 system prompt</strong>：512 token 的 system prompt 配 32 token 的随机后缀，
+后续每个会话都命中 512 token（32 块），第一条为 0。会话数从 4 到 16 都稳定命中——
+因为 block table 的引用计数让同一批物理块被多条序列共享，不随会话数增长。</p>
+<p><strong>LRU 压力</strong>：40 条互不相同、各 256 token 的前缀（工作集 640 块）对三种受限 KV 池：</p>
+<div class="highlight"><pre><span></span><code>     KV块数      单前缀块数      工作集块数               逐轮命中块
+      128         16        640              [0, 0]
+       64         16        640              [0, 0]
+       48         16        640              [0, 0]
+</code></pre></div>
+
+<p>三种池容量都远小于工作集（640 块），所以逐轮命中都是 0：为新前缀分配时，
+<code>alloc</code> 从空闲链头部取块，而链头正是上一轮刚归还的前缀。<strong>容量效应在引擎上要量到
+拐点，需要把工作集压到池容量附近</strong>；<code>mini_paged_kv.py</code> 的 [D] 用 14/12/10 块的
+小池给出了这条曲线（14 块工作集：池 32/16 → 每轮 14 块命中，池 12 → 6 块，池 10 → 4 块）。</p>
+<h3 id="sglang">同一扫描在 SGLang 上：页粒度决定命中量</h3>
+<p>SGLang 0.5.19 的响应里带 <code>meta_info['cached_tokens']</code>，同一扫描得到：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">共享前缀</th>
+<th style="text-align: right;">page_size=16 命中</th>
+<th style="text-align: right;">page_size=1 命中</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0 / 1 / 15</td>
+<td style="text-align: right;">0 / 0 / 0</td>
+<td style="text-align: right;">0 / 1 / 15</td>
+</tr>
+<tr>
+<td style="text-align: right;">16 / 17 / 31</td>
+<td style="text-align: right;">16 / 16 / 16</td>
+<td style="text-align: right;">16 / 17 / 31</td>
+</tr>
+<tr>
+<td style="text-align: right;">32 / 33</td>
+<td style="text-align: right;">32 / 32</td>
+<td style="text-align: right;">32 / 33</td>
+</tr>
+<tr>
+<td style="text-align: right;">127</td>
+<td style="text-align: right;">112</td>
+<td style="text-align: right;">127</td>
+</tr>
+<tr>
+<td style="text-align: right;">128 / 129</td>
+<td style="text-align: right;">128 / 128</td>
+<td style="text-align: right;">128 / 129</td>
+</tr>
+</tbody>
+</table>
+<p><code>page_size=16</code> 时命中量与 vLLM 的块对齐结果逐点相同；<code>page_size=1</code> 时命中量恰好等于
+共享长度——<strong>基数树本身是 token 级的，块粒度是引擎加上去的约束</strong>。
+这解释了 5.2 §源码解析里两种结构的差别：vLLM 的哈希表天然以块为单位，
+SGLang 的基数树可以在节点里存任意长度的段，用 <code>page_size</code> 统一对齐到分配器。</p>
+<h3 id="_12">容量拐点是阶跃的</h3>
+<p>前面的扫描都让工作集远小于池。把两者压到同一数量级后，曲线不是渐变的
+（<code>labs/L5/prefix_eviction_scan.py</code>：40 条互异前缀 × 256 token、块 16、工作集 640 块、
+逐条顺序提交，vLLM 侧固定 <code>max_num_batched_tokens=512</code>）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">池容量（块）</th>
+<th style="text-align: right;">工作集/池</th>
+<th style="text-align: right;">填充后即刻回访末条</th>
+<th style="text-align: right;">第 2 轮命中</th>
+<th style="text-align: right;">第 3 轮命中</th>
+<th style="text-align: right;">第 2 轮最小</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">240 / 400 / 560</td>
+<td style="text-align: right;">2.67 / 1.60 / 1.14</td>
+<td style="text-align: right;">93.8%</td>
+<td style="text-align: right;">0.0%</td>
+<td style="text-align: right;">0.0%</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td style="text-align: right;">640</td>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">93.8%</td>
+<td style="text-align: right;">87.7%</td>
+<td style="text-align: right;">93.8%</td>
+<td style="text-align: right;">224</td>
+</tr>
+<tr>
+<td style="text-align: right;">720 / 960</td>
+<td style="text-align: right;">0.89 / 0.67</td>
+<td style="text-align: right;">93.8%</td>
+<td style="text-align: right;">93.8%</td>
+<td style="text-align: right;">93.8%</td>
+<td style="text-align: right;">240</td>
+</tr>
+</tbody>
+</table>
+<p>三点：</p>
+<ol>
+<li><strong>"0 命中"不是缓存被关掉。</strong> 池 560 块时，40 条前缀填完<strong>立刻回访最后一条</strong>仍有
+   93.8% 命中；而第 2 轮从第一条按同一顺序再遍历一遍，命中是 0。这是 LRU 的顺序扫描
+   退化：每次 miss 都要拿新块并驱逐"最久未用"的那一条，被驱逐的恰好是这一轮还没访问
+   到的下一条。池相对工作集越小，扫描越接近"每条都在驱逐下一条"。</li>
+<li><strong>拐点在池 ≈ 工作集。</strong> 池=640 块时第 2 轮 87.7%、第 3 轮回到 93.8%；720 块时两轮
+   都稳定。容量再大也不会超过 93.8%，因为每条前缀的<strong>最后一块</strong>会被请求自己生成的
+   token 改写、哈希不再匹配——256 token 的 prompt 只复用前 240 个。</li>
+<li><strong>两引擎拐点位置一致，临界点行为不同。</strong> 同一负载在 SGLang 0.5.19 上
+   （<code>page_size=16</code>，池由 <code>max_total_tokens</code> 控制，工作集 10240 token）：池
+   3840/6400/8960 时第 2/3 轮 0、末条回访 93.8%；池 10240（=1.00×）时第 2/3 轮只有
+   <strong>2.3%</strong>；池 11520（1.125×）回到 93.8%。<strong>vLLM 在 1.00× 处仍保住 87.7%，SGLang
+   在 1.00× 处几乎全丢</strong>：两者分配粒度相同（16 token），差别在结构——vLLM 是块池上的
+   逐块 LRU，SGLang 按基数树叶子整链回收，临界状态下整链回收会连带丢掉还没访问的分支。</li>
+</ol>
+<h3 id="lru-lfuslru">驱逐策略：同负载下 LRU 与 LFU/SLRU 只在热点回访上分开</h3>
+<p>把池压到工作集的一半（320 块 / 5120 token），跑三段负载：热点 8 条前缀各访问 3 次、
+冷点 32 条各访问 1 次冲刷、再回访热点与冷点。vLLM 0.29.0 的块池只有一种顺序；
+SGLang 0.5.19 的基数树可选 <code>radix_eviction_policy=lru/lfu/slru/priority</code>，于是这一组
+是"同一负载、不同策略"的直接对照：</p>
+<table>
+<thead>
+<tr>
+<th>引擎 / 策略</th>
+<th>热点第 1/2/3 次</th>
+<th style="text-align: right;">冷点冲刷</th>
+<th style="text-align: right;">回到热点</th>
+<th style="text-align: right;">再问冷点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM（块池 LRU）</td>
+<td>0 / 93.8 / 93.8%</td>
+<td style="text-align: right;">0.0%</td>
+<td style="text-align: right;"><strong>0.0%</strong></td>
+<td style="text-align: right;">0.0%</td>
+</tr>
+<tr>
+<td>SGLang <code>lru</code></td>
+<td>0 / 93.8 / 93.8%</td>
+<td style="text-align: right;">0.0%</td>
+<td style="text-align: right;"><strong>0.0%</strong></td>
+<td style="text-align: right;">0.0%</td>
+</tr>
+<tr>
+<td>SGLang <code>lfu</code></td>
+<td>0 / 93.8 / 93.8%</td>
+<td style="text-align: right;">0.0%</td>
+<td style="text-align: right;"><strong>93.8%</strong></td>
+<td style="text-align: right;">0.0%</td>
+</tr>
+<tr>
+<td>SGLang <code>slru</code></td>
+<td>0 / 93.8 / 93.8%</td>
+<td style="text-align: right;">0.0%</td>
+<td style="text-align: right;"><strong>93.8%</strong></td>
+<td style="text-align: right;">0.0%</td>
+</tr>
+</tbody>
+</table>
+<p>两个引擎的 LRU 逐格一致：冷点各 16 块的冲刷量远超半个池，把热点整链挤出去，回访时
+全 miss。换成按频次（<code>lfu</code>）或分段最近使用（<code>slru</code>）后，访问过 3 次的热点在冲刷后
+仍命中 93.8%，而只访问过 1 次的冷点在两种策略下都不命中——<strong>策略差异只出现在"回访
+仍有价值的热点"上</strong>。没有可区分热点的负载上，几种策略退化成同一条曲线。</p>
+<h3 id="_13">缓存与驱逐的作用域</h3>
+<p>前缀缓存是<strong>引擎实例本地</strong>的。两台机器（crater 与 crater2）各自用同一段 512 token
+前缀跑同一序列（<code>labs/L5/prefix_scope_probe.py</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th style="text-align: right;">crater</th>
+<th style="text-align: right;">crater2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>首次请求</td>
+<td style="text-align: right;">0 token（16.1 ms）</td>
+<td style="text-align: right;">0 token（16.1 ms）</td>
+</tr>
+<tr>
+<td>紧接再来</td>
+<td style="text-align: right;">496 token（5.9 ms）</td>
+<td style="text-align: right;">496 token（5.8 ms）</td>
+</tr>
+<tr>
+<td><code>reset_prefix_cache()</code> 后再来</td>
+<td style="text-align: right;">0 token（11.0 ms）</td>
+<td style="text-align: right;">0 token（11.0 ms）</td>
+</tr>
+<tr>
+<td>重建后再来</td>
+<td style="text-align: right;">496 token（5.9 ms）</td>
+<td style="text-align: right;">496 token（6.2 ms）</td>
+</tr>
+</tbody>
+</table>
+<p>两台的首次请求都不命中：一台机器建立的缓存不会让另一台受益；显式驱逐把本实例的缓存
+清空，随后可以完整重建。命中量 496 = 31 块，与容量扫描里"最后一块不复用"一致。
+跨实例取回要靠外部存储层，接口与成本见 8.6/9.3；9.3-D 实测迁移后的复用率仍是 0.003，
+目标实例需要自己重建缓存。</p>
+<h3 id="_14">消融建议</h3>
 <table>
 <thead>
 <tr>
@@ -669,10 +1004,18 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 <td>换 SGLang 跑同样的扫描</td>
 <td>对照基数树的曲线形状。它的 <code>page_size</code> 语义与 vLLM 的 <code>block_size</code> 不完全等价</td>
 </tr>
+<tr>
+<td>把池容量扫过工作集</td>
+<td>拐点是阶跃的：池小于工作集时重复顺序扫描命中归零，池略大时稳定在"除最后一块外全部命中"</td>
+</tr>
+<tr>
+<td>换 <code>radix_eviction_policy=lfu/slru</code></td>
+<td>在同一段热点/冷点负载上比较回访命中；LRU 下热点会被冷点冲刷掉</td>
+</tr>
 </tbody>
 </table>
 <hr />
-<h2 id="_11">原始现场</h2>
+<h2 id="_15">原始现场</h2>
 <details>
 <summary>① 引擎启动时关于 KV cache 的原始日志</summary>
 <div class="highlight"><pre><span></span><code>块大小 = 16 token；GPU 块数 = 4064
@@ -700,9 +1043,167 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 
 <p>注意有 <code>external_</code> 前缀的一对。它们对应<strong>引擎外部的 KV 存储</strong>
 （LMCache / Mooncake Store / NIXL 拉回来的块）。本机是 0，因为没接外部层。
-<strong>这两个指标的存在本身就说明 vLLM 已经把「KV 来自别的机器」当成一等公民</strong>——<span class="xref pending" title="PD 分离：KV cache 成为数据平面（后续章节）">L6.4</span> 会用到。</p>
+<strong>这两个指标的存在本身就说明 vLLM 已经把「KV 来自别的机器」当成一等公民</strong>——<a class="xref" href="../L6/6.4-pd-disaggregation.html" title="PD 分离：KV cache 成为数据平面">L6.4</a> 会用到。</p>
 <p><code>kv_cache_usage_perc</code> 是 0，因为采样时所有请求已完成、块已释放。
-要看真实占用率必须在压测<strong>过程中</strong>采（<span class="xref pending" title="可观测性与正确的压测（后续章节）">L8.3</span>）。</p>
+要看真实占用率必须在压测<strong>过程中</strong>采（<a class="xref" href="../L8/8.3-observability-benchmark.html" title="可观测性与正确的压测">L8.3</a>）。</p>
+</details>
+<details>
+<summary>③ 逐请求命中账（块边界 / 相同后缀 / 多会话 / LRU 压力）</summary>
+<div class="srcref"><code>results/crater/5.2/hits-20260921/prefix_hits.txt</code><span>（文件不存在）</span></div>
+</details>
+<details>
+<summary>④ 缓存键身份：用引擎自己的哈希器逐字段对照</summary>
+<details class="fold srcfold"><summary>results/crater/5.2/keys-20260921/cache_key_identity.txt 全文（11 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.2-C 缓存键身份 · block_size=16 · 6 个满块 · 哈希算法 sha256（引擎实际入口 get_request_block_hasher）
+  用例                                      首个不同块      共有前缀块                          结论
+  LoRA 名字 A（其余不变）                             0          0                 进键：第 0 块即不同
+  LoRA 名字 A vs B                              0          0                  进键：名字不同即不同
+  同名 A、不同路径/权重                                —          6                   不进键：同名即同键
+  cache_salt = tenant-1                       0          0  进键：salt 只加在第 0 块，尾 5 块相同 0
+  temperature/top_p/seed 改变                   —          6                         不进键
+  同一块 token、不同父块哈希                            0          0                     进键：滚动哈希
+
+多模态（源码确认，未在本机跑真实张量）：extra_keys 里带 `(mm_feature.identifier, offset - start_token_idx)`，见 v1/core/kv_cache_utils.py `_gen_mm_extra_hash_keys`；prompt_embeds 带每块 sha256，见 `_gen_prompt_embeds_extra_hash_keys`。
+模型权重/revision 不在键里：换模型要换引擎，进程内的块表本来就是空的，所以「同一引擎内改权重」不是它承诺支持的更新方式。
+</pre></div>
+<div class="srcref"><code>results/crater/5.2/keys-20260921/cache_key_identity.txt 全文（11 行）</code><a href="../code/results/crater/5.2/keys-20260921/cache_key_identity.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑤ 带 fork / COW 的分页状态机与无缓存参照对拍</summary>
+<details class="fold srcfold"><summary>results/local/5.2/20260921-paged-kv/paged_kv.txt 全文（38 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.2-A 分页 KV 状态机：fork / COW / 驱逐 与无缓存参照逐位置对拍
+值函数 v_p = f(v_(p-1), t_p) mod 2^61-1，与 token 前缀一一对应
+
+[A] 单请求 + 重复请求：复用块的内容是否等于重算
+  r0: tokens=2048 computed=2048 blocks=128
+     idx  block  ref  valid  full  cached
+       0      0    1     16  True    True
+       1      1    1     16  True    True
+       2      2    1     16  True    True
+    ...（共 128 块，其余省略）
+    r0 首次：复用 0 块 / 重算 2048 token；内容对拍 2048 位置，不一致 0
+    r1 复用：复用 127 块 / 重算 16 token；内容对拍 2048 位置，不一致 0
+    r2 关闭 num_tokens-1 上限（块池原始语义）：复用 128 块 / 重算 0 token；内容不一致 0
+
+[B] 共享前缀：非对齐边界 + 中段改变 + 相同后缀不同前缀
+        共享前缀     复用块   重算token     对拍位置    不一致   公式⌊p/16⌋
+           0       0       256      256      0          0
+          15       0       256      256      0          0
+          16       1       240      256      0          1
+          17       1       240      256      0          1
+         127       7       144      256      0          7
+         128       8       128      256      0          8
+         129       8       128      256      0          8
+    中段第 96 个 token 改为不同值：复用块 6（只到断点前一块 = 6），重算 160 token，内容不一致 0
+
+[C] fork 后分叉写入：COW 是否保护父序列
+    块对齐：COW 复制 0 次；父序列内容不一致 0，子序列不一致 0（对拍 68/68 位置）
+      父表尾：[(3, 2, 16), (4, 1, 4)]  子表尾：[(3, 2, 16), (5, 1, 4)]
+    块内偏移：COW 复制 1 次；父序列内容不一致 0，子序列不一致 0（对拍 74/74 位置）
+      父表尾：[(3, 2, 16), (4, 1, 10)]  子表尾：[(3, 2, 16), (5, 1, 10)]
+    关闭 COW：别名写入 2 次；后写的父序列内容不一致 1 位置（首个位置 70），先写的子序列不一致 0 位置
+
+[D] 驱逐顺序与缓存压力：空闲链 LRU 是否先打尾部块
+    6 块池、6 块序列：淘汰 [5, 4] 后仍可匹配 4 块（保留前 4 块前缀，被淘汰的是尾部）
+    池 32 块（热前缀 8 块 + 3 条冷请求各 2 块，跑 4 轮）：逐轮命中块 [0, 14, 14, 14]，内容不一致 0，分配 14，归还 56
+    池 16 块（热前缀 8 块 + 3 条冷请求各 2 块，跑 4 轮）：逐轮命中块 [0, 14, 14, 14]，内容不一致 0，分配 14，归还 56
+    池 12 块（热前缀 8 块 + 3 条冷请求各 2 块，跑 4 轮）：逐轮命中块 [0, 6, 6, 6]，内容不一致 0，分配 38，归还 56
+    池 10 块（热前缀 8 块 + 3 条冷请求各 2 块，跑 4 轮）：逐轮命中块 [0, 4, 4, 4]，内容不一致 0，分配 44，归还 56
+</pre></div>
+<div class="srcref"><code>results/local/5.2/20260921-paged-kv/paged_kv.txt 全文（38 行）</code><a href="../code/results/local/5.2/20260921-paged-kv/paged_kv.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑥ SGLang 基数树：page_size=16 与 page_size=1 的命中量</summary>
+<details class="fold srcfold"><summary>results/crater2/5.2/sglang-prefix-p16-20260921/sglang_prefix_p16.txt 全文（14 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>SGLang 对照 · Qwen/Qwen3-1.7B · page_size=16 · chunked_prefill_size=8192 · 引擎启动 17.1 s
+  base 预热：cached [0]，prompt [257]，e2e [41.012669913470745]
+        共享前缀 cached_tokens page    预测块   e2e ms
+           0             0   16      0      8.4
+           1             0   16      0      9.7
+          15             0   16      0      9.7
+          16            16   16      1     15.4
+          17            16   16      1     10.3
+          31            16   16      1     10.2
+          32            32   16      2     10.3
+          33            32   16      2     10.3
+         127           112   16      7      9.7
+         128           128   16      8      8.8
+         129           128   16      8      8.7
+</pre></div>
+<div class="srcref"><code>results/crater2/5.2/sglang-prefix-p16-20260921/sglang_prefix_p16.txt 全文（14 行）</code><a href="../code/results/crater2/5.2/sglang-prefix-p16-20260921/sglang_prefix_p16.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/crater2/5.2/sglang-prefix-p1-20260921/sglang_prefix_p1.txt 全文（14 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>SGLang 对照 · Qwen/Qwen3-1.7B · page_size=1 · chunked_prefill_size=8192 · 引擎启动 17.2 s
+  base 预热：cached [0]，prompt [257]，e2e [32.294658944010735]
+        共享前缀 cached_tokens page    预测块   e2e ms
+           0             0    1      0      9.0
+           1             1    1      1     63.6
+          15            15    1     15      9.8
+          16            16    1     16     10.2
+          17            17    1     17     10.2
+          31            31    1     31     10.3
+          32            32    1     32     10.2
+          33            33    1     33     10.2
+         127           127    1    127      9.3
+         128           128    1    128      8.8
+         129           129    1    129      9.0
+</pre></div>
+<div class="srcref"><code>results/crater2/5.2/sglang-prefix-p1-20260921/sglang_prefix_p1.txt 全文（14 行）</code><a href="../code/results/crater2/5.2/sglang-prefix-p1-20260921/sglang_prefix_p1.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑦ 容量拐点扫描（vLLM 六档，含末条回访）</summary>
+<details class="fold srcfold"><summary>results/crater/5.2/eviction-20260922/eviction_capacity_sweep6.txt 全文（9 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.2 补测 · 前缀缓存容量与驱逐策略 · vllm · capacity · prompt 256 token、前缀 40 条
+  工作集 640 块（40×16）；预算 [240, 400, 560, 640, 720, 960] 块；max_num_batched_tokens=512
+           预算      工作集/预算     第1轮命中%     末条回访%     第2轮命中%     第3轮命中%     第2轮最小
+          240       42.67        0.0      93.8        0.0        0.0         0
+          400       25.60        0.0      93.8        0.0        0.0         0
+          560       18.29        0.0      93.8        0.0        0.0         0
+          640       16.00        0.0      93.8       87.7       93.8       224
+          720       14.22        0.0      93.8       93.8       93.8       240
+          960       10.67        0.0      93.8       93.8       93.8       240
+</pre></div>
+<div class="srcref"><code>results/crater/5.2/eviction-20260922/eviction_capacity_sweep6.txt 全文（9 行）</code><a href="../code/results/crater/5.2/eviction-20260922/eviction_capacity_sweep6.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑧ 容量拐点扫描（SGLang 六档，含末条回访）</summary>
+<details class="fold srcfold"><summary>results/crater2/5.2/eviction-20260922/eviction_capacity_sweep6.txt 全文（9 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.2 补测 · 前缀缓存容量与驱逐策略 · sglang · capacity · prompt 256 token、前缀 40 条
+  工作集 10240 token；预算 [3840, 6400, 8960, 10240, 11520, 15360] token；策略 [None]
+           预算      工作集/预算     第1轮命中%     末条回访%     第2轮命中%     第3轮命中%     第2轮最小
+         3840        2.67        0.0      93.8        0.0        0.0         0
+         6400        1.60        0.0      93.8        0.0        0.0         0
+         8960        1.14        0.0      93.8        0.0        0.0         0
+        10240        1.00        0.0      93.8        2.3        2.3         0
+        11520        0.89        0.0      93.8       93.8       93.8       240
+        15360        0.67        0.0      93.8       93.8       93.8       240
+</pre></div>
+<div class="srcref"><code>results/crater2/5.2/eviction-20260922/eviction_capacity_sweep6.txt 全文（9 行）</code><a href="../code/results/crater2/5.2/eviction-20260922/eviction_capacity_sweep6.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑨ 驱逐策略同负载对照（vLLM 块池 LRU / SGLang lru、lfu、slru）</summary>
+<details class="fold srcfold"><summary>results/crater/5.2/eviction-20260922/eviction_policy.txt 全文（3 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.2 补测 · 前缀缓存容量与驱逐策略 · vllm · policy · prompt 256 token、前缀 40 条
+  工作集 640 块（40×16）；预算 [320] 块；max_num_batched_tokens=512
+     lru(块池) 预算 320：热点前三次命中 [0.0, 93.8, 93.8]%，冷点冲刷 0.0%，回到热点 0.0%，再问冷点 0.0%
+</pre></div>
+<div class="srcref"><code>results/crater/5.2/eviction-20260922/eviction_policy.txt 全文（3 行）</code><a href="../code/results/crater/5.2/eviction-20260922/eviction_policy.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/crater2/5.2/eviction-20260922/eviction_policy.txt 全文（5 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.2 补测 · 前缀缓存容量与驱逐策略 · sglang · policy · prompt 256 token、前缀 40 条
+  工作集 10240 token；预算 [5120] token；策略 ['lru', 'lfu', 'slru']
+         lru 预算 5120：热点前三次命中 [0.0, 93.8, 93.8]%，冷点冲刷 0.0%，回到热点 0.0%，再问冷点 0.0%
+         lfu 预算 5120：热点前三次命中 [0.0, 93.8, 93.8]%，冷点冲刷 0.0%，回到热点 93.8%，再问冷点 0.0%
+        slru 预算 5120：热点前三次命中 [0.0, 93.8, 93.8]%，冷点冲刷 0.0%，回到热点 93.8%，再问冷点 0.0%
+</pre></div>
+<div class="srcref"><code>results/crater2/5.2/eviction-20260922/eviction_policy.txt 全文（5 行）</code><a href="../code/results/crater2/5.2/eviction-20260922/eviction_policy.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑩ 缓存与驱逐的作用域（两台机器）</summary>
+<details class="fold srcfold"><summary>results/crater/5.2/eviction-20260922/scope_crater.txt 全文（5 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.2 补测 · 缓存与驱逐的作用域 · crater · Qwen/Qwen3-1.7B · prompt 512 token
+  首次命中 0 token（16.1 ms）
+  紧接再来 496 token（5.9 ms）
+  显式驱逐（reset_prefix_cache）后再来 0 token（11.0 ms）
+  重建后再来 496 token（5.9 ms）
+</pre></div>
+<div class="srcref"><code>results/crater/5.2/eviction-20260922/scope_crater.txt 全文（5 行）</code><a href="../code/results/crater/5.2/eviction-20260922/scope_crater.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/crater2/5.2/eviction-20260922/scope_crater2.txt 全文（5 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.2 补测 · 缓存与驱逐的作用域 · crater2 · Qwen/Qwen3-1.7B · prompt 512 token
+  首次命中 0 token（16.1 ms）
+  紧接再来 496 token（5.8 ms）
+  显式驱逐（reset_prefix_cache）后再来 0 token（11.0 ms）
+  重建后再来 496 token（6.2 ms）
+</pre></div>
+<div class="srcref"><code>results/crater2/5.2/eviction-20260922/scope_crater2.txt 全文（5 行）</code><a href="../code/results/crater2/5.2/eviction-20260922/scope_crater2.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
 </details>
 <details>
 <summary>③ SGLang 的 TreeNode 完整字段（原样）</summary>
@@ -745,7 +1246,7 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 <strong>在 GPU 上</strong>（value 非空）、<strong>只在主机内存里</strong>（value 空但 host_value 非空）、
 或<strong>彻底没了</strong>。三态，不是两态。</p>
 <p><code>event_hash_value</code> 的注释 "Namespace-aware hashes used only for external KV events"
-—— 对外广播 KV 事件时用带命名空间的哈希，这是多租户下防止跨租户误复用的设计（<span class="xref pending" title="路由与网关（后续章节）">L8.1</span>）。</p>
+—— 对外广播 KV 事件时用带命名空间的哈希，这是多租户下防止跨租户误复用的设计（<a class="xref" href="../L8/8.1-routing-gateway.html" title="路由与网关">L8.1</a>）。</p>
 </details>
 <details>
 <summary>④ vLLM 空闲链表的完整 docstring（设计理由都写在里面）</summary>
@@ -774,7 +1275,7 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 四件事全说了。找这种 docstring 是 <a class="xref" href="../M/M1-reading-large-codebase.html" title="如何读一个十万行的混合代码库">M1</a>（读大型代码库）的核心技巧之一。</p>
 </details>
 <hr />
-<h2 id="_12">前沿</h2>
+<h2 id="_16">前沿</h2>
 <table>
 <thead>
 <tr>
@@ -792,7 +1293,7 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 <tr>
 <td><strong>KV 作为数据平面</strong></td>
 <td>PD 分离后，块哈希必须跨机器一致</td>
-<td>NIXL、Mooncake Store；这解释了 <code>NONE_HASH</code> 种子为什么要跨进程一致（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（后续章节）">L6.4</span>）</td>
+<td>NIXL、Mooncake Store；这解释了 <code>NONE_HASH</code> 种子为什么要跨进程一致（<a class="xref" href="../L6/6.4-pd-disaggregation.html" title="PD 分离：KV cache 成为数据平面">L6.4</a>）</td>
 </tr>
 <tr>
 <td><strong>agentic 负载的淘汰策略</strong></td>
@@ -802,7 +1303,7 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 <tr>
 <td><strong>前缀感知路由</strong></td>
 <td>把复用决策提到引擎之外</td>
-<td>vLLM production-stack / SGLang router 的 prefix-aware routing（<span class="xref pending" title="路由与网关（后续章节）">L8.1</span>）</td>
+<td>vLLM production-stack / SGLang router 的 prefix-aware routing（<a class="xref" href="../L8/8.1-routing-gateway.html" title="路由与网关">L8.1</a>）</td>
 </tr>
 <tr>
 <td><strong>异构 KV</strong></td>
@@ -814,13 +1315,18 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 <td>同内容不同前缀能否共享</td>
 <td>研究阶段；难点正是本章说的"KV 上下文相关"</td>
 </tr>
+<tr>
+<td><strong>缓存身份的边界</strong></td>
+<td>哪些更新算"换了一个模型"</td>
+<td>adapter 只按名字进键（同名换权重不失效）；<code>cache_salt</code> 提供显式隔离；见 5.10 的同名热更新实测</td>
+</tr>
 </tbody>
 </table>
 <blockquote>
 <p>上表中除本章实测外的内容来自各自论文与源码，<strong>加速比尚未复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
-<h2 id="_13">陷阱</h2>
+<h2 id="_17">陷阱</h2>
 <p><strong>1. 混淆共享长度、命中长度和耗时。</strong> 本例只缓存满块，但同样的预测块数
 不保证调用耗时相同；调度、采样和测量波动也会影响时间。</p>
 <p><strong>2. 把变化的内容放在 prompt 开头。</strong> 滚动哈希意味着前缀一断全断。
@@ -837,8 +1343,18 @@ attention 那一项不随重算量线性下降（<a class="xref" href="../L0/0.2
 <p><strong>6. 同进程建第二个引擎不释放第一个。</strong> 会报
 <code>Free memory on device cuda:0 (12.45/31.36 GiB) is less than desired</code>。
 <code>del</code> 不够，要 <code>engine_core.shutdown()</code>。</p>
+<p><strong>7. 命中块数不等于节省的时间。</strong> 命中 240 个 token 的那条请求墙钟 5.5 ms，命中 0 的
+7.1 ms；差 1.6 ms，而 240 token 的 prefill 单独算是 3.6 ms 量级。省下的不止是重算，
+还有被它顺带避免的分块与调度开销——反之，命中率很低的负载里哈希与查表的开销都是净支出。</p>
+<p><strong>8. 同名 adapter 热更新不会使旧 KV 失效。</strong> 块哈希里只有 <code>lora_name</code>，
+换了权重文件但名字不变时哈希逐位相同，引擎会继续用旧 adapter 算出的 KV（5.10 实测）。</p>
+<p><strong>9. 把"池装不下"读成"命中按比例下降"。</strong> 池小于工作集时，按同一顺序重复扫描的命中
+是 0 而不是部分命中：每次 miss 分配新块都会驱逐这一轮还没访问到的下一条。要判断缓存
+是否还在，得在填充后立刻回访最后一条，而不是看下一轮的均值。</p>
+<p><strong>10. 用"运行次数"而不是"命中量"判断复用。</strong> 前缀缓存是实例本地的：另一台机器、
+另一个进程、或调用过显式驱逐之后，同一段文本的命中都会回到 0。</p>
 <hr />
-<h2 id="_14">自测题</h2>
+<h2 id="_18">自测题</h2>
 <details>
 <summary>1. 为什么块哈希必须包含父块哈希？举一个不包含会出错的具体例子。</summary>
 <p>因为 KV 是上下文相关的。</p>
@@ -862,7 +1378,16 @@ B 的要 attend 到 16 个 Y。<strong>算出的 K、V 数值完全不同。</st
 缓存容量 = 全部块，而不只是"没被引用的那些"。</p>
 </details>
 <details>
-<summary>3. block_size 从 16 改成 64，有哪些收益和代价？在什么负载下你会改大？</summary>
+<summary>3. 同一个 adapter 名字换了权重文件，前缀缓存会自动失效吗？怎么才能让缓存按预期隔离？</summary>
+<p>不会。vLLM 0.29.0 的 <code>_gen_lora_extra_hash_keys</code> 只把 <code>lora_request.lora_name</code> 放进
+<code>extra_keys</code>，权重路径与 revision 都不参与哈希。同名换权重时块哈希逐位相同，
+引擎复用旧 adapter 算出的 KV，输出与旧版本一致（5.10 的同名热更新实测）。</p>
+<p>要让缓存按预期隔离，有三条路：换 adapter 名字（最直接）、给请求带
+<code>cache_salt</code>（第 0 块换键，整条序列随之失效）、或换引擎实例。
+<code>labs/L5/cache_key_identity.py</code> 可以逐字段验证这三条是否生效。</p>
+</details>
+<details>
+<summary>4. block_size 从 16 改成 64，有哪些收益和代价？在什么负载下你会改大？</summary>
 <p><strong>收益</strong>：
 - block table 变短 4 倍 → <code>_prepare_inputs</code> 里的 CPU 指针算术变少（<a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 第 14 阶段）
 - attention kernel 的块寻址开销变小
@@ -878,14 +1403,14 @@ B 的要 attend 到 16 个 Y。<strong>算出的 K、V 数值完全不同。</st
 它可以做真正的 token 级复用，代价是树更深、遍历更慢。</p>
 </details>
 <details>
-<summary>4. 我的服务有 1000 个用户，每人一个 3000 token 的私有 system prompt，之后是短问题。前缀缓存能帮上忙吗？</summary>
+<summary>5. 我的服务有 1000 个用户，每人一个 3000 token 的私有 system prompt，之后是短问题。前缀缓存能帮上忙吗？</summary>
 <p><strong>跨用户帮不上</strong>（每人的 system prompt 不同，没有公共前缀），
 <strong>同一用户的多次请求能帮上</strong>（第二次起 3000 token 全命中）。</p>
 <p>但有个容量问题：1000 × 3000 token × 114.69 KB = <strong>328 GB</strong> 的 KV，
 远超单卡 25 GB。所以缓存会不停被 LRU 淘汰，命中率取决于<strong>用户请求的时间局部性</strong>。</p>
 <p><strong>工程解法</strong>（都指向后面的章节）：
-1. <strong>会话亲和路由</strong>（<span class="xref pending" title="路由与网关（后续章节）">L8.1</span>）：把同一用户路由到同一台机器，让局部性变强。
-2. <strong>KV 分级存储</strong>（<span class="xref pending" title="PD 分离：KV cache 成为数据平面（后续章节）">L6.4</span>）：把冷的 3000-token 前缀卸到 DRAM/SSD，命中时拉回来。
+1. <strong>会话亲和路由</strong>（<a class="xref" href="../L8/8.1-routing-gateway.html" title="路由与网关">L8.1</a>）：把同一用户路由到同一台机器，让局部性变强。
+2. <strong>KV 分级存储</strong>（<a class="xref" href="../L6/6.4-pd-disaggregation.html" title="PD 分离：KV cache 成为数据平面">L6.4</a>）：把冷的 3000-token 前缀卸到 DRAM/SSD，命中时拉回来。
    拉回来的成本是 344 MB / PCIe 47.5 GB/s ≈ 7 ms，<strong>仍然远快于重算的 41 ms</strong>。
    这就是 Mooncake 那条路线的经济学。
 3. <strong>重排 prompt</strong>：如果 system prompt 里有公共部分（比如统一的工具定义），
@@ -893,7 +1418,7 @@ B 的要 attend 到 16 个 Y。<strong>算出的 K、V 数值完全不同。</st
 <p>顺带：这道题也说明为什么 <code>vllm:external_prefix_cache_hits</code> 这个指标存在。</p>
 </details>
 <details>
-<summary>5. SGLang 的基数树在什么负载下明显赢过 vLLM 的哈希表？在什么负载下反而是负担？</summary>
+<summary>6. SGLang 的基数树在什么负载下明显赢过 vLLM 的哈希表？在什么负载下反而是负担？</summary>
 <p><strong>赢的场景 —— 前缀高度嵌套的树状结构</strong>：
 - 多轮对话：第 1 轮是第 2 轮的前缀，第 2 轮是第 3 轮的前缀……天然是一条链
 - agent 的分支探索：同一个上下文分叉出多条推理路径

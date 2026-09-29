@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.2 编译工具链：nvcc → PTX → SASS</title>
-<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
-<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
 
 </head>
 <body>
@@ -24,24 +24,28 @@
 <li><a href="#sass">SASS：真实机器码</a></li>
 <li><a href="#sm_120-sm_120a-sm_120f">sm_120 / sm_120a / sm_120f：三个目标</a></li>
 <li><a href="#-o">-O 级别：主要影响的是指令数</a></li>
+<li><a href="#_5">制品矩阵：变体、哈希与"哪一行被优化掉了"</a></li>
 <li><a href="#__launch_bounds__">__launch_bounds__：寄存器预算与运行时间</a></li>
+<li><a href="#unroll-spill">unroll × 寄存器预算：什么时候才会真的 spill</a></li>
 </ul>
 </li>
-<li><a href="#_5">工程实现 · 源码解析：真实世界的两种代码生成</a><ul>
+<li><a href="#_6">工程实现 · 源码解析：真实世界的两种代码生成</a><ul>
 <li><a href="#1-fatbincutlass">1. 静态 fatbin：CUTLASS 的路子</a></li>
 <li><a href="#2-jitnvjet">2. 运行时 JIT：nvjet 的路子</a></li>
 <li><a href="#3-triton">3. Triton：第三种路子</a></li>
+<li><a href="#4-jit">4. 三种输入的加载结果与 JIT 缓存的时间</a></li>
+<li><a href="#5-ptx-cubin">5. PTX / cubin 的加载：四种输入的真实结果</a></li>
 </ul>
 </li>
-<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_7">消融建议</a></li>
+<li><a href="#_8">消融建议</a></li>
 </ul>
 </li>
-<li><a href="#_8">原始现场</a></li>
-<li><a href="#_9">前沿</a></li>
-<li><a href="#_10">陷阱</a></li>
-<li><a href="#_11">自测题</a></li>
+<li><a href="#_9">原始现场</a></li>
+<li><a href="#_10">前沿</a></li>
+<li><a href="#_11">陷阱</a></li>
+<li><a href="#_12">自测题</a></li>
 </ul>
 </div>
 </nav>
@@ -57,24 +61,28 @@
 <li><a href="#sass">SASS：真实机器码</a></li>
 <li><a href="#sm_120-sm_120a-sm_120f">sm_120 / sm_120a / sm_120f：三个目标</a></li>
 <li><a href="#-o">-O 级别：主要影响的是指令数</a></li>
+<li><a href="#_5">制品矩阵：变体、哈希与"哪一行被优化掉了"</a></li>
 <li><a href="#__launch_bounds__">__launch_bounds__：寄存器预算与运行时间</a></li>
+<li><a href="#unroll-spill">unroll × 寄存器预算：什么时候才会真的 spill</a></li>
 </ul>
 </li>
-<li><a href="#_5">工程实现 · 源码解析：真实世界的两种代码生成</a><ul>
+<li><a href="#_6">工程实现 · 源码解析：真实世界的两种代码生成</a><ul>
 <li><a href="#1-fatbincutlass">1. 静态 fatbin：CUTLASS 的路子</a></li>
 <li><a href="#2-jitnvjet">2. 运行时 JIT：nvjet 的路子</a></li>
 <li><a href="#3-triton">3. Triton：第三种路子</a></li>
+<li><a href="#4-jit">4. 三种输入的加载结果与 JIT 缓存的时间</a></li>
+<li><a href="#5-ptx-cubin">5. PTX / cubin 的加载：四种输入的真实结果</a></li>
 </ul>
 </li>
-<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_7">消融建议</a></li>
+<li><a href="#_8">消融建议</a></li>
 </ul>
 </li>
-<li><a href="#_8">原始现场</a></li>
-<li><a href="#_9">前沿</a></li>
-<li><a href="#_10">陷阱</a></li>
-<li><a href="#_11">自测题</a></li>
+<li><a href="#_9">原始现场</a></li>
+<li><a href="#_10">前沿</a></li>
+<li><a href="#_11">陷阱</a></li>
+<li><a href="#_12">自测题</a></li>
 </ul>
 </div>
 </nav>
@@ -410,6 +418,81 @@ Volta 到 Blackwell 的每一代各编一份。</p>
 </table>
 <p><strong><code>-O0</code> → <code>-O1</code> 指令数减半</strong>，之后基本饱和。注意 <code>nvcc -O3</code> 只控制宿主代码，
 设备代码要用 <code>-Xptxas -O3</code> 才生效（本实验两个都给了）。</p>
+<h3 id="_5">制品矩阵：变体、哈希与"哪一行被优化掉了"</h3>
+<p>同一份 <code>kernels.cu</code>（saxpy + 归约 + GEMM）编四个变体，每个都落盘预处理、PTX、
+cubin 与 SASS，并记字节数和 sha256：</p>
+<table>
+<thead>
+<tr>
+<th>变体</th>
+<th style="text-align: right;">预处理(B)</th>
+<th style="text-align: right;">PTX(B)</th>
+<th style="text-align: right;">SASS(B)</th>
+<th style="text-align: right;">寄存器</th>
+<th style="text-align: right;">spill</th>
+<th>sha256(cubin)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-O0 -Xptxas -O0</code></td>
+<td style="text-align: right;">1,386,491</td>
+<td style="text-align: right;">9,513</td>
+<td style="text-align: right;">123,077</td>
+<td style="text-align: right;">30</td>
+<td style="text-align: right;">0</td>
+<td><code>2ddbb14a9b9f</code></td>
+</tr>
+<tr>
+<td><code>-O2 -Xptxas -O2</code></td>
+<td style="text-align: right;">1,427,094</td>
+<td style="text-align: right;">9,513</td>
+<td style="text-align: right;">59,141</td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">0</td>
+<td><code>9804f7910c1e</code></td>
+</tr>
+<tr>
+<td><code>-O3 -Xptxas -O3</code></td>
+<td style="text-align: right;">1,427,094</td>
+<td style="text-align: right;">9,513</td>
+<td style="text-align: right;">59,141</td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">0</td>
+<td><code>af5e4a372eeb</code></td>
+</tr>
+<tr>
+<td><code>-O3 -Xptxas -O3 --use_fast_math</code></td>
+<td style="text-align: right;">1,427,094</td>
+<td style="text-align: right;">9,609</td>
+<td style="text-align: right;">59,141</td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">0</td>
+<td><code>565b9357f33d</code></td>
+</tr>
+</tbody>
+</table>
+<p>三条读法：</p>
+<ul>
+<li><strong>PTX 在三档优化下完全相同</strong>（同为 9,513 字节、同一个哈希）：
+  <code>-O0/-O2/-O3</code> 的差别发生在 ptxas 里，不在 cicc 里。要看最终指令，
+  必须走到 SASS 或 cubin。</li>
+<li><strong>SASS 从 123 KB 降到 59 KB</strong>：<code>nvcc -O0</code> 默认仍给 ptxas 传 <code>-O3</code>，
+  只写 <code>-O0</code> 不改变设备代码；旧 lab 的消融项说的就是这件事。</li>
+<li><strong>fast-math 改变了 PTX 与 cubin 哈希，但 SASS 字节数恰好一样</strong> ——
+  它是等量的指令替换，不是增减。数值代价见下。</li>
+</ul>
+<p><code>--use_fast_math</code> 的数值对照（同一个 <code>.cu</code> 编两次成两个编译单元，同一输入，n = 2²⁰）：</p>
+<div class="highlight"><pre><span></span><code>    precise[0]=86.1946411  fast[0]=86.1946411
+    max |diff| = 1.526e-05   max rel = 2.977e-07
+    SASS 指令数：precise=360 fast=80
+</code></pre></div>
+
+<p><strong>SASS 少 4.5 倍，数值差 1.5e-05（相对 3e-07）。</strong> 前者是收益，后者是必须
+记下来的代价：fast-math 允许把除法换成近似倒数、把 <code>sqrtf</code> 换成近似平方根。</p>
+<p>源码行到指令的映射用 <code>-lineinfo</code> 加 <code>nvdisasm -c -gi</code> 得到：每条 SASS 指令
+都带 <code>//## File "kernels.cu", line N</code>，按行统计指令数即可看出哪些源码行真的
+生成了代码、哪些被优化删除或与相邻行合并（完整映射在产物 <code>line.sass</code>）。</p>
 <h3 id="__launch_bounds__"><code>__launch_bounds__</code>：寄存器预算与运行时间</h3>
 <p><code>__launch_bounds__(N)</code> 告诉编译器"这个 kernel 最多用 N 个线程/block"，
 ptxas 会据此<strong>限制寄存器用量</strong>，使得 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span> 个线程能同时驻留：</p>
@@ -477,8 +560,129 @@ heavy&lt;200, 1024&gt;                  64     1672     4680     4848       1024
 <p>诊断方法：<code>-Xptxas -v</code> 里 <code>spill stores</code> 一旦不为 0 就要警惕，
 超过几百字节且在内循环里，基本可以断定是灾难。</p>
 </div>
+<h3 id="unroll-spill">unroll × 寄存器预算：什么时候才会真的 spill</h3>
+<p><code>-maxrregcount</code> 是<strong>硬上限</strong>，<code>__launch_bounds__(N, MINB)</code> 只是<strong>目标</strong> ——
+ptxas 可以选择不满足它。同一个计算受限 kernel（64 条独立 FMA 链）实测：</p>
+<table>
+<thead>
+<tr>
+<th><code>-maxrregcount</code></th>
+<th style="text-align: right;">寄存器</th>
+<th style="text-align: right;">spill 存(B)</th>
+<th style="text-align: right;">local(B)</th>
+<th style="text-align: right;">驻留 block/SM</th>
+<th style="text-align: right;">TFLOPS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认</td>
+<td style="text-align: right;">79</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">119.8</td>
+</tr>
+<tr>
+<td>128</td>
+<td style="text-align: right;">71</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">118.9</td>
+</tr>
+<tr>
+<td>64</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">108</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">13.4</td>
+</tr>
+<tr>
+<td>48</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">540</td>
+<td style="text-align: right;">216</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">2.8</td>
+</tr>
+<tr>
+<td>32</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">1004</td>
+<td style="text-align: right;">336</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;"><strong>1.2</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>从 79 个寄存器压到 32，占用率翻倍（3 → 6 block/SM），算力从 119.8 掉到
+1.2 TFLOPS（100 倍）。</strong> 这就是"用 spill 换占用率"的量化版本。</p>
+<p>同样两个旋钮放在访存受限的 kernel 上（1 GiB 流式读，UNROLL 个 <code>float4</code>/线程）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">unroll</th>
+<th style="text-align: right;">MINB</th>
+<th style="text-align: right;">寄存器</th>
+<th style="text-align: right;">local(B)</th>
+<th style="text-align: right;">block/SM</th>
+<th style="text-align: right;">GB/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">1695.7</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">1694.8</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">38</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">1687.9</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">56</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1699.0</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">40</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">1689.1</td>
+</tr>
+</tbody>
+</table>
+<p>16 个组合的带宽全部落在 1687–1700 GB/s（差 0.7%），寄存器从 18 涨到 56，
+一个 spill 都没有。<strong>访存受限的 kernel 对寄存器预算不敏感</strong>：延迟已经被
+在途请求掩盖，多出来的寄存器买不到带宽。</p>
+<p>还有一个反直觉的点：<code>__launch_bounds__(256, 8)</code>（预算 32 个寄存器）在
+CHAINS=64 时报的是 <strong>70 个寄存器、驻留 3 个 block</strong> —— ptxas 选择了不满足
+MINB，而不是 spill。所以真实调优必须同时看 <code>-Xptxas -v</code> 的寄存器与 spill，
+不能只看占用率数字。</p>
 <hr />
-<h2 id="_5">工程实现 · 源码解析：真实世界的两种代码生成</h2>
+<h2 id="_6">工程实现 · 源码解析：真实世界的两种代码生成</h2>
 <h3 id="1-fatbincutlass">1. 静态 fatbin：CUTLASS 的路子</h3>
 <p><a class="xref" href="../L0/0.1-request-lifecycle.html" title="从 HTTP 到 SASS：一次请求的完整调用栈">L0.1</a> 的 trace 显示 vLLM 的 bf16 GEMM 是
 <code>cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x64_64x3_nn_align8</code>。
@@ -524,8 +728,246 @@ cuobjdump warning : Function listed in --function '...' not found
 里面有 <code>.ttir/.ttgir/.llir/.ptx/.cubin</code> 五份产物。
 它既不是静态 fatbin，也不是 cuBLAS 那种闭源 JIT，
 而是<strong>用户可见的、每一跳都落盘的 JIT</strong>。<a class="xref" href="../L2/2.5-kernel-dsl-shootout.html" title="CUDA 与 kernel DSL 对比">L2.5</a> 会对比这三条路。</p>
+<h3 id="4-jit">4. 三种输入的加载结果与 JIT 缓存的时间</h3>
+<p>Triton 的每一跳都能落盘（<code>TRITON_KERNEL_DUMP=1</code>）。同一个逐元素算子：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th style="text-align: right;">字节</th>
+<th>sha256(前12)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ttir</td>
+<td style="text-align: right;">3,498</td>
+<td><code>5395335a6a39</code></td>
+</tr>
+<tr>
+<td>ttgir</td>
+<td style="text-align: right;">3,933</td>
+<td><code>0cdc2e8fe44b</code></td>
+</tr>
+<tr>
+<td>llir</td>
+<td style="text-align: right;">7,914</td>
+<td><code>c4ec05cdf691</code></td>
+</tr>
+<tr>
+<td>ptx</td>
+<td style="text-align: right;">5,781</td>
+<td><code>86f677241819</code></td>
+</tr>
+<tr>
+<td>cubin</td>
+<td style="text-align: right;">10,712</td>
+<td><code>92330060df4a</code></td>
+</tr>
+</tbody>
+</table>
+<p>ttir 里只有 tensor 语义；ttgir 里出现了</p>
+<div class="highlight"><pre><span></span><code>#blocked = #ttg.blocked&lt;{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}&gt;
+</code></pre></div>
+
+<p><strong>线程映射与"每个线程处理几个元素"是这一跳确定的</strong>，与手写 CUDA 时
+手动规划 tile 循环是同一件事 —— 只是一个由编译器选，一个由开发者静态指定。
+同一算子（<code>y = 2x + b</code>）两条路径的规模对照：</p>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th style="text-align: right;">PTX 指令行</th>
+<th style="text-align: right;">SASS 指令</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>手写 CUDA</td>
+<td style="text-align: right;">25</td>
+<td style="text-align: right;">64</td>
+</tr>
+<tr>
+<td>Triton</td>
+<td style="text-align: right;">59</td>
+<td style="text-align: right;">112</td>
+</tr>
+</tbody>
+</table>
+<p>指令数只说明 lowering 粒度，不是性能排名（性能对照在 2.5）。</p>
+<h3 id="5-ptx-cubin">5. PTX / cubin 的加载：四种输入的真实结果</h3>
+<p>用 driver API 直接加载（<code>labs/L2/ptx_load.cu</code>），同一台 sm_120 设备：</p>
+<table>
+<thead>
+<tr>
+<th>输入</th>
+<th>加载结果</th>
+<th style="text-align: right;">首次 launch</th>
+<th style="text-align: right;">100 次平均</th>
+<th style="text-align: right;">y[0]（期望 3.0）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-arch=sm_120</code> 的 PTX</td>
+<td>成功</td>
+<td style="text-align: right;">0.017 ms</td>
+<td style="text-align: right;">0.0044 ms</td>
+<td style="text-align: right;">3.0</td>
+</tr>
+<tr>
+<td><code>compute_90</code> 的 PTX</td>
+<td>成功（驱动 JIT）</td>
+<td style="text-align: right;">0.016 ms</td>
+<td style="text-align: right;">0.0044 ms</td>
+<td style="text-align: right;">3.0</td>
+</tr>
+<tr>
+<td><code>sm_120</code> 的 cubin</td>
+<td>成功</td>
+<td style="text-align: right;">0.014 ms</td>
+<td style="text-align: right;">0.0044 ms</td>
+<td style="text-align: right;">3.0</td>
+</tr>
+<tr>
+<td><code>sm_120a</code> 的 cubin</td>
+<td><strong>成功</strong></td>
+<td style="text-align: right;">0.014 ms</td>
+<td style="text-align: right;">0.0044 ms</td>
+<td style="text-align: right;">3.0</td>
+</tr>
+<tr>
+<td>PTX 头改成 <code>.version 10.0</code></td>
+<td><strong>失败</strong></td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+</tbody>
+</table>
+<p>最后一行给出真实的兼容性错误原文：</p>
+<div class="highlight"><pre><span></span><code>CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+detail: the provided PTX was compiled with an unsupported toolchain.
+</code></pre></div>
+
+<p>驱动 580.95.05 在这台 sm_120 上接受了 <code>sm_120a</code> 的 cubin 并跑出正确结果。
+这与"带 <code>a</code> 后缀的目标只保证在对应设备上可用"的直觉相反，属于要按具体驱动
+复测的边界 —— 换驱动或换卡之前不要依赖它，正式制品仍应按目标设备选架构。</p>
+<p>JIT 缓存的时间差（同一份 PTX，加载 3 次）：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>三次加载耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CUDA_CACHE_DISABLE=1</code></td>
+<td>5.602 / 5.675 / 5.591 ms</td>
+</tr>
+<tr>
+<td>默认缓存（首次 + 两次命中）</td>
+<td>5.849 / 0.063 / 0.061 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>首次 5.8 ms，命中后 0.06 ms（约 90 倍）。</strong> 这就是"第一次调用特别慢"的来源：
+驱动要把 PTX 编译成 SASS 并写进计算缓存。测冷启动时必须区分这两者，
+否则报出来的既不是冷启动也不是稳态。</p>
+<p>CuTe-DSL 这一条路线补上了中间表示。之前失败的原因有两层，都不在 kernel 里：
+<code>@cute.jit</code> 的 host 函数<strong>不该接收 <code>torch.cuda.Stream</code></strong>（launch 走当前流），
+以及 <code>CUDA_TOOLKIT_PATH</code> 必须指向 CUDA 安装根（否则 libNVVM 报后端失败）。
+换成固定 commit 的 CUTLASS 源码树里的例子（<code>147295a3</code>，
+<code>examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm</code>）后，
+用 <code>CUTE_DSL_KEEP=ir,ptx,cubin</code> 可以一次拿到四份产物：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>产物</th>
+<th style="text-align: right;">体量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>clean MLIR（canonicalize + CSE 之后）</td>
+<td><code>*_clean.mlir</code></td>
+<td style="text-align: right;">152,430 B</td>
+</tr>
+<tr>
+<td>PTX</td>
+<td><code>*.sm_120a.ptx</code></td>
+<td style="text-align: right;">95,574 B</td>
+</tr>
+<tr>
+<td>cubin</td>
+<td><code>*.sm_120a.cubin</code></td>
+<td style="text-align: right;">47,592 B</td>
+</tr>
+<tr>
+<td>SASS</td>
+<td><code>cuobjdump -sass</code></td>
+<td style="text-align: right;">1,184 条指令</td>
+</tr>
+</tbody>
+</table>
+<p>clean MLIR 里的算子分布（<code>tile_shape_mnk = 128×128×64</code>）：</p>
+<div class="highlight"><pre><span></span><code>cute.gemm               8   原子类型 !mma_f16_f16_f32_16x8x16，累加器 !memref_rmem_f32
+cute.copy              34   其中 copy_ldsm 24（= ldmatrix）
+nvvm.cp.async.bulk     17   TMA 搬运
+nvvm.mbarrier          14   异步同步
+nvvm.setmaxregister     2   寄存器预算声明（increase 232）
+tcgen05 / tmem          0   sm_120 上没有这条路径（L2.4 的门控实测）
+</code></pre></div>
+
+<p>三条路线的产物形状放在一起看，"抽象层次 → IR 形状"就清楚了：</p>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>中间表示</th>
+<th>设备代码</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>手写 CUDA</td>
+<td>只有 PTX（9,513 B，<code>-O0/-O2/-O3</code> 完全相同）</td>
+<td>SASS 123 KB → 59 KB（优化档位作用在 ptxas）</td>
+</tr>
+<tr>
+<td>Triton</td>
+<td>ttir 3,498 → ttgir 3,933 → llir 7,914 B</td>
+<td>PTX 5,781 B → cubin 10,712 B</td>
+</tr>
+<tr>
+<td>CuTe-DSL</td>
+<td>clean MLIR 152,430 B（带 layout、原子类型与流水）</td>
+<td>PTX 95,574 B → cubin 47,592 B</td>
+</tr>
+</tbody>
+</table>
+<p>两点对照：</p>
+<ol>
+<li><strong>CuTe-DSL 的 MLIR 比 Triton 的 ttgir 大两个数量级</strong>，因为它把 layout 代数、
+   TMA 描述符、流水与寄存器预算都显式留在 IR 里；Triton 的 ttgir 只保留
+   <code>#blocked</code> 这类布局线索，线程映射之后的细节交给 LLVM。</li>
+<li><strong>PTX 与 SASS 的 mma 条数一一对应</strong>（256 ↔ 256），说明这条路上
+   <code>mma.sync</code> 既没被展开也没被合并 —— "看 PTX 猜最终指令"在这个 kernel 上成立，
+   但仍要先固定目标架构与优化档位（否则就像 <code>-O0</code> 那样：PTX 相同而 SASS 差一倍）。</li>
+</ol>
+<p>命令：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_TOOLKIT_PATH</span><span class="o">=</span><span class="nv">$CUDA_HOME</span>
+<span class="nv">CUTE_DSL_KEEP</span><span class="o">=</span>ir,ptx,cubin<span class="w"> </span><span class="nv">CUTE_DSL_DUMP_DIR</span><span class="o">=</span>out/cute<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>python<span class="w"> </span>dense_gemm.py<span class="w"> </span>--mnkl<span class="w"> </span><span class="m">4096</span>,4096,4096,1<span class="w"> </span>--tile_shape_mnk<span class="w"> </span><span class="m">128</span>,128,64
+python<span class="w"> </span>labs/L2/sass_census.py<span class="w"> </span>out/cute/*.cubin
+</code></pre></div>
+
+<p>工件：<code>results/crater/2.4/20260913-sm120-paths/dsl-sm120/artifacts_excerpt.txt</code>
+（完整 cubin/PTX/MLIR 按大体积产物规则留在运行机）。</p>
 <hr />
-<h2 id="_6">工程实现 · 自己写一遍</h2>
+<h2 id="_7">工程实现 · 自己写一遍</h2>
 <p><code>labs/L2/toolchain_tour.sh</code> 把每一跳都留下产物。三个要点：</p>
 <p><strong>(1) <code>--dryrun</code> 看流水线，<code>--keep</code> 留产物</strong></p>
 <div class="highlight"><pre><span></span><code>nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-O3<span class="w"> </span>-c<span class="w"> </span>demo.cu<span class="w"> </span>-o<span class="w"> </span>demo.o<span class="w"> </span>--dryrun<span class="w">        </span><span class="c1"># 只打印不执行</span>
@@ -557,8 +999,12 @@ nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> 
 而非硬件机制本身不存在。</p>
 <hr />
 <h2 id="lab">动手 lab</h2>
-<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>labs/L2/toolchain_tour.sh<span class="w"> </span>/tmp/tour<span class="w">     </span><span class="c1"># 全流程产物</span>
-python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp/tour/lb.log
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>labs/L2/toolchain_tour.sh<span class="w"> </span>out/2.2/tour<span class="w">     </span><span class="c1"># 全流程产物（八跳、fatbin、__launch_bounds__）</span>
+python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>out/2.2/tour/lb.log
+
+bash<span class="w"> </span>labs/L2/toolchain_matrix.sh<span class="w"> </span>out/2.2/matrix<span class="w"> </span><span class="c1"># 制品矩阵、行映射、fast-math、spill 硬上限</span>
+nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-Xptxas<span class="w"> </span>-v<span class="w"> </span>-o<span class="w"> </span>sweep<span class="w"> </span>labs/L2/toolchain_sweep.cu<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>./sweep
+python<span class="w"> </span>labs/L2/toolchain_lowering.py<span class="w"> </span>--out-dir<span class="w"> </span>out/2.2/lowering<span class="w">   </span><span class="c1"># Triton IR、加载兼容性、JIT 缓存</span>
 
 <span class="c1"># 单独看某一跳</span>
 nvcc<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-ptx<span class="w"> </span>demo.cu<span class="w"> </span>-o<span class="w"> </span>demo.ptx<span class="w">           </span><span class="c1"># 只到 PTX</span>
@@ -568,7 +1014,7 @@ cuobjdump<span class="w"> </span>-lelf<span class="w"> </span>demo.o<span class=
 c++filt<span class="w"> </span>_Z11reduce_tileILi256EEvPKfPfi<span class="w">               </span><span class="c1"># 还原符号名</span>
 </code></pre></div>
 
-<h3 id="_7">消融建议</h3>
+<h3 id="_8">消融建议</h3>
 <table>
 <thead>
 <tr>
@@ -599,13 +1045,25 @@ c++filt<span class="w"> </span>_Z11reduce_tileILi256EEvPKfPfi<span class="w">   
 </tr>
 <tr>
 <td>用 <code>compute-sanitizer ./a.out</code></td>
-<td>本机已装。检查越界与竞态，比看 SASS 更早发现问题</td>
+<td>redist 解包版可用（见 2.1）。检查越界与竞态，比看 SASS 更早发现问题</td>
+</tr>
+<tr>
+<td>把 <code>toolchain_matrix.sh</code> 的 <code>-maxrregcount</code> 加到 <code>sweep_capped.cu</code> 的 compute kernel 上</td>
+<td>spill 与 TFLOPS 一起掉：32 个寄存器时从 119.8 掉到 1.2 TFLOPS</td>
+</tr>
+<tr>
+<td>把 <code>toolchain_lowering.py</code> 的 <code>.version</code> 改成更大的值</td>
+<td>驱动给出 <code>CUDA_ERROR_UNSUPPORTED_PTX_VERSION</code> 原文</td>
+</tr>
+<tr>
+<td>删掉 JIT 缓存目录再跑一次 <code>ptx_load</code></td>
+<td>首次加载从 0.06 ms 变回 5.8 ms</td>
 </tr>
 </tbody>
 </table>
 <p>第三项实验比较不同架构标志生成的代码及其性能，相关兼容性问题见 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a>。</p>
 <hr />
-<h2 id="_8">原始现场</h2>
+<h2 id="_9">原始现场</h2>
 <details>
 <summary>① 完整的中间产物列表</summary>
 <div class="highlight"><pre><span></span><code>$ nvcc -arch=sm_120 -O3 -c demo.cu -o demo.o --keep --keep-dir .
@@ -718,7 +1176,43 @@ $ cuobjdump -lelf libcublasLt.so.13 | grep -oE "sm_[0-9]+[af]?" | sort | uniq -c
 但至少现在知道了它开放的原因，以及下一步该往哪查。</p>
 </details>
 <hr />
-<h2 id="_9">前沿</h2>
+<details>
+<summary>⑨ 制品矩阵与 unroll／寄存器扫描</summary>
+<div class="highlight"><pre><span></span><code>变体                             cpp1       ptx        sass       regs     smem     spill
+O0 (-O0 -Xptxas -O0)               1386491    9513       123077     30       1024     0
+O2 (-O2 -Xptxas -O2)               1427094    9513       59141      37       1024     0
+O3 (-O3 -Xptxas -O3)               1427094    9513       59141      37       1024     0
+O3fast (-O3 --use_fast_math)       1427094    9609       59141      37       1024     0
+
+[compute] 独立 FMA 链数 × 寄存器预算（iters=200000）
+chains     MINB   regs     local(B)   occ blk   TFLOPS
+64         8      70       0          3         119.0      ← ptxas 没有满足 MINB=8 的 32 寄存器预算
+
+-maxrregcount 硬上限（CHAINS=64）
+maxrregcount   regs   spill(B)  local(B)  occ blk  TFLOPS
+(默认)         79     0         0         3        119.8
+64             64     108       48        4        13.4
+48             48     540       216       5        2.8
+32             32     1004      336       6        1.2
+</code></pre></div>
+
+</details>
+<details>
+<summary>⑩ 四种输入的加载结果与 JIT 缓存</summary>
+<div class="highlight"><pre><span></span><code>valid_sm120.ptx      load=0.055 ms  CUDA_SUCCESS   y[0]=3.0
+compute90.ptx        load=0.072 ms  CUDA_SUCCESS   y[0]=3.0
+valid_sm120.cubin    load=0.014 ms  CUDA_SUCCESS   y[0]=3.0
+sm120a.cubin         load=0.014 ms  CUDA_SUCCESS   y[0]=3.0
+future_version.ptx   load=3.484 ms  CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+                     detail: the provided PTX was compiled with an unsupported toolchain.
+
+JIT 缓存：cold(CUDA_CACHE_DISABLE=1) 5.602/5.675/5.591 ms
+          warm                     5.849/0.063/0.061 ms
+</code></pre></div>
+
+</details>
+<hr />
+<h2 id="_10">前沿</h2>
 <table>
 <thead>
 <tr>
@@ -757,7 +1251,9 @@ $ cuobjdump -lelf libcublasLt.so.13 | grep -oE "sm_[0-9]+[af]?" | sort | uniq -c
 <p>除本章实测外的内容来自各自文档，<strong>尚未复现</strong><span class="unverified">未实测</span>。</p>
 </blockquote>
 <hr />
-<h2 id="_10">陷阱</h2>
+<h2 id="_11">陷阱</h2>
+<p><strong>0. <code>-O0</code> 不改变设备代码。</strong> ptxas 有自己的 <code>-O</code>；只写 <code>nvcc -O0</code>
+时设备代码仍按 ptxas 默认优化。判据是 SASS 字节数或哈希，不是命令行。</p>
 <p><strong>1. 以为 <code>nvcc -O3</code> 优化了设备代码。</strong> 它只管宿主代码，设备代码要 <code>-Xptxas -O3</code>。</p>
 <p><strong>2. 忽略 <code>-Xptxas -v</code> 里的 spill。</strong> 本章实测：2796 字节的 spill 带来 <strong>23 倍</strong>减速，
 而且<strong>不会有任何报错或警告</strong>。</p>
@@ -771,7 +1267,7 @@ $ cuobjdump -lelf libcublasLt.so.13 | grep -oE "sm_[0-9]+[af]?" | sort | uniq -c
 而且如果 PTX ISA 版本高于驱动支持范围，会直接失败。</p>
 <p><strong>7. 未观察到 spill 不等于不会发生。</strong> 编译器优化可能消除了实验原本想制造的寄存器压力。</p>
 <hr />
-<h2 id="_11">自测题</h2>
+<h2 id="_12">自测题</h2>
 <details>
 <summary>1. 我的 kernel 编译时 <code>-Xptxas -v</code> 报 <code>Used 255 registers</code>。这是好事还是坏事？</summary>
 <p><strong>看情况，但 255 是个特殊数字——它是硬件上限。</strong></p>
@@ -892,6 +1388,32 @@ $ cuobjdump -lelf libcublasLt.so.13 | grep -oE "sm_[0-9]+[af]?" | sort | uniq -c
 <p><strong>(d) 直接写一个用 <code>kind::mxf8f6f4.block_scale</code> 的 kernel 测吞吐</strong>（<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a> 的建议）。
 如果它达到 1501 FLOP/clk/SM，就基本确认了。</p>
 <p><strong>(a) 最直接，(d) 最不依赖工具。</strong> <a class="xref" href="../L2/2.4-gemm-ladder.html" title="优化阶梯 II：逐步实现 GEMM">L2.4</a> 会走 (d)。</p>
+</details>
+<details>
+<summary>6. 同一份 `.cu` 编出两个变体：一个 `-O0`、一个 `-O3`，PTX 完全一样。这正常吗？</summary>
+<p>正常。<code>nvcc -O</code> 控制 cicc 的高层优化，而这里的 PTX 在 <code>-O0/-O2/-O3</code> 下
+都是 9,513 字节、同一个哈希 —— 差别全部发生在 ptxas 里。
+要看到区别得比对 SASS：<code>-O0</code>（且 <code>-Xptxas -O0</code>）123 KB，<code>-O2/-O3</code> 59 KB。</p>
+<p>推论：<strong>只凭 PTX 判断"编译器优化了什么"是不成立的</strong>，PTX 是虚拟 ISA，
+真实指令在 ptxas 之后。</p>
+</details>
+<details>
+<summary>7. 为了把占用率从 3 个 block/SM 提到 6，把寄存器从 79 压到 32 值得吗？</summary>
+<p>本章实测：不值得。同一个计算受限 kernel，79 个寄存器时 119.8 TFLOPS、
+驻留 3 个 block/SM；压到 32 个寄存器后驻留 6 个 block/SM，但 spill 1004 字节，
+算力掉到 <strong>1.2 TFLOPS（100 倍差距）</strong>。</p>
+<p>判据是墙钟时间而不是占用率。而且 <code>__launch_bounds__(256, MINB)</code> 只是目标：
+实测 MINB=8（预算 32）时 ptxas 报了 70 个寄存器、驻留 3 个 block ——
+它选择了不满足目标，也不 spill。所以要么用 <code>-maxrregcount</code> 明确硬压并接受
+spill，要么就别动寄存器。</p>
+</details>
+<details>
+<summary>8. 同一个 PTX 模块，第一次加载 5.8 ms、第二次 0.06 ms，为什么？</summary>
+<p>驱动在首次加载时把 PTX 编译成 SASS，并把结果写进计算缓存
+（默认在 <code>~/.nv/ComputeCache</code>）。第二次加载直接命中缓存，所以快约 90 倍。
+<code>CUDA_CACHE_DISABLE=1</code> 后三次都是 5.6–5.7 ms，正好验证这一点。</p>
+<p>冷启动测量必须说明缓存状态；只报一个数会把 JIT 成本算进稳态，或者反过来
+把稳态当成冷启动。这也是"只分发 PTX、让驱动 JIT"的路线在服务里要考虑的代价。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.1-cuda-execution-model.html">&#8592; 2.1 CUDA 执行模型与 CUDA Graph</a><a class="nav-next" href="../L2/2.3-memory-bound-ladder.html">2.3 优化阶梯 I：memory-bound 算子 &#8594;</a></nav>
 </main>
 </body>

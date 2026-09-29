@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10.2 采样器与步数</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">10.2</div>
+  <div class="sidebar-title">采样器与步数</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一步采样是四次坐标变换</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#ode">从概率流 ODE 到"一步"</a></li>
+<li><a href="#_4">多步方法：把上一步的模型输出留下来</a></li>
+<li><a href="#_5">变量约定：同一个调度器的两套尺度</a></li>
+<li><a href="#shift">时间网格与 shift</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 源码解析</a><ul>
+<li><a href="#euler-heunedm">Euler 与 Heun：EDM 变量、两阶段状态机</a></li>
+<li><a href="#dpm-solver">DPM-Solver++：转换、历史与降阶</a></li>
+<li><a href="#_7">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_8">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#a">A：求解器参照与库对拍</a></li>
+<li><a href="#bcdsdxl-lcm-cfg">B/C/D：SDXL 与 LCM 的步数—CFG—求解器对照</a></li>
+</ul>
+</li>
+<li><a href="#_9">原始现场</a></li>
+<li><a href="#_10">前沿：三种"少步"不是同一件事</a></li>
+<li><a href="#_11">陷阱</a></li>
+<li><a href="#_12">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一步采样是四次坐标变换</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#ode">从概率流 ODE 到"一步"</a></li>
+<li><a href="#_4">多步方法：把上一步的模型输出留下来</a></li>
+<li><a href="#_5">变量约定：同一个调度器的两套尺度</a></li>
+<li><a href="#shift">时间网格与 shift</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 源码解析</a><ul>
+<li><a href="#euler-heunedm">Euler 与 Heun：EDM 变量、两阶段状态机</a></li>
+<li><a href="#dpm-solver">DPM-Solver++：转换、历史与降阶</a></li>
+<li><a href="#_7">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_8">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#a">A：求解器参照与库对拍</a></li>
+<li><a href="#bcdsdxl-lcm-cfg">B/C/D：SDXL 与 LCM 的步数—CFG—求解器对照</a></li>
+</ul>
+</li>
+<li><a href="#_9">原始现场</a></li>
+<li><a href="#_10">前沿：三种"少步"不是同一件事</a></li>
+<li><a href="#_11">陷阱</a></li>
+<li><a href="#_12">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L10 · 扩散与 flow matching</div>
+  <div class="mod-id">10.2</div>
+  <h1>采样器与步数</h1>
+  <p class="lede">比较 Euler、Heun、DPM-Solver++ 等兼容采样器的误差与求值成本；在固定模型和质量口径下记录步数、NFE、延迟，并区分蒸馏模型的训练差异。 补齐 LCM/DMD2 训练与 RL/蒸馏的状态和产物区别。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · diffusers 0.40.0 · SDXL base 1.0 (fp16) · LCM-SDXL</span><span class="chip">前置 10.1（参数化与解析场）· 2.3/2.6（访存与 profiling，选读）· 5.2/5.3（调度，10.3 用）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>上一章把"模型学什么"讲清楚了，这一章只回答"怎么把它积出来"。</p>
+<ol>
+<li>采样一步里到底调用了模型几次？"步数"和 NFE 什么时候不相等？</li>
+<li>时间网格、变量约定（EDM 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 与 VP 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mi>t</mi></msub></mrow></math></span>）和 prediction_type 怎样限制哪些 solver 是合法的？</li>
+<li>少步生成模型（LCM）的改进来自权重还是来自 solver？把两件事混在一起会得出什么错误结论？</li>
+</ol>
+<hr />
+<h2 id="_2">心智模型：一步采样是四次坐标变换</h2>
+<p>把任意 scheduler 的一步拆开，都是同样四件事，顺序固定：</p>
+<figure>
+
+
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="一步采样的四个动作与两套变量">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="20" font-size="13" font-weight="600">一步采样：时间 → 缩放 → 预测转换 → 更新</text>
+
+    <rect x="12" y="40" width="150" height="70" rx="5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <text x="87" y="62" text-anchor="middle" font-size="11.5" font-weight="600">① 时间网格</text>
+    <text x="87" y="80" text-anchor="middle" font-size="10.5">t_i → σ_i</text>
+    <text x="87" y="97" text-anchor="middle" font-size="10.5">shift 重映射在这里</text>
+
+    <rect x="176" y="40" width="150" height="70" rx="5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <text x="251" y="62" text-anchor="middle" font-size="11.5" font-weight="600">② 输入缩放</text>
+    <text x="251" y="80" text-anchor="middle" font-size="10.5">x_in = x/√(σ²+1)</text>
+    <text x="251" y="97" text-anchor="middle" font-size="10.5">EDM 变量；VP 变量不缩放</text>
+
+    <rect x="340" y="40" width="150" height="70" rx="5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <text x="415" y="62" text-anchor="middle" font-size="11.5" font-weight="600">③ 预测转换</text>
+    <text x="415" y="80" text-anchor="middle" font-size="10.5">ε / x₀ / v → 更新量</text>
+    <text x="415" y="97" text-anchor="middle" font-size="10.5">x₀ = x − σ·ε</text>
+
+    <rect x="504" y="40" width="150" height="70" rx="5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <text x="579" y="62" text-anchor="middle" font-size="11.5" font-weight="600">④ 更新</text>
+    <text x="579" y="80" text-anchor="middle" font-size="10.5">Euler / Heun / 多步</text>
+    <text x="579" y="97" text-anchor="middle" font-size="10.5">dx/dσ = (x − x₀)/σ</text>
+
+    <path d="M 162 75 L 176 75" stroke="currentColor" stroke-width="1.2" marker-end="url(#a2)"/>
+    <path d="M 326 75 L 340 75" stroke="currentColor" stroke-width="1.2" marker-end="url(#a2)"/>
+    <path d="M 490 75 L 504 75" stroke="currentColor" stroke-width="1.2" marker-end="url(#a2)"/>
+
+    <rect x="12" y="128" width="732" height="108" rx="5" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.8"/>
+    <text x="24" y="148" font-size="12" font-weight="600">两套变量不能混用（同一台调度器的两个约定）</text>
+    <text x="24" y="170" font-size="11">EDM 变量（Euler / Heun）：状态 x = x₀ + σn，初始噪声乘 init_noise_sigma = √(σ_max²+1) ≈ 157.4</text>
+    <text x="24" y="190" font-size="11">VP 变量（DPM-Solver++ / DDIM）：状态就是 x_t，α = 1/√(σ²+1)，σ_t = σ·α，noise 乘 1</text>
+    <text x="24" y="210" font-size="11">NFE：Euler = N，Heun = 2N−1，DPM-Solver++(2M) = N（N = 推理步数）</text>
+    <text x="24" y="228" font-size="11">模型输入看到的张量相同，但"状态张量"的尺度不同；把两套变量代入同一更新会直接错开一个 σ 量级</text>
+
+    <defs><marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 z" fill="currentColor"/></marker></defs>
+  </g>
+</svg>
+
+
+</figure>
+
+<p>三条先给结论：</p>
+<ul>
+<li><strong>NFE 不等于步数。</strong> Heun 每步两次求值，但库内 <code>timesteps</code> 会被复制成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>N</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 项、末步只求值一次，所以 NFE 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>N</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 而不是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>N</mi></mrow></math></span>。</li>
+<li><strong>变量约定决定初始噪声。</strong> EDM 变量的调度器（Euler/Heun）要求初始 latent 乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><msubsup><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow><mn>2</mn></msubsup><mo>&#x0002B;</mo><mn>1</mn></mrow></msqrt></mrow></math></span>（SDXL 上约 157.4），VP 变量的调度器（DPM-Solver++/DDIM）乘 1。这一步写错，后面的曲线再漂亮也没有意义。</li>
+<li><strong>换 scheduler 不换权重，不会得到少步模型。</strong> LCM 的少步来自权重与 scheduler 成对替换，见 10.2-C 的失败样本。</li>
+</ul>
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="ode">从概率流 ODE 到"一步"</h3>
+<p>10.1 已经给出概率流 ODE。用 EDM 的变量写（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x0003D;</mo><msub><mi>x</mi><mn>0</mn></msub><mo>&#x0002B;</mo><mi>&#x003C3;</mi><mi>n</mi></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi><mo>&#x0003D;</mo><msub><mi>s</mi><mi>t</mi></msub><mo>&#x0002F;</mo><msub><mi>a</mi><mi>t</mi></msub></mrow></math></span>），它只有一项：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><mi mathvariant="normal">d</mi><mi>x</mi></mrow><mrow><mi mathvariant="normal">d</mi><mi>&#x003C3;</mi></mrow></mfrac><mo>&#x0003D;</mo><mfrac><mrow><mi>x</mi><mo>&#x02212;</mo><msub><mi>D</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00028;</mo><mi>x</mi><mi>;</mi><mi>&#x003C3;</mi><mo stretchy="false">&#x00029;</mo></mrow><mrow><mi>&#x003C3;</mi></mrow></mfrac><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>D</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00028;</mo><mi>x</mi><mi>;</mi><mi>&#x003C3;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>x</mi><mo>&#x02212;</mo><mi>&#x003C3;</mi><mspace width="0.167em" /><msub><mi>&#x003F5;</mi><mi>&#x003B8;</mi></msub><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 当作自变量，一次采样就是从 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow></msub></mrow></math></span> 积分到 0。任何一步求解器都是对这条 ODE 的离散：</p>
+<ul>
+<li><strong>Euler（一阶，1 NFE/步）</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mrow><mi>i</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></msub><mo>&#x0003D;</mo><msub><mi>x</mi><mi>i</mi></msub><mo>&#x0002B;</mo><mo stretchy="false">&#x00028;</mo><msub><mi>&#x003C3;</mi><mrow><mi>i</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></msub><mo>&#x02212;</mo><msub><mi>&#x003C3;</mi><mi>i</mi></msub><mo stretchy="false">&#x00029;</mo><mstyle displaystyle="true" scriptlevel="0"><mfrac><mrow><msub><mi>x</mi><mi>i</mi></msub><mo>&#x02212;</mo><msub><mi>D</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00028;</mo><msub><mi>x</mi><mi>i</mi></msub><mi>;</mi><msub><mi>&#x003C3;</mi><mi>i</mi></msub><mo stretchy="false">&#x00029;</mo></mrow><mrow><msub><mi>&#x003C3;</mi><mi>i</mi></msub></mrow></mfrac></mstyle></mrow></math></span>。全局误差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mi>h</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>。</li>
+<li><strong>Heun（二阶，2 NFE/步）</strong>：先用 Euler 预测 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>x</mi><mo>&#x0002A;</mo></msup></mrow></math></span>，再在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mrow><mi>i</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></msub></mrow></math></span> 处求一次导，取两次导数的平均。全局误差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>h</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span>。</li>
+<li><strong>中点法（二阶，2 NFE/步）</strong>：在区间中点求导。在解析场上与 Heun 同阶（实测观测阶 2.045 对 1.967）。</li>
+</ul>
+<p><code>labs/L10/solver_reference.py</code> 在解析 ODE <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi mathvariant="normal">d</mi><mi>x</mi><mo>&#x0002F;</mo><mi mathvariant="normal">d</mi><mi>t</mi><mo>&#x0003D;</mo><mo>&#x02212;</mo><mi>&#x003BB;</mi><mi>x</mi></mrow></math></span>（闭式解 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mo>&#x02212;</mo><mi>&#x003BB;</mi><mi>t</mi></mrow></msup></mrow></math></span>）与 10.1 的解析 VP 场上量观测阶：</p>
+<table>
+<thead>
+<tr>
+<th>场</th>
+<th>Euler</th>
+<th>Heun</th>
+<th>中点法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mi>&#x003BB;</mi><mi>x</mi></mrow></math></span>（闭式解）</td>
+<td>1.015</td>
+<td>2.022</td>
+<td>2.022</td>
+</tr>
+<tr>
+<td>VP 二维 Gaussian（RK4 参照）</td>
+<td>0.989</td>
+<td>1.967</td>
+<td>2.045</td>
+</tr>
+<tr>
+<td>FM 二维 GMM（RK4 参照）</td>
+<td>1.001</td>
+<td>1.845</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>"二阶"是<strong>条件</strong>而不是恒等式：它要求向量场在步长尺度上足够光滑。GMM 的模式之间场变化快：VP 场上 Heun 的观测阶从 1.967 掉到 1.87（10.1-B），FM 场上只有 1.845。</p>
+<h3 id="_4">多步方法：把上一步的模型输出留下来</h3>
+<p>Euler 与 Heun 都只用当前点的信息。DPM-Solver++(2M) 额外使用上一次的<strong>数据预测</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span>，因此在相同 NFE 下拿到二阶精度。它的自然变量是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003BB;</mi><mo>&#x0003D;</mo><mi>log</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003B1;</mi><mo>&#x0002F;</mo><mi>&#x003C3;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>log</mi><mtext>SNR</mtext><mo>&#x0002F;</mo><mn>2</mn></mrow></math></span>，二阶更新（diffusers <code>solver_type="midpoint"</code>）为</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>x</mi><mrow><mi>t</mi></mrow></msub><mo>&#x0003D;</mo><mfrac><mrow><msub><mi>&#x003C3;</mi><mi>t</mi></msub></mrow><mrow><msub><mi>&#x003C3;</mi><mrow><msub><mi>s</mi><mn>0</mn></msub></mrow></msub></mrow></mfrac><msub><mi>x</mi><mrow><msub><mi>s</mi><mn>0</mn></msub></mrow></msub><mo>&#x02212;</mo><msub><mi>&#x003B1;</mi><mi>t</mi></msub><mo minsize="1.2em" maxsize="1.2em">(</mo><msup><mi>e</mi><mrow><mo>&#x02212;</mo><mi>h</mi></mrow></msup><mo>&#x02212;</mo><mn>1</mn><mo minsize="1.2em" maxsize="1.2em">)</mo><msub><mi>D</mi><mn>0</mn></msub><mo>&#x02212;</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><msub><mi>&#x003B1;</mi><mi>t</mi></msub><mo minsize="1.2em" maxsize="1.2em">(</mo><msup><mi>e</mi><mrow><mo>&#x02212;</mo><mi>h</mi></mrow></msup><mo>&#x02212;</mo><mn>1</mn><mo minsize="1.2em" maxsize="1.2em">)</mo><msub><mi>D</mi><mn>1</mn></msub><mo>&#x0002C;</mo><mspace width="2em" /><mi>h</mi><mo>&#x0003D;</mo><msub><mi>&#x003BB;</mi><mi>t</mi></msub><mo>&#x02212;</mo><msub><mi>&#x003BB;</mi><mrow><msub><mi>s</mi><mn>0</mn></msub></mrow></msub><mo>&#x0002C;</mo><mspace width="1em" /><msub><mi>D</mi><mn>1</mn></msub><mo>&#x0003D;</mo><mfrac><mrow><mn>1</mn></mrow><mrow><msub><mi>r</mi><mn>0</mn></msub></mrow></mfrac><mo stretchy="false">&#x00028;</mo><msub><mi>D</mi><mn>0</mn></msub><mo>&#x02212;</mo><msubsup><mi>D</mi><mn>1</mn><mrow><mi>p</mi><mi>r</mi><mi>e</mi><mi>v</mi></mrow></msubsup><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>历史状态带来两个必须显式处理的边界：</p>
+<ul>
+<li><strong>起步阶段</strong>没有历史，第一步只能一阶（库内 <code>lower_order_nums &lt; 1</code> 时走 <code>dpm_solver_first_order_update</code>）。</li>
+<li><strong>末步</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span> 时 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BB;</mi><mi>t</mi></msub><mo>&#x02192;</mo><mo>&#x0002B;</mo><mo>&#x0221E;</mo></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>h</mi><mo>&#x02192;</mo><mo>&#x0221E;</mo></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>r</mi><mn>0</mn></msub><mo>&#x0003D;</mo><msub><mi>h</mi><mn>0</mn></msub><mo>&#x0002F;</mo><mi>h</mi><mo>&#x02192;</mo><mn>0</mn></mrow></math></span>，二阶项的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><msub><mi>r</mi><mn>0</mn></msub></mrow></math></span> 会发散。库内用 <code>lower_order_final</code> 把它降回一阶，触发条件有三条：<code>euler_at_final</code>、<code>lower_order_final and len(timesteps) &lt; 15</code>、或 <code>final_sigmas_type == "zero"</code>（<strong>默认就是 "zero"</strong>）。</li>
+</ul>
+<p>实测的历史状态（10 步、<code>labs/L10/solver_reference.py</code> 的 <code>history</code> 字段）：第一步 <code>first</code>、第二到第九步 <code>second</code>、第十步 <code>first</code>。这套"起步一阶 + 中间二阶 + 末步一阶"的模式对任何步数都成立，步数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02265;</mo><mn>15</mn></mrow></math></span> 时中间段不会因为 <code>len&lt;15</code> 而缩短，但末步仍因 <code>final_sigmas_type="zero"</code> 降阶。</p>
+<h3 id="_5">变量约定：同一个调度器的两套尺度</h3>
+<p>这是本章最容易出错、也最少被写清楚的一点。diffusers 的两族调度器内部状态尺度不同：</p>
+<table>
+<thead>
+<tr>
+<th>调度器</th>
+<th>状态的物理量</th>
+<th><code>init_noise_sigma</code></th>
+<th><code>scale_model_input</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>EulerDiscreteScheduler</code> / <code>HeunDiscreteScheduler</code></td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x0003D;</mo><msub><mi>x</mi><mn>0</mn></msub><mo>&#x0002B;</mo><mi>&#x003C3;</mi><mi>n</mi></mrow></math></span>（EDM）</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><msubsup><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow><mn>2</mn></msubsup><mo>&#x0002B;</mo><mn>1</mn></mrow></msqrt><mo>&#x02248;</mo><mn>157.4</mn></mrow></math></span></td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x0002F;</mo><msqrt><mrow><msup><mi>&#x003C3;</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>1</mn></mrow></msqrt></mrow></math></span></td>
+</tr>
+<tr>
+<td><code>DPMSolverMultistepScheduler</code> / <code>DDIMScheduler</code></td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mi>&#x003B1;</mi><msub><mi>x</mi><mn>0</mn></msub><mo>&#x0002B;</mo><msub><mi>&#x003C3;</mi><mi>t</mi></msub><mi>&#x003F5;</mi></mrow></math></span>（VP）</td>
+<td>1.0</td>
+<td>恒等</td>
+</tr>
+</tbody>
+</table>
+<p><code>labs/L10/solver_reference.py</code> 用同一个解析模型分别喂给四个调度器，并把初始噪声按各自的 <code>init_noise_sigma</code> 缩放，手写实现逐项复现库内更新：Euler 最大绝对差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>9.98</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span>、Heun <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1.62</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span>、DPM-Solver++(2M) <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>8.00</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>7</mn></mrow></msup></mrow></math></span>（库内部是 float32）。若把 EDM 调度器的状态直接按 VP 解释，第一步就会差一个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow></msub></mrow></math></span> 量级。</p>
+<h3 id="shift">时间网格与 shift</h3>
+<p><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 网格决定"把步数花在哪里"。diffusers 的 flow-match 调度器提供一个显式重映射（10.1 已给出源码位置）：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msup><mi>&#x003C3;</mi><mi>&#x02032;</mi></msup><mo>&#x0003D;</mo><mfrac><mrow><mtext>shift</mtext><mo>&#x000B7;</mo><mi>&#x003C3;</mi></mrow><mrow><mn>1</mn><mo>&#x0002B;</mo><mo stretchy="false">&#x00028;</mo><mtext>shift</mtext><mo>&#x02212;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo><mi>&#x003C3;</mi></mrow></mfrac><mo>&#x0002E;</mo></mrow></math></div></p>
+<p><code>shift&gt;1</code> 把网格推向噪声端（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 大的一端），让数据端分到更细的步长。实测（<code>solver_reference.json</code> 的 <code>flow_match.diffusers</code>）：<code>shift=3</code> 时基网格端点为 <code>1.0</code> 与 <code>0.002994</code>（逆映射回原网格：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>s</mi><mo>&#x0002F;</mo><mo stretchy="false">&#x00028;</mo><mtext>shift</mtext><mo>&#x02212;</mo><mo stretchy="false">&#x00028;</mo><mtext>shift</mtext><mo>&#x02212;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo><mi>s</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>，往返误差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2.2</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>16</mn></mrow></msup></mrow></math></span>），而<strong>不去 shift 的直觉公式 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">s</mi><mi mathvariant="normal">p</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">c</mi><mi mathvariant="normal">e</mi></mrow><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x0002C;</mo><mn>1</mn><mo>&#x0002F;</mo><mi>N</mi><mo>&#x0002C;</mo><mi>N</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 是错的</strong>——库内的基网格是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">s</mi><mi mathvariant="normal">p</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">c</mi><mi mathvariant="normal">e</mi></mrow><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x0002C;</mo><mn>1</mn><mo>&#x0002F;</mo><mi>T</mi><mo>&#x0002C;</mo><mi>N</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 再映射，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math></span> 是训练步数而不是推理步数。直接把 shift 当训练配置、或按 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><mi>N</mi></mrow></math></span> 反推网格，是两处常见错误。</p>
+<hr />
+<h2 id="_6">工程实现 · 源码解析</h2>
+<h3 id="euler-heunedm">Euler 与 Heun：EDM 变量、两阶段状态机</h3>
+<p><code>EulerDiscreteScheduler</code> 的 <code>init_noise_sigma</code>（<code>scheduling_euler_discrete.py:278</code>）、<code>scale_model_input</code>（<code>:326</code>）与 <code>step</code>（<code>:685</code>）构成完整的一步：先按 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 缩放输入，再用</p>
+<div class="highlight"><pre><span></span><code><span class="n">pred_original_sample</span> <span class="o">=</span> <span class="n">sample</span> <span class="o">-</span> <span class="n">sigma_hat</span> <span class="o">*</span> <span class="n">model_output</span>      <span class="c1"># :772  (prediction_type == "epsilon")</span>
+<span class="n">derivative</span> <span class="o">=</span> <span class="p">(</span><span class="n">sample</span> <span class="o">-</span> <span class="n">pred_original_sample</span><span class="p">)</span> <span class="o">/</span> <span class="n">sigma_hat</span>      <span class="c1"># :782</span>
+<span class="n">prev_sample</span> <span class="o">=</span> <span class="n">sample</span> <span class="o">+</span> <span class="n">derivative</span> <span class="o">*</span> <span class="n">dt</span>                        <span class="c1"># :786</span>
+</code></pre></div>
+
+<p><code>HeunDiscreteScheduler</code> 用状态机实现"每步两个阶段"：<code>state_in_first_order</code>（<code>:539</code>）决定用 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 还是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mrow><mtext>next</mtext></mrow></msub></mrow></math></span> 求 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mn>0</mn></msub></mrow></math></span>（<code>:604-607</code>），第一阶段把导数与样本存进 <code>self.prev_derivative</code>/<code>self.sample</code>（<code>:623-630</code>），第二阶段取平均后再更新（<code>:635-644</code>）。它的 <code>set_timesteps</code> 把每个时间戳复制一份、末尾去掉一个（<code>len(timesteps)=2N-1</code>），因此<strong>循环次数等于 NFE，但每两个循环才推进一个"推理步"</strong>。实测 10/20/40 步的库内 <code>timesteps</code> 长度是 19/39/79，<code>sigmas</code> 长度是 20/40/80。</p>
+<h3 id="dpm-solver">DPM-Solver++：转换、历史与降阶</h3>
+<p><code>DPMSolverMultistepScheduler</code> 的三段关键代码：<code>convert_model_output</code>（<code>:749</code>）把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003F5;</mi></mrow></math></span> 或 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>v</mi></mrow></math></span> 统一换成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mn>0</mn></msub></mrow></math></span> 预测；<code>multistep_dpm_solver_second_order_update</code>（<code>:921</code>）实现上面那条二阶公式；<code>step</code> 里的阶数选择（<code>:1239-1275</code>）决定这一步用一阶还是二阶，并把当前的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mn>0</mn></msub></mrow></math></span> 预测推进 <code>self.model_outputs</code> 历史队列。</p>
+<div class="highlight"><pre><span></span><code><span class="n">lower_order_final</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">step_index</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">timesteps</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">euler_at_final</span>
+    <span class="ow">or</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">lower_order_final</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">timesteps</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">15</span><span class="p">)</span>
+    <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">final_sigmas_type</span> <span class="o">==</span> <span class="s2">"zero"</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>这段代码是"末步降阶"的全部依据，也是把步数从 20 改成 40 时行为发生变化的地方（<code>:1239</code>）。默认 <code>final_sigmas_type="zero"</code> 让末步总是一阶，避免 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span> 处的除零。</p>
+<h3 id="_7">设计取舍</h3>
+<p><strong>为什么 Heun 要复制 timesteps。</strong> 每个 scheduler 的公开契约是"每个 timestep 调用一次 <code>step</code>"，这样 pipeline 的循环不需要为二阶方法写特例。代价是 <code>len(timesteps)</code> 不再等于用户给的步数，任何按 <code>len(timesteps)</code> 统计 NFE 的代码都会多算。<strong>统计 NFE 只能靠模型前向的计数</strong>（本章 lab 用 <code>register_forward_pre_hook</code> 数 unet 调用与 batch），这是唯一不依赖 scheduler 实现细节的口径。</p>
+<p><strong>为什么一个库里有两种变量约定。</strong> Euler/Heun 直接继承 EDM 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 参数化（k-diffusion 血统），DPM-Solver++ 继承 VP 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B1;</mi><mo>&#x0002F;</mo><mi>&#x003C3;</mi></mrow></math></span> 参数化（DPM-Solver 论文血统）。两者数学等价但状态尺度不同。库用 <code>init_noise_sigma</code> 与 <code>scale_model_input</code> 把差异收在调度器内部，pipeline 只需要调用这两个方法；自己手写循环时如果跳过 <code>scale_model_input</code>（或按错的那套乘初噪），结果会静默错。</p>
+<p><strong>为什么 shift 放在调度器而不是模型里。</strong> shift 只改变网格疏密，不改变模型输出语义，因此可以按分辨率、按步数动态设置（<code>use_dynamic_shifting</code>）。代价是同一份权重在不同 shift 下的最优步数不同，"多少步够用"必须与 shift 一起报告。</p>
+<hr />
+<h2 id="_8">工程实现 · 自己写一遍</h2>
+<p><code>labs/L10/solver_reference.py</code> 约 470 行，三部分可独立运行：解析 ODE 的阶数、解析 VP/FM 场上的误差、与 diffusers 的逐步对拍。多步实现里最关键的五行是历史与降阶：</p>
+<div class="highlight"><pre><span></span><code><span class="n">d0</span> <span class="o">=</span> <span class="p">(</span><span class="n">x</span> <span class="o">-</span> <span class="n">sig_s0</span> <span class="o">*</span> <span class="n">m0</span><span class="p">)</span> <span class="o">/</span> <span class="n">alpha_s0</span>                 <span class="c1"># convert_model_output: ε → x0</span>
+<span class="n">lower_order_final</span> <span class="o">=</span> <span class="p">(</span><span class="n">i</span> <span class="o">==</span> <span class="n">n</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">and</span> <span class="p">((</span><span class="n">lower_order_final_cfg</span> <span class="ow">and</span> <span class="n">n</span> <span class="o">&lt;</span> <span class="mi">15</span><span class="p">)</span>
+                                      <span class="ow">or</span> <span class="n">final_sigmas_type</span> <span class="o">==</span> <span class="s2">"zero"</span><span class="p">)</span>
+<span class="k">if</span> <span class="n">lower_order_nums</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">lower_order_final</span><span class="p">:</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="p">(</span><span class="n">sig_t</span> <span class="o">/</span> <span class="n">sig_s0</span><span class="p">)</span> <span class="o">*</span> <span class="n">x</span> <span class="o">-</span> <span class="n">alpha_t</span> <span class="o">*</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="n">h</span><span class="p">)</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="n">d0</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">d1</span> <span class="o">=</span> <span class="p">(</span><span class="mf">1.0</span> <span class="o">/</span> <span class="n">r0</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">d0</span> <span class="o">-</span> <span class="n">m_prev</span><span class="p">)</span>               <span class="c1"># 历史差分</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="p">(</span><span class="n">sig_t</span> <span class="o">/</span> <span class="n">sig_s0</span><span class="p">)</span> <span class="o">*</span> <span class="n">x</span> <span class="o">-</span> <span class="n">alpha_t</span> <span class="o">*</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="n">h</span><span class="p">)</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="n">d0</span> \
+        <span class="o">-</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">alpha_t</span> <span class="o">*</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="n">h</span><span class="p">)</span> <span class="o">-</span> <span class="mf">1.0</span><span class="p">)</span> <span class="o">*</span> <span class="n">d1</span>
+</code></pre></div>
+
+<p>与库对拍时，模型输入必须走 <code>scale_model_input</code>，初始噪声必须乘 <code>init_noise_sigma</code>，否则比较的是两个不同的积分问题。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="a">A：求解器参照与库对拍</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 本地（无 diffusers 时自动跳过库对拍）</span>
+python<span class="w"> </span>labs/L10/solver_reference.py<span class="w"> </span>--out<span class="w"> </span>results/local/10.2/20260923-solver/solver_reference.json
+<span class="c1"># crater（含 diffusers 0.40.0 逐项对拍）</span>
+python<span class="w"> </span>labs/L10/solver_reference.py<span class="w"> </span>--out<span class="w"> </span>results/crater/10.2/20260923-solver/solver_reference.json
+</code></pre></div>
+
+<p>关键读数：解析 ODE 与 VP 场上的观测阶（上表）；四组步数下的库对拍误差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02264;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>6</mn></mrow></msup></mrow></math></span>；NFE 与 <code>len(timesteps)</code> 的关系；DPM++ 的历史状态（<code>first, second×8, first</code>）；flow-match 的 shift 往返误差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2.2</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>16</mn></mrow></msup></mrow></math></span>。</p>
+<h3 id="bcdsdxl-lcm-cfg">B/C/D：SDXL 与 LCM 的步数—CFG—求解器对照</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L10/solver_quality_bench.py<span class="w"> </span>pilot<span class="w"> </span>--out<span class="w"> </span>&lt;out&gt;<span class="w">          </span><span class="c1"># 先估时间与显存</span>
+python<span class="w"> </span>labs/L10/solver_quality_bench.py<span class="w"> </span>run<span class="w"> </span>--out<span class="w"> </span>&lt;out&gt;<span class="w"> </span>--resolution<span class="w"> </span><span class="m">768</span>
+python<span class="w"> </span>labs/L10/solver_quality_bench.py<span class="w"> </span>mismatch<span class="w"> </span>--out<span class="w"> </span>&lt;out&gt;<span class="w">       </span><span class="c1"># 权重/scheduler 错配的失败样本</span>
+</code></pre></div>
+
+<p>四个维度：步数与 CFG 的扫描、求解器对照（DDIM/Heun/DPM-Solver++，同 latents）、LCM 的 2/4/8 步、以及两处 scheduler 错配。每个配置记录实际 NFE、每次调用的 batch（CFG 让它翻倍）、文本编码与 VAE 的固定成本、完整墙钟与峰值显存；质量用 CLIP 图文相似度与同 latent 的特征距离。</p>
+<p>BENCH_PLACEHOLDER</p>
+<hr />
+<h2 id="_9">原始现场</h2>
+<details class="fold">
+<summary>求解器对拍与历史状态（results/crater/10.2/20260923-solver/solver_reference.json 摘录）</summary>
+<div class="highlight"><pre><span></span><code><span class="err">SOLVER_RAW</span>
+</code></pre></div>
+
+</details>
+<details class="fold">
+<summary>SDXL/LCM 对照的配置与计时（results/crater/10.2/20260923-sdxl/solver_bench.json 摘录）</summary>
+<div class="highlight"><pre><span></span><code><span class="err">BENCH_RAW</span>
+</code></pre></div>
+
+</details>
+<hr />
+<h2 id="_10">前沿：三种"少步"不是同一件事</h2>
+<p><strong>（1）蒸馏：把多步轨迹压进权重（LCM）。</strong> teacher 是同一个 SDXL 权重配 DDIM 多步求解器；student 一步就要预测最终 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mn>0</mn></msub></mrow></math></span>。训练脚本把 teacher 的 DDIM 一步作为目标，并加两项设计：teacher 与目标都在 <code>torch.no_grad()</code> 下计算（<code>train_lcm_distill_sdxl_wds.py:1364</code>、<code>:1431</code>），以及<strong>边界条件</strong>——t 接近 0 时用 EDM 的 skip/out 缩放（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>c</mi><mrow><mtext>skip</mtext></mrow></msub><mo>&#x0003D;</mo><msubsup><mi>&#x003C3;</mi><mrow><mtext>data</mtext></mrow><mn>2</mn></msubsup><mo>&#x0002F;</mo><mo stretchy="false">&#x00028;</mo><msup><mi>&#x003C3;</mi><mn>2</mn></msup><mo>&#x0002B;</mo><msubsup><mi>&#x003C3;</mi><mrow><mtext>data</mtext></mrow><mn>2</mn></msubsup><mo stretchy="false">&#x00029;</mo></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>c</mi><mrow><mtext>out</mtext></mrow></msub><mo>&#x0003D;</mo><mi>&#x003C3;</mi><mo>&#x0002F;</mo><mo stretchy="false">&#x00028;</mo><msup><mi>&#x003C3;</mi><mn>2</mn></msup><mo>&#x0002B;</mo><msubsup><mi>&#x003C3;</mi><mrow><mtext>data</mtext></mrow><mn>2</mn></msubsup><msup><mo stretchy="false">&#x00029;</mo><mrow><mn>1</mn><mo>&#x0002F;</mo><mn>2</mn></mrow></msup></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mrow><mtext>data</mtext></mrow></msub><mo>&#x0003D;</mo><mn>0.5</mn></mrow></math></span>、时间缩放 10.0，<code>:331-336</code>）把 student 的输出与输入做凸组合，保证极限处不退化成噪声。student 预测写成 <code>model_pred = c_skip_start * noisy_model_input + c_out_start * pred_x_0</code>（<code>:1358</code>），目标是 <code>target = c_skip * x_prev + c_out * pred_x_0</code>（<code>:1453</code>），loss 是 MSE 或 Huber（<code>:1457-1460</code>，<code>--loss_type {l2,huber}</code>）。同一脚本还提供 LoRA student（<code>train_lcm_distill_lora_sdxl_wds.py</code>，PEFT <code>LoraConfig</code> 在 <code>:1021-1027</code>，导出成 kohya-ss 命名 <code>:90-100</code>）——<strong>少步能力在权重里，LoRA 也能承载</strong>。</p>
+<p><strong>（2）分布匹配：把"像不像"交给 critic（DMD2）。</strong> DMD2 维护三个角色：generator、real score、fake score。生成器用 real/fake 两个 score 的差做分布匹配损失（<code>DMD2/main/sd_guidance.py:168</code> 的 <code>compute_distribution_matching_loss</code>，fake 分支在 <code>:194</code>，real 分支在 <code>:219</code>/<code>:226</code>），critic（fake score）用扩散损失单独训练（<code>compute_loss_fake</code>，<code>:257</code>），两者交替更新。它的 guidance 约定也写死在代码里：<code>assert self.fake_guidance_scale == 1, "no guidance for fake"</code>（<code>:87-90</code>）——fake score 必须是无引导的，否则分布匹配的目标本身被引导扭曲。</p>
+<p><strong>（3）RL 后训练：改的是奖励，不是步数。</strong> Flow-GRPO 把 flow matching 的确定性 ODE 转成边缘分布等价的 SDE 以获得探索性采样，再用可验证奖励做在线 RL；"denoising reduction"只是把<strong>训练时</strong>的去噪步数减少、推理仍用完整调度。它的收益用任务指标衡量：GenEval 63%→95%、视觉文字渲染 59%→92%（论文摘要）。这三个数字与 solver 数值误差没有关系——<strong>把 RL 后训练的收益说成"换了更好的求解器"是范畴错误</strong>。</p>
+<p><strong>（4）把 CFG 蒸进模型（语音侧的例子）。</strong> ZipVoice 的蒸馏版在 fm_decoder 上打开 <code>use_guidance_scale_embed=True</code>，推理默认从 teacher 的 <code>num_step=16, guidance_scale=1.0</code> 变成 <code>num_step=8, guidance_scale=3.0</code>（<code>zipvoice/models/zipvoice_distill.py:27-71</code>、<code>zipvoice/bin/infer_zipvoice.py:733-741</code>）。注意蒸馏版仍然需要把 guidance scale 当输入传进去——<strong>CFG 蒸馏是把两次前向合成一次，不是把 guidance 消掉</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>改什么</th>
+<th>推理端变化</th>
+<th>质量的正确口径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>solver 数值（本章 A/B）</td>
+<td>不改权重</td>
+<td>步数/NFE、时间网格</td>
+<td>与高精度解的轨迹误差 + 语义质量</td>
+</tr>
+<tr>
+<td>LCM / 一致性蒸馏</td>
+<td>改权重（+ scheduler）</td>
+<td>2–8 步、CFG=1</td>
+<td>独立任务指标，不与 teacher 步数混谈</td>
+</tr>
+<tr>
+<td>DMD2</td>
+<td>改权重 + 加 critic</td>
+<td>少步、可能无 CFG</td>
+<td>分布层面指标 + 退化样例</td>
+</tr>
+<tr>
+<td>Flow-GRPO 等 RL</td>
+<td>改权重</td>
+<td>步数不变</td>
+<td>任务奖励 + 质量/多样性不退化</td>
+</tr>
+<tr>
+<td>CFG 蒸馏（ZipVoice）</td>
+<td>改权重（guidance 嵌入）</td>
+<td>前向次数减半</td>
+<td>同任务指标、固定 guidance 值</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_11">陷阱</h2>
+<ol>
+<li><strong>把步数当 NFE。</strong> Heun 是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>N</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span>，不是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span>，也不是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>N</mi></mrow></math></span>。用 <code>len(timesteps)</code> 统计会得到 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>N</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 的循环次数但与"推理步"混淆。</li>
+<li><strong>忘记 <code>init_noise_sigma</code>。</strong> EDM 调度器的初始噪声要乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><msubsup><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow><mn>2</mn></msubsup><mo>&#x0002B;</mo><mn>1</mn></mrow></msqrt></mrow></math></span>（SDXL 上 157.4）。漏乘时输出不是噪声而是接近 0 的张量，脚本不会报错。</li>
+<li><strong>两套变量互相代入。</strong> 把 EDM 状态喂给 VP 调度器（或反之），误差是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 量级，不是数值精度。</li>
+<li><strong>多步方法末步不降阶。</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span> 时 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><msub><mi>r</mi><mn>0</mn></msub></mrow></math></span> 发散；必须按库的三条 <code>lower_order_final</code> 逻辑之一降阶。</li>
+<li><strong>按 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x0002F;</mo><mi>N</mi></mrow></math></span> 反推 flow-match 网格。</strong> 基网格是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">s</mi><mi mathvariant="normal">p</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">c</mi><mi mathvariant="normal">e</mi></mrow><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x0002C;</mo><mn>1</mn><mo>&#x0002F;</mo><mi>T</mi><mo>&#x0002C;</mo><mi>N</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math></span> 是训练步数。</li>
+<li><strong>换 scheduler 就当少步模型。</strong> 失败样本见 10.2-C；少步能力在权重里。</li>
+<li><strong>只报加速不报质量。</strong> 吞吐/延迟与任务质量必须分别记录（D 段的口径）。</li>
+<li><strong>同 seed 不同 latents。</strong> 比较不同 solver 的质量时 seed 相同但 latent 不同，差异无法归因；必须复用 latent。</li>
+<li><strong>把 shift 当训练配置。</strong> 它只影响推理网格。</li>
+<li><strong>把高步数输出当客观真值。</strong> 高步数只是另一个数值解，不能作为质量的金标准（10.2-F 的边界）。</li>
+</ol>
+<hr />
+<h2 id="_12">自测题</h2>
+<details class="fold">
+<summary>题目</summary>
+<ol>
+<li>Heun 在 20 步下的 NFE 是多少？库内 <code>len(timesteps)</code> 是多少？两者为什么不同？</li>
+<li>EDM 变量的调度器为什么要求初始噪声乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><msubsup><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow><mn>2</mn></msubsup><mo>&#x0002B;</mo><mn>1</mn></mrow></msqrt></mrow></math></span>？用 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x0003D;</mo><msub><mi>x</mi><mn>0</mn></msub><mo>&#x0002B;</mo><mi>&#x003C3;</mi><mi>n</mi></mrow></math></span> 推导。</li>
+<li>DPM-Solver++ 的末步为什么必须降阶？如果不降阶，哪一项会发散？</li>
+<li>解析 ODE 上 Euler 的观测阶是 1.015、Heun 是 2.022。如果换到 GMM 场，Heun 的观测阶降到 1.87，可能的原因是什么？</li>
+<li>同一份 SDXL 权重，只把 <code>DDPMScheduler</code> 换成 <code>LCMScheduler</code>、步数设成 4，输出会怎样？为什么这个实验不能证明"LCM 没用"？</li>
+<li>为什么统计 NFE 不能依赖 <code>scheduler.timesteps</code> 的长度，而要数模型前向？</li>
+<li>Flow-GRPO 的 "denoising reduction" 与 LCM 的少步有什么区别？</li>
+<li>ZipVoice 的蒸馏版为什么推理时仍要传 guidance scale？</li>
+</ol>
+</details>
+<details class="fold">
+<summary>答案</summary>
+<ol>
+<li>NFE <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mn>2</mn><mo>&#x000D7;</mo><mn>20</mn><mo>&#x02212;</mo><mn>1</mn><mo>&#x0003D;</mo><mn>39</mn></mrow></math></span>；库内 <code>timesteps</code> 长度也是 39（每个时间戳复制一份、末尾去掉一个），<code>sigmas</code> 长度 40。但"推理步数"是 20：每两个循环推进一个推理步，前一个循环只存状态、不提交新样本。</li>
+<li>从 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x0003D;</mo><msub><mi>x</mi><mn>0</mn></msub><mo>&#x0002B;</mo><mi>&#x003C3;</mi><mi>n</mi></mrow></math></span> 出发，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>n</mi><mi>&#x0007E;</mi><mi mathvariant="script">N</mi><mo stretchy="false">&#x00028;</mo><mn>0</mn><mo>&#x0002C;</mo><mi>I</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>，所以 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mi mathvariant="normal">V</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">r</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><msup><mi>&#x003C3;</mi><mn>2</mn></msup><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span>（数据近似单位方差）。要让初始状态与 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi><mo>&#x0003D;</mo><msub><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow></msub></mrow></math></span> 时的边际一致，初噪必须乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mrow><msubsup><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow><mn>2</mn></msubsup><mo>&#x0002B;</mo><mn>1</mn></mrow></msqrt></mrow></math></span>；乘 1 相当于把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mrow><mo>max</mo></mrow></msub></mrow></math></span> 压到 1，整条轨迹从错误的噪声水平开始。</li>
+<li>末步 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003C3;</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mn>0</mn></mrow></math></span>，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BB;</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mi>log</mi><mo stretchy="false">&#x00028;</mo><msub><mi>&#x003B1;</mi><mi>t</mi></msub><mo>&#x0002F;</mo><msub><mi>&#x003C3;</mi><mi>t</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x02192;</mo><mo>&#x0002B;</mo><mo>&#x0221E;</mo></mrow></math></span>，于是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>h</mi><mo>&#x02192;</mo><mo>&#x0221E;</mo></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>r</mi><mn>0</mn></msub><mo>&#x0003D;</mo><msub><mi>h</mi><mn>0</mn></msub><mo>&#x0002F;</mo><mi>h</mi><mo>&#x02192;</mo><mn>0</mn></mrow></math></span>，二阶项里的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mfrac><mn>1</mn><mrow><msub><mi>r</mi><mn>0</mn></msub></mrow></mfrac><mo stretchy="false">&#x00028;</mo><msub><mi>D</mi><mn>0</mn></msub><mo>&#x02212;</mo><msubsup><mi>D</mi><mn>1</mn><mrow><mi>p</mi><mi>r</mi><mi>e</mi><mi>v</mi></mrow></msubsup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 发散。库默认 <code>final_sigmas_type="zero"</code> 使末步走一阶。</li>
+<li>GMM 的边际速度场在模式之间存在快速变化，Heun 的局部截断误差展开要求场在步长内足够光滑；步长较大时高阶项不再主导，观测阶下降。这类"阶数掉下来"是场的光滑性问题，不是实现错误。</li>
+<li>输出接近一张常数图/噪声。因为 LCM 的权重是用 LCM 的边界条件与 teacher 一步目标训练的，普通 SDXL 权重没有这个语义；这个实验只说明"权重与 scheduler 必须匹配"，不能评价 LCM 方法本身。</li>
+<li><code>timesteps</code> 的长度是实现细节（Heun 复制、SDE 变体插入额外步、动态 shift 改变网格），而"模型被调用几次"是资源成本的直接来源。只有前向计数对两者都成立。</li>
+<li>LCM 改的是权重与推理步数（2–8 步可用）；Flow-GRPO 的 denoising reduction 只减少<strong>训练时</strong>的去噪步数以降低 rollout 成本，推理仍用完整调度，模型能力的变化来自 RL 奖励。</li>
+<li>蒸馏版把 guidance scale 作为条件嵌入喂给模型，模型在训练时见过不同 guidance 值；推理时必须给同一个量，否则条件分布与训练不匹配。CFG 蒸馏减少的是前向次数，不是把 guidance 参数消掉。</li>
+</ol>
+</details>
+<div class="footnote">
+<hr />
+<ol>
+<li id="fn:lcm">
+<p>Luo, Tan, Huang, Li, Zhao. <em>Latent Consistency Models: Synthesizing High-Resolution Images with Few-Step Inference</em>. arXiv:2310.04378；训练脚本见 <code>diffusers/examples/consistency_distillation/train_lcm_distill_sdxl_wds.py</code>。&#160;<a class="footnote-backref" href="#fnref:lcm" title="Jump back to footnote 1 in the text">&#8617;</a></p>
+</li>
+<li id="fn:dpm">
+<p>Lu, Zhou, Bao, Chen, Li, Zhu. <em>DPM-Solver++: Fast Solver for Guided Sampling of Diffusion Probabilistic Models</em>. arXiv:2211.01095。&#160;<a class="footnote-backref" href="#fnref:dpm" title="Jump back to footnote 2 in the text">&#8617;</a></p>
+</li>
+<li id="fn:edm">
+<p>Karras, Aittala, Aila, Laine. <em>Elucidating the Design Space of Diffusion-Based Generative Models</em>. arXiv:2206.00364（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C3;</mi></mrow></math></span> 参数化与 skip/out 缩放）。&#160;<a class="footnote-backref" href="#fnref:edm" title="Jump back to footnote 3 in the text">&#8617;</a></p>
+</li>
+<li id="fn:dmd2">
+<p>Yin, Gharbi, Zhang, Shechtman, Durand, Freeman, Park. <em>Improved Distribution Matching Distillation for Fast Image Synthesis</em>. 代码见 <code>tianweiy/DMD2</code>。&#160;<a class="footnote-backref" href="#fnref:dmd2" title="Jump back to footnote 4 in the text">&#8617;</a></p>
+</li>
+<li id="fn:flowgrpo">
+<p>Liu, Zhang, et al. <em>Flow-GRPO: Training Flow Matching Models via Online RL</em>. arXiv:2505.05470。&#160;<a class="footnote-backref" href="#fnref:flowgrpo" title="Jump back to footnote 5 in the text">&#8617;</a></p>
+</li>
+<li id="fn:zipvoice">
+<p>Zhu, Ye, et al. <em>ZipVoice: Fast and High-Quality Zero-Shot Text-to-Speech with Flow Matching</em>. 代码见 <code>k2-fsa/ZipVoice</code>。&#160;<a class="footnote-backref" href="#fnref:zipvoice" title="Jump back to footnote 6 in the text">&#8617;</a></p>
+</li>
+</ol>
+</div></article><nav class="pagenav"><a class="nav-prev" href="../L10/10.1-ddpm-to-rectified-flow.html">&#8592; 10.1 从 DDPM 到 rectified flow</a><a class="nav-next" href="../M/M1-reading-large-codebase.html">M1 如何读一个十万行的混合代码库 &#8594;</a></nav>
+</main>
+</body>
+</html>

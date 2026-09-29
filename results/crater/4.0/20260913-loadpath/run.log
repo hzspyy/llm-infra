@@ -1,0 +1,380 @@
+
+==============================================================================
+[A] 字节区间与解析器审计
+==============================================================================
+
+--- A1 全部 checkpoint 的区间审计 ------------------------------------------------
+  Qwen/Qwen3-1.7B                        分片 2  张量  311  问题 0
+  Qwen/Qwen3-8B                          分片 5  张量  399  问题 0
+  Qwen/Qwen2.5-1.5B-Instruct-AWQ         分片 1  张量  731  问题 0
+  Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4   分片 1  张量  926  问题 0
+  区间自洽（无重叠、无越界、无空洞、shape/dtype 与偏移一致）。
+
+--- A2 头尾元素逐位对拍：原始字节 vs safe_open -----------------------------------------
+  model.embed_tokens.weight                        BF16  [151936, 2048] 头 一致  尾 一致
+  lm_head.weight                                   BF16  [151936, 2048] 头 一致  尾 一致
+  model.norm.weight                                BF16  [2048]         头 一致  尾 一致
+  model.layers.0.self_attn.q_proj.weight           BF16  [2048, 2048]   头 一致  尾 一致
+  model.layers.0.self_attn.k_proj.weight           BF16  [1024, 2048]   头 一致  尾 一致
+  model.layers.0.self_attn.v_proj.weight           BF16  [1024, 2048]   头 一致  尾 一致
+  model.layers.0.self_attn.o_proj.weight           BF16  [2048, 2048]   头 一致  尾 一致
+  model.layers.0.mlp.gate_proj.weight              BF16  [6144, 2048]   头 一致  尾 一致
+  model.layers.0.mlp.up_proj.weight                BF16  [6144, 2048]   头 一致  尾 一致
+  model.layers.0.mlp.down_proj.weight              BF16  [2048, 6144]   头 一致  尾 一致
+  model.layers.0.self_attn.q_norm.weight           BF16  [128]          头 一致  尾 一致
+  model.layers.20.self_attn.q_proj.weight          BF16  [2048, 2048]   头 一致  尾 一致
+  12 个张量 × 头尾 4 个元素：不一致 0 个。
+
+--- A3 损坏输入：手写解析器 / safetensors / 最小分片加载器 ---------------------------------
+
+  [valid] 220 B
+    手写解析器 : 通过
+    safetensors: a:OK(2, 2) / w:OK(4, 8)
+
+  [truncated] 212 B
+    手写解析器 : ['a: 超出数据区（终点 80 > 72）', '数据区尾部不齐：最后一个张量止于 80，实际 72']
+    safetensors: SafetensorError: Error while deserializing header: incomplete metadata, file not fully covered
+
+  [overlap] 219 B
+    手写解析器 : ['a: 与前一张量重叠（起点 0 < 前终点 64）', '数据区尾部不齐：最后一个张量止于 64，实际 80']
+    safetensors: SafetensorError: Error while deserializing header: invalid offset for tensor `w`
+
+  [dtype_shape_mismatch] 219 B
+    手写解析器 : ['w: shape/dtype 需要 128 字节，头声明 64 字节']
+    safetensors: SafetensorError: Error while deserializing header: invalid shape, data type, or offset for tensor
+
+--- 缺分片：index 指向的文件不存在 ----------------------------------------------------
+  取 index 中 model.layers.20.self_attn.q_proj.weight -> model-00003-of-00005.safetensors
+  最小分片加载器: FileNotFoundError: index 指向的分片不存在: model-00003-of-00005.safetensors
+  分片恢复后直接打开: 直接打开该分片仍成功（key 数 111）
+
+==============================================================================
+[B] 绑定与融合追踪：文件 -> 参数 -> 融合布局 -> 设备张量
+==============================================================================
+  文件字节 3875.3 MiB（2 个分片）
+
+--- B1 HF 加载：声明参数量、实际常驻与 tie 指针 -------------------------------------------
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 21416.37it/s]
+  parameters() 计数 1720574976（1.721 B）
+  config: tie_word_embeddings = True
+  embed/hm_head 同指针: True   embed (151936, 2048) head (151936, 2048)
+  文件字节 3875.3 MiB vs parameters×2B 3281.7 MiB  差 +593.5 MiB
+  CPU 常驻增量 635 MiB（加载耗时 0.22 s）
+  文件里 lm_head 另存一份: model-00002-of-00002.safetensors，593.5 MiB，与 embed 逐位相同 True，占文件 15.3%
+  触碰全部页后常驻 4499 MiB（全量求和 0.08 s，校验和 313609.344）
+    其中 checkpoint 文件的映射页常驻 0 MiB；参数本身 3281.7 MiB
+
+--- B2 vLLM 加载：融合布局与磁盘命名的逐元素对照 --------------------------------------------
+INFO 09-13 17:26:53 [api_utils.py:286] non-default args: {'dtype': 'bfloat16', 'max_model_len': 2048, 'gpu_memory_utilization': 0.5, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/scratch/learn/models/hf/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e'}
+WARNING 09-13 17:26:53 [arg_utils.py:1801] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
+INFO 09-13 17:26:53 [model.py:684] Resolved architecture: Qwen3ForCausalLM
+INFO 09-13 17:26:53 [model.py:2021] Using max model len 2048
+INFO 09-13 17:26:53 [scheduler.py:277] Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING 09-13 17:26:53 [vllm.py:1371] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 09-13 17:26:53 [vllm.py:1406] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 09-13 17:26:53 [kernel.py:369] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-13 17:26:53 [vllm.py:1585] Cudagraph is disabled under eager mode
+INFO 09-13 17:26:53 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+INFO 09-13 17:26:55 [core.py:123] Initializing a V1 LLM engine (v0.29.0) with config: model='/scratch/learn/models/hf/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e', speculative_config=None, tokenizer='/scratch/learn/models/hf/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/scratch/learn/models/hf/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+INFO 09-13 17:26:55 [parallel_state.py:1775] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_3d4d08fc1ebe413782202747908c470b backend=nccl
+INFO 09-13 17:26:55 [parallel_state.py:2119] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+INFO 09-13 17:26:55 [gpu_worker.py:429] Using V2 Model Runner
+INFO 09-13 17:26:56 [model_runner.py:382] Loading model from scratch...
+INFO 09-13 17:26:56 [cuda.py:492] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+INFO 09-13 17:26:56 [flash_attn.py:897] Using FlashAttention version 2
+INFO 09-13 17:26:56 [weight_utils.py:863] Filesystem type for checkpoints: OVERLAY. Checkpoint size: 3.78 GiB. Available RAM: 18.89 GiB.
+INFO 09-13 17:26:56 [weight_utils.py:886] Auto-prefetch is disabled because the filesystem (OVERLAY) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  50% Completed | 1/2 [00:00<00:00,  3.08it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00,  4.94it/s]
+
+INFO 09-13 17:26:56 [default_loader.py:430] Loading weights took 0.41 seconds
+INFO 09-13 17:26:58 [model_runner.py:404] Model loading took 3.22 GiB memory and 2.263048 seconds
+INFO 09-13 17:26:58 [topk_topp_sampler.py:62] Using FlashInfer for top-p & top-k sampling.
+INFO 09-13 17:26:58 [utils.py:306] Using LBNHC KV cache layout.
+INFO 09-13 17:26:59 [gpu_worker.py:625] Available KV cache memory: 11.65 GiB
+INFO 09-13 17:26:59 [kv_cache_utils.py:2032] GPU KV cache size: 109,056 tokens, Maximum concurrency for 2,048 tokens per request: 53.25x
+INFO 09-13 17:26:59 [kernel_warmup.py:124] JIT kernel warmup starting.
+INFO 09-13 17:26:59 [kernel_warmup.py:134] JIT kernel warmup finished in 0.00s.
+INFO 09-13 17:26:59 [kernel_warmup.py:309] Using FlashInfer autotune cache file: /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/a5796d796562fc9042e1c62a7c455382938aa5761f40c760a457100ddd52009c/autotune_configs.json
+2026-09-13 17:26:59,785 - INFO - autotuner.py:2789 - flashinfer.jit: [Autotuner]: Loaded 0 configs from /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/a5796d796562fc9042e1c62a7c455382938aa5761f40c760a457100ddd52009c/autotune_configs.json
+2026-09-13 17:26:59,785 - INFO - autotuner.py:972 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+INFO 09-13 17:26:59 [kernel_warmup.py:266] Running FlashInfer autotune with 8192 tokens.
+2026-09-13 17:26:59,819 - INFO - autotuner.py:995 - flashinfer.jit: [Autotuner]: Autotuning process ends
+2026-09-13 17:26:59,822 - INFO - autotuner.py:2652 - flashinfer.jit: [Autotuner]: Saved 0 configs to /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/a5796d796562fc9042e1c62a7c455382938aa5761f40c760a457100ddd52009c/autotune_configs.json (0 new, 0 from previous config)
+INFO 09-13 17:26:59 [gpu_worker.py:860] Free memory on device (25.13/31.36 GiB) on startup. Desired GPU memory utilization is (0.5, 15.68 GiB). Actual usage is 3.62 GiB for consumed memory (weights + non-torch), 0.41 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=12350777856` (11.5 GiB) to fit into requested memory, or `--kv-cache-memory=22494767616` (20.95 GiB) to fully utilize gpu memory. Current kv cache memory in use is 11.65 GiB.
+INFO 09-13 17:27:00 [jit_monitor.py:85] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+INFO 09-13 17:27:00 [torch_utils.py:277] Reducing Torch threads from 16 to 1 for serving. Set OMP_NUM_THREADS in the external environment to override.
+INFO 09-13 17:27:00 [core.py:368] init engine (profile, create kv cache, warmup model) took 2.80 s
+INFO 09-13 17:27:00 [hf.py:547] Detected the chat template content format to be 'string'. You can set `--chat-template-content-format` to override this.
+  引擎 init 7.55 s；显存 allocated 0 -> 15417 MiB（峰值 15940，reserved 16310）
+  model.layers.0.self_attn.qkv_proj.weight (4096, 2048)  <- 3 个磁盘张量  逐元素相同 True  max|diff| 0.000e+00
+  model.layers.0.mlp.gate_up_proj.weight (12288, 2048)  <- 2 个磁盘张量  逐元素相同 True  max|diff| 0.000e+00
+  model.layers.20.self_attn.qkv_proj.weight (4096, 2048)  <- 3 个磁盘张量  逐元素相同 True  max|diff| 0.000e+00
+  vLLM 侧 lm_head 与 embed 同指针: True；lm_head.weight 单独注册为参数: False
+    [vllm 日志] Loading weights took 0.41 seconds
+    [vllm 日志] Model loading took 3.22 GiB memory and 2.263048 seconds
+    [vllm 日志] init engine (profile, create kv cache, warmup model) took 2.80 s
+
+--- B3 TP 分片：用 vLLM 自己的 weight_loader 复现 q/k/v 切分 -------------------------
+  tp=2 每片 shape (2048, 2048)；直接行拼接还原 False；按 shard_id 分段拼接还原 True
+  tp=4 每片 shape (1024, 2048)；直接行拼接还原 False；按 shard_id 分段拼接还原 True
+  tp=1 的复现与引擎实际 qkv_proj 逐元素相同: True
+  （kv 头数 8、tp=4 → tp < nkv，每片持 2 个 kv 头，num_kv_head_replicas=1；tp ≥ nkv 时 vLLM 改为复制 kv 头，见 linear.py:1042）
+
+已写出 out/4.0/20260913-loadpath/checkpoint_load_path.json
+
+==============================================================================
+[C] 量化布局追踪：磁盘 / 手写解包 / 官方实现 / 执行布局
+==============================================================================
+
+--- C1 磁盘布局 ---------------------------------------------------------------
+  [awq] q_proj.bias      (1536,)          float16
+  [awq] q_proj.qweight   (1536, 192)      int32
+  [awq] q_proj.qzeros    (12, 192)        int32
+  [awq] q_proj.scales    (12, 1536)       float16
+        quantization_config: {"bits": 4, "group_size": 128, "modules_to_not_convert": null, "quant_method": "awq", "version": "gemm", "zero_point": true}
+        k_proj 同结构：qweight (1536, 32)，scales (12, 256)（out 从 1536 变 256）
+  [gptq] q_proj.bias      (1536,)          float16
+  [gptq] q_proj.g_idx     (1536,)          int32
+  [gptq] q_proj.qweight   (192, 1536)      int32
+  [gptq] q_proj.qzeros    (12, 192)        int32
+  [gptq] q_proj.scales    (12, 1536)       float16
+        quantization_config: {"batch_size": 1, "bits": 4, "block_name_to_quantize": null, "cache_block_outputs": true, "damp_percent": 0.01, "dataset": null, "desc_act": false, "e
+        k_proj 同结构：qweight (192, 256)，scales (12, 256)（out 从 1536 变 256）
+
+--- C2 AWQ 手写解包 vs ops.awq_dequantize（逐元素） --------------------------------
+  q_proj: 手写 (1536, 1536) vs 官方 (1536, 1536)  逐元素相同比例 1.000000  max|diff| 0.000e+00
+
+--- C3 GPTQ 手写解包 vs 未量化同位置权重 ----------------------------------------------
+  fused qkv 手写解包 (1536, 2048) vs 未量化 (1536, 2048)
+    cosine 0.987205   相对最大差 0.1646（4-bit 量化的固有误差）
+
+--- C3b 磁盘布局不是 kernel 期望的布局 -----------------------------------------------
+  把磁盘原样的 qweight/qzeros/scales 直接喂 ops.gptq_gemm，结果与手写反量化不一致。
+  原因是 kernel 前有布局变换：exllama.py:125 permute_param_layout_ + ops.gptq_shuffle，
+  marlin.py:129 permute_param_layout_ + ops.gptq_marlin_repack（marlin.py:130）。
+
+--- C4 往返自检：dense -> 量化 -> 打包 -> 解包 ---------------------------------------
+  AWQ 布局往返逐元素一致: True   GPTQ 布局往返逐元素一致: True
+  （GPTQ 的零点在文件里存 zero-1，打包时写回 zrow-1；AWQ 存原值）
+
+--- C5 vLLM 加载后的执行布局、逐层对拍与加载阶段事件 ------------------------------------------
+INFO 09-13 17:27:12 [api_utils.py:286] non-default args: {'dtype': 'float16', 'max_model_len': 1024, 'gpu_memory_utilization': 0.45, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-AWQ/snapshots/3ecffa0ceb27851800f45519bab9c457a04405e1'}
+WARNING 09-13 17:27:12 [arg_utils.py:1801] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
+INFO 09-13 17:27:12 [model.py:684] Resolved architecture: Qwen2ForCausalLM
+INFO 09-13 17:27:12 [model.py:2021] Using max model len 1024
+INFO 09-13 17:27:12 [scheduler.py:277] Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING 09-13 17:27:12 [vllm.py:1371] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 09-13 17:27:12 [vllm.py:1406] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 09-13 17:27:12 [kernel.py:369] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-13 17:27:12 [vllm.py:1585] Cudagraph is disabled under eager mode
+INFO 09-13 17:27:12 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+INFO 09-13 17:27:13 [core.py:123] Initializing a V1 LLM engine (v0.29.0) with config: model='/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-AWQ/snapshots/3ecffa0ceb27851800f45519bab9c457a04405e1', speculative_config=None, tokenizer='/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-AWQ/snapshots/3ecffa0ceb27851800f45519bab9c457a04405e1', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.float16, max_seq_len=1024, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=auto_awq, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-AWQ/snapshots/3ecffa0ceb27851800f45519bab9c457a04405e1, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+INFO 09-13 17:27:13 [parallel_state.py:1775] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_719500bf29e04ff9a582b8933f2b77f9 backend=nccl
+INFO 09-13 17:27:13 [parallel_state.py:2119] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+INFO 09-13 17:27:13 [gpu_worker.py:429] Using V2 Model Runner
+INFO 09-13 17:27:14 [model_runner.py:382] Loading model from scratch...
+INFO 09-13 17:27:14 [auto_awq.py:448] Using MarlinLinearKernel for AutoAWQMarlinLinearMethod
+INFO 09-13 17:27:14 [cuda.py:492] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+INFO 09-13 17:27:14 [flash_attn.py:897] Using FlashAttention version 2
+INFO 09-13 17:27:15 [weight_utils.py:863] Filesystem type for checkpoints: OVERLAY. Checkpoint size: 1.50 GiB. Available RAM: 17.60 GiB.
+INFO 09-13 17:27:15 [weight_utils.py:886] Auto-prefetch is disabled because the filesystem (OVERLAY) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  2.89it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  2.89it/s]
+
+INFO 09-13 17:27:15 [default_loader.py:430] Loading weights took 0.35 seconds
+INFO 09-13 17:27:16 [model_runner.py:404] Model loading took 1.1 GiB memory and 2.886570 seconds
+INFO 09-13 17:27:16 [topk_topp_sampler.py:62] Using FlashInfer for top-p & top-k sampling.
+INFO 09-13 17:27:16 [utils.py:306] Using LBNHC KV cache layout.
+INFO 09-13 17:27:17 [marlin_utils.py:625] Marlin kernel can achieve better performance for small size_n with experimental use_atomic_add feature. You can consider set environment variable VLLM_MARLIN_USE_ATOMIC_ADD to 1 if possible.
+INFO 09-13 17:27:18 [gpu_worker.py:625] Available KV cache memory: 12.1 GiB
+INFO 09-13 17:27:18 [kv_cache_utils.py:2032] GPU KV cache size: 453,136 tokens, Maximum concurrency for 1,024 tokens per request: 442.52x
+INFO 09-13 17:27:18 [kernel_warmup.py:124] JIT kernel warmup starting.
+INFO 09-13 17:27:18 [kernel_warmup.py:134] JIT kernel warmup finished in 0.00s.
+INFO 09-13 17:27:18 [kernel_warmup.py:309] Using FlashInfer autotune cache file: /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/78b36b4c892dc11f3dcb79835920eb171f09320a7bd6bd04b6b6078a2b9eceb2/autotune_configs.json
+2026-09-13 17:27:18,716 - INFO - autotuner.py:2789 - flashinfer.jit: [Autotuner]: Loaded 0 configs from /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/78b36b4c892dc11f3dcb79835920eb171f09320a7bd6bd04b6b6078a2b9eceb2/autotune_configs.json
+2026-09-13 17:27:18,717 - INFO - autotuner.py:972 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+INFO 09-13 17:27:18 [kernel_warmup.py:266] Running FlashInfer autotune with 8192 tokens.
+2026-09-13 17:27:18,753 - INFO - autotuner.py:995 - flashinfer.jit: [Autotuner]: Autotuning process ends
+2026-09-13 17:27:18,755 - INFO - autotuner.py:2652 - flashinfer.jit: [Autotuner]: Saved 0 configs to /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/78b36b4c892dc11f3dcb79835920eb171f09320a7bd6bd04b6b6078a2b9eceb2/autotune_configs.json (0 new, 0 from previous config)
+INFO 09-13 17:27:18 [gpu_worker.py:860] Free memory on device (19.8/31.36 GiB) on startup. Desired GPU memory utilization is (0.45, 14.11 GiB). Actual usage is 1.53 GiB for consumed memory (weights + non-torch), 0.48 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=12835128218` (11.95 GiB) to fit into requested memory, or `--kv-cache-memory=18940160512` (17.64 GiB) to fully utilize gpu memory. Current kv cache memory in use is 12.1 GiB.
+INFO 09-13 17:27:19 [jit_monitor.py:85] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+INFO 09-13 17:27:19 [torch_utils.py:277] Reducing Torch threads from 16 to 1 for serving. Set OMP_NUM_THREADS in the external environment to override.
+INFO 09-13 17:27:19 [core.py:368] init engine (profile, create kv cache, warmup model) took 2.87 s
+INFO 09-13 17:27:19 [hf.py:547] Detected the chat template content format to be 'string'. You can set `--chat-template-content-format` to override this.
+
+  [awq] 引擎 init 7.93 s；quant 层 repack 112 层共 0.471 s
+    [vllm] Loading weights took 0.35 seconds
+    [vllm] Model loading took 1.1 GiB memory and 2.886570 seconds
+    [vllm] init engine (profile, create kv cache, warmup model) took 2.87 s
+    qweight              [96, 4096]       int32
+    qzeros               [12, 256]        int32
+    scales               [12, 2048]       float16
+    bias                 [2048]           float16
+    g_idx                [0]              int32
+    g_idx_sort_indices   [0]              int32
+    第 0 层 qkv_proj：引擎(输出去掉 x=0 响应) vs 手写解包 max|diff| 1.166e-01（相对 3.66e-04）
+    加载后 bias 的幅度 316.000，与引擎 x=0 响应的一致性 0.250
+INFO 09-13 17:27:21 [api_utils.py:286] non-default args: {'dtype': 'float16', 'max_model_len': 1024, 'gpu_memory_utilization': 0.45, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-GPTQ-Int4/snapshots/4f5a0e31008e2966e8f787964bcc4e1105e03dc3'}
+WARNING 09-13 17:27:21 [arg_utils.py:1801] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
+INFO 09-13 17:27:21 [model.py:684] Resolved architecture: Qwen2ForCausalLM
+INFO 09-13 17:27:21 [model.py:2021] Using max model len 1024
+INFO 09-13 17:27:21 [kernel.py:369] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-13 17:27:22 [core.py:123] Initializing a V1 LLM engine (v0.29.0) with config: model='/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-GPTQ-Int4/snapshots/4f5a0e31008e2966e8f787964bcc4e1105e03dc3', speculative_config=None, tokenizer='/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-GPTQ-Int4/snapshots/4f5a0e31008e2966e8f787964bcc4e1105e03dc3', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.float16, max_seq_len=1024, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=auto_gptq, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-GPTQ-Int4/snapshots/4f5a0e31008e2966e8f787964bcc4e1105e03dc3, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+INFO 09-13 17:27:22 [parallel_state.py:1775] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_b1c5c56d91d345809e24b1f44d99cc2f backend=nccl
+Traceback (most recent call last):
+  File "/scratch/learn/work/labs/L4/checkpoint_load_path.py", line 786, in section_C
+    llm = LLM(model=d, dtype="float16", gpu_memory_utilization=0.45,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 343, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 179, in from_engine_args
+    return cls(
+           ^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 105, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 112, in make_client
+    return InprocClient(vllm_config, executor_class, log_stats)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 317, in __init__
+    self.engine_core = EngineCore(*args, **kwargs)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 134, in __init__
+    self.model_executor = executor_class(vllm_config)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 110, in __init__
+    self._init_executor()
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 69, in _init_executor
+    self.driver_worker.init_device()
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/worker/worker_base.py", line 355, in init_device
+    self.worker.init_device()  # type: ignore
+    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 440, in init_device
+    self.requested_memory = request_memory(init_snapshot, self.cache_config)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/learn/envs/serve/lib/python3.12/site-packages/vllm/v1/worker/utils.py", line 526, in request_memory
+    raise ValueError(
+ValueError: Free memory on device cuda:0 (7.93/31.36 GiB) on startup is less than desired GPU memory utilization (0.45, 14.11 GiB). Decrease GPU memory utilization or reduce GPU memory used by other processes.
+
+--- C6 compressed-tensors 元数据 ---------------------------------------------
+  compressed-tensors 0.17.0
+  QuantizationArgs 字段: ['num_bits', 'type', 'symmetric', 'group_size', 'strategy', 'block_structure', 'dynamic', 'actorder', 'scale_dtype', 'zp_dtype', 'observer', 'observer_kwargs']
+  QuantizationStrategy: ['tensor', 'channel', 'group', 'block', 'token', 'tensor_group', 'attn_head']
+  CompressionFormat: ['dense', 'sparse-bitmask', 'sparse-24-bitmask', 'int-quantized', 'float-quantized', 'naive-quantized', 'pack-quantized', 'marlin-24']
+  本地没有 compressed-tensors 打包的 checkpoint，字段与格式名只作结构对照；无实例对拍，标 UNVERIFIED。
+
+已写出 out/4.0/20260913-loadpath/checkpoint_load_path.json
+[rank0]:[W913 17:27:23.505887919 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+
+==============================================================================
+[C] 量化布局追踪：磁盘 / 手写解包 / 官方实现 / 执行布局
+==============================================================================
+
+--- C1 磁盘布局 ---------------------------------------------------------------
+  [awq] q_proj.bias      (1536,)          float16
+  [awq] q_proj.qweight   (1536, 192)      int32
+  [awq] q_proj.qzeros    (12, 192)        int32
+  [awq] q_proj.scales    (12, 1536)       float16
+        quantization_config: {"bits": 4, "group_size": 128, "modules_to_not_convert": null, "quant_method": "awq", "version": "gemm", "zero_point": true}
+        k_proj 同结构：qweight (1536, 32)，scales (12, 256)（out 从 1536 变 256）
+  [gptq] q_proj.bias      (1536,)          float16
+  [gptq] q_proj.g_idx     (1536,)          int32
+  [gptq] q_proj.qweight   (192, 1536)      int32
+  [gptq] q_proj.qzeros    (12, 192)        int32
+  [gptq] q_proj.scales    (12, 1536)       float16
+        quantization_config: {"batch_size": 1, "bits": 4, "block_name_to_quantize": null, "cache_block_outputs": true, "damp_percent": 0.01, "dataset": null, "desc_act": false, "e
+        k_proj 同结构：qweight (192, 256)，scales (12, 256)（out 从 1536 变 256）
+
+--- C2 AWQ 手写解包 vs ops.awq_dequantize（逐元素） --------------------------------
+  q_proj: 手写 (1536, 1536) vs 官方 (1536, 1536)  逐元素相同比例 1.000000  max|diff| 0.000e+00
+
+--- C3 GPTQ 手写解包 vs 未量化同位置权重 ----------------------------------------------
+  fused qkv 手写解包 (1536, 2048) vs 未量化 (1536, 2048)
+    cosine 0.987205   相对最大差 0.1646（4-bit 量化的固有误差）
+
+--- C3b 磁盘布局不是 kernel 期望的布局 -----------------------------------------------
+  把磁盘原样的 qweight/qzeros/scales 直接喂 ops.gptq_gemm，结果与手写反量化不一致。
+  原因是 kernel 前有布局变换：exllama.py:125 permute_param_layout_ + ops.gptq_shuffle，
+  marlin.py:129 permute_param_layout_ + ops.gptq_marlin_repack（marlin.py:130）。
+
+--- C4 往返自检：dense -> 量化 -> 打包 -> 解包 ---------------------------------------
+  AWQ 布局往返逐元素一致: True   GPTQ 布局往返逐元素一致: True
+  （GPTQ 的零点在文件里存 zero-1，打包时写回 zrow-1；AWQ 存原值）
+
+--- C5 vLLM 加载后的执行布局、逐层对拍与加载阶段事件 ------------------------------------------
+INFO 09-13 17:37:09 [api_utils.py:286] non-default args: {'dtype': 'float16', 'max_model_len': 1024, 'gpu_memory_utilization': 0.45, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-GPTQ-Int4/snapshots/4f5a0e31008e2966e8f787964bcc4e1105e03dc3'}
+WARNING 09-13 17:37:09 [arg_utils.py:1801] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
+INFO 09-13 17:37:09 [model.py:684] Resolved architecture: Qwen2ForCausalLM
+INFO 09-13 17:37:09 [model.py:2021] Using max model len 1024
+INFO 09-13 17:37:10 [scheduler.py:277] Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING 09-13 17:37:10 [vllm.py:1371] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 09-13 17:37:10 [vllm.py:1406] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 09-13 17:37:10 [kernel.py:369] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-13 17:37:10 [vllm.py:1585] Cudagraph is disabled under eager mode
+INFO 09-13 17:37:10 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+INFO 09-13 17:37:11 [core.py:123] Initializing a V1 LLM engine (v0.29.0) with config: model='/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-GPTQ-Int4/snapshots/4f5a0e31008e2966e8f787964bcc4e1105e03dc3', speculative_config=None, tokenizer='/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-GPTQ-Int4/snapshots/4f5a0e31008e2966e8f787964bcc4e1105e03dc3', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.float16, max_seq_len=1024, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=auto_gptq, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/scratch/learn/models/hf/hub/models--Qwen--Qwen2.5-1.5B-Instruct-GPTQ-Int4/snapshots/4f5a0e31008e2966e8f787964bcc4e1105e03dc3, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+INFO 09-13 17:37:11 [parallel_state.py:1775] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_4f9e251f1cf64a249aa9d1962dab7dc7 backend=nccl
+INFO 09-13 17:37:11 [parallel_state.py:2119] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+INFO 09-13 17:37:11 [gpu_worker.py:429] Using V2 Model Runner
+INFO 09-13 17:37:12 [model_runner.py:382] Loading model from scratch...
+INFO 09-13 17:37:12 [auto_gptq.py:357] Using MarlinLinearKernel for AutoGPTQLinearMethod
+INFO 09-13 17:37:12 [cuda.py:492] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+INFO 09-13 17:37:12 [flash_attn.py:897] Using FlashAttention version 2
+INFO 09-13 17:37:12 [weight_utils.py:863] Filesystem type for checkpoints: OVERLAY. Checkpoint size: 1.07 GiB. Available RAM: 18.82 GiB.
+INFO 09-13 17:37:12 [weight_utils.py:886] Auto-prefetch is disabled because the filesystem (OVERLAY) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  7.59it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  7.58it/s]
+
+INFO 09-13 17:37:12 [default_loader.py:430] Loading weights took 0.14 seconds
+INFO 09-13 17:37:13 [model_runner.py:404] Model loading took 1.1 GiB memory and 1.600289 seconds
+INFO 09-13 17:37:13 [topk_topp_sampler.py:62] Using FlashInfer for top-p & top-k sampling.
+INFO 09-13 17:37:13 [utils.py:306] Using LBNHC KV cache layout.
+INFO 09-13 17:37:13 [marlin_utils.py:625] Marlin kernel can achieve better performance for small size_n with experimental use_atomic_add feature. You can consider set environment variable VLLM_MARLIN_USE_ATOMIC_ADD to 1 if possible.
+INFO 09-13 17:37:14 [gpu_worker.py:625] Available KV cache memory: 0.51 GiB
+INFO 09-13 17:37:14 [kv_cache_utils.py:2032] GPU KV cache size: 19,104 tokens, Maximum concurrency for 1,024 tokens per request: 18.66x
+INFO 09-13 17:37:14 [kernel_warmup.py:124] JIT kernel warmup starting.
+INFO 09-13 17:37:14 [kernel_warmup.py:134] JIT kernel warmup finished in 0.00s.
+INFO 09-13 17:37:14 [kernel_warmup.py:309] Using FlashInfer autotune cache file: /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/66c95cd3fc1ae9ddc332da31525d00296d51c00052f6dde31226a17465a198be/autotune_configs.json
+2026-09-13 17:37:15,000 - INFO - autotuner.py:2789 - flashinfer.jit: [Autotuner]: Loaded 0 configs from /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/66c95cd3fc1ae9ddc332da31525d00296d51c00052f6dde31226a17465a198be/autotune_configs.json
+2026-09-13 17:37:15,000 - INFO - autotuner.py:972 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+INFO 09-13 17:37:15 [kernel_warmup.py:266] Running FlashInfer autotune with 8192 tokens.
+2026-09-13 17:37:15,050 - INFO - autotuner.py:995 - flashinfer.jit: [Autotuner]: Autotuning process ends
+2026-09-13 17:37:15,052 - INFO - autotuner.py:2652 - flashinfer.jit: [Autotuner]: Saved 0 configs to /scratch/learn/.cache/vllm/flashinfer_autotune_cache/0.6.18/120f/66c95cd3fc1ae9ddc332da31525d00296d51c00052f6dde31226a17465a198be/autotune_configs.json (0 new, 0 from previous config)
+INFO 09-13 17:37:15 [gpu_worker.py:860] Free memory on device (25.81/31.36 GiB) on startup. Desired GPU memory utilization is (0.45, 14.11 GiB). Actual usage is 13.12 GiB for consumed memory (weights + non-torch), 0.48 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=390628250` (0.36 GiB) to fit into requested memory, or `--kv-cache-memory=12947876352` (12.06 GiB) to fully utilize gpu memory. Current kv cache memory in use is 0.51 GiB.
+INFO 09-13 17:37:15 [jit_monitor.py:85] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+INFO 09-13 17:37:15 [torch_utils.py:277] Reducing Torch threads from 16 to 1 for serving. Set OMP_NUM_THREADS in the external environment to override.
+INFO 09-13 17:37:15 [core.py:368] init engine (profile, create kv cache, warmup model) took 2.62 s
+INFO 09-13 17:37:16 [hf.py:547] Detected the chat template content format to be 'string'. You can set `--chat-template-content-format` to override this.
+
+  [gptq] 引擎 init 6.20 s；quant 层 repack 112 层共 0.022 s
+    [vllm] Loading weights took 0.14 seconds
+    [vllm] Model loading took 1.1 GiB memory and 1.600289 seconds
+    [vllm] init engine (profile, create kv cache, warmup model) took 2.62 s
+    qweight              [96, 4096]       int32
+    g_idx                [0]              int32
+    scales               [12, 2048]       float16
+    qzeros               [0]              int32
+    bias                 [2048]           float16
+    g_idx_sort_indices   [0]              int32
+    第 0 层 qkv_proj：引擎(输出去掉 x=0 响应) vs 手写解包 max|diff| 1.223e-01（相对 3.81e-04）
+    加载后 bias 的幅度 316.000，与引擎 x=0 响应的一致性 0.250
+
+--- C6 compressed-tensors 元数据 ---------------------------------------------
+  compressed-tensors 0.17.0
+  QuantizationArgs 字段: ['num_bits', 'type', 'symmetric', 'group_size', 'strategy', 'block_structure', 'dynamic', 'actorder', 'scale_dtype', 'zp_dtype', 'observer', 'observer_kwargs']
+  QuantizationStrategy: ['tensor', 'channel', 'group', 'block', 'token', 'tensor_group', 'attn_head']
+  CompressionFormat: ['dense', 'sparse-bitmask', 'sparse-24-bitmask', 'int-quantized', 'float-quantized', 'naive-quantized', 'pack-quantized', 'marlin-24']
+  本地没有 compressed-tensors 打包的 checkpoint，字段与格式名只作结构对照；无实例对拍，标 UNVERIFIED。
+
+已写出 out/4.0/20260913-loadpath/checkpoint_load_path.json

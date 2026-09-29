@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.5 长上下文分布式</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">6.5</div>
+  <div class="sidebar-title">长上下文分布式</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#attention-rank">心智模型：切开序列之后，attention 变成一个跨 rank 的归约</a></li>
+<li><a href="#_2">机制拆解与推导</a><ul>
+<li><a href="#1-rank">1. 归一化统计量怎样跨 rank 合并</a></li>
+<li><a href="#2">2. 掩码必须用全局位置</a></li>
+<li><a href="#3-dkdv">3. dK/dV 不是局部量</a></li>
+<li><a href="#4">4. 两种换维方案的适用条件与通信量</a></li>
+<li><a href="#5-kv">5. 容量账：KV 是线性的，激活是平方的</a></li>
+<li><a href="#6">6. 实测的显存墙与时间</a></li>
+<li><a href="#7-cp-tp">7. CP 与 TP 的组合：切的东西不同</a></li>
+</ul>
+</li>
+<li><a href="#_3">工程实现 · 源码解析</a><ul>
+<li><a href="#_4">代码入口</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">命令</a></li>
+<li><a href="#_8">实测数字</a></li>
+<li><a href="#_9">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#attention-rank">心智模型：切开序列之后，attention 变成一个跨 rank 的归约</a></li>
+<li><a href="#_2">机制拆解与推导</a><ul>
+<li><a href="#1-rank">1. 归一化统计量怎样跨 rank 合并</a></li>
+<li><a href="#2">2. 掩码必须用全局位置</a></li>
+<li><a href="#3-dkdv">3. dK/dV 不是局部量</a></li>
+<li><a href="#4">4. 两种换维方案的适用条件与通信量</a></li>
+<li><a href="#5-kv">5. 容量账：KV 是线性的，激活是平方的</a></li>
+<li><a href="#6">6. 实测的显存墙与时间</a></li>
+<li><a href="#7-cp-tp">7. CP 与 TP 的组合：切的东西不同</a></li>
+</ul>
+</li>
+<li><a href="#_3">工程实现 · 源码解析</a><ul>
+<li><a href="#_4">代码入口</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">命令</a></li>
+<li><a href="#_8">实测数字</a></li>
+<li><a href="#_9">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L6 · 分布式：通信、并行、分离</div>
+  <div class="mod-id">6.5</div>
+  <h1>长上下文分布式</h1>
+  <p class="lede">sequence / context parallel、ring attention、超长 KV 的分片与调度。</p>
+  <div class="chips"><span class="chip">实测机器 worldvln（2/4× L40S，PCIe，无 NVLink）· Qwen3-8B 结构参数 · BF16</span><span class="chip">前置 6.0b（DTensor 布局）· 6.1（集合通信成本）· 3.2（FlashAttention 世代）· 3.4（稀疏与线性 attention）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>序列长度是唯一一个会让<strong>所有</strong>账同时爆炸的维度。权重不随 S 变，KV 随 S 线性长，而 attention 的注意力矩阵随 S² 长。到 32K 上下文时，一份"不重算"的训练激活能比推理 KV 大两个数量级以上。</p>
+<p>上下文并行（CP）切的就是这个维度。它看起来最直观——把序列切开，每张卡只算一段——但切开之后 attention 不再局部：每个查询都要看到它前面所有的键值，而那些键值现在在别的卡上。</p>
+<ol>
+<li>序列分片怎样改变 attention？归一化统计量怎样跨 rank 合并？</li>
+<li>通信、重算与状态，什么时候谁主导？</li>
+<li>CP 和 TP 能怎么组合？合法性的边界在哪？</li>
+</ol>
+<hr />
+<h2 id="attention-rank">心智模型：切开序列之后，attention 变成一个跨 rank 的归约</h2>
+<figure>
+
+
+<svg viewBox="0 0 830 450" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="上下文并行的两种换维方案">
+  <defs>
+    <marker id="h65" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">CP=2：序列切两段，每段只有一半的查询和一半的键值</text>
+
+    <!-- ring -->
+    <rect x="12" y="34" width="396" height="216" rx="5" fill="none" stroke="currentColor"/>
+    <text x="24" y="54" font-size="11.5" font-weight="600">ring：KV 块沿环传递，在线 softmax 归并</text>
+    <g font-size="10">
+      <rect x="24" y="66" width="168" height="42" rx="3" fill="none" stroke="currentColor"/>
+      <text x="32" y="82" font-size="9.5">rank 0：Q[0:L]，K/V[0:L]</text>
+      <text x="32" y="98" font-size="9.5">先看自己的块，再看别人的</text>
+      <rect x="204" y="66" width="180" height="42" rx="3" fill="none" stroke="currentColor"/>
+      <text x="212" y="82" font-size="9.5">rank 1：Q[L:2L]，K/V[L:2L]</text>
+      <text x="212" y="98" font-size="9.5">方向相反，各收 1 轮</text>
+      <line x1="192" y1="87" x2="204" y2="87" stroke="currentColor" marker-end="url(#h65)"/>
+    </g>
+    <text x="24" y="130" font-size="10">每轮：本地 Q 对本轮 KV 做分数 → 更新运行量</text>
+    <text x="24" y="148" font-size="10" font-family="monospace">m_new = max(m, rowmax(s))</text>
+    <text x="24" y="164" font-size="10" font-family="monospace">l = l·e^(m−m_new) + Σe^(s−m_new)</text>
+    <text x="24" y="180" font-size="10" font-family="monospace">O = O·e^(m−m_new) + e^(s−m_new)·V</text>
+    <text x="24" y="200" font-size="10">通信：CP−1 轮，每轮 1 个 KV 块</text>
+    <text x="24" y="216" font-size="10" opacity="0.85">实测 CP=2 的 collective：c10d::send/recv_ + nccl:coalesced</text>
+    <text x="24" y="234" font-size="10" font-weight="600">不要求 S 能被 CP 整除；代价是每轮的块长可能不等</text>
+
+    <!-- ulysses -->
+    <rect x="422" y="34" width="396" height="216" rx="5" fill="none" stroke="currentColor"/>
+    <text x="434" y="54" font-size="11.5" font-weight="600">ulysses：all-to-all 把序列维换成 head 维</text>
+    <g font-size="10">
+      <rect x="434" y="66" width="168" height="42" rx="3" fill="none" stroke="currentColor"/>
+      <text x="442" y="82" font-size="9.5">交换前：(B, H, S/2, D)</text>
+      <text x="442" y="98" font-size="9.5">全部 head、一半序列</text>
+      <rect x="614" y="66" width="180" height="42" rx="3" fill="none" stroke="currentColor"/>
+      <text x="622" y="82" font-size="9.5">交换后：(B, H/2, S, D)</text>
+      <text x="622" y="98" font-size="9.5">一半 head、完整序列</text>
+      <line x1="602" y1="87" x2="614" y2="87" stroke="currentColor" marker-end="url(#h65)"/>
+    </g>
+    <text x="434" y="130" font-size="10">每个 rank 在完整序列上算自己那 H/CP 个 head，</text>
+    <text x="434" y="146" font-size="10">再 all-to-all 换回序列切分。</text>
+    <text x="434" y="166" font-size="10">通信：两次 all-to-all，每次搬 B·S·H·D</text>
+    <text x="434" y="184" font-size="10" opacity="0.85">实测 CP=2 的 collective：c10d::alltoall_ + nccl:all_to_all ×2</text>
+    <text x="434" y="204" font-size="10" font-weight="600">要求 S%CP==0 且 H、G 都能被 CP 整除</text>
+    <text x="434" y="222" font-size="10" opacity="0.85">实测 S=70、CP=4 时直接报错拒绝，不退化成别的方案</text>
+
+    <!-- 底部 -->
+    <line x1="12" y1="266" x2="818" y2="266" stroke="currentColor" opacity="0.3"/>
+    <text x="12" y="288" font-size="11.5" font-weight="600">两条最容易踩错的线</text>
+    <text x="12" y="310" font-size="10">① 掩码必须用<tspan font-weight="600">全局位置</tspan>：本地 Q 的全局行号是 offset+i，不能与键列一样从 0 开始。</text>
+    <text x="12" y="328" font-size="10">② dK/dV 不是局部量：本 rank 的 K/V 块被所有 rank 的查询用到，梯度必须跨 rank 归约，</text>
+    <text x="12" y="346" font-size="10">　 而 PyTorch 的 P2P 与 all_to_all 没有注册 autograd，直接穿过去会<tspan font-weight="600">静默给错值</tspan>。</text>
+
+    <rect x="12" y="362" width="806" height="76" rx="4" fill="none" stroke="currentColor"/>
+    <text x="24" y="382" font-size="10.5" font-weight="600">本机实测（CP=2，S=64，FP64 参照）</text>
+    <text x="24" y="400" font-size="10">ring 值差 8.9e-16；ulysses 值差 0.0；正确 CP 梯度 dQ=0.0、dK=dV=2.7e-15</text>
+    <text x="24" y="418" font-size="10">直接让 autograd 穿过 P2P：dK 误差 2.04、dV 误差 2.66 —— 与真值同量级，完全不可用</text>
+    <text x="24" y="434" font-size="10" opacity="0.85">这一条不是实现细节，是 CP 反向必须写通信转置（反向环 / 逆 all-to-all）或显式归约的根本原因。</text>
+  </g>
+</svg>
+
+
+</figure>
+
+<hr />
+<h2 id="_2">机制拆解与推导</h2>
+<h3 id="1-rank">1. 归一化统计量怎样跨 rank 合并</h3>
+<p>attention 的归一化不是「先算完整 softmax 再除」——那样需要 O(S²) 的中间矩阵。它是<strong>流式</strong>的：每处理一个键值块，就更新三个运行量：</p>
+<div class="highlight"><pre><span></span><code>m_new = max(m, rowmax(s))                    运行最大值
+l     = l · exp(m − m_new) + Σ exp(s − m_new) 运行归一化因子
+O     = O · exp(m − m_new) + exp(s − m_new) · V  运行输出
+</code></pre></div>
+
+<p><code>exp(m − m_new)</code> 这一项是整件事的关键：上一轮的结果是按旧的 <code>m</code> 归一的，<code>m</code> 变大之后必须整体缩放。一个块被完全掩码掉时 <code>rowmax(s) = −∞</code>，<code>m_new</code> 会保持住旧值（<code>max(m, −∞) = m</code>），缩放因子为 1，不出错；但如果 <code>m</code> 初值是 <code>−∞</code> 而第一个块全被掩码，<code>m − m_new = −∞ − (−∞) = NaN</code>，所以实现里要把非有限的 <code>m</code> 归零再算 <code>exp</code>。这一条是本机实现里唯一需要小心处理的数值细节。</p>
+<p><strong>CP 的合并正是在这个层面发生的</strong>：每个 rank 拿到的不是「一半的注意力」，而是<strong>同一次归约的另一个加数</strong>。ring 的做法是把 KV 块沿环转一圈，每个 rank 用所有块更新自己那份 <code>(m, l, O)</code>；ulysses 的做法是先换维，让每个 rank 在完整序列上算自己那几个 head，直接得到完整的 <code>(m, l, O)</code>。两条路的最终数值相同（实测 8.9e-16 与 0.0，都在 FP64 噪声地板内）。</p>
+<h3 id="2">2. 掩码必须用全局位置</h3>
+<p>本地 Q 只覆盖全局位置 <code>[offset, offset+L)</code>，而键列如果来自完整序列就是 <code>[0, S)</code>。用 <code>arange(L)</code> 去和 <code>arange(S)</code> 比大小，在 CP=1 时碰巧对（offset=0），CP&gt;1 时<strong>全错且不报错</strong>——它会静默地让每个 rank 按「自己段内的相对位置」做因果掩码。</p>
+<p>本机第一版实现就踩了这个坑，报的是形状不匹配（<code>(32)</code> vs <code>(128)</code>），因为掩码形状对不上。如果 S 恰好等于 L×CP 且两边形状碰巧一致，就会静默算错。修法是给参照实现加 <code>q_offset</code>，掩码两侧都用全局位置。</p>
+<h3 id="3-dkdv">3. dK/dV 不是局部量</h3>
+<p>这是 CP 最容易搞错的地方：</p>
+<ul>
+<li><strong>dQ 是局部的</strong>。本 rank 的查询只由本 rank 的 Q 产生，autograd 直接对。实测 dQ 误差 0.0。</li>
+<li><strong>dK/dV 不是</strong>。本 rank 的 K/V 块会被<strong>所有</strong> rank 的查询用到（ring 里它被传了一圈，ulysses 里它被换维后所有 rank 共享），所以它的梯度是若干份局部贡献之和。</li>
+</ul>
+<p>而 PyTorch 的 <code>dist.batch_isend_irecv</code>、<code>dist.all_to_all</code> <strong>没有注册 autograd kernel</strong>——直接让 autograd 穿过它们，PyTorch 只发一条 <code>UserWarning</code>，然后给出静默错误的结果。实测：</p>
+<table>
+<thead>
+<tr>
+<th>梯度</th>
+<th style="text-align: right;">正确做法</th>
+<th style="text-align: right;">直接穿 P2P</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>dQ</td>
+<td style="text-align: right;">0.0</td>
+<td style="text-align: right;">7.8e-16（对，因为它是局部的）</td>
+</tr>
+<tr>
+<td>dK</td>
+<td style="text-align: right;">2.7e-15</td>
+<td style="text-align: right;"><strong>2.04</strong></td>
+</tr>
+<tr>
+<td>dV</td>
+<td style="text-align: right;">2.7e-15</td>
+<td style="text-align: right;"><strong>2.66</strong></td>
+</tr>
+</tbody>
+</table>
+<p>误差 2.04 与真值同量级，也就是说<strong>结果完全不可用，而且没有任何报错</strong>。正确做法有两条：手写通信的转置（ring 的反向环、all-to-all 的逆变换），或者把「本地反向得到的每块梯度」跨 rank 归约一次。本机用后者验证：把各 rank 的 K/V 收齐、用本地 Q 在完整序列上跑一次 attention、autograd 得到每块的局部贡献、再 <code>all_reduce</code> 求和，得到 2.7e-15，与参照一致。</p>
+<h3 id="4">4. 两种换维方案的适用条件与通信量</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>通信模式</th>
+<th style="text-align: right;">轮次</th>
+<th>每 rank 字节</th>
+<th>前提</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ring</td>
+<td>P2P 环传 KV</td>
+<td style="text-align: right;">CP−1</td>
+<td>(CP−1) × 2·G·(S/CP)·D·2B</td>
+<td>无（非整除也行）</td>
+</tr>
+<tr>
+<td>ulysses</td>
+<td>两次 all-to-all</td>
+<td style="text-align: right;">2</td>
+<td>2 × 2·S·H·D·2B</td>
+<td>S%CP==0 且 H、G 都被 CP 整除</td>
+</tr>
+</tbody>
+</table>
+<p>CP=2、S=8192、Qwen3-8B 结构（H=32, G=8, D=128）实测的每 rank 字节：ring 16.0 MiB，ulysses 256 MiB——<strong>ulysses 是 ring 的 16 倍</strong>。原因在公式里：ring 每轮只传 KV 块（G=8 个头），而 ulysses 每次 all-to-all 要搬全部 H=32 个头的隐藏状态，还搬两次。</p>
+<p>换来的是适用性：ulysses 要求 <code>S % CP == 0</code>，实测 <strong>S=70、CP=4 时直接报错拒绝</strong>（<code>ValueError: S=70 不能被 CP=4 整除，Ulysses 需要等长分块</code>），而 ring 在同一用例下正常通过（值差 4.4e-16，段长 <code>[18, 18, 17, 17]</code>）。<strong>非整除时 ring 是唯一选择</strong>；整除时 ulysses 用 16 倍的通信换更简单的计算和更好的 kernel 效率。</p>
+<h3 id="5-kv">5. 容量账：KV 是线性的，激活是平方的</h3>
+<p>这是本章最重要的一个数。Qwen3-8B（36 层、8 个 kv_head、head_dim 128、BF16）每 rank 的状态（CP 只切序列，不切 head）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">CP</th>
+<th style="text-align: right;">推理 KV/rank</th>
+<th style="text-align: right;">训练激活/rank（不重算）</th>
+<th style="text-align: right;">激活 ÷ KV</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">288.0 MiB</td>
+<td style="text-align: right;">9.8 GiB</td>
+<td style="text-align: right;">34×</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">72.0 MiB</td>
+<td style="text-align: right;">2.4 GiB</td>
+<td style="text-align: right;">34×</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1152.0 MiB</td>
+<td style="text-align: right;">146.3 GiB</td>
+<td style="text-align: right;">130×</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">288.0 MiB</td>
+<td style="text-align: right;">36.6 GiB</td>
+<td style="text-align: right;">130×</td>
+</tr>
+<tr>
+<td style="text-align: right;">16384</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">576.0 MiB</td>
+<td style="text-align: right;">145.1 GiB</td>
+<td style="text-align: right;">258×</td>
+</tr>
+<tr>
+<td style="text-align: right;">32768</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1152.0 MiB</td>
+<td style="text-align: right;"><strong>578.4 GiB</strong></td>
+<td style="text-align: right;"><strong>514×</strong></td>
+</tr>
+</tbody>
+</table>
+<p>两条读法：</p>
+<p><strong>CP 对两者的缩放是一样的</strong>（都按 1/CP 降），所以<strong>比值与 CP 无关，只随 S 线性增长</strong>：34× → 130× → 258× → 514×，正好是 S 的 8 倍、16 倍、32 倍关系。<strong>用「全局 token 数除以卡数」估算显存，在这两者上会得到完全不同量级的错误</strong>——推理 KV 是 <code>S/CP</code> 的线性函数，训练激活是 <code>(S/CP)·S</code> 的双线性函数。</p>
+<p><strong>不重算的训练在长上下文下根本放不下。</strong> S=8192、CP=4 时每 rank 训练激活 36.6 GiB，而单卡 44 GiB；S=32768 时 578 GiB/rank。这还没有算权重、优化器状态和 MLP 的中间激活。所以长上下文训练的可行前提是<strong>分块 + 重算</strong>，CP 只是把 <code>S/CP</code> 这一半账变小，动不了 <code>S</code> 那一半。</p>
+<h3 id="6">6. 实测的显存墙与时间</h3>
+<p>在 2/4 张 L40S 上按 Qwen3-8B 结构（单层注意力，BF16）实测：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th>CP=1</th>
+<th>CP=2</th>
+<th>CP=4</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">2048</td>
+<td>11.4 ms</td>
+<td>6.6 ms</td>
+<td>6.0 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td>177.6 ms</td>
+<td>97.0 ms</td>
+<td>58.3 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">16384</td>
+<td><strong>前向 OOM</strong></td>
+<td>372.4 ms</td>
+<td>202.3 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">32768</td>
+<td>—</td>
+<td><strong>前向 OOM</strong></td>
+<td>759.4 ms</td>
+</tr>
+</tbody>
+</table>
+<p>（前向，3 次中位；单层。OOM 的原因是单个注意力矩阵 <code>H×S/CP×S×2B</code>：CP=1、S=16384 时它正好是 16 GiB，需要一次连续分配。）</p>
+<p><strong>前向本身就已经撞墙了。</strong> CP=1 在 S=16384 上要一次分配 16 GiB 的分数矩阵；CP=2 在 S=32768 上同样。CP=4 能过 S=32768（每 rank 8 GiB 的分数矩阵），但<strong>反向仍然 OOM</strong>——autograd 要把每一轮的注意力矩阵全部留住，CP=4 时是 3 轮 × 8 GiB。这直接说明：<strong>CP 把每 rank 的注意力矩阵按 1/CP 缩小，但没有改变它的 O(S²) 性质；要让它装得下，必须分块（flash 式）+ 重算。</strong></p>
+<p>时间上的缩放也不是线性的：CP 从 1 加到 4，S=8192 的前向从 177.6 ms 降到 58.3 ms（3.05×），S=16384 从 OOM 变成 202.3 ms。而 batch 从 1 加到 2，CP=4 的前向从 60.5 ms 变成 115.4 ms（1.9×）——说明在这个规模上时间主要还是被计算而不是被通信主导。</p>
+<h3 id="7-cp-tp">7. CP 与 TP 的组合：切的东西不同</h3>
+<p>用 profiler 抓到两条方案的实际 collective 顺序（CP=2、S=8192）：</p>
+<div class="highlight"><pre><span></span><code>ring    ：c10d::send ×1, c10d::recv_ ×1, nccl:coalesced ×1, c10d::send ×1, ...
+ulysses ：c10d::alltoall_ ×1, nccl:all_to_all ×2, c10d::alltoall_ ×1, nccl:all_to_all ×1, ...
+</code></pre></div>
+
+<p>CP=4 的 ring 是 3 轮 P2P（<code>CP−1 = 3</code>），与设计一致；ulysses 始终是 2 次 all-to-all，与 CP 无关。</p>
+<p>CP 与 TP 的合法性边界不同：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>切什么</th>
+<th>整除条件</th>
+<th>非整除时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CP</td>
+<td>序列</td>
+<td>ulysses 要 <code>S%CP==0</code>；ring 不要求</td>
+<td>ring 可用，段长不等</td>
+</tr>
+<tr>
+<td>TP</td>
+<td>head / 权重</td>
+<td><code>H</code>、<code>G</code>、<code>intermediate</code> 都要被 TP 整除</td>
+<td>直接报错（6.2 已测）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>两者可以叠加</strong>：CP 切序列、TP 切 head，条件互不冲突（<code>S%CP==0</code> 且 <code>H%TP==0</code>、<code>G%TP==0</code>）。实测 CP=4 用 <code>H=16, G=8</code> 组合通过，ulysses 的换维在 head 维上做的正是 TP 也在切的那个维度——所以 Ulysses 常被拿来和 TP 联合调优：<strong>它把 CP 的通信放到 head 维上，与 TP 的 all-reduce 共享同一条链路的账</strong>。</p>
+<hr />
+<h2 id="_3">工程实现 · 源码解析</h2>
+<h3 id="_4">代码入口</h3>
+<p>本机没有 Megatron / DeepSpeed 的源码树，CP 的实现事实来自本章的手写实现与 PyTorch 的分布式原语；参考实现的位置按公开仓库给出，未在本机运行。</p>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>labs/L6/context_parallel_attention.py</code> <code>ring_attention</code></td>
+<td>ring 传 KV + 在线 softmax 归并（本章实现）</td>
+</tr>
+<tr>
+<td><code>labs/L6/context_parallel_attention.py</code> <code>ulysses_attention</code></td>
+<td>all-to-all 换维（本章实现）</td>
+</tr>
+<tr>
+<td><code>labs/L6/context_parallel_attention.py</code> <code>cp_gradients</code></td>
+<td>正确的 CP 梯度：本地反向 + 跨 rank 归约</td>
+</tr>
+<tr>
+<td><code>torch/distributed/distributed_c10d.py</code></td>
+<td><code>all_to_all</code> / <code>batch_isend_irecv</code>；两者都未注册 autograd kernel</td>
+</tr>
+<tr>
+<td>Megatron-LM <code>megatron/core/parallel_state.py</code></td>
+<td>CP/TP 进程组的建立与合法性检查</td>
+</tr>
+<tr>
+<td>DeepSpeed <code>deepspeed/sequence/</code></td>
+<td>Ulysses 的 all-to-all 实现</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_5">设计取舍</h3>
+<p><strong>为什么 CP 只切序列、不切 head。</strong> 切 head 是 TP 做的事。CP 的动机是「单卡的序列太长」，所以它切序列；代价是 attention 变成跨 rank 归约。把两者搞混会出现「既切了序列又切了 head」的布局，KV 的分片关系变得难以推理。</p>
+<p><strong>为什么 ring 不要求整除而 ulysses 要求。</strong> ring 的每一轮传的是一个「本来就不等长」的段，接收方按对方的段长分配缓冲即可；ulysses 的 all-to-all 要求对等分块，非整除只能补 padding，而补 padding 会污染注意力（padding 位置的分数不能参与 softmax）。所以本机实现选择明确报错，而不是静默补零。</p>
+<p><strong>为什么 CP 的反向必须显式写通信。</strong> 因为 dK/dV 的贡献来自其他 rank 的查询。框架不可能猜到这一点——<code>all_to_all</code>、<code>isend/irecv</code> 对 autograd 来说只是「一个把数据搬走的黑盒」，梯度穿过去得到的是「把上游梯度原样搬回」，而正确值是「所有 rank 的局部贡献之和」。实测误差 2.04/2.66 说明这不是精度问题，是数量级错误。</p>
+<p><strong>为什么 CP 不减少必须要算的 FLOPs。</strong> 注意力本身是 <code>O(S²)</code> 的，切成 CP 份之后每 rank 只算 <code>S/CP × S</code> 的分数矩阵，总 FLOPs 不变。CP 换来的是<strong>每卡的显存</strong>和<strong>并行度</strong>，不是总计算量。真正减少 FLOPs 的是 3.4 讲的稀疏/线性 attention。</p>
+<hr />
+<h2 id="_6">工程实现 · 自己写一遍</h2>
+<p>在线 softmax 的更新只有三行，但数值边界决定了实现能不能跑长序列：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">153</span>             <span class="n">allow</span> <span class="o">=</span> <span class="n">allow</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">kv_pos</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">&gt;=</span> <span class="p">(</span><span class="n">q_pos</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">-</span> <span class="n">window</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">154</span>         <span class="n">s</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="o">~</span><span class="n">allow</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"-inf"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">155</span>         <span class="n">blk_max</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">values</span>
+<span class="linenos" aria-hidden="true">156</span>         <span class="n">m_new</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">blk_max</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">157</span>         <span class="n">m_safe</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">m_new</span><span class="p">),</span> <span class="n">m_new</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">m_new</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">158</span>         <span class="n">alpha</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">m</span> <span class="o">-</span> <span class="n">m_safe</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">m</span> <span class="o">-</span> <span class="n">m_safe</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">159</span>                             <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">m</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">160</span>         <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">s</span> <span class="o">-</span> <span class="n">m_safe</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">s</span> <span class="o">-</span> <span class="n">m_safe</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">161</span>                         <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">s</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">162</span>         <span class="n">l</span> <span class="o">=</span> <span class="n">l</span> <span class="o">*</span> <span class="n">alpha</span> <span class="o">+</span> <span class="n">p</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">163</span>         <span class="n">O</span> <span class="o">=</span> <span class="n">O</span> <span class="o">*</span> <span class="n">alpha</span> <span class="o">+</span> <span class="n">p</span> <span class="o">@</span> <span class="n">cur_v</span>
+<span class="linenos" aria-hidden="true">164</span>         <span class="n">m</span> <span class="o">=</span> <span class="n">m_safe</span>
+<span class="linenos" aria-hidden="true">165</span>         <span class="k">if</span> <span class="n">step</span> <span class="o">&lt;</span> <span class="n">cp_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">166</span>             <span class="n">nxt</span> <span class="o">=</span> <span class="p">(</span><span class="n">cp_rank</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">cp_size</span>
+<span class="linenos" aria-hidden="true">167</span>             <span class="n">prv</span> <span class="o">=</span> <span class="p">(</span><span class="n">cp_rank</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">cp_size</span>
+<span class="linenos" aria-hidden="true">168</span>             <span class="n">src_rank</span> <span class="o">=</span> <span class="p">(</span><span class="n">cur_rank</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">cp_size</span>
+<span class="linenos" aria-hidden="true">169</span>             <span class="n">_</span><span class="p">,</span> <span class="n">recv_len</span> <span class="o">=</span> <span class="n">shard_bounds</span><span class="p">(</span><span class="n">global_seq</span><span class="p">,</span> <span class="n">cp_size</span><span class="p">,</span> <span class="n">src_rank</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">170</span>             <span class="n">cur_k</span> <span class="o">=</span> <span class="n">_ring_pass</span><span class="p">(</span><span class="n">cur_k</span><span class="p">,</span> <span class="n">nxt</span><span class="p">,</span> <span class="n">prv</span><span class="p">,</span> <span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">recv_len</span><span class="p">,</span> <span class="n">D</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">171</span>             <span class="n">cur_v</span> <span class="o">=</span> <span class="n">_ring_pass</span><span class="p">(</span><span class="n">cur_v</span><span class="p">,</span> <span class="n">nxt</span><span class="p">,</span> <span class="n">prv</span><span class="p">,</span> <span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="n">recv_len</span><span class="p">,</span> <span class="n">D</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">172</span>             <span class="n">cur_rank</span> <span class="o">=</span> <span class="n">src_rank</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/context_parallel_attention.py 第 153–172 行</code><a href="../code/labs/L6/context_parallel_attention.py.html#labs-L6-context_parallel_attention-py-L-153">在完整文件中打开 &rarr;</a></div></div>
+<p>掩码必须用全局位置——这是 CP 里最容易静默出错的一处：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">61</span> <span class="k">def</span><span class="w"> </span><span class="nf">causal_window_mask</span><span class="p">(</span><span class="n">seq_kv</span><span class="p">,</span> <span class="n">window</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">,</span> <span class="n">q_offset</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">seq_q</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">62</span> <span class="w">    </span><span class="sd">"""查询行 i 的全局位置是 q_offset + i，键列 j 的全局位置是 j。</span>
+<span class="linenos" aria-hidden="true">63</span> 
+<span class="linenos" aria-hidden="true">64</span> <span class="sd">    CP 下本地 Q 只是一段（q_offset&gt;0），而 KV 可能是完整序列，</span>
+<span class="linenos" aria-hidden="true">65</span> <span class="sd">    所以掩码必须用**全局位置**算，不能默认 q 与 k 从同一个 0 开始。</span>
+<span class="linenos" aria-hidden="true">66</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true">67</span>     <span class="n">seq_q</span> <span class="o">=</span> <span class="n">seq_q</span> <span class="k">if</span> <span class="n">seq_q</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">seq_kv</span>
+<span class="linenos" aria-hidden="true">68</span>     <span class="n">q_pos</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">q_offset</span><span class="p">,</span> <span class="n">q_offset</span> <span class="o">+</span> <span class="n">seq_q</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">69</span>     <span class="n">kv_pos</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">seq_kv</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">70</span>     <span class="n">allow</span> <span class="o">=</span> <span class="n">kv_pos</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">&lt;=</span> <span class="n">q_pos</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">71</span>     <span class="k">if</span> <span class="n">window</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">72</span>         <span class="n">allow</span> <span class="o">=</span> <span class="n">allow</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">kv_pos</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">&gt;=</span> <span class="p">(</span><span class="n">q_pos</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">-</span> <span class="n">window</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">73</span>     <span class="k">return</span> <span class="n">allow</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/context_parallel_attention.py 第 61–74 行</code><a href="../code/labs/L6/context_parallel_attention.py.html#labs-L6-context_parallel_attention-py-L-61">在完整文件中打开 &rarr;</a></div></div>
+<p>正确的 CP 梯度：本地反向得到的每块梯度要跨 rank 归约一次：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">255</span>     <span class="n">k_parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">k</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">cp_size</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">256</span>     <span class="n">v_parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">cp_size</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">257</span>     <span class="n">dist</span><span class="o">.</span><span class="n">all_gather</span><span class="p">(</span><span class="n">k_parts</span><span class="p">,</span> <span class="n">k</span><span class="o">.</span><span class="n">contiguous</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">258</span>     <span class="n">dist</span><span class="o">.</span><span class="n">all_gather</span><span class="p">(</span><span class="n">v_parts</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">contiguous</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">259</span>     <span class="n">k_all</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">k_parts</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">260</span>     <span class="n">v_all</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">v_parts</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">261</span>     <span class="n">q_local</span> <span class="o">=</span> <span class="n">q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">start</span><span class="p">:</span><span class="n">start</span> <span class="o">+</span> <span class="n">length</span><span class="p">,</span> <span class="p">:]</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">262</span>     <span class="n">out</span> <span class="o">=</span> <span class="n">reference_attention</span><span class="p">(</span><span class="n">q_local</span><span class="p">,</span> <span class="n">k_all</span><span class="p">,</span> <span class="n">v_all</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">window</span><span class="o">=</span><span class="n">window</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">263</span>                               <span class="n">q_offset</span><span class="o">=</span><span class="n">start</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">264</span>     <span class="n">dq</span><span class="p">,</span> <span class="n">dk_all</span><span class="p">,</span> <span class="n">dv_all</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">out</span><span class="o">.</span><span class="n">sum</span><span class="p">(),</span> <span class="p">(</span><span class="n">q_local</span><span class="p">,</span> <span class="n">k_all</span><span class="p">,</span> <span class="n">v_all</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">265</span>     <span class="c1"># 每个 rank 只贡献了自己那批查询的梯度，求和才是完整的 dK/dV</span>
+<span class="linenos" aria-hidden="true">266</span>     <span class="n">dist</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">dk_all</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">267</span>     <span class="n">dist</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">dv_all</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">268</span>     <span class="c1"># 取回本 rank 那块</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/context_parallel_attention.py 第 255–268 行</code><a href="../code/labs/L6/context_parallel_attention.py.html#labs-L6-context_parallel_attention-py-L-255">在完整文件中打开 &rarr;</a></div></div>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="_7">命令</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 任务 A：ring 与 ulysses 的值/梯度对拍（含非整除、GQA、窗口）</span>
+python<span class="w"> </span>labs/L6/context_parallel_attention.py<span class="w"> </span>A<span class="w"> </span>--cp<span class="w"> </span><span class="m">2</span><span class="w"> </span>--seq<span class="w"> </span><span class="m">64</span><span class="w"> </span>--heads<span class="w"> </span><span class="m">8</span><span class="w"> </span>--kv-heads<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--head-dim<span class="w"> </span><span class="m">16</span><span class="w"> </span>--case<span class="w"> </span>base<span class="w"> </span>--out<span class="w"> </span>results/local/6.5/run/A
+python<span class="w"> </span>labs/L6/context_parallel_attention.py<span class="w"> </span>A<span class="w"> </span>--cp<span class="w"> </span><span class="m">4</span><span class="w"> </span>--seq<span class="w"> </span><span class="m">70</span><span class="w"> </span>--case<span class="w"> </span>nondiv<span class="w"> </span>--out<span class="w"> </span>...
+
+<span class="c1"># 任务 B：容量与时间扫描</span>
+python<span class="w"> </span>labs/L6/long_context_bench.py<span class="w"> </span>scan<span class="w"> </span>--cp<span class="w"> </span><span class="m">4</span><span class="w"> </span>--device<span class="w"> </span>cuda<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--sizes<span class="w"> </span><span class="m">2048</span>,8192,16384,32768<span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.5/run/scan
+
+<span class="c1"># 任务 C：CP/TP 结构与 collective 顺序</span>
+python<span class="w"> </span>labs/L6/long_context_bench.py<span class="w"> </span>compare<span class="w"> </span>--cp<span class="w"> </span><span class="m">4</span><span class="w"> </span>--seq<span class="w"> </span><span class="m">8192</span><span class="w"> </span>--device<span class="w"> </span>cuda<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>results/worldvln/6.5/run/compare
+</code></pre></div>
+
+<h3 id="_8">实测数字</h3>
+<ul>
+<li><strong>值</strong>：ring 值差 8.9e-16、ulysses 0.0（FP64 参照，5 个用例覆盖基础/非整除/GQA/窗口/CP=4）。</li>
+<li><strong>梯度</strong>：正确 CP 梯度 dQ=0.0、dK=dV=2.7e-15；直接穿 P2P 的 dK/dV 误差 2.04/2.66。</li>
+<li><strong>适用性</strong>：S=70、CP=4 时 Ulysses 明确拒绝，ring 通过（段长 <code>[18,18,17,17]</code>）。</li>
+<li><strong>通信量</strong>（S=8192、CP=2）：ring 16.0 MiB/rank，ulysses 256 MiB/rank，差 16 倍。</li>
+<li><strong>容量</strong>：S=32768、CP=4 时推理 KV 1152 MiB/rank，而不重算的训练激活 578.4 GiB/rank，比值 514×。</li>
+<li><strong>显存墙</strong>：CP=1 前向在 S=16384 OOM（单个分数矩阵 16 GiB）；CP=4 前向能过 S=32768（759.4 ms）但反向仍 OOM（3 轮 × 8 GiB）。</li>
+<li><strong>collective 顺序</strong>：ring 每轮 <code>send/recv_ + nccl:coalesced</code>，共 CP−1 轮；ulysses 固定 2 次 <code>alltoall_ + nccl:all_to_all</code>。</li>
+</ul>
+<h3 id="_9">消融建议</h3>
+<ol>
+<li>把 <code>ring_attention</code> 的 <code>m</code> 初始化从 <code>-inf</code> 改成 0，观察全掩码块是否产生 NaN——用来确认「非有限 m 归零」这条分支是必需的。</li>
+<li>把掩码换成局部相对位置（<code>arange(L)</code> 对 <code>arange(S)</code>），观察 CP=2 时值差是否立刻变大——这是本章最容易静默出错的一处。</li>
+<li>把 ring 的分块从整块改成 flash 式小块（例如 1024），重新跑 S=16384/32768，观察前向与反向的显存墙是否被推后。</li>
+<li>在 <code>cp_gradients</code> 里去掉 <code>all_reduce</code>，观察 dK/dV 是否正好变成「只有本 rank 查询的贡献」——用来量化跨 rank 归约到底贡献了多少。</li>
+</ol>
+<hr />
+<h2 id="_10">原始现场</h2>
+<p><strong>CP 的反向：正确归约 vs 直接穿 P2P</strong>（<code>results/local/6.5/20260914-cp/A/A_base.json</code>）</p>
+<div class="highlight"><pre><span></span><code>正确 CP 梯度：dQ=0.00e+00 dK=2.66e-15 dV=2.66e-15
+              （直接穿 P2P 的 dK/dV 误差=2.04e+00/2.66e+00）
+base   S=64 CP=2 本 rank 段=32 ring 值差=8.88e-16 dQ=7.77e-16 dK=2.04e+00 dV=2.66e+00 轮=1
+       | ulysses 值差=0.0 轮=2
+</code></pre></div>
+
+<p><strong>非整除：Ulysses 拒绝、ring 通过</strong>（<code>A_nondiv.json</code>）</p>
+<div class="highlight"><pre><span></span><code>nondiv S=70 CP=4 本 rank 段=18 ring 值差=4.44e-16 轮=3
+       | ulysses ValueError: S=70 不能被 CP=4 整除，Ulysses 需要等长分块（ring 不受此限）
+</code></pre></div>
+
+<p><strong>collective 顺序</strong>（<code>results/worldvln/6.5/20260914-cp/compare/compare_cp2_s8192.json</code>）</p>
+<div class="highlight"><pre><span></span><code>S=8192 CP=2 段长=[4096, 4096] 不齐度=1.000
+  ring    ：c10d::send×1, c10d::recv_×1, nccl:coalesced×1, c10d::send×1, ...
+  ulysses ：c10d::alltoall_×1, nccl:all_to_all×2, c10d::alltoall_×1, nccl:all_to_all×1
+  batch1 前向=96.5 ms batch2 前向=192.4 ms
+</code></pre></div>
+
+<p><strong>显存墙</strong>（<code>results/worldvln/6.5/20260914-cp/6_5_scan.log</code>）</p>
+<div class="highlight"><pre><span></span><code>S=16384 CP=2 本段=8192 fwd=372.4 ms fwd+bwd=673.4 ms
+S=32768 CP=4 本段=8192 fwd=759.4 ms fwd+bwd=OOM
+torch.OutOfMemoryError: Tried to allocate 16.00 GiB.
+  （autograd 要留住每一轮的注意力矩阵：CP=4 时 3 轮 × 8 GiB）
+</code></pre></div>
+
+<p><strong>本轮工件的完整入口</strong></p>
+<ul>
+<li>任务 A（CPU/Gloo，5 个用例）：<a href="../raw/results/local/6.5/20260914-cp/A/A_base.json">A 目录</a> 下的 <code>A_base.json</code>、<code>A_nondiv.json</code>、<code>A_gqa.json</code>、<code>A_window.json</code>、<code>A_cp4.json</code></li>
+<li>任务 B：<a href="../raw/results/worldvln/6.5/20260914-cp/scan/scan_cp4.json">CP=4 扫描</a>、<a href="../raw/results/worldvln/6.5/20260914-cp/6_5_scan.log">扫描日志</a></li>
+<li>任务 C：<a href="../raw/results/worldvln/6.5/20260914-cp/compare/compare_cp2_s8192.json">CP=2 对照</a>、<a href="../raw/results/worldvln/6.5/20260914-cp/compare/compare_cp4_s8192.json">CP=4 对照</a></li>
+</ul>
+<hr />
+<h2 id="_11">前沿</h2>
+<p><strong>ring attention 与它的变体。</strong> ring attention 的价值在于通信量随 CP 线性增长而不随 S 增长（每轮只传 1/CP 的 KV），且能与计算重叠。变体主要在两处做文章：块大小与重叠策略（把 KV 传输与本地 flash 计算压到不同流上），以及负载均衡（因果掩码下每轮的 KV 块长度不同，需要按「负责多少查询」重新分配）。</p>
+<p><strong>Ulysses 与 TP 的联合。</strong> Ulysses 在 head 维上做 all-to-all，而 TP 也在切 head，所以两者可以复用同一条链路的账，甚至可以把 CP 的换维和 TP 的 all-reduce 合并。这条路的复杂度在于布局：<code>(B, H, S, D)</code> 在 CP、TP、DP 三维上的分片关系必须一次性推清楚。</p>
+<p><strong>重算与分块是长上下文的硬前提。</strong> 本章测到 S=32768、CP=4 时训练激活 578 GiB/rank。任何不重算的方案都放不下。真正的解法是 flash 式分块（把 <code>O(S²)</code> 的分数矩阵变成 <code>O(S·Bc)</code> 的块）+ 选择性重算（把激活换时间）。CP 与它们是正交的：CP 缩小每卡的 <code>S/CP</code>，分块与重算把 <code>S</code> 那一半的常数压下来。</p>
+<p><strong>与稀疏/线性 attention 的关系。</strong> 3.4 讲的稀疏与线性 attention 是<strong>减少必须算的 FLOPs</strong>；CP 是<strong>把同样的 FLOPs 分到更多卡上</strong>。两者不冲突也不互相替代：一个 32K 上下文的模型可以同时用滑动窗口（减 FLOPs）和 CP（分显存）。本机没有做两者叠加的实测，保持 <code>UNVERIFIED</code>。</p>
+<hr />
+<h2 id="_12">陷阱</h2>
+<p><strong>1. 用相对位置做因果掩码。</strong> 本地 Q 的全局行号是 <code>offset+i</code>，键列是全局位置。CP=1 时碰巧对，CP&gt;1 时全错且可能不报错。</p>
+<p><strong>2. 让 autograd 穿过 P2P 或 all_to_all。</strong> 这两个算子没注册 autograd kernel，PyTorch 只发一个警告然后给出静默错误的结果。实测 dK/dV 误差 2.04/2.66，与真值同量级。CP 的反向必须显式写通信转置或跨 rank 归约。</p>
+<p><strong>3. 把 dQ 和 dK/dV 当成同一类量。</strong> dQ 是局部的（本 rank 查询），autograd 直接对；dK/dV 是全局的（所有 rank 的查询都要用）。两者在 CP 下的性质完全不同。</p>
+<p><strong>4. 用「全局 token 数 ÷ 卡数」估算显存。</strong> 推理 KV 是 <code>S/CP</code> 的线性函数，训练激活是 <code>(S/CP)·S</code> 的双线性函数。S=32768、CP=4 时两者差 514 倍。</p>
+<p><strong>5. 认为 CP 能减少总计算量。</strong> CP 把 <code>S×S</code> 的分数矩阵按 1/CP 切开，总 FLOPs 不变。它换的是每卡显存和并行度。减少 FLOPs 要靠稀疏/线性 attention。</p>
+<p><strong>6. 以为切了 CP 就能训长上下文。</strong> S=8192、CP=4 时每 rank 训练激活 36.6 GiB，S=32768 时 578 GiB。不重算的路线在任何 CP 度下都放不下；分块 + 重算是前提。</p>
+<p><strong>7. 用 Ulysses 处理非整除序列。</strong> S=70、CP=4 时它直接报错。要么改用 ring，要么补 padding——而补 padding 会污染 softmax（padding 位置的分数不能参与归一化）。</p>
+<p><strong>8. 忽略在线 softmax 的数值边界。</strong> 一个块被完全掩码时 <code>rowmax = -inf</code>；若此时运行最大值还是初值 <code>-inf</code>，<code>exp(-inf - (-inf)) = NaN</code>。实现里必须把非有限的 <code>m</code> 归零。实测的 FP64 值差 8.9e-16 说明这条分支处理对了。</p>
+<hr />
+<h2 id="_13">自测题</h2>
+<details class="fold">
+<summary>1. CP=4、S=32768、Qwen3-8B 结构时，每 rank 的推理 KV 是多少？训练激活呢？</summary>
+<p>推理 KV = 2 × 36 层 × 8 kv_head × (32768/4) × 128 × 2 B = 1152 MiB/rank。
+训练激活（不重算）= 36 层 × (32 head × 8192 × 32768 × 2 B + 32 × 8192 × 128 × 2 B) ≈ 578.4 GiB/rank。
+两者相差 514 倍，而这个比值 = S / 6 ≈ S 的线性函数；它只与 S 有关，与 CP 无关。</p>
+</details>
+<details class="fold">
+<summary>2. 为什么 dQ 可以直接用 autograd，而 dK/dV 不行？</summary>
+<p>本 rank 的查询只由本 rank 的 Q 产生，所以 dQ 是局部的，autograd 沿着本地计算图就能得到正确值（实测误差 0.0）。而本 rank 的 K/V 块会被所有 rank 的查询用到——ring 里它被传了一圈，ulysses 里它被换维后共享——所以 dK/dV 是若干份局部贡献之和，必须跨 rank 归约。PyTorch 的 P2P 与 all_to_all 没有注册 autograd kernel，直接穿过去只会得到「把上游梯度原样搬回」的错误结果（实测误差 2.04/2.66）。</p>
+</details>
+<details class="fold">
+<summary>3. ring 与 ulysses 的通信量差多少？为什么？</summary>
+<p>CP=2、S=8192、Qwen3-8B 结构下 ring 是 16.0 MiB/rank，ulysses 是 256 MiB/rank，差 16 倍。
+ring 每轮只传 KV 块 <code>2·G·(S/CP)·D</code>，G=8；ulysses 每次 all-to-all 要搬全部 H=32 个头的隐藏状态 <code>S·H·D</code>，而且要搬两次。16 = (2 × 32) / (1 × 8) × &hellip; 用公式看：ring 总量 = (CP−1)·2·G·(S/CP)·D·2B，ulysses = 4·S·H·D·B，比值 = 2H·CP/((CP−1)·G) = 2×32×2/(1×8) = 16。</p>
+</details>
+<details class="fold">
+<summary>4. S=70、CP=4 时两条路各是什么结果？</summary>
+<p>ring 通过：段长 <code>[18, 18, 17, 17]</code>，值差 4.44e-16，3 轮通信。ulysses 直接报错：<code>S=70 不能被 CP=4 整除，Ulysses 需要等长分块</code>。这条限制不是实现偷懒——all-to-all 需要对等分块，补 padding 会让 padding 位置的分数进入 softmax，必须排除。所以非整除时 ring 是唯一选择。</p>
+</details>
+<details class="fold">
+<summary>5. 在线 softmax 里 `m` 的初值是 −inf，如果第一个键值块被完全掩码会发生什么？</summary>
+<p><code>rowmax(s) = −inf</code>，<code>m_new = max(−inf, −inf) = −inf</code>，于是 <code>exp(m − m_new) = exp(−inf − (−inf)) = exp(NaN) = NaN</code>，整个输出变成 NaN。修法是把非有限的 <code>m_new</code> 归零再算指数（此时 <code>alpha = exp(−inf − 0) = 0</code>，正确地把旧贡献清掉），并对 <code>p</code> 也做同样的有限性检查。</p>
+</details>
+<details class="fold">
+<summary>6. CP 能减少注意力的总 FLOPs 吗？</summary>
+<p>不能。完整的注意力是 <code>O(S²)</code>，切成 CP 份之后每 rank 算 <code>S/CP × S</code> 的分数矩阵，加起来还是 <code>S²</code>。CP 换到的是每卡显存和并行度。要减少 FLOPs 得靠 3.4 讲的稀疏（滑动窗口/sink）或线性 attention——而两者可以叠加：滑动窗口减 FLOPs，CP 分显存。</p>
+</details>
+<details class="fold">
+<summary>7. 为什么 CP=4 能跑通 S=32768 的前向，反向却 OOM？</summary>
+<p>前向只需要当前的分数矩阵，CP=4 时每 rank 是 <code>32 × 8192 × 32768 × 2B = 8 GiB</code>，一次分配放得下。反向要保存每一轮的分数矩阵用于计算梯度，ring 有 3 轮，就是 3 × 8 = 24 GiB，加上其他的就超出 44 GiB 卡。这说明 CP 把注意力矩阵按 1/CP 缩小，但没有改变它的 O(S²) 性质——要真正放下必须分块 + 重算。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L6/6.4-pd-disaggregation.html">&#8592; 6.4 PD 分离：KV cache 成为数据平面</a><a class="nav-next" href="../L7/7.0-autograd-anatomy.html">7.0 PyTorch autograd 引擎：反向图、调度与保存值 &#8594;</a></nav>
+</main>
+</body>
+</html>

@@ -1,0 +1,1204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.11 训练作业调度、性能诊断与规模决策</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">7.11</div>
+  <div class="sidebar-title">训练作业调度、性能诊断与规模决策</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型：完成计算不等于提交进度</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#_4">作业与数据进度的状态归属</a></li>
+<li><a href="#_5">三种准入策略的代价</a></li>
+<li><a href="#goodput">失败重放与 goodput</a></li>
+<li><a href="#step">时间线：共同 step 窗口与活动区间并集</a></li>
+<li><a href="#mfu">MFU 的公式与限制</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现：源码解析</a><ul>
+<li><a href="#torchtitan-profiler">TorchTitan 的真实 profiler 入口</a></li>
+<li><a href="#api">从进程 API 到可检查协议</a></li>
+<li><a href="#_7">分析器的时间窗口契约</a></li>
+<li><a href="#_8">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_9">工程实现：小进程与分析器</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_10">作业清单与环境契约</a></li>
+<li><a href="#_11">进程故障实测</a></li>
+<li><a href="#_12">真实事件与假设预算分开</a></li>
+</ul>
+</li>
+<li><a href="#711-i">完整教学项目：把实际成本汇总起来（7.11-I）</a></li>
+<li><a href="#_13">原始现场</a></li>
+<li><a href="#_14">前沿与规模决策</a><ul>
+<li><a href="#smollm3">SmolLM3 配方的预算账</a></li>
+<li><a href="#711-g">另三条公开流程的字段账（7.11-G）</a></li>
+</ul>
+</li>
+<li><a href="#_15">陷阱</a></li>
+<li><a href="#_16">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型：完成计算不等于提交进度</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#_4">作业与数据进度的状态归属</a></li>
+<li><a href="#_5">三种准入策略的代价</a></li>
+<li><a href="#goodput">失败重放与 goodput</a></li>
+<li><a href="#step">时间线：共同 step 窗口与活动区间并集</a></li>
+<li><a href="#mfu">MFU 的公式与限制</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现：源码解析</a><ul>
+<li><a href="#torchtitan-profiler">TorchTitan 的真实 profiler 入口</a></li>
+<li><a href="#api">从进程 API 到可检查协议</a></li>
+<li><a href="#_7">分析器的时间窗口契约</a></li>
+<li><a href="#_8">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_9">工程实现：小进程与分析器</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_10">作业清单与环境契约</a></li>
+<li><a href="#_11">进程故障实测</a></li>
+<li><a href="#_12">真实事件与假设预算分开</a></li>
+</ul>
+</li>
+<li><a href="#711-i">完整教学项目：把实际成本汇总起来（7.11-I）</a></li>
+<li><a href="#_13">原始现场</a></li>
+<li><a href="#_14">前沿与规模决策</a><ul>
+<li><a href="#smollm3">SmolLM3 配方的预算账</a></li>
+<li><a href="#711-g">另三条公开流程的字段账（7.11-G）</a></li>
+</ul>
+</li>
+<li><a href="#_15">陷阱</a></li>
+<li><a href="#_16">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L7 · 训练与后训练基础设施</div>
+  <div class="mod-id">7.11</div>
+  <h1>训练作业调度、性能诊断与规模决策</h1>
+  <p class="lede">训练作业的准入、rank/rendezvous、故障恢复、有效进度、训练 trace、MFU/内存/通信/I/O 诊断与资源预算。</p>
+  <div class="chips"><span class="chip">实测机器 本地 CPU（torch 2.14.0）· 分析对象为 7.1 在 crater 采集的实测插桩事件</span><span class="chip">前置 7.2（分片与并行）· 7.3（框架与配方）· 7.4（checkpoint 与容错）· 7.9（精度与优化器）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答的三个问题</h2>
+<ol>
+<li>worker 退出、慢 rank 或 checkpoint 未提交时，作业怎样恢复到一致的更新点？</li>
+<li>真实事件时间线、合成预算、MFU 和有效训练进度分别说明什么，分母从哪里来？</li>
+<li>怎样从数据、数值、并行与调度四个层次定位浪费，并做资源选择？</li>
+</ol>
+<hr />
+<h2 id="_2">心智模型：完成计算不等于提交进度</h2>
+<p>worker 处理过样本、learner 完成更新、checkpoint 对外可见，是三个不同事件。恢复以已提交的一致状态为准；失败区间可以重放，但对外统计的已提交样本不能重复计数。</p>
+<div class="diagram-scroll" role="region" aria-label="机制图，可横向滚动" tabindex="0" style="--diagram-min-width:820px">
+
+
+<svg viewBox="0 0 820 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="作业从启动到提交的状态归属，以及时间线与分母的关系">
+<rect width="820" height="330" rx="12" fill="#f1f5f9"/>
+<g font-family="system-ui,sans-serif" fill="#0f172a" text-anchor="middle">
+<rect x="20" y="24" width="180" height="58" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+<text x="110" y="48" font-size="15">启动 worker</text><text x="110" y="68" font-size="12">真实 PID、进度与 ACK</text>
+<rect x="220" y="24" width="190" height="58" rx="8" fill="#dcfce7" stroke="#15803d"/>
+<text x="315" y="48" font-size="15">收齐当前步 ACK</text><text x="315" y="68" font-size="12">候选状态，尚未提交</text>
+<rect x="430" y="24" width="370" height="58" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+<text x="615" y="48" font-size="15">原子发布 checkpoint 与 latest 指针</text>
+<text x="615" y="68" font-size="12">提交计数、已消费游标与模型状态一起可见</text>
+<text x="200" y="55" font-size="20">→</text><text x="410" y="55" font-size="20">→</text>
+<rect x="20" y="102" width="780" height="52" rx="8" fill="#fee2e2" stroke="#b91c1c"/>
+<text x="410" y="124" font-size="14">故障 / 进度超时 → 回收本次全部 worker → 从合法 latest 恢复 → 重放未提交样本</text>
+<text x="410" y="144" font-size="12">physical 计数可以重复，committed 计数不重复</text>
+<rect x="20" y="176" width="380" height="132" rx="8" fill="#fffbeb" stroke="#b45309"/>
+<text x="210" y="198" font-size="14" font-weight="600">时间线的三类口径</text>
+<text x="210" y="222" font-size="12">共同 step 窗口 T_window：协调者时钟的步边界</text>
+<text x="210" y="243" font-size="12">活动区间并集 T_covered：rank 真正忙的区间</text>
+<text x="210" y="264" font-size="12">最长局部跨度 T_local_max：只作诊断</text>
+<text x="210" y="288" font-size="12">MFU 分母只能用 T_window，用 T_local_max 会系统性高估</text>
+<rect x="420" y="176" width="380" height="132" rx="8" fill="#eef2ff" stroke="#4f46e5"/>
+<text x="610" y="198" font-size="14" font-weight="600">准入策略的三种取舍</text>
+<text x="610" y="222" font-size="12">FIFO：顺序准入，容量碎片会被浪费</text>
+<text x="610" y="243" font-size="12">整组准入 + 保守回填：填碎片但不推迟更早作业</text>
+<text x="610" y="264" font-size="12">抢占：高优先级作业零排队，代价是重放与重建</text>
+<text x="610" y="288" font-size="12">三者都要用同一套卡时账比较，不能用队列长度代替</text>
+</g></svg>
+
+
+</div>
+
+<p><strong>关键要点</strong>：</p>
+<ul>
+<li>提交点由 checkpoint 协议定义，不由"进程还在跑"或"已经算完一批"定义。</li>
+<li>MFU 的分母是共同 step 窗口。每个 rank 的局部活动跨度只是诊断量。</li>
+<li>准入策略的差别体现在同一作业集合的 makespan、空闲卡时与重放卡时上，需要一起报告。</li>
+</ul>
+<p>本章使用真实本机子进程检查 watchdog、ACK 和提交协议，用离散事件模拟比较准入策略，用已有实测插桩事件检验时间线口径。worker 内只计算确定性标量状态；不把该协议实验当作 NN 训练、NCCL 故障恢复或生产调度器测量。</p>
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="_4">作业与数据进度的状态归属</h3>
+<p>作业声明至少固定代码/环境版本、rank 拓扑、资源、数据版本、恢复入口、重试上限与超时策略。整组准入（gang admission）要让同步训练所需的 worker 一起满足资源条件；单个 rank 已启动而其它 rank 长期等待，通常不能形成有效训练进度。</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>owner</th>
+<th>提交/恢复原则</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PID、连接、进度时钟</td>
+<td>coordinator</td>
+<td>重启后重新建立，不从旧 PID 推断存活</td>
+</tr>
+<tr>
+<td>正在处理的 sample IDs</td>
+<td>worker / 数据分配器</td>
+<td>ACK 前后都可能失败，不能直接充当恢复游标</td>
+</tr>
+<tr>
+<td>参数、optimizer、scheduler、scaler</td>
+<td>learner</td>
+<td>必须属于同一逻辑更新点</td>
+</tr>
+<tr>
+<td>已提交游标与样本计数</td>
+<td>checkpoint 协议</td>
+<td>与模型状态一同发布</td>
+</tr>
+<tr>
+<td>rollout/teacher 请求 ID 和版本</td>
+<td>对应服务协议</td>
+<td>超时、重复回包与过期结果分别处理</td>
+</tr>
+</tbody>
+</table>
+<p>普通 torchrun/Elastic 能启动和重启 worker，应用仍负责 checkpoint 和数据一致性。Kueue/JobSet 这类编排组件负责的是配额、队列与整组准入，不是训练状态：它们能让"整组一起启动"成立，但不会替你保证 optimizer、RNG 和已消费数据已经恢复。</p>
+<h3 id="_5">三种准入策略的代价</h3>
+<p>在固定的 8 卡与作业集合上，三种策略给出不同的 makespan 与卡时账。作业集合是声明的合成假设：<code>J1-long-6cards</code>（6 卡、600 s、优先级 1、checkpoint 间隔 300 s）、<code>J2-low-4cards</code>（4 卡、300 s、优先级 0、间隔 100 s）、<code>J3-small-2cards</code>（2 卡、150 s、优先级 0、间隔 50 s，t=10 s 到达）、<code>J4-high-4cards</code>（4 卡、300 s、优先级 2、间隔 100 s，t=200 s 到达）。</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th style="text-align: right;">makespan</th>
+<th style="text-align: right;">忙碌卡时</th>
+<th style="text-align: right;">重放卡时</th>
+<th style="text-align: right;">空闲卡时</th>
+<th style="text-align: right;">利用率</th>
+<th style="text-align: right;">高优先级作业排队</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FIFO 顺序准入</td>
+<td style="text-align: right;">1050 s</td>
+<td style="text-align: right;">6300</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">2100</td>
+<td style="text-align: right;">0.750</td>
+<td style="text-align: right;">550 s</td>
+</tr>
+<tr>
+<td>整组准入 + 保守回填</td>
+<td style="text-align: right;">900 s</td>
+<td style="text-align: right;">6300</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">0.875</td>
+<td style="text-align: right;">400 s</td>
+</tr>
+<tr>
+<td>优先级抢占</td>
+<td style="text-align: right;">1100 s</td>
+<td style="text-align: right;">7500</td>
+<td style="text-align: right;">1200</td>
+<td style="text-align: right;">1300</td>
+<td style="text-align: right;">0.852</td>
+<td style="text-align: right;">0 s</td>
+</tr>
+</tbody>
+</table>
+<p>FIFO 让 2 卡的空闲容量一直等到长作业结束；保守回填把 J3 放进这 2 张卡，makespan 从 1050 s 降到 900 s。抢占把 J4 的排队时间压到 0，代价是 J1 在 t=200 s 被抢占时丢掉 200 s 工作（6 卡 × 200 s = 1200 卡秒），makespan 反而增长到 1100 s。抢占是否值得取决于高优先级作业的价值与 checkpoint 间隔：若 J1 的间隔是 100 s 而不是 300 s，同样在 t=200 s 被抢占时损失为 0。</p>
+<h3 id="goodput">失败重放与 goodput</h3>
+<p>设窗口中处理了 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>n</mi><mrow><mi>p</mi><mi>h</mi><mi>y</mi><mi>s</mi><mi>i</mi><mi>c</mi><mi>a</mi><mi>l</mi></mrow></msub></mrow></math></span> 个样本，新增提交 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>n</mi><mrow><mi>c</mi><mi>o</mi><mi>m</mi><mi>m</mi><mi>i</mi><mi>t</mi></mrow></msub></mrow></math></span> 个有效样本，墙钟时间为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math></span>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>t</mi><mi>h</mi><mi>r</mi><mi>o</mi><mi>u</mi><mi>g</mi><mi>h</mi><mi>p</mi><mi>u</mi><msub><mi>t</mi><mrow><mi>p</mi><mi>h</mi><mi>y</mi><mi>s</mi><mi>i</mi><mi>c</mi><mi>a</mi><mi>l</mi></mrow></msub><mo>&#x0003D;</mo><msub><mi>n</mi><mrow><mi>p</mi><mi>h</mi><mi>y</mi><mi>s</mi><mi>i</mi><mi>c</mi><mi>a</mi><mi>l</mi></mrow></msub><mo>&#x0002F;</mo><mi>T</mi><mo>&#x0002C;</mo><mspace width="2em" /><mi>g</mi><mi>o</mi><mi>o</mi><mi>d</mi><mi>p</mi><mi>u</mi><mi>t</mi><mo>&#x0003D;</mo><msub><mi>n</mi><mrow><mi>c</mi><mi>o</mi><mi>m</mi><mi>m</mi><mi>i</mi><mi>t</mi></mrow></msub><mo>&#x0002F;</mo><mi>T</mi><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>失败前完成但尚未提交的工作可能再次执行，因此 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>n</mi><mrow><mi>p</mi><mi>h</mi><mi>y</mi><mi>s</mi><mi>i</mi><mi>c</mi><mi>a</mi><mi>l</mi></mrow></msub><mo>&#x0003E;</mo><msub><mi>n</mi><mrow><mi>c</mi><mi>o</mi><mi>m</mi><mi>m</mi><mi>i</mi><mi>t</mi></mrow></msub></mrow></math></span> 是合法现象。两个计数都应保留。这里的 goodput 是已提交处理进度，不自动代表模型质量提升；数据重复、错误 mask、scaler 跳步或退化训练都可能让"忙碌"与有效学习脱节。</p>
+<p>本章协议先把完整候选 JSON 写入 <code>.pending</code>，通过同一文件系统的 rename 发布，再原子替换 latest 指针。coordinator 必须先收齐所有当前步 ACK。该实验验证进程故障下的可见性和重放，不验证掉电持久性、分布式文件系统的原子语义或 DCP 的内部协议。</p>
+<h3 id="step">时间线：共同 step 窗口与活动区间并集</h3>
+<p>同一 rank 的事件区间为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>I</mi><mi>i</mi></msub><mo>&#x0003D;</mo><mo stretchy="false">[</mo><msub><mi>s</mi><mi>i</mi></msub><mo>&#x0002C;</mo><msub><mi>e</mi><mi>i</mi></msub><mo stretchy="false">]</mo></mrow></math></span>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>T</mi><mrow><mi>s</mi><mi>p</mi><mi>a</mi><mi>n</mi></mrow></msub><mo>&#x0003D;</mo><msub><mo>max</mo><mi>i</mi></msub><msub><mi>e</mi><mi>i</mi></msub><mo>&#x02212;</mo><msub><mo>min</mo><mi>i</mi></msub><msub><mi>s</mi><mi>i</mi></msub><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>T</mi><mrow><mi>c</mi><mi>o</mi><mi>v</mi><mi>e</mi><mi>r</mi><mi>e</mi><mi>d</mi></mrow></msub><mo>&#x0003D;</mo><mrow><mo stretchy="true" fence="true" form="prefix">&#x0007C;</mo><msub><mo>&#x022C3;</mo><mi>i</mi></msub><msub><mi>I</mi><mi>i</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x0007C;</mo></mrow><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>compute=[0,10] ms、comm=[5,15] ms 时两类事件各 10 ms，但并集是 15 ms：把两者相加会把重叠的 5 ms 算两次。没有被事件覆盖的区间只能叫"未归因"，不能自动叫 dataloader 气泡。</p>
+<p>多 rank 时还要区分三个量。<strong>共同 step 窗口</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>T</mi><mrow><mi>w</mi><mi>i</mi><mi>n</mi><mi>d</mi><mi>o</mi><mi>w</mi></mrow></msub></mrow></math></span> 由协调者时钟的步边界定义，是同步训练真正的墙钟分母；<strong>活动区间并集</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>T</mi><mrow><mi>c</mi><mi>o</mi><mi>v</mi><mi>e</mi><mi>r</mi><mi>e</mi><mi>d</mi></mrow></msub></mrow></math></span> 是各 rank 真正在工作的区间；<strong>最长局部跨度</strong> <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>T</mi><mrow><mi>l</mi><mi>o</mi><mi>c</mi><mi>a</mi><mi>l</mi><mi>&#x0005F;</mi><mi>m</mi><mi>a</mi><mi>x</mi></mrow></msub></mrow></math></span> 只是单 rank 的诊断值。两个 rank 的活动错位时，"每个 rank 各自忙 100 ms"并不等于"这一步 100 ms"——本机构造的两 rank fixture 里，共同窗口是 190 ms，而最长局部跨度只有 100 ms，用后者当分母会把 MFU 从 6.54% 高估到 12.42%（1.9 倍）。所以分析器在缺少共同窗口时直接输出 <code>null</code>，不自行补一个分母。</p>
+<h3 id="mfu">MFU 的公式与限制</h3>
+<p>给定同一窗口内模型工作量的估计 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>F</mi><mrow><mi>m</mi><mi>o</mi><mi>d</mi><mi>e</mi><mi>l</mi></mrow></msub></mrow></math></span>、设备数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>N</mi></mrow></math></span>、对应 dtype/稀疏设置的单设备峰值 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mrow><mi>p</mi><mi>e</mi><mi>a</mi><mi>k</mi></mrow></msub></mrow></math></span> 和共同 step 窗口 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>T</mi><mrow><mi>w</mi><mi>i</mi><mi>n</mi><mi>d</mi><mi>o</mi><mi>w</mi></mrow></msub></mrow></math></span>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>M</mi><mi>F</mi><mi>U</mi><mo>&#x0003D;</mo><mfrac><mrow><msub><mi>F</mi><mrow><mi>m</mi><mi>o</mi><mi>d</mi><mi>e</mi><mi>l</mi></mrow></msub></mrow><mrow><mi>N</mi><msub><mi>P</mi><mrow><mi>p</mi><mi>e</mi><mi>a</mi><mi>k</mi></mrow></msub><msub><mi>T</mi><mrow><mi>w</mi><mi>i</mi><mi>n</mi><mi>d</mi><mi>o</mi><mi>w</mi></mrow></msub></mrow></mfrac><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>稠密 Transformer 常用 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>6</mn><mi>P</mi><mo>&#x000D7;</mo><mi>t</mi><mi>o</mi><mi>k</mi><mi>e</mi><mi>n</mi><mi>s</mi></mrow></math></span> 估计训练 FLOPs，全重算有时用额外 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>P</mi><mo>&#x000D7;</mo><mi>t</mi><mi>o</mi><mi>k</mi><mi>e</mi><mi>n</mi><mi>s</mi></mrow></math></span> 估计。它们省略部分 attention、embedding、非线性与具体重算结构，不能直接充当硬件计数器读数。HFU 若用估计的执行 FLOPs，必须标为估算；若声称实测硬件利用率，则需要对应计数器。</p>
+<p>padding token 参与计算但不一定参与 loss；teacher/critic、rollout 和 checkpoint 可能属于完整作业成本，却不在 learner 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>6</mn><mi>P</mi></mrow></math></span> 分子里。当设备峰值、FLOP 模型或共同窗口任一缺失时，本章分析器不输出 MFU 数值。</p>
+<hr />
+<h2 id="_6">工程实现：源码解析</h2>
+<h3 id="torchtitan-profiler">TorchTitan 的真实 profiler 入口</h3>
+<p>固定 TorchTitan <code>1c7ab808</code> 的 <code>torchtitan/observability/profiler.py:290</code> 是 <code>Profiler.build_torch_profiler</code>，根据配置创建并启动 profiler；<code>:285</code> 在训练推进时调用 profiler step。源码快照见文末原始现场。</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">358</span>         <span class="n">wait</span> <span class="o">=</span> <span class="n">profile_freq</span> <span class="o">-</span> <span class="p">(</span><span class="n">active</span> <span class="o">+</span> <span class="n">warmup</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">359</span>         <span class="n">activities</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CPU</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">360</span>         <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">361</span>             <span class="n">activities</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CUDA</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">362</span>         <span class="k">elif</span> <span class="n">torch</span><span class="o">.</span><span class="n">xpu</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">363</span>             <span class="n">activities</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">XPU</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">364</span> 
+<span class="linenos" aria-hidden="true">365</span>         <span class="n">torch_profiler</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">profile</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">366</span>             <span class="n">activities</span><span class="o">=</span><span class="n">activities</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">367</span>             <span class="n">schedule</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">schedule</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">368</span>                 <span class="n">wait</span><span class="o">=</span><span class="n">wait</span><span class="p">,</span> <span class="n">warmup</span><span class="o">=</span><span class="n">warmup</span><span class="p">,</span> <span class="n">active</span><span class="o">=</span><span class="n">active</span><span class="p">,</span> <span class="o">**</span><span class="n">additional_params</span>
+<span class="linenos" aria-hidden="true">369</span>             <span class="p">),</span>
+<span class="linenos" aria-hidden="true">370</span>             <span class="n">on_trace_ready</span><span class="o">=</span><span class="n">trace_handler</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">371</span>             <span class="n">record_shapes</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">372</span>         <span class="p">)</span>
+<span class="linenos" aria-hidden="true">373</span>         <span class="n">torch_profiler</span><span class="o">.</span><span class="fm">__enter__</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">374</span>         <span class="n">torch_profiler</span><span class="o">.</span><span class="n">step_num</span> <span class="o">=</span> <span class="n">global_step</span>
+</pre></div>
+<div class="srcref"><code>results/local/7.11/20260918-orchestration/source/torchtitan/profiler.py 第 358–374 行</code><a href="../code/results/local/7.11/20260918-orchestration/source/torchtitan/profiler.py.html#results-local-7-11-20260918-orchestration-source-torchtitan-profiler-py-L-358">在完整文件中打开 &rarr;</a></div></div>
+<p>这里按实际设备选择 activity，再用 wait/warmup/active schedule 采样。<code>record_shapes=True</code> 有助于把异常与形状关联；trace handler 管理输出。Profiler 采集本身有开销，稳定吞吐仍需独立未插桩基准。Trainer 调用链和状态归属见 <a href="7.3-training-frameworks.html">7.3</a>。</p>
+<h3 id="api">从进程 API 到可检查协议</h3>
+<p><code>training_job_simulator.py</code> 的 <code>ProcessCoordinator.start</code> 调用 <code>multiprocessing.get_context('spawn').Process.start()</code>，worker 首条 ready 消息返回真实 PID。<code>execute</code> 收集 progress/ACK，监控进程存活与 0.5 秒进度 deadline；<code>stop</code> 先发送 stop，再 join，必要时 terminate/kill，并确认所有创建过的子进程已退出。它不会扫描并终止其它作业的进程。</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 62</span>     <span class="k">def</span><span class="w"> </span><span class="nf">start</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 63</span>         <span class="k">for</span> <span class="n">rank</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">world_size</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 64</span>             <span class="n">parent</span><span class="p">,</span><span class="n">child</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">Pipe</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 65</span>             <span class="n">process</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">Process</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">worker</span><span class="p">,</span><span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">child</span><span class="p">,</span><span class="n">rank</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 66</span>             <span class="n">process</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 67</span>             <span class="n">child</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 68</span>             <span class="bp">self</span><span class="o">.</span><span class="n">processes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">process</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 69</span>             <span class="bp">self</span><span class="o">.</span><span class="n">all_processes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">process</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 70</span>             <span class="bp">self</span><span class="o">.</span><span class="n">connections</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">parent</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 71</span>             <span class="k">if</span> <span class="ow">not</span> <span class="n">parent</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 72</span>                 <span class="k">raise</span> <span class="ne">TimeoutError</span><span class="p">(</span><span class="s1">'worker did not become ready'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 73</span>             <span class="bp">self</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="s1">'spawn'</span><span class="p">,</span><span class="o">**</span><span class="p">{</span><span class="n">k</span><span class="p">:</span><span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span><span class="n">v</span> <span class="ow">in</span> <span class="n">parent</span><span class="o">.</span><span class="n">recv</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span><span class="o">!=</span><span class="s1">'kind'</span><span class="p">})</span>
+<span class="linenos" aria-hidden="true"> 74</span> 
+<span class="linenos" aria-hidden="true"> 75</span>     <span class="k">def</span><span class="w"> </span><span class="nf">stop</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 76</span>         <span class="k">for</span> <span class="n">conn</span><span class="p">,</span> <span class="n">process</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">connections</span><span class="p">,</span><span class="bp">self</span><span class="o">.</span><span class="n">processes</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 77</span>             <span class="k">if</span> <span class="n">process</span><span class="o">.</span><span class="n">is_alive</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 78</span>                 <span class="k">try</span><span class="p">:</span><span class="n">conn</span><span class="o">.</span><span class="n">send</span><span class="p">({</span><span class="s1">'op'</span><span class="p">:</span><span class="s1">'stop'</span><span class="p">})</span>
+<span class="linenos" aria-hidden="true"> 79</span>                 <span class="k">except</span> <span class="p">(</span><span class="ne">BrokenPipeError</span><span class="p">,</span><span class="ne">EOFError</span><span class="p">,</span><span class="ne">OSError</span><span class="p">):</span><span class="k">pass</span>
+<span class="linenos" aria-hidden="true"> 80</span>         <span class="k">for</span> <span class="n">conn</span><span class="p">,</span><span class="n">process</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">connections</span><span class="p">,</span><span class="bp">self</span><span class="o">.</span><span class="n">processes</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 81</span>             <span class="n">process</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="mf">.2</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 82</span>             <span class="n">terminated</span> <span class="o">=</span> <span class="kc">False</span>
+<span class="linenos" aria-hidden="true"> 83</span>             <span class="k">if</span> <span class="n">process</span><span class="o">.</span><span class="n">is_alive</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 84</span>                 <span class="n">process</span><span class="o">.</span><span class="n">terminate</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 85</span>                 <span class="n">terminated</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="linenos" aria-hidden="true"> 86</span>                 <span class="n">process</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="mf">1.</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 87</span>             <span class="k">if</span> <span class="n">process</span><span class="o">.</span><span class="n">is_alive</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 88</span>                 <span class="n">process</span><span class="o">.</span><span class="n">kill</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 89</span>                 <span class="n">process</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="mf">1.</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 90</span>             <span class="bp">self</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="s1">'reaped'</span><span class="p">,</span><span class="n">pid</span><span class="o">=</span><span class="n">process</span><span class="o">.</span><span class="n">pid</span><span class="p">,</span><span class="n">exit_code</span><span class="o">=</span><span class="n">process</span><span class="o">.</span><span class="n">exitcode</span><span class="p">,</span><span class="n">terminated</span><span class="o">=</span><span class="n">terminated</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 91</span>             <span class="k">assert</span> <span class="ow">not</span> <span class="n">process</span><span class="o">.</span><span class="n">is_alive</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 92</span>             <span class="n">conn</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 93</span>         <span class="bp">self</span><span class="o">.</span><span class="n">connections</span><span class="o">=</span><span class="p">[]</span>
+<span class="linenos" aria-hidden="true"> 94</span>         <span class="bp">self</span><span class="o">.</span><span class="n">processes</span><span class="o">=</span><span class="p">[]</span>
+<span class="linenos" aria-hidden="true"> 95</span> 
+<span class="linenos" aria-hidden="true"> 96</span>     <span class="k">def</span><span class="w"> </span><span class="nf">publish</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span><span class="n">state</span><span class="p">,</span><span class="n">interrupt</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 97</span>         <span class="n">payload</span><span class="o">=</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">state</span><span class="p">,</span><span class="n">sort_keys</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">encode</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 98</span>         <span class="n">pending</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="o">/</span><span class="sa">f</span><span class="s2">"step-</span><span class="si">{</span><span class="n">state</span><span class="p">[</span><span class="s1">'step'</span><span class="p">]</span><span class="si">}</span><span class="s2">.pending"</span>
+<span class="linenos" aria-hidden="true"> 99</span>         <span class="n">pending</span><span class="o">.</span><span class="n">write_bytes</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">100</span>         <span class="k">if</span> <span class="n">interrupt</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">101</span>             <span class="bp">self</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="s1">'publication_interrupted'</span><span class="p">,</span><span class="n">step</span><span class="o">=</span><span class="n">state</span><span class="p">[</span><span class="s1">'step'</span><span class="p">],</span><span class="n">pending_bytes</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">102</span>             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s1">'checkpoint not published'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">103</span>         <span class="n">committed</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="o">/</span><span class="sa">f</span><span class="s2">"step-</span><span class="si">{</span><span class="n">state</span><span class="p">[</span><span class="s1">'step'</span><span class="p">]</span><span class="si">}</span><span class="s2">.json"</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/training_job_simulator.py 第 62–103 行</code><a href="../code/labs/L7/training_job_simulator.py.html#labs-L7-training_job_simulator-py-L-62">在完整文件中打开 &rarr;</a></div></div>
+<p>发布协议只写 <code>.pending</code>、rename 到正式文件、原子替换 latest 指针三步；失败注入在 rename 之前抛出，保证未完成的 checkpoint 不会被 latest 选中。</p>
+<h3 id="_7">分析器的时间窗口契约</h3>
+<p><code>training_trace_analysis.py</code> 的 <code>analyze_events</code> 先校验输入来源类型与时间有限性，再逐 rank 计算跨度、并集与未归因区间。只有当输入提供 <code>step_window</code>（协调者时钟的 <code>start_ms</code>/<code>end_ms</code>）时，才用它作 MFU 分母；事件落在窗口之外、窗口短于任何 rank 的局部活动跨度都会直接报错。</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">239</span> <span class="k">def</span><span class="w"> </span><span class="nf">analyze_events</span><span class="p">(</span><span class="n">payload</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">240</span> <span class="w">    </span><span class="sd">"""按明确的共同 step 窗口分析事件；没有窗口时不给 MFU 分母。</span>
+<span class="linenos" aria-hidden="true">241</span> 
+<span class="linenos" aria-hidden="true">242</span> <span class="sd">    每个 rank 的局部跨度只作诊断：同步训练的全局关键路径由共同 step 边界</span>
+<span class="linenos" aria-hidden="true">243</span> <span class="sd">    （或显式的跨 rank 观测窗口）决定，最长局部跨度会系统性低估它。</span>
+<span class="linenos" aria-hidden="true">244</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true">245</span>     <span class="k">if</span> <span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'source_kind'</span><span class="p">)</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">'measured'</span><span class="p">,</span><span class="s1">'measured_instrumented'</span><span class="p">,</span><span class="s1">'author_log'</span><span class="p">,</span><span class="s1">'synthetic_fixture'</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">246</span>         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'event input requires an explicit measured/author source kind'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">247</span>     <span class="n">events</span><span class="o">=</span><span class="n">payload</span><span class="p">[</span><span class="s1">'events'</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">248</span>     <span class="k">if</span> <span class="ow">not</span> <span class="n">events</span><span class="p">:</span><span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'empty event list'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">249</span>     <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="ow">not</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="n">k</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">'start_ms'</span><span class="p">,</span><span class="s1">'end_ms'</span><span class="p">)):</span>
+<span class="linenos" aria-hidden="true">250</span>         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'event times must be finite'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">251</span> 
+<span class="linenos" aria-hidden="true">252</span>     <span class="n">ranks</span><span class="o">=</span><span class="p">{}</span>
+<span class="linenos" aria-hidden="true">253</span>     <span class="k">for</span> <span class="n">rank</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">({</span><span class="n">e</span><span class="p">[</span><span class="s1">'rank'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">}):</span>
+<span class="linenos" aria-hidden="true">254</span>         <span class="n">own</span><span class="o">=</span><span class="p">[</span><span class="n">e</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span> <span class="k">if</span> <span class="n">e</span><span class="p">[</span><span class="s1">'rank'</span><span class="p">]</span><span class="o">==</span><span class="n">rank</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">255</span>         <span class="n">span</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span><span class="p">)</span><span class="o">-</span><span class="nb">min</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">256</span>         <span class="n">busy</span><span class="o">=</span><span class="n">interval_union</span><span class="p">([(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">257</span>         <span class="n">categories</span><span class="o">=</span><span class="p">{</span><span class="n">key</span><span class="p">:</span><span class="n">interval_union</span><span class="p">([(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span> <span class="k">if</span> <span class="n">e</span><span class="p">[</span><span class="s1">'category'</span><span class="p">]</span><span class="o">==</span><span class="n">key</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">258</span>                     <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">({</span><span class="n">e</span><span class="p">[</span><span class="s1">'category'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span><span class="p">})}</span>
+<span class="linenos" aria-hidden="true">259</span>         <span class="n">ranks</span><span class="p">[</span><span class="nb">str</span><span class="p">(</span><span class="n">rank</span><span class="p">)]</span><span class="o">=</span><span class="p">{</span><span class="s1">'wall_span_ms'</span><span class="p">:</span><span class="n">span</span><span class="p">,</span><span class="s1">'union_covered_ms'</span><span class="p">:</span><span class="n">busy</span><span class="p">,</span><span class="s1">'unattributed_ms'</span><span class="p">:</span><span class="n">span</span><span class="o">-</span><span class="n">busy</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">260</span>                           <span class="s1">'category_union_ms'</span><span class="p">:</span><span class="n">categories</span><span class="p">,</span><span class="s1">'category_sums_may_overlap'</span><span class="p">:</span><span class="kc">True</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">261</span> 
+<span class="linenos" aria-hidden="true">262</span>     <span class="n">max_local_span</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="s1">'wall_span_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">ranks</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">263</span>     <span class="n">observed_start</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">264</span>     <span class="n">observed_end</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">265</span>     <span class="n">observed_span</span><span class="o">=</span><span class="n">observed_end</span><span class="o">-</span><span class="n">observed_start</span>
+<span class="linenos" aria-hidden="true">266</span>     <span class="n">covered_all</span><span class="o">=</span><span class="n">interval_union</span><span class="p">([(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">267</span> 
+<span class="linenos" aria-hidden="true">268</span>     <span class="n">window</span><span class="o">=</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'step_window'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">269</span>     <span class="n">window_ms</span><span class="o">=</span><span class="kc">None</span>
+<span class="linenos" aria-hidden="true">270</span>     <span class="n">window_union</span><span class="o">=</span><span class="kc">None</span>
+<span class="linenos" aria-hidden="true">271</span>     <span class="n">window_unattributed</span><span class="o">=</span><span class="kc">None</span>
+<span class="linenos" aria-hidden="true">272</span>     <span class="k">if</span> <span class="n">window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">273</span>         <span class="n">start</span><span class="p">,</span><span class="n">end</span><span class="o">=</span><span class="n">window</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">window</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">274</span>         <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">start</span><span class="p">)</span> <span class="ow">and</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">end</span><span class="p">))</span> <span class="ow">or</span> <span class="n">end</span><span class="o">&lt;=</span><span class="n">start</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">275</span>             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'step_window must be a finite increasing interval'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">276</span>         <span class="n">window_ms</span><span class="o">=</span><span class="n">end</span><span class="o">-</span><span class="n">start</span>
+<span class="linenos" aria-hidden="true">277</span>         <span class="k">if</span> <span class="n">window_ms</span> <span class="o">&lt;</span> <span class="n">max_local_span</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">278</span>             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'provided step_window is shorter than a rank-local activity span'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">279</span>         <span class="n">outside</span><span class="o">=</span><span class="p">[</span><span class="n">e</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span> <span class="k">if</span> <span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">]</span><span class="o">&lt;</span><span class="n">start</span> <span class="ow">or</span> <span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">]</span><span class="o">&gt;</span><span class="n">end</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">280</span>         <span class="k">if</span> <span class="n">outside</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">281</span>             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'events fall outside the declared common step window'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">282</span>         <span class="n">window_union</span><span class="o">=</span><span class="n">interval_union</span><span class="p">(</span><span class="n">clip_intervals</span><span class="p">([(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">],(</span><span class="n">start</span><span class="p">,</span><span class="n">end</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true">283</span>         <span class="n">window_unattributed</span><span class="o">=</span><span class="n">window_ms</span><span class="o">-</span><span class="n">window_union</span>
+<span class="linenos" aria-hidden="true">284</span> 
+<span class="linenos" aria-hidden="true">285</span>     <span class="n">flops</span><span class="o">=</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'model_flops_per_step_estimate'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">286</span>     <span class="n">peak</span><span class="o">=</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'peak_tflops_per_device'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">287</span>     <span class="n">devices</span><span class="o">=</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'num_devices'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">288</span>     <span class="n">inputs_present</span><span class="o">=</span><span class="nb">all</span><span class="p">(</span><span class="n">x</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">(</span><span class="n">flops</span><span class="p">,</span><span class="n">peak</span><span class="p">,</span><span class="n">devices</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">289</span>     <span class="k">if</span> <span class="n">inputs_present</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">290</span>         <span class="k">if</span> <span class="n">flops</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">peak</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">devices</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">291</span>             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'invalid FLOP, peak or device count'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">292</span> 
+<span class="linenos" aria-hidden="true">293</span>     <span class="k">def</span><span class="w"> </span><span class="nf">mfu_for</span><span class="p">(</span><span class="n">denominator_ms</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">294</span>         <span class="k">if</span> <span class="ow">not</span> <span class="n">inputs_present</span> <span class="ow">or</span> <span class="n">denominator_ms</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">denominator_ms</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">295</span>             <span class="k">return</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">296</span>         <span class="k">return</span> <span class="mf">100.0</span><span class="o">*</span><span class="n">flops</span><span class="o">/</span><span class="p">(</span><span class="n">peak</span><span class="o">*</span><span class="mf">1e12</span><span class="o">*</span><span class="n">devices</span><span class="o">*</span><span class="n">denominator_ms</span><span class="o">/</span><span class="mf">1000.0</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/training_trace_analysis.py 第 239–296 行</code><a href="../code/labs/L7/training_trace_analysis.py.html#labs-L7-training_trace_analysis-py-L-239">在完整文件中打开 &rarr;</a></div></div>
+<h3 id="_8">设计取舍</h3>
+<p>父进程集中提交容易检查一致性，但父进程自身的高可用是另一项任务。短 deadline 能快速发现无进展，也容易把正常慢步骤当故障，应按实际工作分布设定。同步全组恢复降低状态组合复杂度，却会重复计算已完成但未提交的工作。把"最长局部跨度"当全局窗口会让 MFU 好看而失去意义，因此宁可返回 <code>null</code>。异步 teacher/reward 服务还需独立的请求去重与版本协议；本章的超时用子进程内延迟模拟，没有调用真实远程服务。</p>
+<hr />
+<h2 id="_9">工程实现：小进程与分析器</h2>
+<p><code>training_job_simulator.py</code> 的 worker 将收到的 sample IDs 求和加入标量状态；两 rank 每步各处理两个 ID，共两步。第二步注入一次故障，随后从 latest 恢复重试。检查器断言最终 committed IDs 为 0–7、rank states 为 <code>[10,18]</code>，并保留所有 physical IDs。</p>
+<p><code>training_job_manifest.py</code> 声明合法作业（6 节点 × 8 卡 = 48 rank）并推导 rank → 环境变量映射，同时用五个反例检查非法配置。<code>training_scheduling_budget.py</code> 输出准入策略对照与公开配方预算账。<code>training_trace_analysis.py</code> 必须显式选择 <code>--input</code>、<code>--cross-rank-demo</code> 或 <code>--synthetic-demo</code> 之一。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<p><code>$RUN_DIR</code> 为学习盘上新实验的父目录；本机临时目录遵循 <code>ENVIRONMENTS.md</code>，模拟器的临时工作区默认写外置盘的 <code>scratch/</code>。</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L7/training_job_manifest.py<span class="w"> </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/job-manifest"</span>
+python<span class="w"> </span>labs/L7/training_job_simulator.py<span class="w">  </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/jobs"</span>
+python<span class="w"> </span>labs/L7/training_scheduling_budget.py<span class="w"> </span>--section<span class="w"> </span>admission<span class="w"> </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/admission"</span>
+python<span class="w"> </span>labs/L7/training_scheduling_budget.py<span class="w"> </span>--section<span class="w"> </span>budget<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--yaml-dir<span class="w"> </span>results/local/7.11/&lt;run&gt;/source/smollm3<span class="w"> </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/budget"</span>
+python<span class="w"> </span>labs/L7/training_trace_analysis.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--input<span class="w"> </span>results/crater/7.1/20260914-review-fixes/diagnostics-v2/training_trace_events.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/trace-measured"</span>
+python<span class="w"> </span>labs/L7/training_trace_analysis.py<span class="w"> </span>--cross-rank-demo<span class="w"> </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/trace-cross-rank"</span>
+python<span class="w"> </span>labs/L7/training_trace_analysis.py<span class="w"> </span>--synthetic-demo<span class="w"> </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/budget-demo"</span>
+</code></pre></div>
+
+<p>教学项目的成本账直接从各阶段的运行目录汇总（需要先完成 7.8/7.1/7.5）：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">RUN</span><span class="o">=</span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/teaching-lm"</span>
+bash<span class="w"> </span>labs/L7/run_teaching_lm.sh<span class="w"> </span>cost<span class="w">     </span><span class="c1"># -&gt; $RUN/cost/cost.json</span>
+</code></pre></div>
+
+<h3 id="_10">作业清单与环境契约</h3>
+<p>合法清单一次完整流转：<code>PENDING → ADMITTED → INITIALIZING → RUNNING → FAILED_TRANSIENT → RESTARTING → RESUMING → RUNNING → COMPLETED</code>，world_size=48，rank 0 与 rank 47 的环境分别是 <code>RANK=0/LOCAL_RANK=0</code> 与 <code>RANK=47/LOCAL_RANK=7</code>。五个反例各自停在校验阶段并给出具体原因：节点数为 0、每节点 3 卡、未知 rendezvous 后端、缺恢复目录、<code>--nproc_per_node</code> 与资源声明不一致。</p>
+<h3 id="_11">进程故障实测</h3>
+<table>
+<thead>
+<tr>
+<th>注入</th>
+<th style="text-align: right;">恢复次数</th>
+<th style="text-align: right;">physical ID 数</th>
+<th style="text-align: right;">重复数</th>
+<th>最终提交</th>
+<th>存活子进程</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>子进程 exit(17)</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">2</td>
+<td>0–7</td>
+<td>无</td>
+</tr>
+<tr>
+<td>rank 无进展超时</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">2</td>
+<td>0–7</td>
+<td>无</td>
+</tr>
+<tr>
+<td>非法 batch</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">2</td>
+<td>0–7</td>
+<td>无</td>
+</tr>
+<tr>
+<td>checkpoint 发布前中断</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">4</td>
+<td>0–7</td>
+<td>无</td>
+</tr>
+<tr>
+<td>mock reward 超时</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">2</td>
+<td>0–7</td>
+<td>无</td>
+</tr>
+<tr>
+<td>mock teacher 超时</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">2</td>
+<td>0–7</td>
+<td>无</td>
+</tr>
+</tbody>
+</table>
+<p>发布中断时所有 worker 已 ACK，所以两个 rank 的未提交工作都会重放，重复数为 4；其它故障只重放已 ACK 的部分。未 ACK 的真实计算不能凭空恢复计数，因此 physical 字段的观测边界也需明确。</p>
+<h3 id="_12">真实事件与假设预算分开</h3>
+<p>RTX 5090 D、SmolLM2-360M、FP32 第二次更新的插桩事件跨度为 <strong>134.8905 ms</strong>（forward 41.5728 ms、backward/unscale 62.6010 ms、diagnostics/optimizer 30.7167 ms），三个区间在该采集协议下相邻，并集等于跨度、未归因为 0 ms。这份输入没有共同 step 窗口，也没有设备峰值，因此 MFU 输出 <code>null</code>，不做任何分母假设。</p>
+<p><code>--synthetic-demo</code> 的 3B、64 设备、阶段时长都是预算假设，例中 1285 ms 与 MFU=46.41% 来自这些常量的算式，不是 64 张 H100 的运行结果。<code>--cross-rank-demo</code> 是专门暴露口径错误的构造：局部跨度 100 ms、共同窗口 190 ms、并集 180 ms、窗口内未归因 10 ms。</p>
+<hr />
+<h2 id="711-i">完整教学项目：把实际成本汇总起来（7.11-I）</h2>
+<p>I 任务要求把各教学项目从数据准备到部署的实际时间、峰值与存储汇总，并用 pilot 预测与实际预算对照。<code>labs/L7/teaching_cost_report.py</code> 读各阶段的 <code>run.json</code> 与目录字节，输出一张表；GPU 小时按单卡墙钟折算，不把 CPU 数据准备混进去。</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th style="text-align: right;">step</th>
+<th style="text-align: right;">有效 token</th>
+<th style="text-align: right;">墙钟 s</th>
+<th style="text-align: right;">GPU 小时</th>
+<th style="text-align: right;">峰值 MiB</th>
+<th style="text-align: right;">checkpoint 字节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>预训练（6000 步）</td>
+<td style="text-align: right;">6000</td>
+<td style="text-align: right;">98,112,000</td>
+<td style="text-align: right;">486.6</td>
+<td style="text-align: right;">0.1352</td>
+<td style="text-align: right;">8633</td>
+<td style="text-align: right;">2,163,400,150</td>
+</tr>
+<tr>
+<td>SFT（900 步）</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">5,823,900</td>
+<td style="text-align: right;">62.4</td>
+<td style="text-align: right;">0.0173</td>
+<td style="text-align: right;">4351</td>
+<td style="text-align: right;">1,888,057,472</td>
+</tr>
+<tr>
+<td>pilot（预算测算）</td>
+<td style="text-align: right;">200</td>
+<td style="text-align: right;">3,270,400</td>
+<td style="text-align: right;">17.5</td>
+<td style="text-align: right;">0.0049</td>
+<td style="text-align: right;">8633</td>
+<td style="text-align: right;">1,612,719,406</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"><strong>566.5</strong></td>
+<td style="text-align: right;"><strong>0.1574</strong></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"><strong>5,664,177,028</strong></td>
+</tr>
+</tbody>
+</table>
+<p>三件事只有分开记才看得见：</p>
+<ol>
+<li><strong>"有效 token"必须按阶段换分母。</strong> 预训练报的是 next-token target（98,112,000），SFT 报的是回答 token（5,823,900）；把 SFT 的 3.87M 输入 token 当分母会虚高约 1.7 倍。</li>
+<li><strong>峰值由常驻状态决定，不随阶段线性变化。</strong> 预训练 8633 MiB 几乎全程恒定；SFT 只有 4351 MiB，因为模型相同而序列更短、batch 更小。按"训练越长显存越高"估算会估错方向。</li>
+<li><strong>checkpoint 字节和计算量不是一回事。</strong> 预训练 6000 步产生 2.16 GB（<code>last.pt</code> 786.7 MB + <code>best.pt</code> 275.3 MB + 4 个快照），SFT 900 步产生 1.89 GB——步数少 6.7 倍，字节只少 13%，因为每个 checkpoint 的大小由参数量决定。</li>
+</ol>
+<p>预算对照：pilot 用 200 步预测 98.3M token 的主运行约 8.2 分钟，实际 8.11 分钟，误差 1.1%；两阶段合计 0.1525 GPU 小时，只有规划上限 12 小时的 1.3%。<strong>这不是"预算定得太松"，而是教学项目的规模本来就让预算剩很多</strong>：共同任务把文本预训练定在 20M–100M token，6000 步正好落在上沿；剩下的额度按计划留给后训练分支（LoRA/DPO、蒸馏、RL）与视觉适配，各自的预算单列。</p>
+<p>数据侧：7.8-I 的两份产品共 182,743,762 B（171 MB），其中预训练分片 171 MB、SFT 张量 11.5 MB；准备时间 CPU 约 2 分钟 + 14 秒。检查点 5.66 GB 全部留在学习盘，进仓库的只有 <code>manifest.json</code>、<code>run.json</code>、<code>metrics.jsonl</code> 与生成样例（合计约 1.5 MB）。</p>
+<p>还有一项没有计入：被 <code>SIGKILL</code> 打断的那次运行（<a href="7.4-data-ckpt-fault.html">7.4-H</a>）耗掉 15 s、恢复后重放约 54 步。它的 <code>run.json</code> 只记录恢复进程的 55.98 s，被杀进程的 15 s 不在其中——<strong>按 <code>run.json</code> 求和会漏掉失败重跑的成本</strong>，这正是为什么表里单独列 pilot 而把失败重跑写在正文。</p>
+<hr />
+<h2 id="_13">原始现场</h2>
+<table>
+<thead>
+<tr>
+<th>材料</th>
+<th>位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>本次全部命令、工件说明与来源</td>
+<td><a href="../raw/results/local/7.11/20260918-orchestration/manifest.json">manifest.json</a></td>
+</tr>
+<tr>
+<td>作业清单、rank 环境与五类非法配置</td>
+<td><a href="../raw/results/local/7.11/20260918-orchestration/job-manifest/job_manifest_simulation.json">job_manifest_simulation.json</a></td>
+</tr>
+<tr>
+<td>六类进程故障、PID、ACK 与重放记录</td>
+<td><a href="../raw/results/local/7.11/20260918-orchestration/jobs/training_job_simulation_recovery.json">training_job_simulation_recovery.json</a></td>
+</tr>
+<tr>
+<td>准入策略对照与逐次放置</td>
+<td><a href="../raw/results/local/7.11/20260918-orchestration/admission/scheduling_budget.json">scheduling_budget.json</a></td>
+</tr>
+<tr>
+<td>SmolLM3 配方预算账</td>
+<td><a href="../raw/results/local/7.11/20260918-orchestration/budget/scheduling_budget.json">scheduling_budget.json</a></td>
+</tr>
+<tr>
+<td>三条公开流程的字段账（7.11-G）</td>
+<td><a href="../raw/results/local/7.11/20260923-public-flows/public_flows.json">public_flows.json</a>（<a href="../raw/results/local/7.11/20260923-public-flows/manifest.json">口径</a>、配置快照 <code>results/local/7.11/20260923-public-flows/source/</code>）</td>
+</tr>
+<tr>
+<td>实测插桩事件的再分析</td>
+<td><a href="../raw/results/local/7.11/20260918-orchestration/analyzer-measured/training_trace_metrics.json">training_trace_metrics.json</a></td>
+</tr>
+<tr>
+<td>共同窗口构造与错误分母对照</td>
+<td><a href="../raw/results/local/7.11/20260918-orchestration/analyzer-cross-rank/training_trace_metrics.json">training_trace_metrics.json</a>、<a href="../raw/results/local/7.11/20260918-orchestration/analyzer-cross-rank/cross_rank_fixture.json">cross_rank_fixture.json</a></td>
+</tr>
+<tr>
+<td>SmolLM3 三份 Nanotron YAML 快照</td>
+<td><code>results/local/7.11/20260918-orchestration/source/smollm3/</code></td>
+</tr>
+<tr>
+<td>TorchTitan profiler 源码快照</td>
+<td><code>results/local/7.11/20260918-orchestration/source/torchtitan/profiler.py</code></td>
+</tr>
+<tr>
+<td>教学项目成本账</td>
+<td><a href="../raw/results/crater/7.11/20260922-teaching-cost/cost.json">cost.json</a>（<a href="../raw/results/crater/7.11/20260922-teaching-cost/pilot-run.json">pilot</a>、<a href="../raw/results/crater/7.11/20260922-teaching-cost/pretrain-run.json">预训练</a>、<a href="../raw/results/crater/7.11/20260922-teaching-cost/sft-run.json">SFT</a>）</td>
+</tr>
+</tbody>
+</table>
+<details class="fold srcfold"><summary>labs/L7/training_trace_analysis.py 全文（389 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true">  3</span> <span class="sd">labs/L7/training_trace_analysis.py</span>
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">显式事件时间线分析与合成预算示例。</span>
+<span class="linenos" aria-hidden="true">  5</span> 
+<span class="linenos" aria-hidden="true">  6</span> <span class="sd">针对分布式训练步执行时间线进行深度剖析：</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="sd">1. 分解训练步关键路径分段：</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">   - 数据加载排队气泡 (Data Loading Bubble)</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="sd">   - 前向矩阵乘与注意力 (Forward GEMM &amp; Attention)</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="sd">   - 激活重算开销 (Activation Recompute)</span>
+<span class="linenos" aria-hidden="true"> 11</span> <span class="sd">   - 反向梯度计算 (Backward GEMM)</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">   - 集合通信等待 (NCCL AllGather / ReduceScatter / Barrier)</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="sd">   - 优化器更新与参数裁切 (Optimizer Step &amp; Grad Clip)</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="sd">   - 异步快照暂存 (In-Memory Checkpoint Staging)</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="sd">2. 计算 MFU (Model FLOPs Utilization) 与 HFU (Hardware FLOPs Utilization):</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="sd">   - MFU = (6 * Params * Tokens_per_step) / (Peak_TFLOPs * Step_Time)</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="sd">   - 合成示例的执行 FLOP 占比来自 6P/8P 近似，不是硬件计数器 HFU。</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="sd">3. 自动化瓶颈模式识别与优化诊断：</span>
+<span class="linenos" aria-hidden="true"> 19</span> <span class="sd">   - 通信受限 (Communication-Bound / Network Straggler)</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="sd">   - 供数饥饿 (Input-Bound / Disk I/O Throttling)</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="sd">   - 慢节点倾斜 (Straggler Node Skew)</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 23</span> 
+<span class="linenos" aria-hidden="true"> 24</span> <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos" aria-hidden="true"> 25</span> <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos" aria-hidden="true"> 27</span> <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">asdict</span><span class="p">,</span> <span class="n">dataclass</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span>
+<span class="linenos" aria-hidden="true"> 31</span> 
+<span class="linenos" aria-hidden="true"> 32</span> 
+<span class="linenos" aria-hidden="true"> 33</span> <span class="nd">@dataclass</span>
+<span class="linenos" aria-hidden="true"> 34</span> <span class="k">class</span><span class="w"> </span><span class="nc">RankTraceTimeline</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 35</span>     <span class="n">rank_id</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos" aria-hidden="true"> 36</span>     <span class="n">data_loading_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 37</span>     <span class="n">forward_gemm_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 38</span>     <span class="n">forward_attn_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 39</span>     <span class="n">recompute_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 40</span>     <span class="n">backward_gemm_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 41</span>     <span class="n">backward_attn_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 42</span>     <span class="n">comm_wait_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 43</span>     <span class="n">optimizer_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 44</span>     <span class="n">ckpt_staging_ms</span><span class="p">:</span> <span class="nb">float</span>
+<span class="linenos" aria-hidden="true"> 45</span> 
+<span class="linenos" aria-hidden="true"> 46</span>     <span class="nd">@property</span>
+<span class="linenos" aria-hidden="true"> 47</span>     <span class="k">def</span><span class="w"> </span><span class="nf">total_step_time_ms</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 48</span>         <span class="k">return</span> <span class="p">(</span>
+<span class="linenos" aria-hidden="true"> 49</span>             <span class="bp">self</span><span class="o">.</span><span class="n">data_loading_ms</span>
+<span class="linenos" aria-hidden="true"> 50</span>             <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_gemm_ms</span>
+<span class="linenos" aria-hidden="true"> 51</span>             <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_attn_ms</span>
+<span class="linenos" aria-hidden="true"> 52</span>             <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">recompute_ms</span>
+<span class="linenos" aria-hidden="true"> 53</span>             <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">backward_gemm_ms</span>
+<span class="linenos" aria-hidden="true"> 54</span>             <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">backward_attn_ms</span>
+<span class="linenos" aria-hidden="true"> 55</span>             <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">comm_wait_ms</span>
+<span class="linenos" aria-hidden="true"> 56</span>             <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">optimizer_ms</span>
+<span class="linenos" aria-hidden="true"> 57</span>             <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">ckpt_staging_ms</span>
+<span class="linenos" aria-hidden="true"> 58</span>         <span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 59</span> 
+<span class="linenos" aria-hidden="true"> 60</span> 
+<span class="linenos" aria-hidden="true"> 61</span> <span class="nd">@dataclass</span>
+<span class="linenos" aria-hidden="true"> 62</span> <span class="k">class</span><span class="w"> </span><span class="nc">ModelWorkloadSpec</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 63</span>     <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span>
+<span class="linenos" aria-hidden="true"> 64</span>     <span class="n">num_params</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos" aria-hidden="true"> 65</span>     <span class="n">tokens_per_step</span><span class="p">:</span> <span class="nb">int</span>
+<span class="linenos" aria-hidden="true"> 66</span>     <span class="n">has_activation_recompute</span><span class="p">:</span> <span class="nb">bool</span>
+<span class="linenos" aria-hidden="true"> 67</span>     <span class="n">recompute_ratio</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>  <span class="c1"># 1.0 表示全量重算 Transformer Block 前向</span>
+<span class="linenos" aria-hidden="true"> 68</span>     <span class="n">gpu_peak_tflops_bf16</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">989.0</span>  <span class="c1"># NVIDIA H100 SXM5 峰值 BF16 Dense 算力 (无张量核稀疏)</span>
+<span class="linenos" aria-hidden="true"> 69</span>     <span class="n">num_gpus</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>
+<span class="linenos" aria-hidden="true"> 70</span> 
+<span class="linenos" aria-hidden="true"> 71</span> 
+<span class="linenos" aria-hidden="true"> 72</span> <span class="k">class</span><span class="w"> </span><span class="nc">TrainingTraceAnalyzer</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 73</span> <span class="w">    </span><span class="sd">"""训练性能剖析器"""</span>
+<span class="linenos" aria-hidden="true"> 74</span> 
+<span class="linenos" aria-hidden="true"> 75</span>     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">workload</span><span class="p">:</span> <span class="n">ModelWorkloadSpec</span><span class="p">,</span> <span class="n">rank_traces</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">RankTraceTimeline</span><span class="p">]):</span>
+<span class="linenos" aria-hidden="true"> 76</span>         <span class="bp">self</span><span class="o">.</span><span class="n">workload</span> <span class="o">=</span> <span class="n">workload</span>
+<span class="linenos" aria-hidden="true"> 77</span>         <span class="bp">self</span><span class="o">.</span><span class="n">rank_traces</span> <span class="o">=</span> <span class="n">rank_traces</span>
+<span class="linenos" aria-hidden="true"> 78</span> 
+<span class="linenos" aria-hidden="true"> 79</span>     <span class="k">def</span><span class="w"> </span><span class="nf">compute_metrics</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true"> 80</span>         <span class="c1"># 各卡总耗时</span>
+<span class="linenos" aria-hidden="true"> 81</span>         <span class="n">step_times</span> <span class="o">=</span> <span class="p">[</span><span class="n">t</span><span class="o">.</span><span class="n">total_step_time_ms</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">rank_traces</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 82</span>         <span class="n">max_step_time_ms</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">step_times</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 83</span>         <span class="n">min_step_time_ms</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">step_times</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 84</span>         <span class="n">avg_step_time_ms</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">step_times</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">step_times</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 85</span> 
+<span class="linenos" aria-hidden="true"> 86</span>         <span class="c1"># 慢卡倾斜度 (Straggler Skew)</span>
+<span class="linenos" aria-hidden="true"> 87</span>         <span class="n">straggler_skew_pct</span> <span class="o">=</span> <span class="p">(</span><span class="n">max_step_time_ms</span> <span class="o">-</span> <span class="n">min_step_time_ms</span><span class="p">)</span> <span class="o">/</span> <span class="n">min_step_time_ms</span> <span class="o">*</span> <span class="mf">100.0</span>
+<span class="linenos" aria-hidden="true"> 88</span> 
+<span class="linenos" aria-hidden="true"> 89</span>         <span class="c1"># FLOPs 计算</span>
+<span class="linenos" aria-hidden="true"> 90</span>         <span class="c1"># 标准无重算模型前反向 FLOPs = 6 * P * tokens</span>
+<span class="linenos" aria-hidden="true"> 91</span>         <span class="n">p</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">workload</span><span class="o">.</span><span class="n">num_params</span>
+<span class="linenos" aria-hidden="true"> 92</span>         <span class="n">tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">workload</span><span class="o">.</span><span class="n">tokens_per_step</span>
+<span class="linenos" aria-hidden="true"> 93</span>         <span class="n">model_flops_per_step</span> <span class="o">=</span> <span class="mf">6.0</span> <span class="o">*</span> <span class="n">p</span> <span class="o">*</span> <span class="n">tokens</span>
+<span class="linenos" aria-hidden="true"> 94</span> 
+<span class="linenos" aria-hidden="true"> 95</span>         <span class="c1"># 近似执行 FLOPs 推演（不是硬件计数器）：全量重算按额外 2P 估算</span>
+<span class="linenos" aria-hidden="true"> 96</span>         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">workload</span><span class="o">.</span><span class="n">has_activation_recompute</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 97</span>             <span class="n">hardware_flops_per_step</span> <span class="o">=</span> <span class="p">(</span><span class="mf">6.0</span> <span class="o">+</span> <span class="mf">2.0</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">workload</span><span class="o">.</span><span class="n">recompute_ratio</span><span class="p">)</span> <span class="o">*</span> <span class="n">p</span> <span class="o">*</span> <span class="n">tokens</span>
+<span class="linenos" aria-hidden="true"> 98</span>         <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 99</span>             <span class="n">hardware_flops_per_step</span> <span class="o">=</span> <span class="n">model_flops_per_step</span>
+<span class="linenos" aria-hidden="true">100</span> 
+<span class="linenos" aria-hidden="true">101</span>         <span class="c1"># 集群理论算力供给 (FLOPs / ms)</span>
+<span class="linenos" aria-hidden="true">102</span>         <span class="c1"># peak_tflops * 10^12 FLOPs/s / 1000 ms/s = peak_tflops * 10^9 FLOPs/ms</span>
+<span class="linenos" aria-hidden="true">103</span>         <span class="n">cluster_peak_flops_per_ms</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">workload</span><span class="o">.</span><span class="n">num_gpus</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">workload</span><span class="o">.</span><span class="n">gpu_peak_tflops_bf16</span> <span class="o">*</span> <span class="mf">1e9</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">104</span>         <span class="n">cluster_peak_flops_per_step</span> <span class="o">=</span> <span class="n">cluster_peak_flops_per_ms</span> <span class="o">*</span> <span class="n">max_step_time_ms</span>
+<span class="linenos" aria-hidden="true">105</span> 
+<span class="linenos" aria-hidden="true">106</span>         <span class="n">mfu</span> <span class="o">=</span> <span class="p">(</span><span class="n">model_flops_per_step</span> <span class="o">/</span> <span class="n">cluster_peak_flops_per_step</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span>
+<span class="linenos" aria-hidden="true">107</span>         <span class="n">hfu</span> <span class="o">=</span> <span class="p">(</span><span class="n">hardware_flops_per_step</span> <span class="o">/</span> <span class="n">cluster_peak_flops_per_step</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span>
+<span class="linenos" aria-hidden="true">108</span> 
+<span class="linenos" aria-hidden="true">109</span>         <span class="c1"># 各阶段耗时占比 (以最慢 Rank 为关键路径基准)</span>
+<span class="linenos" aria-hidden="true">110</span>         <span class="n">slowest_rank</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">rank_traces</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">r</span><span class="p">:</span> <span class="n">r</span><span class="o">.</span><span class="n">total_step_time_ms</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">111</span>         <span class="n">breakdown_pct</span> <span class="o">=</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">112</span>             <span class="s2">"data_loading"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">data_loading_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">113</span>             <span class="s2">"forward_gemm"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">forward_gemm_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">114</span>             <span class="s2">"forward_attn"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">forward_attn_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">115</span>             <span class="s2">"recompute"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">recompute_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">116</span>             <span class="s2">"backward_gemm"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">backward_gemm_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">117</span>             <span class="s2">"backward_attn"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">backward_attn_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">118</span>             <span class="s2">"comm_wait"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">comm_wait_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">119</span>             <span class="s2">"optimizer"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">optimizer_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">120</span>             <span class="s2">"ckpt_staging"</span><span class="p">:</span> <span class="nb">round</span><span class="p">((</span><span class="n">slowest_rank</span><span class="o">.</span><span class="n">ckpt_staging_ms</span> <span class="o">/</span> <span class="n">max_step_time_ms</span><span class="p">)</span> <span class="o">*</span> <span class="mf">100.0</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">121</span>         <span class="p">}</span>
+<span class="linenos" aria-hidden="true">122</span> 
+<span class="linenos" aria-hidden="true">123</span>         <span class="c1"># 瓶颈诊断</span>
+<span class="linenos" aria-hidden="true">124</span>         <span class="n">diagnoses</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">125</span>         <span class="k">if</span> <span class="n">breakdown_pct</span><span class="p">[</span><span class="s2">"comm_wait"</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mf">25.0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">126</span>             <span class="n">diagnoses</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+<span class="linenos" aria-hidden="true">127</span>                 <span class="s2">"severity"</span><span class="p">:</span> <span class="s2">"CRITICAL"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">128</span>                 <span class="s2">"bottleneck"</span><span class="p">:</span> <span class="s2">"COMMUNICATION_BOUND"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">129</span>                 <span class="s2">"message"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"通信阻塞等待占比高达 </span><span class="si">{</span><span class="n">breakdown_pct</span><span class="p">[</span><span class="s1">'comm_wait'</span><span class="p">]</span><span class="si">}</span><span class="s2">%，可能存在跨交换机带宽不足、AllGather 通信与计算未重叠或通信拓扑未对齐"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">130</span>             <span class="p">})</span>
+<span class="linenos" aria-hidden="true">131</span>         <span class="k">if</span> <span class="n">breakdown_pct</span><span class="p">[</span><span class="s2">"data_loading"</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mf">10.0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">132</span>             <span class="n">diagnoses</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+<span class="linenos" aria-hidden="true">133</span>                 <span class="s2">"severity"</span><span class="p">:</span> <span class="s2">"WARNING"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">134</span>                 <span class="s2">"bottleneck"</span><span class="p">:</span> <span class="s2">"INPUT_BOUND"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">135</span>                 <span class="s2">"message"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"数据加载排队气泡占 </span><span class="si">{</span><span class="n">breakdown_pct</span><span class="p">[</span><span class="s1">'data_loading'</span><span class="p">]</span><span class="si">}</span><span class="s2">%，需增加 DataLoader workers 或启用共享内存与 pin_memory"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">136</span>             <span class="p">})</span>
+<span class="linenos" aria-hidden="true">137</span>         <span class="k">if</span> <span class="n">straggler_skew_pct</span> <span class="o">&gt;</span> <span class="mf">15.0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">138</span>             <span class="n">diagnoses</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+<span class="linenos" aria-hidden="true">139</span>                 <span class="s2">"severity"</span><span class="p">:</span> <span class="s2">"WARNING"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">140</span>                 <span class="s2">"bottleneck"</span><span class="p">:</span> <span class="s2">"STRAGGLER_SKEW"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">141</span>                 <span class="s2">"message"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"卡间时延极差达 </span><span class="si">{</span><span class="n">straggler_skew_pct</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">%，存在慢卡拖累整体同步步频"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">142</span>             <span class="p">})</span>
+<span class="linenos" aria-hidden="true">143</span> 
+<span class="linenos" aria-hidden="true">144</span>         <span class="k">return</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">145</span>             <span class="s2">"workload"</span><span class="p">:</span> <span class="n">asdict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">workload</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">146</span>             <span class="s2">"timing_summary_ms"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">147</span>                 <span class="s2">"max_step_time"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">max_step_time_ms</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">148</span>                 <span class="s2">"min_step_time"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">min_step_time_ms</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">149</span>                 <span class="s2">"avg_step_time"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">avg_step_time_ms</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">150</span>                 <span class="s2">"straggler_skew_pct"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">straggler_skew_pct</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">151</span>             <span class="p">},</span>
+<span class="linenos" aria-hidden="true">152</span>             <span class="s2">"utilization_pct"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">153</span>                 <span class="s2">"mfu"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">mfu</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">154</span>                 <span class="s2">"hfu"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">hfu</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">155</span>                 <span class="s2">"recompute_overhead_ratio"</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">hfu</span> <span class="o">/</span> <span class="n">mfu</span> <span class="k">if</span> <span class="n">mfu</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="mf">1.0</span><span class="p">,</span> <span class="mi">3</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">156</span>             <span class="p">},</span>
+<span class="linenos" aria-hidden="true">157</span>             <span class="s2">"breakdown_pct"</span><span class="p">:</span> <span class="n">breakdown_pct</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">158</span>             <span class="s2">"diagnoses"</span><span class="p">:</span> <span class="n">diagnoses</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">159</span>         <span class="p">}</span>
+<span class="linenos" aria-hidden="true">160</span> 
+<span class="linenos" aria-hidden="true">161</span> 
+<span class="linenos" aria-hidden="true">162</span> <span class="k">def</span><span class="w"> </span><span class="nf">generate_scenario_traces</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">ModelWorkloadSpec</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">RankTraceTimeline</span><span class="p">]]]:</span>
+<span class="linenos" aria-hidden="true">163</span>     <span class="n">workload_3b</span> <span class="o">=</span> <span class="n">ModelWorkloadSpec</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">164</span>         <span class="n">model_name</span><span class="o">=</span><span class="s2">"synthetic-dense-3B-budget"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">165</span>         <span class="n">num_params</span><span class="o">=</span><span class="mi">3_000_000_000</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">166</span>         <span class="n">tokens_per_step</span><span class="o">=</span><span class="mi">2_097_152</span><span class="p">,</span>  <span class="c1"># 512 * 4096</span>
+<span class="linenos" aria-hidden="true">167</span>         <span class="n">has_activation_recompute</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">168</span>         <span class="n">recompute_ratio</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">169</span>         <span class="n">gpu_peak_tflops_bf16</span><span class="o">=</span><span class="mf">989.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">170</span>         <span class="n">num_gpus</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">171</span>     <span class="p">)</span>
+<span class="linenos" aria-hidden="true">172</span> 
+<span class="linenos" aria-hidden="true">173</span>     <span class="c1"># 场景 1：高效稳态 (High Efficiency FSDP2)</span>
+<span class="linenos" aria-hidden="true">174</span>     <span class="c1"># 单步约 1250 ms，MFU 约 47.7%，计算密集，通信完美重叠，低气泡</span>
+<span class="linenos" aria-hidden="true">175</span>     <span class="n">traces_steady</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">176</span>     <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">4</span><span class="p">):</span>  <span class="c1"># 采样 4 张代表性卡</span>
+<span class="linenos" aria-hidden="true">177</span>         <span class="n">traces_steady</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">178</span>             <span class="n">RankTraceTimeline</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">179</span>                 <span class="n">rank_id</span><span class="o">=</span><span class="n">r</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">180</span>                 <span class="n">data_loading_ms</span><span class="o">=</span><span class="mf">10.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">181</span>                 <span class="n">forward_gemm_ms</span><span class="o">=</span><span class="mf">320.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">182</span>                 <span class="n">forward_attn_ms</span><span class="o">=</span><span class="mf">110.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">183</span>                 <span class="n">recompute_ms</span><span class="o">=</span><span class="mf">210.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">184</span>                 <span class="n">backward_gemm_ms</span><span class="o">=</span><span class="mf">450.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">185</span>                 <span class="n">backward_attn_ms</span><span class="o">=</span><span class="mf">120.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">186</span>                 <span class="n">comm_wait_ms</span><span class="o">=</span><span class="mf">15.0</span><span class="p">,</span>  <span class="c1"># 极低通信等待 (通信与反向充分重叠)</span>
+<span class="linenos" aria-hidden="true">187</span>                 <span class="n">optimizer_ms</span><span class="o">=</span><span class="mf">45.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">188</span>                 <span class="n">ckpt_staging_ms</span><span class="o">=</span><span class="mf">5.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">189</span>             <span class="p">)</span>
+<span class="linenos" aria-hidden="true">190</span>         <span class="p">)</span>
+<span class="linenos" aria-hidden="true">191</span> 
+<span class="linenos" aria-hidden="true">192</span>     <span class="c1"># 场景 2：通信受限与慢卡拖累 (Comm Bound + Straggler)</span>
+<span class="linenos" aria-hidden="true">193</span>     <span class="c1"># 发生跨节点网络拥塞与网卡抖动，导致通信等待剧增至 850 ms，单步拉长至 2125 ms</span>
+<span class="linenos" aria-hidden="true">194</span>     <span class="n">traces_comm_bound</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos" aria-hidden="true">195</span>         <span class="n">RankTraceTimeline</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mf">12.0</span><span class="p">,</span> <span class="mf">320.0</span><span class="p">,</span> <span class="mf">110.0</span><span class="p">,</span> <span class="mf">210.0</span><span class="p">,</span> <span class="mf">450.0</span><span class="p">,</span> <span class="mf">120.0</span><span class="p">,</span> <span class="mf">750.0</span><span class="p">,</span> <span class="mf">45.0</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">196</span>         <span class="n">RankTraceTimeline</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mf">10.0</span><span class="p">,</span> <span class="mf">320.0</span><span class="p">,</span> <span class="mf">110.0</span><span class="p">,</span> <span class="mf">210.0</span><span class="p">,</span> <span class="mf">450.0</span><span class="p">,</span> <span class="mf">120.0</span><span class="p">,</span> <span class="mf">740.0</span><span class="p">,</span> <span class="mf">45.0</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">197</span>         <span class="n">RankTraceTimeline</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mf">11.0</span><span class="p">,</span> <span class="mf">320.0</span><span class="p">,</span> <span class="mf">110.0</span><span class="p">,</span> <span class="mf">210.0</span><span class="p">,</span> <span class="mf">450.0</span><span class="p">,</span> <span class="mf">120.0</span><span class="p">,</span> <span class="mf">760.0</span><span class="p">,</span> <span class="mf">45.0</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">198</span>         <span class="n">RankTraceTimeline</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mf">85.0</span><span class="p">,</span> <span class="mf">320.0</span><span class="p">,</span> <span class="mf">110.0</span><span class="p">,</span> <span class="mf">210.0</span><span class="p">,</span> <span class="mf">450.0</span><span class="p">,</span> <span class="mf">120.0</span><span class="p">,</span> <span class="mf">920.0</span><span class="p">,</span> <span class="mf">45.0</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">),</span>  <span class="c1"># 慢卡</span>
+<span class="linenos" aria-hidden="true">199</span>     <span class="p">]</span>
+<span class="linenos" aria-hidden="true">200</span> 
+<span class="linenos" aria-hidden="true">201</span>     <span class="c1"># 场景 3：供数受限 (Input-bound)</span>
+<span class="linenos" aria-hidden="true">202</span>     <span class="c1"># 数据加载排队气泡达 480 ms，单步拉长至 1755 ms</span>
+<span class="linenos" aria-hidden="true">203</span>     <span class="n">traces_input_bound</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos" aria-hidden="true">204</span>         <span class="n">RankTraceTimeline</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="mf">480.0</span><span class="p">,</span> <span class="mf">320.0</span><span class="p">,</span> <span class="mf">110.0</span><span class="p">,</span> <span class="mf">210.0</span><span class="p">,</span> <span class="mf">450.0</span><span class="p">,</span> <span class="mf">120.0</span><span class="p">,</span> <span class="mf">25.0</span><span class="p">,</span> <span class="mf">45.0</span><span class="p">,</span> <span class="mf">5.0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">205</span>         <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">4</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">206</span>     <span class="p">]</span>
+<span class="linenos" aria-hidden="true">207</span> 
+<span class="linenos" aria-hidden="true">208</span>     <span class="k">return</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">209</span>         <span class="s2">"healthy_steady_state"</span><span class="p">:</span> <span class="p">(</span><span class="n">workload_3b</span><span class="p">,</span> <span class="n">traces_steady</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">210</span>         <span class="s2">"comm_bound_straggler"</span><span class="p">:</span> <span class="p">(</span><span class="n">workload_3b</span><span class="p">,</span> <span class="n">traces_comm_bound</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">211</span>         <span class="s2">"input_bound_dataloader"</span><span class="p">:</span> <span class="p">(</span><span class="n">workload_3b</span><span class="p">,</span> <span class="n">traces_input_bound</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">212</span>     <span class="p">}</span>
+<span class="linenos" aria-hidden="true">213</span> 
+<span class="linenos" aria-hidden="true">214</span> 
+<span class="linenos" aria-hidden="true">215</span> <span class="k">def</span><span class="w"> </span><span class="nf">interval_union</span><span class="p">(</span><span class="n">intervals</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">216</span>     <span class="n">intervals</span><span class="o">=</span><span class="nb">sorted</span><span class="p">(</span><span class="n">intervals</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">217</span>     <span class="n">total</span><span class="o">=</span><span class="mf">0.</span><span class="p">;</span><span class="n">right</span><span class="o">=</span><span class="kc">None</span>
+<span class="linenos" aria-hidden="true">218</span>     <span class="k">for</span> <span class="n">start</span><span class="p">,</span><span class="n">end</span> <span class="ow">in</span> <span class="n">intervals</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">219</span>         <span class="k">if</span> <span class="n">end</span><span class="o">&lt;</span><span class="n">start</span><span class="p">:</span><span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'event ends before it starts'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">220</span>         <span class="k">if</span> <span class="n">right</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">start</span><span class="o">&gt;=</span><span class="n">right</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">221</span>             <span class="n">total</span><span class="o">+=</span><span class="n">end</span><span class="o">-</span><span class="n">start</span>
+<span class="linenos" aria-hidden="true">222</span>             <span class="n">right</span><span class="o">=</span><span class="n">end</span>
+<span class="linenos" aria-hidden="true">223</span>         <span class="k">elif</span> <span class="n">end</span><span class="o">&gt;</span><span class="n">right</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">224</span>             <span class="n">total</span><span class="o">+=</span><span class="n">end</span><span class="o">-</span><span class="n">right</span>
+<span class="linenos" aria-hidden="true">225</span>             <span class="n">right</span><span class="o">=</span><span class="n">end</span>
+<span class="linenos" aria-hidden="true">226</span>     <span class="k">return</span> <span class="n">total</span>
+<span class="linenos" aria-hidden="true">227</span> 
+<span class="linenos" aria-hidden="true">228</span> 
+<span class="linenos" aria-hidden="true">229</span> <span class="k">def</span><span class="w"> </span><span class="nf">clip_intervals</span><span class="p">(</span><span class="n">intervals</span><span class="p">,</span> <span class="n">window</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">230</span>     <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">window</span>
+<span class="linenos" aria-hidden="true">231</span>     <span class="n">out</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">232</span>     <span class="k">for</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">intervals</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">233</span>         <span class="n">a2</span><span class="p">,</span> <span class="n">b2</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">start</span><span class="p">),</span> <span class="nb">min</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">end</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">234</span>         <span class="k">if</span> <span class="n">b2</span> <span class="o">&gt;</span> <span class="n">a2</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">235</span>             <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">a2</span><span class="p">,</span> <span class="n">b2</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">236</span>     <span class="k">return</span> <span class="n">out</span>
+<span class="linenos" aria-hidden="true">237</span> 
+<span class="linenos" aria-hidden="true">238</span> 
+<span class="linenos" aria-hidden="true">239</span> <span class="k">def</span><span class="w"> </span><span class="nf">analyze_events</span><span class="p">(</span><span class="n">payload</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">240</span> <span class="w">    </span><span class="sd">"""按明确的共同 step 窗口分析事件；没有窗口时不给 MFU 分母。</span>
+<span class="linenos" aria-hidden="true">241</span> 
+<span class="linenos" aria-hidden="true">242</span> <span class="sd">    每个 rank 的局部跨度只作诊断：同步训练的全局关键路径由共同 step 边界</span>
+<span class="linenos" aria-hidden="true">243</span> <span class="sd">    （或显式的跨 rank 观测窗口）决定，最长局部跨度会系统性低估它。</span>
+<span class="linenos" aria-hidden="true">244</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true">245</span>     <span class="k">if</span> <span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'source_kind'</span><span class="p">)</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">'measured'</span><span class="p">,</span><span class="s1">'measured_instrumented'</span><span class="p">,</span><span class="s1">'author_log'</span><span class="p">,</span><span class="s1">'synthetic_fixture'</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">246</span>         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'event input requires an explicit measured/author source kind'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">247</span>     <span class="n">events</span><span class="o">=</span><span class="n">payload</span><span class="p">[</span><span class="s1">'events'</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">248</span>     <span class="k">if</span> <span class="ow">not</span> <span class="n">events</span><span class="p">:</span><span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'empty event list'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">249</span>     <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="ow">not</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="n">k</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">'start_ms'</span><span class="p">,</span><span class="s1">'end_ms'</span><span class="p">)):</span>
+<span class="linenos" aria-hidden="true">250</span>         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'event times must be finite'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">251</span> 
+<span class="linenos" aria-hidden="true">252</span>     <span class="n">ranks</span><span class="o">=</span><span class="p">{}</span>
+<span class="linenos" aria-hidden="true">253</span>     <span class="k">for</span> <span class="n">rank</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">({</span><span class="n">e</span><span class="p">[</span><span class="s1">'rank'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">}):</span>
+<span class="linenos" aria-hidden="true">254</span>         <span class="n">own</span><span class="o">=</span><span class="p">[</span><span class="n">e</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span> <span class="k">if</span> <span class="n">e</span><span class="p">[</span><span class="s1">'rank'</span><span class="p">]</span><span class="o">==</span><span class="n">rank</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">255</span>         <span class="n">span</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span><span class="p">)</span><span class="o">-</span><span class="nb">min</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">256</span>         <span class="n">busy</span><span class="o">=</span><span class="n">interval_union</span><span class="p">([(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">257</span>         <span class="n">categories</span><span class="o">=</span><span class="p">{</span><span class="n">key</span><span class="p">:</span><span class="n">interval_union</span><span class="p">([(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span> <span class="k">if</span> <span class="n">e</span><span class="p">[</span><span class="s1">'category'</span><span class="p">]</span><span class="o">==</span><span class="n">key</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">258</span>                     <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">({</span><span class="n">e</span><span class="p">[</span><span class="s1">'category'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">own</span><span class="p">})}</span>
+<span class="linenos" aria-hidden="true">259</span>         <span class="n">ranks</span><span class="p">[</span><span class="nb">str</span><span class="p">(</span><span class="n">rank</span><span class="p">)]</span><span class="o">=</span><span class="p">{</span><span class="s1">'wall_span_ms'</span><span class="p">:</span><span class="n">span</span><span class="p">,</span><span class="s1">'union_covered_ms'</span><span class="p">:</span><span class="n">busy</span><span class="p">,</span><span class="s1">'unattributed_ms'</span><span class="p">:</span><span class="n">span</span><span class="o">-</span><span class="n">busy</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">260</span>                           <span class="s1">'category_union_ms'</span><span class="p">:</span><span class="n">categories</span><span class="p">,</span><span class="s1">'category_sums_may_overlap'</span><span class="p">:</span><span class="kc">True</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">261</span> 
+<span class="linenos" aria-hidden="true">262</span>     <span class="n">max_local_span</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="s1">'wall_span_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">ranks</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">263</span>     <span class="n">observed_start</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">264</span>     <span class="n">observed_end</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">265</span>     <span class="n">observed_span</span><span class="o">=</span><span class="n">observed_end</span><span class="o">-</span><span class="n">observed_start</span>
+<span class="linenos" aria-hidden="true">266</span>     <span class="n">covered_all</span><span class="o">=</span><span class="n">interval_union</span><span class="p">([(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">267</span> 
+<span class="linenos" aria-hidden="true">268</span>     <span class="n">window</span><span class="o">=</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'step_window'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">269</span>     <span class="n">window_ms</span><span class="o">=</span><span class="kc">None</span>
+<span class="linenos" aria-hidden="true">270</span>     <span class="n">window_union</span><span class="o">=</span><span class="kc">None</span>
+<span class="linenos" aria-hidden="true">271</span>     <span class="n">window_unattributed</span><span class="o">=</span><span class="kc">None</span>
+<span class="linenos" aria-hidden="true">272</span>     <span class="k">if</span> <span class="n">window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">273</span>         <span class="n">start</span><span class="p">,</span><span class="n">end</span><span class="o">=</span><span class="n">window</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">window</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">274</span>         <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">start</span><span class="p">)</span> <span class="ow">and</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">end</span><span class="p">))</span> <span class="ow">or</span> <span class="n">end</span><span class="o">&lt;=</span><span class="n">start</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">275</span>             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'step_window must be a finite increasing interval'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">276</span>         <span class="n">window_ms</span><span class="o">=</span><span class="n">end</span><span class="o">-</span><span class="n">start</span>
+<span class="linenos" aria-hidden="true">277</span>         <span class="k">if</span> <span class="n">window_ms</span> <span class="o">&lt;</span> <span class="n">max_local_span</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">278</span>             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'provided step_window is shorter than a rank-local activity span'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">279</span>         <span class="n">outside</span><span class="o">=</span><span class="p">[</span><span class="n">e</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span> <span class="k">if</span> <span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">]</span><span class="o">&lt;</span><span class="n">start</span> <span class="ow">or</span> <span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">]</span><span class="o">&gt;</span><span class="n">end</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">280</span>         <span class="k">if</span> <span class="n">outside</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">281</span>             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'events fall outside the declared common step window'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">282</span>         <span class="n">window_union</span><span class="o">=</span><span class="n">interval_union</span><span class="p">(</span><span class="n">clip_intervals</span><span class="p">([(</span><span class="n">e</span><span class="p">[</span><span class="s1">'start_ms'</span><span class="p">],</span><span class="n">e</span><span class="p">[</span><span class="s1">'end_ms'</span><span class="p">])</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">events</span><span class="p">],(</span><span class="n">start</span><span class="p">,</span><span class="n">end</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true">283</span>         <span class="n">window_unattributed</span><span class="o">=</span><span class="n">window_ms</span><span class="o">-</span><span class="n">window_union</span>
+<span class="linenos" aria-hidden="true">284</span> 
+<span class="linenos" aria-hidden="true">285</span>     <span class="n">flops</span><span class="o">=</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'model_flops_per_step_estimate'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">286</span>     <span class="n">peak</span><span class="o">=</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'peak_tflops_per_device'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">287</span>     <span class="n">devices</span><span class="o">=</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'num_devices'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">288</span>     <span class="n">inputs_present</span><span class="o">=</span><span class="nb">all</span><span class="p">(</span><span class="n">x</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">(</span><span class="n">flops</span><span class="p">,</span><span class="n">peak</span><span class="p">,</span><span class="n">devices</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">289</span>     <span class="k">if</span> <span class="n">inputs_present</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">290</span>         <span class="k">if</span> <span class="n">flops</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">peak</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">devices</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">291</span>             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">'invalid FLOP, peak or device count'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">292</span> 
+<span class="linenos" aria-hidden="true">293</span>     <span class="k">def</span><span class="w"> </span><span class="nf">mfu_for</span><span class="p">(</span><span class="n">denominator_ms</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">294</span>         <span class="k">if</span> <span class="ow">not</span> <span class="n">inputs_present</span> <span class="ow">or</span> <span class="n">denominator_ms</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">denominator_ms</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">295</span>             <span class="k">return</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">296</span>         <span class="k">return</span> <span class="mf">100.0</span><span class="o">*</span><span class="n">flops</span><span class="o">/</span><span class="p">(</span><span class="n">peak</span><span class="o">*</span><span class="mf">1e12</span><span class="o">*</span><span class="n">devices</span><span class="o">*</span><span class="n">denominator_ms</span><span class="o">/</span><span class="mf">1000.0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">297</span> 
+<span class="linenos" aria-hidden="true">298</span>     <span class="n">mfu</span><span class="o">=</span><span class="n">mfu_for</span><span class="p">(</span><span class="n">window_ms</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">299</span>     <span class="k">if</span> <span class="n">window_ms</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">300</span>         <span class="n">basis</span><span class="o">=</span><span class="s1">'no common step window in the input: MFU denominator unavailable'</span>
+<span class="linenos" aria-hidden="true">301</span>     <span class="k">elif</span> <span class="ow">not</span> <span class="n">inputs_present</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">302</span>         <span class="n">basis</span><span class="o">=</span><span class="s1">'common step window present but model FLOP/peak/device inputs incomplete'</span>
+<span class="linenos" aria-hidden="true">303</span>     <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">304</span>         <span class="n">basis</span><span class="o">=</span><span class="s1">'model FLOP estimate over the declared common step window; not a hardware counter'</span>
+<span class="linenos" aria-hidden="true">305</span>     <span class="k">return</span> <span class="p">{</span><span class="s1">'source_kind'</span><span class="p">:</span><span class="n">payload</span><span class="p">[</span><span class="s1">'source_kind'</span><span class="p">],</span><span class="s1">'source'</span><span class="p">:</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'source'</span><span class="p">),</span> <span class="s1">'ranks'</span><span class="p">:</span><span class="n">ranks</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">306</span>             <span class="s1">'step_window_ms'</span><span class="p">:</span><span class="n">window_ms</span><span class="p">,</span><span class="s1">'step_window_clock'</span><span class="p">:(</span><span class="n">window</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'clock'</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">307</span>             <span class="s1">'window_union_covered_ms'</span><span class="p">:</span><span class="n">window_union</span><span class="p">,</span><span class="s1">'window_unattributed_ms'</span><span class="p">:</span><span class="n">window_unattributed</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">308</span>             <span class="s1">'observed_span_ms'</span><span class="p">:</span><span class="n">observed_span</span><span class="p">,</span><span class="s1">'covered_all_ranks_ms'</span><span class="p">:</span><span class="n">covered_all</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">309</span>             <span class="s1">'observed_unattributed_ms'</span><span class="p">:</span><span class="n">observed_span</span><span class="o">-</span><span class="n">covered_all</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">310</span>             <span class="s1">'max_rank_local_span_ms'</span><span class="p">:</span><span class="n">max_local_span</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">311</span>             <span class="s1">'max_local_span_is_not_global_window'</span><span class="p">:</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">312</span>             <span class="s1">'mfu_estimate_pct'</span><span class="p">:</span><span class="n">mfu</span><span class="p">,</span><span class="s1">'mfu_basis'</span><span class="p">:</span><span class="n">basis</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">313</span>             <span class="s1">'mfu_wrong_basis_pct'</span><span class="p">:</span><span class="n">mfu_for</span><span class="p">(</span><span class="n">max_local_span</span><span class="p">)</span> <span class="k">if</span> <span class="n">window_ms</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">314</span>             <span class="s1">'hardware_flops_measured'</span><span class="p">:</span><span class="kc">False</span><span class="p">,</span><span class="s1">'quality_measured'</span><span class="p">:</span><span class="kc">False</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">315</span>             <span class="s1">'note'</span><span class="p">:</span><span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'note'</span><span class="p">)}</span>
+<span class="linenos" aria-hidden="true">316</span> 
+<span class="linenos" aria-hidden="true">317</span> 
+<span class="linenos" aria-hidden="true">318</span> <span class="k">def</span><span class="w"> </span><span class="nf">cross_rank_window_fixture</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">319</span> <span class="w">    </span><span class="sd">"""两 rank 局部活动错位：局部跨度低估共同窗口。</span>
+<span class="linenos" aria-hidden="true">320</span> 
+<span class="linenos" aria-hidden="true">321</span> <span class="sd">    rank0 在 [100,200] 忙，rank1 在 [190,290] 忙；同步训练里这个 step 从</span>
+<span class="linenos" aria-hidden="true">322</span> <span class="sd">    rank0 开始到 rank1 结束，窗口是 [100,290]=190 ms，而最长局部跨度只有</span>
+<span class="linenos" aria-hidden="true">323</span> <span class="sd">    100 ms。第二段在窗口内留出 rank1 到达前的 50 ms 空档（[200,250]），</span>
+<span class="linenos" aria-hidden="true">324</span> <span class="sd">    用来分别验证"跨 rank 观测跨度"和"活动区间并集"。</span>
+<span class="linenos" aria-hidden="true">325</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true">326</span>     <span class="n">events</span><span class="o">=</span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">327</span>         <span class="p">{</span><span class="s1">'rank'</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="s1">'category'</span><span class="p">:</span><span class="s1">'forward_backward'</span><span class="p">,</span><span class="s1">'start_ms'</span><span class="p">:</span><span class="mf">100.0</span><span class="p">,</span><span class="s1">'end_ms'</span><span class="p">:</span><span class="mf">200.0</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">328</span>         <span class="p">{</span><span class="s1">'rank'</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="s1">'category'</span><span class="p">:</span><span class="s1">'forward_backward'</span><span class="p">,</span><span class="s1">'start_ms'</span><span class="p">:</span><span class="mf">190.0</span><span class="p">,</span><span class="s1">'end_ms'</span><span class="p">:</span><span class="mf">240.0</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">329</span>         <span class="p">{</span><span class="s1">'rank'</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="s1">'category'</span><span class="p">:</span><span class="s1">'comm'</span><span class="p">,</span><span class="s1">'start_ms'</span><span class="p">:</span><span class="mf">250.0</span><span class="p">,</span><span class="s1">'end_ms'</span><span class="p">:</span><span class="mf">290.0</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">330</span>     <span class="p">]</span>
+<span class="linenos" aria-hidden="true">331</span>     <span class="k">return</span> <span class="p">{</span><span class="s1">'source_kind'</span><span class="p">:</span><span class="s1">'synthetic_fixture'</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">332</span>             <span class="s1">'source'</span><span class="p">:</span><span class="s1">'cross-rank window fixture: rank-local spans overlap but do not share boundaries'</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">333</span>             <span class="s1">'events'</span><span class="p">:</span><span class="n">events</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">334</span>             <span class="s1">'step_window'</span><span class="p">:{</span><span class="s1">'start_ms'</span><span class="p">:</span><span class="mf">100.0</span><span class="p">,</span><span class="s1">'end_ms'</span><span class="p">:</span><span class="mf">290.0</span><span class="p">,</span><span class="s1">'clock'</span><span class="p">:</span><span class="s1">'coordinator step boundary'</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">335</span>                            <span class="s1">'note'</span><span class="p">:</span><span class="s1">'the step ends when the last rank finishes its comm segment'</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">336</span>             <span class="s1">'model_flops_per_step_estimate'</span><span class="p">:</span><span class="mf">6.0</span><span class="o">*</span><span class="mi">1_000_000_000</span><span class="o">*</span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">337</span>             <span class="s1">'peak_tflops_per_device'</span><span class="p">:</span><span class="mf">989.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">338</span>             <span class="s1">'num_devices'</span><span class="p">:</span><span class="mi">2</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">339</span>             <span class="s1">'note'</span><span class="p">:</span><span class="s1">'fixture only: durations are constructed to expose denominator mistakes'</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">340</span> 
+<span class="linenos" aria-hidden="true">341</span> 
+<span class="linenos" aria-hidden="true">342</span> <span class="k">def</span><span class="w"> </span><span class="nf">write_json</span><span class="p">(</span><span class="n">outdir</span><span class="p">,</span> <span class="n">filename</span><span class="p">,</span> <span class="n">result</span><span class="p">,</span> <span class="n">cases</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">343</span>     <span class="k">with</span> <span class="p">(</span><span class="n">outdir</span> <span class="o">/</span> <span class="n">filename</span><span class="p">)</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="s1">'x'</span><span class="p">)</span> <span class="k">as</span> <span class="n">stream</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">344</span>         <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">345</span>         <span class="n">stream</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="s1">'</span><span class="se">\n</span><span class="s1">'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">346</span>     <span class="k">with</span> <span class="p">(</span><span class="n">outdir</span> <span class="o">/</span> <span class="s1">'cases.json'</span><span class="p">)</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="s1">'x'</span><span class="p">)</span> <span class="k">as</span> <span class="n">stream</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">347</span>         <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">cases</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">348</span>         <span class="n">stream</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="s1">'</span><span class="se">\n</span><span class="s1">'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">349</span> 
+<span class="linenos" aria-hidden="true">350</span> 
+<span class="linenos" aria-hidden="true">351</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">352</span>     <span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="linenos" aria-hidden="true">353</span>     <span class="n">parser</span><span class="o">=</span><span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">(</span><span class="n">description</span><span class="o">=</span><span class="s1">'Read explicit event traces, a cross-rank window fixture, or an explicitly synthetic budget example'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">354</span>     <span class="n">group</span><span class="o">=</span><span class="n">parser</span><span class="o">.</span><span class="n">add_mutually_exclusive_group</span><span class="p">(</span><span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">355</span>     <span class="n">group</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">'--input'</span><span class="p">,</span><span class="nb">type</span><span class="o">=</span><span class="n">Path</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">356</span>     <span class="n">group</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">'--synthetic-demo'</span><span class="p">,</span><span class="n">action</span><span class="o">=</span><span class="s1">'store_true'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">357</span>     <span class="n">group</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">'--cross-rank-demo'</span><span class="p">,</span><span class="n">action</span><span class="o">=</span><span class="s1">'store_true'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">358</span>     <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">'--outdir'</span><span class="p">,</span><span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span><span class="nb">type</span><span class="o">=</span><span class="n">Path</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">359</span>     <span class="n">args</span><span class="o">=</span><span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">360</span>     <span class="n">args</span><span class="o">.</span><span class="n">outdir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span><span class="n">exist_ok</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">361</span>     <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">input</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">362</span>         <span class="n">payload</span><span class="o">=</span><span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">input</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">363</span>         <span class="n">result</span><span class="o">=</span><span class="n">analyze_events</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">364</span>         <span class="n">cases</span><span class="o">=</span><span class="p">{</span><span class="s1">'source_kind'</span><span class="p">:</span><span class="n">result</span><span class="p">[</span><span class="s1">'source_kind'</span><span class="p">],</span><span class="s1">'source_file'</span><span class="p">:</span><span class="nb">str</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">input</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">365</span>                <span class="s1">'common_step_window_provided'</span><span class="p">:</span><span class="n">result</span><span class="p">[</span><span class="s1">'step_window_ms'</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">366</span>                <span class="s1">'GPU_execution_by_this_analyzer'</span><span class="p">:</span><span class="kc">False</span><span class="p">,</span><span class="s1">'hardware_counters'</span><span class="p">:</span><span class="kc">False</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">367</span>     <span class="k">elif</span> <span class="n">args</span><span class="o">.</span><span class="n">cross_rank_demo</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">368</span>         <span class="n">payload</span><span class="o">=</span><span class="n">cross_rank_window_fixture</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">369</span>         <span class="n">result</span><span class="o">=</span><span class="n">analyze_events</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">370</span>         <span class="n">cases</span><span class="o">=</span><span class="p">{</span><span class="s1">'source_kind'</span><span class="p">:</span><span class="n">result</span><span class="p">[</span><span class="s1">'source_kind'</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">371</span>                <span class="s1">'fixture'</span><span class="p">:</span><span class="s1">'rank-local spans 100 ms vs common window 190 ms'</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">372</span>                <span class="s1">'GPU_execution_by_this_analyzer'</span><span class="p">:</span><span class="kc">False</span><span class="p">,</span><span class="s1">'hardware_counters'</span><span class="p">:</span><span class="kc">False</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">373</span>         <span class="k">with</span> <span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">outdir</span> <span class="o">/</span> <span class="s1">'cross_rank_fixture.json'</span><span class="p">)</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="s1">'x'</span><span class="p">)</span> <span class="k">as</span> <span class="n">stream</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">374</span>             <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">payload</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">375</span>             <span class="n">stream</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="s1">'</span><span class="se">\n</span><span class="s1">'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">376</span>     <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">377</span>         <span class="n">result</span><span class="o">=</span><span class="p">{</span><span class="s1">'source_kind'</span><span class="p">:</span><span class="s1">'synthetic_budget'</span><span class="p">,</span><span class="s1">'scenarios'</span><span class="p">:{}}</span>
+<span class="linenos" aria-hidden="true">378</span>         <span class="k">for</span> <span class="n">name</span><span class="p">,(</span><span class="n">workload</span><span class="p">,</span><span class="n">traces</span><span class="p">)</span> <span class="ow">in</span> <span class="n">generate_scenario_traces</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">379</span>             <span class="n">result</span><span class="p">[</span><span class="s1">'scenarios'</span><span class="p">][</span><span class="n">name</span><span class="p">]</span><span class="o">=</span><span class="p">{</span><span class="s1">'assumptions'</span><span class="p">:</span><span class="n">asdict</span><span class="p">(</span><span class="n">workload</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">380</span>                 <span class="s1">'simulated_rank_count'</span><span class="p">:</span><span class="nb">len</span><span class="p">(</span><span class="n">traces</span><span class="p">),</span><span class="s1">'raw_synthetic_rank_timings'</span><span class="p">:[</span><span class="n">asdict</span><span class="p">(</span><span class="n">t</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">traces</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">381</span>                 <span class="s1">'metrics'</span><span class="p">:</span><span class="n">TrainingTraceAnalyzer</span><span class="p">(</span><span class="n">workload</span><span class="p">,</span><span class="n">traces</span><span class="p">)</span><span class="o">.</span><span class="n">compute_metrics</span><span class="p">()}</span>
+<span class="linenos" aria-hidden="true">382</span>         <span class="n">result</span><span class="p">[</span><span class="s1">'scope'</span><span class="p">]</span><span class="o">=</span><span class="s1">'All durations and the 64-device deployment are assumptions, not H100 measurements'</span>
+<span class="linenos" aria-hidden="true">383</span>         <span class="n">cases</span><span class="o">=</span><span class="p">{</span><span class="s1">'source_kind'</span><span class="p">:</span><span class="s1">'synthetic_budget'</span><span class="p">,</span><span class="s1">'GPU_execution_by_this_analyzer'</span><span class="p">:</span><span class="kc">False</span><span class="p">,</span><span class="s1">'hardware_counters'</span><span class="p">:</span><span class="kc">False</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">384</span>     <span class="n">write_json</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">outdir</span><span class="p">,</span><span class="s1">'training_trace_metrics.json'</span><span class="p">,</span><span class="n">result</span><span class="p">,</span><span class="n">cases</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">385</span>     <span class="nb">print</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">386</span> 
+<span class="linenos" aria-hidden="true">387</span> 
+<span class="linenos" aria-hidden="true">388</span> <span class="k">if</span> <span class="vm">__name__</span><span class="o">==</span><span class="s1">'__main__'</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">389</span>     <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/training_trace_analysis.py 全文（389 行）</code><a href="../code/labs/L7/training_trace_analysis.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<hr />
+<h2 id="_14">前沿与规模决策</h2>
+<h3 id="smollm3">SmolLM3 配方的预算账</h3>
+<p>三份 Nanotron YAML 都写 <code>micro_batch_size=3</code>、<code>batch_accumulation_per_replica=1</code>、<code>sequence_length=4096</code>、<code>train_steps=4,720,000</code>、<code>checkpoint_interval=2000</code>；DP/TP 不在 YAML 里，由 run 名的 48 节点 × 8 卡与 TP=2 推出 DP=192，于是全局 batch 为 576 个样本、11.14 T token（4,720,000 × 576 × 4096）。阶段区间按 YAML 的 <code>start_training_step</code> 切分（stage3 那份同时给出 stage2 与 decay 起点）：stable 1–3,450,000 步 = 8.14 T token，stage2 3,450,001–4,198,000 步 = 1.77 T token，decay 4,198,001–4,720,000 步 = 1.23 T token。</p>
+<p>在声明的设备假设下（3 B 参数、384 张卡、989 TFLOP/s 单卡峰值 BF16、40% MFU），<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>6</mn><mi>P</mi></mrow></math></span> 估计给出 2.004e23 FLOPs：墙钟约 366.5 小时（15.3 天），合计约 14.07 万 GPU 小时。checkpoint 每 2000 步一次共 2360 次，按 bf16 参数 + fp32 master + Adam m/v 估计每次 42 GB，整轮写入约 99.1 TB。</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th style="text-align: right;">值（声明假设下）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全局 batch</td>
+<td style="text-align: right;">576 样本（3 × 1 × 192）</td>
+</tr>
+<tr>
+<td>总 token / 总 FLOPs（6P）</td>
+<td style="text-align: right;">1.114e13 / 2.004e23</td>
+</tr>
+<tr>
+<td>墙钟 / GPU 小时</td>
+<td style="text-align: right;">366.5 h / 140,747 GPU·h</td>
+</tr>
+<tr>
+<td>checkpoint 次数 / 单次 / 合计</td>
+<td style="text-align: right;">2360 / 42 GB / 99.1 TB</td>
+</tr>
+<tr>
+<td>单次故障平均重放（间隔 2000 步）</td>
+<td style="text-align: right;">1000 步 = 2.36e9 token = 29.8 GPU·h</td>
+</tr>
+</tbody>
+</table>
+<p>两个可计算的决策：</p>
+<ul>
+<li><strong>checkpoint 间隔</strong>。间隔从 2000 步加到 4000 步，写入量减半（99.1 → 49.6 TB），单次故障平均重放从 29.8 增到 59.6 GPU·h。若故障率是每 10 万步一次，整轮 4.72M 步约 47 次故障，多付约 1.41 千 GPU·h（约为 14.07 万 GPU·h 预算的 1.0%）。所以这个决定取决于存储带宽与故障分布，而不是"越频繁越安全"。</li>
+<li><strong>准入策略</strong>。碎片化容量（本机例中 2 张空闲卡）用保守回填消化，makespan 从 1050 s 降到 900 s；抢占留给真正有优先级价值的作业，并把可被抢占作业的 checkpoint 间隔压到小于其被抢占的典型时长，让重放损失接近 0。</li>
+</ul>
+<h3 id="711-g">另三条公开流程的字段账（7.11-G）</h3>
+<p>SmolLM3 之所以能算出墙钟，是因为它公布了三份训练 YAML 与启动规模。另外三条流程没有公布作者机器的迭代时间或训练日志，<strong>能复算的只有配置里写死的量</strong>：token 预算、可训练参数组、checkpoint 次数、奖励调用量与公开程度。<code>labs/L7/training_scheduling_budget.py --section public-flows</code> 只读仓库内的配置快照（Cosmos SFT 的 TOML、SpecForge 的 Eagle3/DFlash 配方与草稿 config、CosyVoice2 GRPO 的 <code>run.sh</code>），输出下面三张表，不产生任何 GPU 小时估计。</p>
+<p>Cosmos3-Edge 的两条 SFT 配方分别是生成分支（<code>task=vfm</code>）与 Reasoner 分支（<code>task=vlm</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>vision_sft_edge（生成）</th>
+<th>videophy2_sft_edge（Reasoner）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>优化器覆盖的参数组</td>
+<td><code>moe_gen</code>、<code>time_embedder</code>、<code>vae2llm</code>、<code>llm2vae</code>、<code>k_norm_und_for_gen</code></td>
+<td>未指定，Optimizer 覆盖全部参数</td>
+</tr>
+<tr>
+<td>lr / weight decay</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>4</mn></mrow></msup></mrow></math></span> / 0</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>6</mn></mrow></msup></mrow></math></span> / 0.1</td>
+</tr>
+<tr>
+<td>每 micro-batch 预算</td>
+<td>45,056 打包 token</td>
+<td>1 样本 × 16,000 序列长度</td>
+</tr>
+<tr>
+<td>grad accum / max_iter</td>
+<td>2 / 500</td>
+<td>8 / 50</td>
+</tr>
+<tr>
+<td>整轮 token 上界（每 rank）</td>
+<td>45.06 M</td>
+<td>6.4 M</td>
+</tr>
+<tr>
+<td>精度 / 激活重算 / compile / EMA</td>
+<td>bf16 / full / 开 / 开</td>
+<td>bf16 / full / 关 / 关</td>
+</tr>
+<tr>
+<td>save_iter / 整轮 checkpoint 次数</td>
+<td>100 / 5</td>
+<td>100 / 1（只在最后）</td>
+</tr>
+</tbody>
+</table>
+<p>生成分支只把生成路径与两个 connector、时间嵌入放进优化器，Reasoner 分支没有参数组限制——"同一个模型的两条 SFT 配方更新对象不同"在配置里是显式的，不需要从 loss 反推。Reasoner 分支的 <code>max_iter=50</code> 小于它的 <code>save_iter=100</code>，中途不落盘；作者没有公布单迭代时间，因此"更密保存的收益"在本材料里无法定量。</p>
+<p>SpecForge 的 Eagle3 配方（Qwen3-8B target + 单层草稿）：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>target / 草稿结构</td>
+<td><code>Qwen/Qwen3-8B</code>（词表 151,936）/ 1 层、hidden 4096、草稿词表 32,000</td>
+</tr>
+<tr>
+<td>epochs / max_steps / batch / max_length</td>
+<td>10 / 10,000 / 1 / 4096</td>
+</tr>
+<tr>
+<td>目标模型 token 预算</td>
+<td>40.96 M（10,000 × 1 × 4096）</td>
+</tr>
+<tr>
+<td>每 epoch 样本量（隐含）</td>
+<td>1,000</td>
+</tr>
+<tr>
+<td>save_interval / checkpoint 次数</td>
+<td>1000 / 10</td>
+</tr>
+<tr>
+<td>部署模式 / trainer rank</td>
+<td>disaggregated / 1 节点 1 进程</td>
+</tr>
+</tbody>
+</table>
+<p>batch=1、length 4096 意味着每个 step 触发一次目标模型前向；同一份数据训 10 个 epoch，把特征离线预生成一次即可复用，目标前向从 10,000 次降到 1,000 次（省 90%）。这是本章第二个可计算的决策，代价写在"陷阱"里：缓存身份（模型 revision、模板、层号）一变就要重跑目标模型。</p>
+<p>CosyVoice2 的 GRPO 配方：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练样本 / epoch</td>
+<td>80,000 / 1</td>
+</tr>
+<tr>
+<td>GPU / micro batch / train batch</td>
+<td>8 / 4 / 32</td>
+</tr>
+<tr>
+<td>rollout n / prompt / response 长度</td>
+<td>4 / 1024 / 512</td>
+</tr>
+<tr>
+<td>采样总数（含 n 与 epoch）</td>
+<td>320,000</td>
+</tr>
+<tr>
+<td>奖励服务</td>
+<td>Triton 上的 token2wav + SenseVoice ASR 串联，独立占 8 个设备</td>
+</tr>
+<tr>
+<td>save_freq / test_freq</td>
+<td>100 / 100</td>
+</tr>
+</tbody>
+</table>
+<p>奖励服务单独占 8 个设备，等于训练集群的 100%——这条配方把三分之一以上的机器预算花在打分上，而奖励又来自第三方 codec/ASR。奖励调用量是 80,000 × 4 × 1 = 320,000 次；把它缩容或与训练共置可以省设备，代价是拉长奖励等待、放大策略陈旧度。作者没有公布奖励服务时延与训练曲线，这条只能作为配置层面的取舍。</p>
+<p>三条流程的公开程度需要与数字一起读：Cosmos、SpecForge、CosyVoice 都公开了配置与（部分）权重，但都没有公布作者机器的迭代墙钟与完整训练日志；SpecForge 的 Qwen3-8B 草稿权重是公开发布物，Cosmos3-Edge 的权重可下载，CosyVoice2 GRPO 只有配方、基础权重与奖励实现。<strong>因此本节的数字是字段账，不是成本账</strong>；教学项目的成本来自上文 7.11-I 的实测，两者不能混记。</p>
+<hr />
+<h2 id="_15">陷阱</h2>
+<ul>
+<li><strong>用最长局部跨度当全局窗口</strong>。同步训练的墙钟由共同 step 边界决定；本机构造里两者差 1.9 倍。缺少窗口时应输出 <code>null</code>，而不是挑一个更好看的分母。</li>
+<li><strong>把不同 YAML 相加</strong>。三份 SmolLM3 配置的 <code>train_steps</code> 都是 4,720,000，它们描述同一次训练的不同阶段，相加会得到 3 倍 token 预算。</li>
+<li><strong>把类别时间相加</strong>。重叠区间只能取并集，未被覆盖的部分叫未归因。</li>
+<li><strong>把"spawn 日志"当进程证据</strong>。必须有真实 PID 与退出码；"checkpoint 文件存在"也不等于它可恢复。</li>
+<li><strong>把高 GPU 使用率当有效进度</strong>。要看已提交更新与 goodput，而不是利用率或队列长度。</li>
+<li><strong>把配额调度当状态恢复</strong>。Kueue/JobSet/torchrun 能保证整组启动与重启，但 optimizer、RNG、数据游标仍由应用负责。</li>
+</ul>
+<p>诊断顺序：loss 异常查 mask 与数值；step 慢查未插桩基准与时间线；rank 卡住查 collective 顺序与进程状态；恢复不一致查已提交游标与 optimizer。证据不足时保留未归因，不把预算常量改名为测量。</p>
+<hr />
+<h2 id="_16">自测题</h2>
+<ol>
+<li>一批数据被处理两次，为什么最终提交计数仍可能正确？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">details 答案</p>
+<p>第一次处理可能发生在尚未提交的失败区间。恢复后重放该区间，只有与合法模型状态共同提交的 IDs 计入有效进度。本章保留 physical 重复与 committed 无重复两个字段：注入发布前中断时 physical 重复数为 4，committed 仍是 0–7。</p>
+</div>
+<ol start="2">
+<li>两个 rank 各忙 100 ms、活动错开，这一步的 MFU 分母应该取多少？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">details 答案</p>
+<p>取协调者时钟定义共同 step 窗口。本机 fixture 中窗口是 190 ms，活动并集 180 ms，窗口内还有 10 ms 未归因；用最长局部跨度 100 ms 会把 MFU 高估 1.9 倍。没有窗口时分析器输出 <code>null</code>。</p>
+</div>
+<ol start="3">
+<li>compute 0–10 ms 与 comm 5–15 ms，总步长是多少？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">details 答案</p>
+<p>只覆盖这两个区间时跨度与并集均为 15 ms，类别时间之和为 20 ms。不能把重叠的 5 ms 再加到总耗时。</p>
+</div>
+<ol start="4">
+<li>6P、8P 和一段 trace 足够证明硬件 HFU 吗？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">details 答案</p>
+<p>不够。6P/8P 是模型/重算 FLOP 近似，trace 是时间材料；只有匹配设备峰值与任务口径才能给出估算，硬件计数仍需要独立采集。MFU 也不衡量任务质量。</p>
+</div>
+<ol start="5">
+<li>抢占一个 checkpoint 间隔 300 s、已运行 200 s 的作业会丢多少工作？怎样把损失压到接近 0？</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">details 答案</p>
+<p>已保存的检查点进度是 0，损失 200 s，按 6 卡计是 1200 卡秒。把间隔压到 100 s 后，同一时刻已保存 200 s，损失为 0。代价是 checkpoint 次数增加，需要与写入带宽和存储预算一起权衡。</p>
+</div></article><nav class="pagenav"><a class="nav-prev" href="../L7/7.10-multimodal-training-orchestration.html">&#8592; 7.10 多模态与生成模型训练编排</a><a class="nav-next" href="../L8/8.1-routing-gateway.html">8.1 路由与网关 &#8594;</a></nav>
+</main>
+</body>
+</html>

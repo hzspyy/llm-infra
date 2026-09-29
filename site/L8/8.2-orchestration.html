@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.2 编排：K8s / Ray / Slurm</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">8.2</div>
+  <div class="sidebar-title">编排：K8s / Ray / Slurm</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：三种"活着"之间的空隙</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 六阶段，以及每一段由什么触发</a></li>
+<li><a href="#2">2. 就绪判据必须是"真实请求"，但探测本身有代价</a></li>
+<li><a href="#3">3. 滚动更新的容量算术</a></li>
+<li><a href="#4-gang-scheduling">4. gang scheduling：分配不等于就绪</a></li>
+<li><a href="#5">5. 隔离机制的能力边界</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析与设计取舍</a><ul>
+<li><a href="#kubernetes">Kubernetes：三种探针 + 两个时间窗</a></li>
+<li><a href="#ray-serve">Ray Serve：副本状态机</a></li>
+<li><a href="#slurmallocation-step">Slurm：allocation / step / 进程内就绪</a></li>
+<li><a href="#gang-scheduling">gang scheduling</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#a-worker-crater2">A. 单 worker 的冷/热启动时间线（crater2）</a></li>
+<li><a href="#b-worldvln">B. 双副本 + 崩溃 + 滚动更新（worldvln）</a></li>
+<li><a href="#d-tp2-worldvln">D. TP=2 与部分分配（worldvln）</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：三种"活着"之间的空隙</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 六阶段，以及每一段由什么触发</a></li>
+<li><a href="#2">2. 就绪判据必须是"真实请求"，但探测本身有代价</a></li>
+<li><a href="#3">3. 滚动更新的容量算术</a></li>
+<li><a href="#4-gang-scheduling">4. gang scheduling：分配不等于就绪</a></li>
+<li><a href="#5">5. 隔离机制的能力边界</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析与设计取舍</a><ul>
+<li><a href="#kubernetes">Kubernetes：三种探针 + 两个时间窗</a></li>
+<li><a href="#ray-serve">Ray Serve：副本状态机</a></li>
+<li><a href="#slurmallocation-step">Slurm：allocation / step / 进程内就绪</a></li>
+<li><a href="#gang-scheduling">gang scheduling</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#a-worker-crater2">A. 单 worker 的冷/热启动时间线（crater2）</a></li>
+<li><a href="#b-worldvln">B. 双副本 + 崩溃 + 滚动更新（worldvln）</a></li>
+<li><a href="#d-tp2-worldvln">D. TP=2 与部分分配（worldvln）</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L8 · 集群、生产与前沿</div>
+  <div class="mod-id">8.2</div>
+  <h1>编排：K8s / Ray / Slurm</h1>
+  <p class="lede">gang scheduling、GPU 共享(MIG/MPS)；llm-d / NVIDIA Dynamo / vLLM production-stack / SGLang router 架构对比。含滚动更新与租户边界。</p>
+  <div class="chips"><span class="chip">实测机器 worldvln（2× L40S，PCIe）· crater2（RTX 5090）· Qwen3-1.7B · vLLM 0.29.0</span><span class="chip">前置 6.0（集合通信与进程组）· 8.1（路由与网关）· 8.7（冷启动与权重分发）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><strong>GPU 资源怎样变成一个可用的 worker？</strong> 实测从"选定显卡"到"能服务"要 46.1 s（冷编译缓存）或 27.1 s（热缓存），其中"进程活着但接不了请求"的窗口占 36.8 s / 21.5 s。</li>
+<li><strong>就绪、排空和重启怎样影响请求？</strong> 1600 条持续重放请求里，一次 SIGKILL 崩溃 + 一次滚动更新导致 1 条在途请求重试 3 次后失败并被记录，其余 1599 条成功；副本分别停机 55.5 s 与 60.6 s。</li>
+<li><strong>不同编排器的职责边界在哪里？</strong> K8s、Ray Serve、Slurm 都把"分配资源"和"进程可用"分成两层；把它们混成一层，就会出现"pod Running 但请求全 502"。</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的边界</p>
+<p>本项目的两台 GPU 机器都是<strong>容器</strong>，没有集群控制面：没有 kubelet、没有多个节点、没有 Slurm 控制机，也没有 MIG 能力（实测 <code>nvidia-smi mig -lgip</code> 在两台机器上都返回 <code>No MIG-supported devices found</code>）。因此本章只做<strong>容器内能真实复现</strong>的部分：真实 worker 进程的六阶段、三级就绪探针、崩溃与滚动更新、TP=2 的整组/部分分配。K8s / Ray Serve / Slurm / MIG / MPS 的真实部署在本机<strong>没有执行</strong>，只做固定版本源码与官方文档的字段映射，并明确标注为未完成。</p>
+</div>
+<hr />
+<h2 id="_2">心智模型：三种"活着"之间的空隙</h2>
+<figure>
+
+
+<svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="worker 六阶段与三级探针的覆盖范围">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="20" font-size="13" font-weight="600">worker 六阶段，以及三个探针各自能看见到哪一步</text>
+
+    <line x1="40" y1="70" x2="720" y2="70" stroke="currentColor" stroke-width="1.2" opacity="0.6"/>
+    <g font-size="10.5">
+      <circle cx="70" cy="70" r="5" fill="#61afef"/><text x="44" y="92">ALLOCATED</text>
+      <circle cx="190" cy="70" r="5" fill="#e5c07b"/><text x="158" y="92">LOADING</text>
+      <circle cx="330" cy="70" r="5" fill="#e5c07b"/><text x="298" y="92">WARMING</text>
+      <circle cx="470" cy="70" r="5" fill="#98c379"/><text x="446" y="92">READY</text>
+      <circle cx="590" cy="70" r="5" fill="#e06c75"/><text x="556" y="92">DRAINING</text>
+      <circle cx="690" cy="70" r="5" fill="currentColor"/><text x="664" y="92">STOPPED</text>
+    </g>
+
+    <rect x="70" y="104" width="400" height="22" rx="3" fill="#e5c07b" opacity="0.25"/>
+    <text x="76" y="120" font-size="10.5">pid_alive 能看见这一段（进程存在，但请求全失败）</text>
+    <rect x="470" y="132" width="120" height="22" rx="3" fill="#98c379" opacity="0.3"/>
+    <text x="474" y="148" font-size="10.5">/v1/models 200</text>
+    <rect x="470" y="160" width="120" height="22" rx="3" fill="#98c379" opacity="0.5"/>
+    <text x="474" y="176" font-size="10.5">serving（真实补全）</text>
+
+    <text x="40" y="212" font-size="11">实测（crater2 · RTX 5090 · Qwen3-1.7B · 冷编译缓存）</text>
+    <rect x="40" y="222" width="300" height="86" rx="5" fill="none" stroke="currentColor" stroke-width="1.1"/>
+    <text x="52" y="242" font-size="10.5">lease → process          0.004 s</text>
+    <text x="52" y="260" font-size="10.5">process → weights 加载   22.0 s</text>
+    <text x="52" y="278" font-size="10.5">weights → READY          24.1 s</text>
+    <text x="52" y="298" font-size="10.5" font-weight="600" fill="#e06c75">pid_alive 但不可服务 147 次探测 ≈ 36.8 s</text>
+
+    <text x="396" y="212" font-size="11">同机 · 同一编译缓存的第二次运行</text>
+    <rect x="396" y="222" width="324" height="86" rx="5" fill="none" stroke="#98c379" stroke-width="1.1"/>
+    <text x="408" y="242" font-size="10.5">lease → process          0.0003 s</text>
+    <text x="408" y="260" font-size="10.5">process → weights 加载   16.4 s</text>
+    <text x="408" y="278" font-size="10.5">weights → READY          10.7 s</text>
+    <text x="408" y="298" font-size="10.5" font-weight="600" fill="#98c379">不可服务窗口缩到 86 次 ≈ 21.5 s</text>
+  </g>
+</svg>
+
+
+<figcaption>三次探测的含义完全不同：进程存在、HTTP 端点可用、能返回一次真实补全。只有第三个才算 READY。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1">1. 六阶段，以及每一段由什么触发</h3>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>进入条件</th>
+<th>能接请求吗</th>
+<th>实测（crater2 冷 / 热）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ALLOCATED</td>
+<td>选定的 GPU 显存空闲（本机以 <code>nvidia-smi</code> 核对）</td>
+<td>否</td>
+<td>0.004 s / 0.0003 s</td>
+</tr>
+<tr>
+<td>LOADING</td>
+<td>进程已起，权重文件在读</td>
+<td>否</td>
+<td>22.0 s / 16.4 s</td>
+</tr>
+<tr>
+<td>WARMING</td>
+<td>权重加载完，正在编译与捕获图</td>
+<td>否</td>
+<td>24.1 s / 10.7 s</td>
+</tr>
+<tr>
+<td>READY</td>
+<td><strong>一次真实补全</strong>返回 200 且有 token</td>
+<td>是</td>
+<td>累计 46.1 s / 27.1 s</td>
+</tr>
+<tr>
+<td>DRAINING</td>
+<td>已从路由中摘除，等在途请求归零</td>
+<td>不再接新请求</td>
+<td>实测 0.0069 s（当时无在途）</td>
+</tr>
+<tr>
+<td>STOPPED</td>
+<td>进程退出且显存回到基线</td>
+<td>否</td>
+<td>SIGTERM 后 1.0 s 内回收 32.6 GB</td>
+</tr>
+</tbody>
+</table>
+<p>三点值得单独说明。<strong>一，"进程存活"覆盖了 80% 的启动时间</strong>（36.8 s / 46.1 s）。任何只检查 PID 或只检查 TCP 端口就宣布就绪的做法，都会在这段时间里把请求送进一个必然失败的目标。<strong>二，<code>/v1/models</code> 并不早于服务能力</strong>：本次 148 次冷启动探测里，<code>http_ready</code> 为真但 <code>serving</code> 为假的情况是 0 次——vLLM 0.29 的 HTTP 层在引擎可服务之后才对外。所以"HTTP 200 但不可服务"这个常见假设在本版本上不成立；真正的假就绪窗口在它之前。<strong>三，退出比启动快一个数量级以上</strong>：SIGTERM 到显存归还实测 0.4–2.1 s，而启动要 27–46 s。扩容与缩容的代价天然不对称。</p>
+<h3 id="2">2. 就绪判据必须是"真实请求"，但探测本身有代价</h3>
+<p>三级探针的成本完全不同：读 <code>/proc</code> 是微秒级；<code>GET /v1/models</code> 是毫秒级；发一次真实补全是几十毫秒到几百毫秒，而且会<strong>占用引擎的一个批处理位置</strong>。本次把真实补全探测放在 250 ms 的轮询周期上，探测本身就在给正在启动的引擎加压。生产做法是分层：</p>
+<ul>
+<li>高频（1–5 s）：<code>/health</code> 或 <code>/v1/models</code>，承担"进程还在不在"；</li>
+<li>低频（启动后一次、或每 N 秒）：真实请求探测，承担"能不能真出 token"；</li>
+<li>结果进入一个<strong>滞回</strong>判据（连续 k 次成功才 READY，连续 m 次失败才摘除），避免单次超时抖动导致流量抖动。</li>
+</ul>
+<h3 id="3">3. 滚动更新的容量算术</h3>
+<p>设副本数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>R</mi></mrow></math></span>、单副本就绪时间 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>T</mi><mrow><mtext>ready</mtext></mrow></msub></mrow></math></span>、更新一个副本的时间 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>T</mi><mrow><mtext>roll</mtext></mrow></msub></mrow></math></span>。<code>maxUnavailable=0</code>（先起新再停旧）要求同时存在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>R</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></math></span> 份资源；<code>maxSurge=0</code>（先停旧再起新）则在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>T</mi><mrow><mtext>roll</mtext></mrow></msub></mrow></math></span> 内只有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>R</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 个副本可用，剩余副本的负载变成 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>R</mi><mo>&#x0002F;</mo><mo stretchy="false">&#x00028;</mo><mi>R</mi><mo>&#x02212;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo></mrow></math></span> 倍。</p>
+<p>本次实测的两次事件（worldvln，两个副本，10 QPS 持续重放）：</p>
+<table>
+<thead>
+<tr>
+<th>事件</th>
+<th style="text-align: right;">时刻（重放开始后）</th>
+<th style="text-align: right;">在途请求</th>
+<th style="text-align: right;">恢复时刻</th>
+<th style="text-align: right;">停机时长</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SIGKILL 崩溃 worker-0</td>
+<td style="text-align: right;">30.08 s</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">85.74 s</td>
+<td style="text-align: right;"><strong>55.5 s</strong></td>
+</tr>
+<tr>
+<td>滚动更新 worker-1（排空→SIGTERM→新进程）</td>
+<td style="text-align: right;">90.08 s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">150.66 s</td>
+<td style="text-align: right;"><strong>60.6 s</strong></td>
+</tr>
+</tbody>
+</table>
+<p>在这两段窗口里，另一个副本独自承担全部 10 QPS。<strong>如果两个副本同时不可用，就没有任何副本可接请求</strong>；这正是 <code>maxUnavailable: 0</code> + <code>maxSurge: 1</code> 存在的理由，也是本次实验中"崩溃恢复还没完成就开始滚动更新"这一操作的直接风险（测试设计中显式构造了该重叠窗口以验证风险边界）。</p>
+<p>单副本的重启本身（lease→READY）：崩溃重启 54.8 s（权重 32.6 s + 就绪 22.2 s），滚动更新新进程 57.0 s（权重 34.4 s + 就绪 22.6 s）。两者都明显快于最初的并发冷启动 117.3 s——同机同缓存的对比说明：<strong>并发启动不是免费的</strong>，两个进程同时读权重、同时编译，单副本就绪时间会显著拉长。</p>
+<h3 id="4-gang-scheduling">4. gang scheduling：分配不等于就绪</h3>
+<p>TP=2 的 worker 要么拿到两张卡、要么一张都别要。实测三种情形（worldvln，L40S，默认编译缓存）：</p>
+<table>
+<thead>
+<tr>
+<th>情形</th>
+<th>可见 GPU</th>
+<th style="text-align: right;">TP</th>
+<th>结果</th>
+<th style="text-align: right;">耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>两卡可见</td>
+<td>1,3</td>
+<td style="text-align: right;">2</td>
+<td>READY</td>
+<td style="text-align: right;">86.1 s</td>
+</tr>
+<tr>
+<td>只给一张卡</td>
+<td>1</td>
+<td style="text-align: right;">2</td>
+<td><strong>立即失败，exit 1</strong></td>
+<td style="text-align: right;">14.0 s</td>
+</tr>
+<tr>
+<td>单卡</td>
+<td>1</td>
+<td style="text-align: right;">1</td>
+<td>READY</td>
+<td style="text-align: right;">58.0 s</td>
+</tr>
+</tbody>
+</table>
+<p>部分分配的失败原因是引擎自己拒绝启动，原文是</p>
+<div class="highlight"><pre><span></span><code>Value error, World size (2) is larger than the number of available GPUs (1) in this node.
+</code></pre></div>
+
+<p>这是<strong>好的失败方式</strong>：在加载权重之前就报错，不浪费 86 s。真正危险的是另一种情形——调度器分别、非原子地分配两张卡，第一张给出去以后第二张永远等不到，进程就卡在集合通信初始化里，既不失败也不就绪。<strong>这就是"不能把获得两块 GPU 的时间当成模型就绪时间"的完整含义</strong>：分配是瞬时事件，就绪是 58–86 s 的过程，两者之间还夹着一个可能永久阻塞的状态。</p>
+<h3 id="5">5. 隔离机制的能力边界</h3>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>提供什么</th>
+<th>不提供什么</th>
+<th>本机可用性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MIG</td>
+<td>把受支持的 GPU 切成多个实例，每份有<strong>独立</strong>的计算与显存</td>
+<td>只在受支持的型号上存在；同一实例内无二级隔离</td>
+<td><strong>不可用</strong>：<code>nvidia-smi mig -lgip</code> 在 L40S 与 RTX 5090 上都返回 <code>No MIG-supported devices found</code></td>
+</tr>
+<tr>
+<td>MPS</td>
+<td>多进程共享同一 GPU，减少上下文切换，提供 SM/显存分区的控制接口与优先级</td>
+<td>进程间<strong>没有内存与故障隔离</strong>；一个进程崩溃可能影响同组其他进程</td>
+<td>二进制存在（<code>/usr/bin/nvidia-cuda-mps-control</code>、<code>nvidia-cuda-mps-server</code>），但本机是共享机器，<strong>未启用</strong></td>
+</tr>
+<tr>
+<td>进程隔离</td>
+<td>独立地址空间、独立 CUDA 上下文</td>
+<td>仍共享显存带宽与 L2；显存超卖会互相挤占</td>
+<td>可用，是本章所有实验的基础</td>
+</tr>
+<tr>
+<td>应用层配额</td>
+<td>请求数/并发/Token 预算</td>
+<td>不阻止越权进程直接吃显存</td>
+<td>可用（8.8 展开）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_4">工程实现：源码解析与设计取舍</h2>
+<h3 id="kubernetes">Kubernetes：三种探针 + 两个时间窗</h3>
+<p><code>staging/src/k8s.io/api/core/v1/types.go</code>（commit <code>467cf7b</code>）里的字段定义了容器可用的全部就绪语义：</p>
+<ul>
+<li><code>Probe</code>（<code>:3013</code>）：<code>InitialDelaySeconds</code>（<code>:3019</code>）、<code>FailureThreshold</code>（<code>:3036</code>）；</li>
+<li><code>StartupProbe</code>（<code>:3348</code>）、<code>ReadinessProbe</code>（<code>:3339</code>）、<code>LivenessProbe</code>（<code>:3333</code>）；</li>
+<li><code>TerminationGracePeriodSeconds</code>（Pod 级 <code>:3048</code>，容器级 <code>:4496</code>）。</li>
+</ul>
+<p><strong><code>startupProbe</code> 的语义是"在它成功之前，readiness 与 liveness 都不生效"。</strong> 这正好对应本章的 WARMING 阶段：把 <code>failureThreshold × periodSeconds</code> 设成大于冷启动到可服务的时间（本次 46.1 s，加上两个副本并发启动的放大取 300 s），容器才不会在编译阶段被判死。<strong><code>terminationGracePeriodSeconds</code> 是排空窗口</strong>：kubelet 先执行 <code>preStop</code>，再发 SIGTERM，超过这个时限才 SIGKILL。它与 8.2-B 里的 <code>drain()</code> 是同一件事的两种实现。</p>
+<h3 id="ray-serve">Ray Serve：副本状态机</h3>
+<p><code>python/ray/serve/_private/deployment_state.py</code>（commit <code>03aa07f</code>）里 <code>ReplicaState</code> 有 <code>STARTING</code>（<code>:172</code>）、<code>RECOVERING</code>（<code>:173</code>）、<code>RUNNING</code>（<code>:174</code>），另有 <code>PENDING_ALLOCATION</code> / <code>PENDING_INITIALIZATION</code>（<code>:541-544</code>）。两个 PENDING 状态恰好把"资源分配"和"进程初始化"分开——这就是本章六阶段里 ALLOCATED 与 LOADING/WARMING 的对应物。<code>graceful_shutdown_timeout_s</code> 是它的 <code>terminationGracePeriodSeconds</code>。</p>
+<h3 id="slurmallocation-step">Slurm：allocation / step / 进程内就绪</h3>
+<p>Slurm 的三层是 <code>sbatch</code>（拿到节点与 <code>--gres=gpu:N</code>）、<code>srun</code>（启动作业步里的进程）、以及进程自己加载模型。<strong><code>srun</code> 返回不等于模型可用</strong>：本机实测从进程启动到可服务是 46.1–86.1 s，这段时间在 Slurm 视角里只是"作业步在运行"。<code>--exclusive</code> 提供的是节点级独占，等价于 K8s 的 <code>nvidia.com/gpu</code> 独占语义。</p>
+<h3 id="gang-scheduling">gang scheduling</h3>
+<p>自调度式的"逐个 pod 抢资源"无法表达"要么全给、要么不给"。Kubernetes 的做法是 PodGroup：<code>kubernetes-sigs/scheduler-plugins</code> 的 coscheduling 插件（Beta）用标签 <code>scheduling.x-k8s.io/pod-group</code> 把一组 Pod 绑成同生共死的一个调度单位。TP=2 的 worker 就该这么申请——本次 D 段实测的"只给一张卡时引擎直接报错退出"说明，没有 PodGroup 时至少还有引擎自己兜底；但兜底发生在加载权重之后（14.0 s），而 PodGroup 是在调度阶段就不放行。</p>
+<h3 id="_5">设计取舍</h3>
+<table>
+<thead>
+<tr>
+<th>选择</th>
+<th>代价</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>就绪判据用真实补全，而不是 <code>/health</code></td>
+<td>探测本身占用批处理位置</td>
+<td>本版本 <code>/v1/models</code> 与可服务同时出现（0 次假就绪），但这是实现细节而非契约；跨版本跨引擎不可依赖</td>
+</tr>
+<tr>
+<td>排空用"等在途归零"而不是固定 sleep</td>
+<td>需要网关维护在途计数</td>
+<td>固定 sleep 要么浪费容量、要么切在请求中途</td>
+</tr>
+<tr>
+<td>崩溃重启不保留请求状态</td>
+<td>在途请求只能靠客户端重试</td>
+<td>引擎本身无跨进程请求状态；重试必须由客户端按 request_id 幂等处理</td>
+</tr>
+<tr>
+<td>TP&gt;1 用整组分配</td>
+<td>调度成功率下降、资源碎片增加</td>
+<td>部分分配要么被引擎拒绝（浪费加载时间），要么卡死在集合通信初始化</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="mini">工程实现：mini 实现</h2>
+<p><code>labs/L8/worker_lifecycle.py</code> 用真实子进程实现六阶段，三个探针互相独立：</p>
+<details class="fold">
+<summary>labs/L8/worker_lifecycle.py 三级探针与阶段切分</summary>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">ProbeClient</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">http_ready</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="n">code</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_http</span><span class="p">(</span><span class="s2">"GET"</span><span class="p">,</span> <span class="s2">"/v1/models"</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mf">3.0</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">code</span> <span class="o">==</span> <span class="mi">200</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">serving</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="n">body</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">({</span><span class="s2">"model"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="s2">"prompt"</span><span class="p">:</span> <span class="p">[</span><span class="mi">9707</span><span class="p">],</span>
+                           <span class="s2">"max_tokens"</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">"temperature"</span><span class="p">:</span> <span class="mf">0.0</span><span class="p">})</span><span class="o">.</span><span class="n">encode</span><span class="p">()</span>
+        <span class="n">code</span><span class="p">,</span> <span class="n">raw</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_http</span><span class="p">(</span><span class="s2">"POST"</span><span class="p">,</span> <span class="s2">"/v1/completions"</span><span class="p">,</span> <span class="n">body</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mf">30.0</span><span class="p">)</span>
+        <span class="o">...</span>
+</code></pre></div>
+
+</details>
+<p><code>phase_segments()</code> 按每次 <code>gpu_lease</code> 切段。这一点不是细节：同一个 supervisor 会经历"首次启动 → 崩溃 → 重启"多次启动，只取第一条 <code>ready</code> 会把重启算成 117 s 而不是 55 s（本项目第一次统计就踩了这个坑，修正后段统计为 54.8 s）。</p>
+<p><code>labs/L8/run_8_2.py</code> 是驱动：A 段做冷/热启动时间线，B 段用两个真实副本做崩溃与滚动更新重放，客户端对失败的请求用<strong>同一个 request_id</strong> 重试并把 attempts 逐条记下来。<code>labs/L8/gang_probe.py</code> 做 D 段的 TP=2 与部分分配探针。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="a-worker-crater2">A. 单 worker 的冷/热启动时间线（crater2）</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 冷：全新的 VLLM_CACHE_ROOT，编译与图缓存都从零开始</span>
+python<span class="w"> </span>labs/L8/run_8_2.py<span class="w"> </span>--mode<span class="w"> </span>A<span class="w"> </span>--out-dir<span class="w"> </span>out/8.2_A<span class="w"> </span>--cold<span class="w"> </span>--label<span class="w"> </span>worker_a_cold<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--cache-root<span class="w"> </span>out/8.2_A/cache<span class="w"> </span>--gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span>--port<span class="w"> </span><span class="m">19000</span>
+<span class="c1"># 热：同一个 cache-root 再跑一次</span>
+python<span class="w"> </span>labs/L8/run_8_2.py<span class="w"> </span>--mode<span class="w"> </span>A<span class="w"> </span>--out-dir<span class="w"> </span>out/8.2_A<span class="w"> </span>--label<span class="w"> </span>worker_a_warm<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--cache-root<span class="w"> </span>out/8.2_A/cache<span class="w"> </span>--gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span>--port<span class="w"> </span><span class="m">19000</span>
+</code></pre></div>
+
+<p>实测（Qwen3-1.7B，<code>max_model_len=4096</code>，<code>gpu_memory_utilization=0.35</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th style="text-align: right;">冷</th>
+<th style="text-align: right;">热</th>
+<th style="text-align: right;">差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>lease → process 启动</td>
+<td style="text-align: right;">0.004 s</td>
+<td style="text-align: right;">0.0003 s</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>process → 权重加载完</td>
+<td style="text-align: right;">22.0 s</td>
+<td style="text-align: right;">16.4 s</td>
+<td style="text-align: right;">−5.6 s（权重文件在页缓存里）</td>
+</tr>
+<tr>
+<td>权重 → READY</td>
+<td style="text-align: right;">24.1 s</td>
+<td style="text-align: right;">10.7 s</td>
+<td style="text-align: right;">−13.4 s（编译/图缓存命中）</td>
+</tr>
+<tr>
+<td><strong>lease → READY</strong></td>
+<td style="text-align: right;"><strong>46.1 s</strong></td>
+<td style="text-align: right;"><strong>27.1 s</strong></td>
+<td style="text-align: right;"><strong>−19.0 s</strong></td>
+</tr>
+<tr>
+<td><code>pid_alive</code> 但不可服务</td>
+<td style="text-align: right;">147 次 ≈ 36.8 s</td>
+<td style="text-align: right;">86 次 ≈ 21.5 s</td>
+<td style="text-align: right;">−15.3 s</td>
+</tr>
+<tr>
+<td><code>http_ready</code> 但不可服务</td>
+<td style="text-align: right;">0 次</td>
+<td style="text-align: right;">0 次</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>SIGTERM → 显存归还</td>
+<td style="text-align: right;">0.4 s（32.6 GB）</td>
+<td style="text-align: right;">2.1 s</td>
+<td style="text-align: right;">—</td>
+</tr>
+</tbody>
+</table>
+<h3 id="b-worldvln">B. 双副本 + 崩溃 + 滚动更新（worldvln）</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L8/run_8_2.py<span class="w"> </span>--mode<span class="w"> </span>B<span class="w"> </span>--out-dir<span class="w"> </span>out/8.2/B<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="nv">w0</span><span class="o">=</span><span class="m">0</span>:19000,w1<span class="o">=</span><span class="m">1</span>:19001<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--rate<span class="w"> </span><span class="m">10</span><span class="w"> </span>--duration<span class="w"> </span><span class="m">160</span><span class="w"> </span>--crash-at<span class="w"> </span><span class="m">30</span><span class="w"> </span>--roll-at<span class="w"> </span><span class="m">90</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--prompt-len<span class="w"> </span><span class="m">1024</span><span class="w"> </span>--output-len<span class="w"> </span><span class="m">64</span>
+</code></pre></div>
+
+<p>1024 token 提示、64 token 输出、10 QPS 持续 160 s，客户端轮转选副本并在失败时换副本重试（最多 3 次、同一 request_id）：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">实测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>计划请求 / 成功 / 失败</td>
+<td style="text-align: right;">1600 / 1599 / 1（0.06%）</td>
+</tr>
+<tr>
+<td>最大同时在途</td>
+<td style="text-align: right;">14</td>
+</tr>
+<tr>
+<td>触发重试的请求</td>
+<td style="text-align: right;">1（attempts = 3）</td>
+</tr>
+<tr>
+<td>因"无副本接单"而等待的请求</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>崩溃（worker-0，SIGKILL）停机</td>
+<td style="text-align: right;">55.5 s</td>
+</tr>
+<tr>
+<td>滚动更新（worker-1）停机</td>
+<td style="text-align: right;">60.6 s</td>
+</tr>
+<tr>
+<td>两个副本并发冷启动</td>
+<td style="text-align: right;">各 117.3 s</td>
+</tr>
+</tbody>
+</table>
+<p>唯一失败的请求 <code>r00307</code> 计划到达时刻正好是崩溃瞬间（t=30.02 s），它依次尝试 worker-0、worker-1、worker-1，三次都在 0.26 s 内以 <code>ConnectError: All connection attempts failed</code> 结束。它被完整记在 <code>replay_records.jsonl</code> 里——<strong>失败没有被静默吞掉，这是"不静默丢失"的最低要求</strong>；但为什么换到健康副本仍然连接失败，本次没有隔离出原因（客户端连接池、被击杀进程的端口复用、还是对端 accept 路径），保留为未定位。</p>
+<h3 id="d-tp2-worldvln">D. TP=2 与部分分配（worldvln）</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L8/gang_probe.py<span class="w"> </span>--out-dir<span class="w"> </span>out/8.2/D<span class="w"> </span>--gpus<span class="w"> </span><span class="m">1</span>,3<span class="w"> </span>--cases<span class="w"> </span>both_visible,one_visible,tp1
+</code></pre></div>
+
+<p>结果见上文第 4 节：整组分配 86.1 s 就绪，部分分配 14.0 s 失败退出，单卡 58.0 s 就绪。</p>
+<hr />
+<h2 id="_6">原始现场</h2>
+<p>冷启动摘要（<code>results/crater2/8.2/20260914-startup/summary_A.json</code>）：</p>
+<details class="fold">
+<summary>results/crater2/8.2/20260914-startup/summary_A.json 冷启动阶段分解</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"worker_a"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"lease_to_process_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0039</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"process_to_weights_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">22.017</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"weights_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">24.107</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"process_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">46.124</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"total_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">46.128</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"probe_counts"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"pid_alive_only"</span><span class="p">:</span><span class="w"> </span><span class="mi">147</span><span class="p">,</span><span class="w"> </span><span class="nt">"http_ready_not_serving"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                   </span><span class="nt">"serving"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"total"</span><span class="p">:</span><span class="w"> </span><span class="mi">148</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"cold_cache"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"gpu_free_after_stop_mib"</span><span class="p">:</span><span class="w"> </span><span class="mi">32606</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>重放计数（<code>summary_B.json</code>）与按 <code>gpu_lease</code> 重算的分段统计（<code>worker_segments.json</code>，因为 <code>summary_B.json</code> 里的 <code>worker_phases</code> 只保留了首次启动）：</p>
+<details class="fold">
+<summary>results/worldvln/8.2/20260914-lifecycle/summary_B.json 重放计数</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"planned"</span><span class="p">:</span><span class="w"> </span><span class="mi">1600</span><span class="p">,</span><span class="w"> </span><span class="nt">"rate_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">10.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"window_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">164.27</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"counts"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"SUCCESS"</span><span class="p">:</span><span class="w"> </span><span class="mi">1599</span><span class="p">,</span><span class="w"> </span><span class="nt">"FAILED"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"retried_requests"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"max_inflight"</span><span class="p">:</span><span class="w"> </span><span class="mi">14</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"waiting_requests"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"max_worker_wait_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"retry_attempts_hist"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"1"</span><span class="p">:</span><span class="w"> </span><span class="mi">1599</span><span class="p">,</span><span class="w"> </span><span class="nt">"3"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<details class="fold">
+<summary>results/worldvln/8.2/20260914-lifecycle/worker_segments.json 四段启动（首启 + 崩溃重启 + 滚动更新）</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"由 *_lifecycle.jsonl 与 *_probes.jsonl 按每次 gpu_lease 切段重算"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"segments"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"w0"</span><span class="p">,</span><span class="w">         </span><span class="nt">"segment"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"process_to_weights_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">53.413</span><span class="p">,</span><span class="w"> </span><span class="nt">"weights_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">63.908</span><span class="p">,</span><span class="w"> </span><span class="nt">"total_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">117.324</span><span class="p">,</span><span class="w"> </span><span class="nt">"probe_counts"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"pid_alive_only"</span><span class="p">:</span><span class="w"> </span><span class="mi">151</span><span class="p">}},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"w0_restart"</span><span class="p">,</span><span class="w"> </span><span class="nt">"segment"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"process_to_weights_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">32.571</span><span class="p">,</span><span class="w"> </span><span class="nt">"weights_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">22.239</span><span class="p">,</span><span class="w"> </span><span class="nt">"total_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">54.812</span><span class="p">,</span><span class="w">  </span><span class="nt">"probe_counts"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"pid_alive_only"</span><span class="p">:</span><span class="w"> </span><span class="mi">113</span><span class="p">}},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"w1"</span><span class="p">,</span><span class="w">         </span><span class="nt">"segment"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"process_to_weights_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">53.424</span><span class="p">,</span><span class="w"> </span><span class="nt">"weights_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">63.900</span><span class="p">,</span><span class="w"> </span><span class="nt">"total_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">117.326</span><span class="p">,</span><span class="w"> </span><span class="nt">"probe_counts"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"pid_alive_only"</span><span class="p">:</span><span class="w"> </span><span class="mi">151</span><span class="p">}},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"w1_roll"</span><span class="p">,</span><span class="w">    </span><span class="nt">"segment"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"process_to_weights_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">34.355</span><span class="p">,</span><span class="w"> </span><span class="nt">"weights_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">22.647</span><span class="p">,</span><span class="w"> </span><span class="nt">"total_to_ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">57.003</span><span class="p">,</span><span class="w">  </span><span class="nt">"probe_counts"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"pid_alive_only"</span><span class="p">:</span><span class="w"> </span><span class="mi">116</span><span class="p">}}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>集群事件时间线（<code>cluster_events.jsonl</code>）：</p>
+<details class="fold">
+<summary>results/worldvln/8.2/20260914-lifecycle/cluster_events.jsonl 崩溃与滚动更新</summary>
+<div class="highlight"><pre><span></span><code>{"t_s": 30.081, "event": "crash_begin", "worker": "w0", "inflight": 1}
+{"t_s": 30.203, "event": "crash_done", "worker": "w0", "inflight": 1}
+{"t_s": 85.742, "event": "crash_restart_ready", "worker": "w0_restart"}
+{"t_s": 90.078, "event": "roll_drain_begin", "worker": "w1", "inflight": 0}
+{"t_s": 90.089, "event": "roll_drain_done", "worker": "w1", "waited_s": 0.0069}
+{"t_s": 92.937, "event": "roll_stopped", "worker": "w1"}
+{"t_s": 150.659, "event": "roll_new_ready", "worker": "w1_roll"}
+</code></pre></div>
+
+</details>
+<p>部分分配时引擎自己的报错原文（<code>gang_probe.json</code> 中 <code>tp2_one_visible</code> 记录的字段与 <code>error_excerpt</code> 前两行）：</p>
+<details class="fold">
+<summary>results/worldvln/8.2/20260914-gang/gang_probe.json 部分分配失败</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"tp2_one_visible"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"cuda_visible_devices"</span><span class="p">:</span><span class="w"> </span><span class="s2">"1"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"tensor_parallel_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ready"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ready_elapsed_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">14.004348814021796</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"exit_code"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"error_excerpt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"(APIServer pid=157939) Traceback (most recent call last):\n(APIServer pid=157939) pydantic_core._pydantic_core.ValidationError: 1 validation error for ParallelConfig\n(APIServer pid=157939)   Value error, World size (2) is larger than the number of available GPUs (1) in this node. ..."</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"log"</span><span class="p">:</span><span class="w"> </span><span class="s2">"out/8.2/D/tp2_one_visible.log"</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>编排配置与资料入口：<code>labs/L8/orchestration/k8s_vllm_deployment.yaml</code>（Deployment + Service，字段已逐个对照 k8s <code>types.go</code>）、<code>ray_serve_vllm.py</code>、<code>slurm_job.sh</code>；固定版本材料在 <code>results/crater2/8.2/20260914-refs/</code>（Ray <code>03aa07f</code>、k8s <code>467cf7b</code>、coscheduling 插件 <code>b677cb7</code>、MIG/MPS 官方文档页，<code>manifest.txt</code> 记录字节数与来源）。</p>
+<hr />
+<h2 id="_7">前沿</h2>
+<ol>
+<li><strong>副本状态机是编排器的共同抽象。</strong> Ray Serve 把副本分成 <code>STARTING / RECOVERING / RUNNING</code> 与 <code>PENDING_ALLOCATION / PENDING_INITIALIZATION</code>；Kubernetes 用 <code>startupProbe</code> 把"启动中"从"就绪"里单独切出来。两者都在回答同一个问题：<strong>哪一段时间允许把请求发进来</strong>。</li>
+<li><strong>整组调度。</strong> <code>kubernetes-sigs/scheduler-plugins</code> 的 coscheduling（Beta）用 <code>scheduling.x-k8s.io/pod-group</code> 表达 all-or-nothing；Volcano 等批调度器提供同一语义。TP/PP 并行的 worker 天然属于这一类。</li>
+<li><strong>隔离能力取决于硬件。</strong> MIG 只在受支持的型号上存在（本机 L40S 与 RTX 5090 均不支持），且它提供的是实例内的资源切分而非安全边界；MPS 提供利用率与分区接口，但不提供内存与故障隔离。把"共享 GPU"当成"隔离"是 8.8 要展开的陷阱。</li>
+<li><strong>服务侧的编排层。</strong> Gateway API Inference Extension 与 llm-d 把"哪个 pod 可以接流量"做成 Endpoint Picker 的就绪集合，和本章的三级探针是同一层语义（材料见 <code>results/worldvln/8.1/20260914-refs/</code>）。</li>
+</ol>
+<hr />
+<h2 id="_8">陷阱</h2>
+<ol>
+<li><strong>用 PID 或端口当就绪。</strong> 实测进程存在但不可服务的窗口有 36.8 s（冷）/ 21.5 s（热）。</li>
+<li><strong>把 <code>startupProbe</code> 的窗口设得比冷启动短。</strong> 结果是容器在编译阶段被反复重启，永远到不了 READY。</li>
+<li><strong>忘了排空就给 SIGTERM。</strong> 本次崩溃（无排空）当场打掉 1 条在途请求；滚动更新那次因为刚好无在途，排空只花了 0.0069 s——<strong>排空的代价取决于流量，不是常数</strong>。</li>
+<li><strong>在另一个副本还没恢复时就滚动更新它。</strong> 两个副本同时不可用就没有兜底；<code>maxUnavailable: 0</code> + <code>maxSurge: 1</code> 是为此存在的。</li>
+<li><strong>把"分到两张卡"当成"TP=2 可用"。</strong> 分配是瞬时的，就绪要 86.1 s；非原子分配还会卡死在集合通信初始化。</li>
+<li><strong>跨机器比较启动时间。</strong> 本章 A 段在 RTX 5090 上、B/D 段在 L40S 上，绝对值不可比；只有同机同缓存的前后对比（117.3 s → 54.8 s）才说明问题。</li>
+<li><strong>并发启动当并行扩容。</strong> 两个副本同时冷启动各需 117.3 s，而不是各自 46.1 s 的并行版本——权重 I/O 与编译都在抢同一台机器的资源。</li>
+</ol>
+<hr />
+<h2 id="_9">自测题</h2>
+<details class="fold">
+<summary>1. 为什么&quot;进程存活&quot;不能作为就绪判据？请给出本机实测的窗口大小。</summary>
+<p><strong>答案：</strong>
+因为模型加载与编译都发生在进程启动之后。crater2 上 Qwen3-1.7B 冷启动时，<code>lease → READY</code> 是 46.1 s，其中 147 次探测（≈36.8 s，占 80%）处在"进程存在但不能服务"的状态；热编译缓存下这个窗口是 21.5 s。只检查 PID 或 TCP 端口会把这段时间误判为可用，请求必然失败。</p>
+</details>
+<details class="fold">
+<summary>2. vLLM 0.29 上&quot;HTTP 200 但不服务&quot;的假就绪窗口有多大？这说明什么？</summary>
+<p><strong>答案：</strong>
+实测为 0 次——<code>/v1/models</code> 返回 200 的时刻与真实补全成功几乎同时。这说明在该版本里 HTTP 层在引擎可服务之后才对外，但不能把这条当成契约：它是实现细节，换版本、换引擎（SGLang、TensorRT-LLM）或换成经网关暴露的服务都会变。就绪判据应当显式声明依赖的是哪一层语义，并在升级时重测。</p>
+</details>
+<details class="fold">
+<summary>3. 为什么滚动更新的停机时间（60.6 s）不是&quot;排空时间 + 启动时间&quot;的简单相加？</summary>
+<p><strong>答案：</strong>
+因为排空时间为 0.0069 s（那一刻恰好没有在途请求），所以停机时间几乎完全等于"老进程停止到新进程 READY"的 57.7 s，而启动时间里又包含权重加载（34.4 s）与编译/图捕获（22.6 s）两段。排空是流量相关的，启动是资源相关的；两者要分开测、分开优化，不能合成一个"更新耗时"。</p>
+</details>
+<details class="fold">
+<summary>4. TP=2 只分到一张卡时会发生什么？为什么这个失败方式是可接受的？</summary>
+<p><strong>答案：</strong>
+引擎在参数校验阶段就报 <code>World size (2) is larger than the number of available GPUs (1) in this node</code> 并退出（14.0 s，exit 1），没有进入权重加载。这比"卡在集合通信初始化里既不失败也不就绪"好得多：前者是有界失败，后者会一直占用已分配的 GPU 直到超时。真正的防护仍是调度阶段的整组分配（PodGroup / <code>--exclusive</code>），引擎报错只是最后一道兜底。</p>
+</details>
+<details class="fold">
+<summary>5. 为什么并发冷启动两个副本比串行启动更慢（每个 117.3 s vs 46.1 s）？</summary>
+<p><strong>答案：</strong>
+两个进程同时读同一份权重文件、同时跑编译与图捕获，争用同一台机器的磁盘/页缓存、CPU 与内存带宽，于是各自的阶段都被拉长。这说明"扩容 N 个副本"的延迟不是单副本延迟，而是资源争用下的放大量；容量规划必须按并发启动的实测值算，而不是单副本值乘 N。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L8/8.1-routing-gateway.html">&#8592; 8.1 路由与网关</a><a class="nav-next" href="../L8/8.3-observability-benchmark.html">8.3 可观测性与正确的压测 &#8594;</a></nav>
+</main>
+</body>
+</html>

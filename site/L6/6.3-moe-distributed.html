@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.3 MoE 分布式与 all-to-all</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">6.3</div>
+  <div class="sidebar-title">MoE 分布式与 all-to-all</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#moe">心智模型：一次 MoE 前向里的四次数据流动</a></li>
+<li><a href="#_2">机制拆解与推导</a><ul>
+<li><a href="#1-pack-dispatch-combine">1. pack / dispatch / combine 的四步</a></li>
+<li><a href="#2-id">2. 正确性验证：唯一 ID + 完备性</a></li>
+<li><a href="#3">3. 两条路线的通信量：一个有明确翻转点的判据</a></li>
+<li><a href="#4">4. 分阶段实测</a></li>
+<li><a href="#5">5. 专家布局：一次复制就够了</a></li>
+<li><a href="#6">6. 支持矩阵：三条路线在这台机器上都跑不起来</a></li>
+</ul>
+</li>
+<li><a href="#_3">工程实现 · 源码解析</a><ul>
+<li><a href="#_4">代码入口</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">命令</a></li>
+<li><a href="#_8">实测数字</a></li>
+<li><a href="#_9">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#moe">心智模型：一次 MoE 前向里的四次数据流动</a></li>
+<li><a href="#_2">机制拆解与推导</a><ul>
+<li><a href="#1-pack-dispatch-combine">1. pack / dispatch / combine 的四步</a></li>
+<li><a href="#2-id">2. 正确性验证：唯一 ID + 完备性</a></li>
+<li><a href="#3">3. 两条路线的通信量：一个有明确翻转点的判据</a></li>
+<li><a href="#4">4. 分阶段实测</a></li>
+<li><a href="#5">5. 专家布局：一次复制就够了</a></li>
+<li><a href="#6">6. 支持矩阵：三条路线在这台机器上都跑不起来</a></li>
+</ul>
+</li>
+<li><a href="#_3">工程实现 · 源码解析</a><ul>
+<li><a href="#_4">代码入口</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">命令</a></li>
+<li><a href="#_8">实测数字</a></li>
+<li><a href="#_9">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a></li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L6 · 分布式：通信、并行、分离</div>
+  <div class="mod-id">6.3</div>
+  <h1>MoE 分布式与 all-to-all</h1>
+  <p class="lede">EP、DeepEP v1(NVSHMEM) → v2(NCCL Gin)、IBGDA、UCCL-EP。</p>
+  <div class="chips"><span class="chip">实测机器 worldvln（4× L40S，PCIe，无 NVLink）· NCCL 2.29.7 · OLMoE-1B-7B-0924（64 专家 / top-8）</span><span class="chip">前置 6.2（TP/PP/EP）· 4.4（MoE 路由与不均衡）· 6.1（集合通信成本）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>4.4 量到了 MoE 的两个结构性事实：每一层都有自己的热专家，逐层最热/最冷可达数百倍；而且 batch 一大，稀疏性在带宽角度就消失了。这两件事把「MoE 怎么并行」变成一个通信问题——token 必须离开它所在的卡，去到专家所在的卡，算完再回来。</p>
+<ol>
+<li>pack / dispatch / combine 具体怎样实现？反排列靠什么保证不出错？</li>
+<li>all-to-all 和 all-gather 两条路线，谁的通信量更小？什么时候会翻转？</li>
+<li>专家布局的均衡收益，能不能盖住迁移的代价？</li>
+</ol>
+<p>这一章的实验边界同样是<strong>单机 PCIe、无 NVLink、无 RDMA</strong>。这个边界直接决定了第 3 节的支持矩阵：DeepEP、UCCL-EP、NVSHMEM 三条路线在这台机器上都跑不起来，只能做源码与协议分析。</p>
+<hr />
+<h2 id="moe">心智模型：一次 MoE 前向里的四次数据流动</h2>
+<figure>
+
+
+<svg viewBox="0 0 830 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MoE dispatch 与 combine 的数据流">
+  <defs>
+    <marker id="f63" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">EP=4，每 rank 16 个专家，T 个 token × top-8</text>
+
+    <!-- rank 0 -->
+    <rect x="12" y="34" width="190" height="300" rx="5" fill="none" stroke="currentColor"/>
+    <text x="24" y="54" font-size="11.5" font-weight="600">rank 0</text>
+    <text x="24" y="72" font-size="10">本地 token：T 个</text>
+    <text x="24" y="88" font-size="10">专家 0–15</text>
+    <rect x="24" y="100" width="166" height="44" rx="3" fill="none" stroke="currentColor" stroke-dasharray="3 2"/>
+    <text x="32" y="118" font-size="9.5">① pack：按 (目标rank, 专家) 排序</text>
+    <text x="32" y="134" font-size="9.5">行 = (token_id, k, expert_id, x)</text>
+    <rect x="24" y="156" width="166" height="40" rx="3" fill="none" stroke="currentColor"/>
+    <text x="32" y="174" font-size="9.5">② counts：先换 (发送方,专家) 计数</text>
+    <text x="32" y="190" font-size="9.5" font-family="monospace">all_to_all(counts)</text>
+    <rect x="24" y="208" width="166" height="40" rx="3" fill="none" stroke="currentColor"/>
+    <text x="32" y="226" font-size="9.5">③ dispatch</text>
+    <text x="32" y="242" font-size="9.5" font-family="monospace">all_to_all(payload)</text>
+    <rect x="24" y="260" width="166" height="44" rx="3" fill="none" stroke="currentColor"/>
+    <text x="32" y="278" font-size="9.5">④ 局部重排成 expert-major</text>
+    <text x="32" y="294" font-size="9.5">（不发通信，但必须做）</text>
+    <rect x="24" y="316" width="166" height="30" rx="3" fill="none" stroke="currentColor"/>
+    <text x="32" y="335" font-size="9.5">⑤ grouped GEMM + combine</text>
+
+    <!-- 中间：交换 -->
+    <line x1="202" y1="176" x2="292" y2="176" stroke="currentColor" marker-end="url(#f63)"/>
+    <line x1="292" y1="228" x2="202" y2="228" stroke="currentColor" marker-end="url(#f63)"/>
+    <line x1="202" y1="280" x2="292" y2="280" stroke="currentColor" marker-end="url(#f63)"/>
+    <line x1="292" y1="332" x2="202" y2="332" stroke="currentColor" marker-end="url(#f63)"/>
+
+    <rect x="292" y="120" width="212" height="240" rx="5" fill="none" stroke="currentColor"/>
+    <text x="304" y="140" font-size="11" font-weight="600">交换的四样东西</text>
+    <text x="304" y="164" font-size="10">计数：O(N·E)，与 token 数无关</text>
+    <text x="304" y="182" font-size="10">载荷：O(T·K·H)，是主项</text>
+    <text x="304" y="200" font-size="10">反排列键：(token_id, k)</text>
+    <text x="304" y="218" font-size="10">权重：combine 用的 top-k 权重</text>
+    <line x1="304" y1="232" x2="492" y2="232" stroke="currentColor" opacity="0.3"/>
+    <text x="304" y="254" font-size="10" font-weight="600">固定开销与规模效应</text>
+    <text x="304" y="272" font-size="10">counts 交换实测 42–104 µs，</text>
+    <text x="304" y="288" font-size="10">与 token 数无关</text>
+    <text x="304" y="306" font-size="10">32 token 时它比载荷还贵：</text>
+    <text x="304" y="322" font-size="10">85 µs vs 49 µs（top-2）</text>
+    <text x="304" y="344" font-size="10">4096 token × top-8 时载荷 3.6 ms，</text>
+    <text x="304" y="356" font-size="10">把固定开销摊掉</text>
+
+    <!-- 右侧：两条路线 -->
+    <rect x="520" y="34" width="298" height="150" rx="5" fill="none" stroke="currentColor"/>
+    <text x="532" y="54" font-size="11.5" font-weight="600">路线 A：all-to-all</text>
+    <text x="532" y="74" font-size="10">每 rank 只发 K·T 个 (token,k) 副本</text>
+    <text x="532" y="92" font-size="10" font-family="monospace">每 rank 流量 ≈ 2·K·T·H</text>
+    <text x="532" y="112" font-size="10">随 top-k 线性增长，与 rank 数无关</text>
+    <text x="532" y="132" font-size="10" opacity="0.85">实测（H=2048, T=4096, K=8, N=4）：</text>
+    <text x="532" y="150" font-size="10">发送 256 MiB/rank，dispatch+combine 63.3 ms</text>
+    <text x="532" y="168" font-size="10">峰值 1.96 GiB</text>
+
+    <rect x="520" y="198" width="298" height="150" rx="5" fill="none" stroke="currentColor"/>
+    <text x="532" y="218" font-size="11.5" font-weight="600">路线 B：all-gather + all-reduce</text>
+    <text x="532" y="238" font-size="10">每个 rank 拿到全部 token</text>
+    <text x="532" y="256" font-size="10" font-family="monospace">每 rank 流量 ≈ 3·N·T·H</text>
+    <text x="532" y="276" font-size="10">随 rank 数线性增长，<tspan font-weight="600">与 top-k 无关</tspan></text>
+    <text x="532" y="296" font-size="10" opacity="0.85">实测同配置：</text>
+    <text x="532" y="314" font-size="10">发送 160 MiB/rank，43.7 ms，峰值 3.16 GiB</text>
+    <text x="532" y="336" font-size="10" font-weight="600">翻转条件：K ≷ 1.5·N 时两条路线的字节数互换</text>
+
+    <!-- 底部 -->
+    <line x1="12" y1="348" x2="800" y2="348" stroke="currentColor" opacity="0.3"/>
+    <text x="12" y="370" font-size="10">本机实测（T=4096, K=8, N=4, H=2048）：K=8 &gt; 1.5×4=6，所以 all-gather 的字节更少、</text>
+    <text x="12" y="386" font-size="10">总时间反而快 31%，但代价是峰值显存高 61%。</text>
+    <text x="12" y="406" font-size="10" opacity="0.85">同一个判断在 K=2、N=4 上翻转：all-to-all 每 rank 8.3 MiB，all-gather 仍是 20.9 MiB。</text>
+  </g>
+</svg>
+
+
+</figure>
+
+<hr />
+<h2 id="_2">机制拆解与推导</h2>
+<h3 id="1-pack-dispatch-combine">1. pack / dispatch / combine 的四步</h3>
+<p>MoE 的专家并行把前向拆成四步，每一步都有明确的输入输出：</p>
+<p><strong>① pack。</strong> 本 rank 的每个 token 有 top-k 个专家，先算出每个 (token, k) 的目标 rank（专家归谁），然后按 <code>(目标 rank, 专家 id)</code> 排序，得到发送缓冲。排序的意义在于让接收端能按专家分段。每行必须携带 <code>(token_id, k, expert_id)</code>——这是接收端能反排列的唯一依据。</p>
+<p><strong>② counts 交换。</strong> 发送方告诉每个目标 rank「我要给你多少行」；接收方还需要知道「每个发送方给我的每个本地专家多少行」，才能算出 expert offsets。这一步只交换 <code>O(N·E)</code> 个整数。</p>
+<p><strong>③ dispatch。</strong> 把打包好的行按 counts 分段发给各 rank。</p>
+<p><strong>④ 局部重排 + grouped GEMM + combine。</strong> 收到的行是按发送方分段的，不是按专家分段的；接收端要用 ② 里拿到的 <code>(发送方, 专家)</code> 计数，做一次<strong>本地重排</strong>把行摆成 expert-major。这一步不发通信，但它是真实存在的一步——少了它，grouped GEMM 就得按发送方分段来算，同一个专家的行会散落在多段里。</p>
+<p>反排列的键是 <code>(token_id, k)</code>：combine 回来后按这个键放回原位置，再按 top-k 权重加权求和。</p>
+<h3 id="2-id">2. 正确性验证：唯一 ID + 完备性</h3>
+<p>只用整数就能把正确性钉死。判据是三条：</p>
+<ul>
+<li><strong>无丢失</strong>：接收端收到的行数之和等于发送端发出的总数。</li>
+<li><strong>无重复</strong>：每个 <code>(token_id, k)</code> 在全局只被投递一次。</li>
+<li><strong>无错位</strong>：expert-major 重排后，每个本地专家的段 <code>[offset_e, offset_e + count_e)</code> 里的 expert_id 全部等于 e。</li>
+</ul>
+<p>实测覆盖五种输入（<code>labs/L6/moe_dispatch.py</code>，512 token、8 专家、top-2、EP=4）：</p>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th style="text-align: right;">pairs</th>
+<th style="text-align: right;">分发到</th>
+<th>无丢失/重复/错位</th>
+<th style="text-align: right;">每 rank 负载</th>
+<th>零 token rank</th>
+<th style="text-align: right;">空专家槽</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>均匀</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td>✓</td>
+<td style="text-align: right;"><code>[251, 245, 265, 263]</code></td>
+<td>—</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>倾斜 20%</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td>✓</td>
+<td style="text-align: right;"><code>[408, 196, 212, 208]</code></td>
+<td>—</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>倾斜 50%</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td>✓</td>
+<td style="text-align: right;"><code>[638, 123, 131, 132]</code></td>
+<td>—</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>空专家（8 token、64 专家）</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">16</td>
+<td>✓</td>
+<td style="text-align: right;"><code>[4, 6, 4, 2]</code></td>
+<td>—</td>
+<td style="text-align: right;">50</td>
+</tr>
+<tr>
+<td>全部倾斜到一个 rank</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td>✓</td>
+<td style="text-align: right;"><code>[1024, 0, 0, 0]</code></td>
+<td><code>[1, 2, 3]</code></td>
+<td style="text-align: right;">7</td>
+</tr>
+</tbody>
+</table>
+<p>最后两行是容易被漏掉的边界：<strong>空专家</strong>（专家数远大于 token 数时，64 个专家槽里 50 个一行都没有）与<strong>零 token rank</strong>（全部 token 都路由到 rank 0 持有的专家，另外三个 rank 一行都收不到）。这两种情况下 counts 里出现 0，offset 的构造与接收缓冲的零长度分段都要能正确处理。</p>
+<h3 id="3">3. 两条路线的通信量：一个有明确翻转点的判据</h3>
+<p>两条路线的字节数来自不同的量：</p>
+<ul>
+<li><strong>all-to-all 路线</strong>：每个 <code>(token, k)</code> 副本只发给一个目标 rank，每 rank 发出 <code>K·T·H</code> 字节、收到约 <code>K·T·H</code> 字节，合计 <code>≈ 2·K·T·H</code>。<strong>与 rank 数无关，随 top-k 线性增长。</strong></li>
+<li><strong>all-gather 路线</strong>：先 gather 所有 token（每 rank 收 <code>(N-1)·T·H</code>、发 <code>T·H</code>），再对 <code>N·T·H</code> 的贡献做一次 all_reduce（收发各 <code>N·T·H</code>），合计 <code>≈ 3·N·T·H</code>。<strong>与 top-k 无关，随 rank 数线性增长。</strong></li>
+</ul>
+<p>两者相等的位置在 <code>2K = 3N</code>，即 <code>K = 1.5N</code>：</p>
+<ul>
+<li><code>K &gt; 1.5N</code>：all-gather 的字节更少。</li>
+<li><code>K &lt; 1.5N</code>：all-to-all 的字节更少。</li>
+</ul>
+<p>本机实测正好落在两侧：</p>
+<table>
+<thead>
+<tr>
+<th>配置（T=4096，N=4）</th>
+<th style="text-align: right;">all-to-all 每 rank</th>
+<th style="text-align: right;">all-gather 每 rank</th>
+<th>谁更快</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>top-k=2，H=256</td>
+<td style="text-align: right;">8288 KiB</td>
+<td style="text-align: right;">20864 KiB</td>
+<td>all-to-all（2.5× 少）</td>
+</tr>
+<tr>
+<td>top-k=8，H=256</td>
+<td style="text-align: right;">33152 KiB</td>
+<td style="text-align: right;">20864 KiB</td>
+<td>all-gather 字节少，但实测反而慢 31%</td>
+</tr>
+<tr>
+<td>top-k=8，H=2048</td>
+<td style="text-align: right;">262528 KiB（256 MiB）</td>
+<td style="text-align: right;">164224 KiB（160 MiB）</td>
+<td>all-gather（字节少 37%，时间快 31%）</td>
+</tr>
+</tbody>
+</table>
+<p>K=8、N=4 时 8 &gt; 6，所以 all-gather 的字节更少——这与「MoE 就该用 all-to-all」的直觉相反，但它是 byte 账的直接推论，也被实测证实。</p>
+<p><strong>不过字节少不等于时间短。</strong> H=256、top-k=8 那一行里 all-gather 字节少 37%，时间却慢 31%：那时每 token 的载荷只有 1 KiB，整条路线被集合通信的启动与同步开销支配，而不是被字节数支配。把 H 提到 OLMoE 真实的 2048，载荷变大、固定开销被摊薄，字节账才重新主导，all-gather 才在时间上也赢。</p>
+<h3 id="4">4. 分阶段实测</h3>
+<p><code>labs/L6/moe_dispatch.py</code> 把 dispatch 拆成三个阶段分别计时（CUDA event，中位数，4 卡，H=256）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">tokens</th>
+<th style="text-align: right;">top-k</th>
+<th style="text-align: right;">counts</th>
+<th style="text-align: right;">dispatch</th>
+<th style="text-align: right;">combine</th>
+<th style="text-align: right;">发送字节/rank</th>
+<th style="text-align: right;">峰值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">85.0 µs</td>
+<td style="text-align: right;">48.9 µs</td>
+<td style="text-align: right;">60.4 µs</td>
+<td style="text-align: right;">65 KiB</td>
+<td style="text-align: right;">0.001 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">61.4 µs</td>
+<td style="text-align: right;">55.3 µs</td>
+<td style="text-align: right;">59.4 µs</td>
+<td style="text-align: right;">259 KiB</td>
+<td style="text-align: right;">0.002 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">67.8 µs</td>
+<td style="text-align: right;">99.3 µs</td>
+<td style="text-align: right;">104.4 µs</td>
+<td style="text-align: right;">518 KiB</td>
+<td style="text-align: right;">0.004 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">104.4 µs</td>
+<td style="text-align: right;">301.1 µs</td>
+<td style="text-align: right;">289.8 µs</td>
+<td style="text-align: right;">2072 KiB</td>
+<td style="text-align: right;">0.015 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">52.2 µs</td>
+<td style="text-align: right;">1050.6 µs</td>
+<td style="text-align: right;">1132.5 µs</td>
+<td style="text-align: right;">8288 KiB</td>
+<td style="text-align: right;">0.065 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">46.1 µs</td>
+<td style="text-align: right;">3575.8 µs</td>
+<td style="text-align: right;">4536.3 µs</td>
+<td style="text-align: right;">33152 KiB</td>
+<td style="text-align: right;">0.249 GiB</td>
+</tr>
+</tbody>
+</table>
+<p>三条读法：</p>
+<p><strong>counts 是一个与规模无关的固定成本</strong>（42–104 µs）。token 数从 32 涨到 4096（128×），counts 交换的时间几乎不变。在 32 token、top-2 时它是主要开销（85 µs vs 载荷 49 µs）——<strong>小 batch decode 的 MoE 通信不是在传数据，是在交换元数据。</strong></p>
+<p><strong>载荷阶段近似线性。</strong> 4096 token 相对 256 token，字节涨 16×，dispatch 涨 11.9×、combine 涨 15.7×，规模效应明显。</p>
+<p><strong>峰值显存随 top-k 与 token 数涨。</strong> 4096 token、top-8 时 peak allocated 是 0.249 GiB，主要是发送缓冲 <code>(T·K, H+3)</code> 与接收缓冲。</p>
+<p>倾斜对<strong>时间</strong>几乎没有影响（256 token、top-8 下 s=0/20%/50% 的 dispatch 是 301/377/210 µs，非单调，落在噪声内）。这是合理的：倾斜只改变行的<strong>分布</strong>，不改变总行数与总字节数。倾斜的代价表现在下一节的负载不均衡上。</p>
+<h3 id="5">5. 专家布局：一次复制就够了</h3>
+<p>4.4 的逐层数据显示每层都有热专家（最热/最冷可达数百倍），所以自然的想法是给热专家做复制、把副本放到空闲的 rank 上（EPLB 类做法）。问题是均衡收益能不能盖住迁移代价。</p>
+<p>用每层独立的热专家集合重建这个场景（4096 token、64 专家、top-8、EP=4、倾斜 30%、16 层）：</p>
+<table>
+<thead>
+<tr>
+<th>布局</th>
+<th style="text-align: right;">max/mean（16 层中位）</th>
+<th style="text-align: right;">最差层</th>
+<th style="text-align: right;">最平衡层</th>
+<th style="text-align: right;">迁移</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>静态连续切分</td>
+<td style="text-align: right;">1.50</td>
+<td style="text-align: right;">1.52</td>
+<td style="text-align: right;">1.10</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>EPLB，热专家 1 份副本</td>
+<td style="text-align: right;"><strong>1.09</strong></td>
+<td style="text-align: right;">1.14</td>
+<td style="text-align: right;">1.07</td>
+<td style="text-align: right;">72 MiB/次求解</td>
+</tr>
+<tr>
+<td>EPLB，热专家 2 份副本</td>
+<td style="text-align: right;">1.11</td>
+<td style="text-align: right;">1.15</td>
+<td style="text-align: right;">1.05</td>
+<td style="text-align: right;">144 MiB/次求解</td>
+</tr>
+</tbody>
+</table>
+<p><strong>1 份副本拿走了几乎全部收益，第 2 份只多花一倍迁移。</strong> 最差层的 max/mean 从 1.50 降到 1.08（−28%），但第 2 份副本把中位数从 1.09 抬到 1.11、在第 2 层上甚至出现 −1% 的负收益。</p>
+<p>原因是收益的上界由<strong>最差层</strong>决定：静态布局下最差层的 max/mean 已经是 1.10 左右（因为路由本身近似均匀），只有少数层出现 1.5 以上的尖峰；把尖峰削平之后就接近下界了，继续加副本只是在均匀的层上做无用功。</p>
+<p>重平衡周期直接决定迁移量（一个 epoch 遍历 16 层）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">重平衡周期</th>
+<th style="text-align: right;">每 epoch 求解次数</th>
+<th style="text-align: right;">迁移</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">每 1 层</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1152 MiB/epoch</td>
+</tr>
+<tr>
+<td style="text-align: right;">每 4 层</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">288 MiB/epoch</td>
+</tr>
+<tr>
+<td style="text-align: right;">每 16 层</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">72 MiB/epoch</td>
+</tr>
+</tbody>
+</table>
+<p><strong>周期缩短 16 倍，迁移量涨 16 倍，而均衡指标（上表）是同一个数量级。</strong> 所以周期应该按「热专家集合变化的快慢」来定，而不是越频繁越好。</p>
+<div class="admonition warning">
+<p class="admonition-title">这张表的乐观之处</p>
+<p>负载分流模型假设副本能精确均分该专家的 token。真实 router 是逐 token 独立选择的，不会精确均分；所以上表给的是 EPLB 收益的<strong>上界</strong>，实际收益要打折。要给出可信下界，需要接真实 router 的输出分布做在线重放，本章没有做。</p>
+</div>
+<h3 id="6">6. 支持矩阵：三条路线在这台机器上都跑不起来</h3>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>后端</th>
+<th>入口</th>
+<th>硬性要求</th>
+<th>本机</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DeepEP V1</td>
+<td>NVSHMEM</td>
+<td><code>deep_ep.Buffer(group, num_nvl_bytes, num_rdma_bytes)</code></td>
+<td>NVSHMEM；跨机需 RDMA</td>
+<td>✗ 无 NVSHMEM、无 RDMA</td>
+</tr>
+<tr>
+<td>DeepEP V2</td>
+<td>NCCL Gin</td>
+<td><code>deep_ep.ElasticBuffer</code></td>
+<td><strong>SM90+</strong>、CUDA 12.3+、<strong>NCCL ≥2.30.4</strong>、跨机需 RDMA</td>
+<td>✗ sm_89、NCCL 2.29.7</td>
+</tr>
+<tr>
+<td>UCCL-EP</td>
+<td>UCCL transport</td>
+<td><code>uccl.ep</code>（与 DeepEP 同接口）</td>
+<td>RDMA NIC + <code>nvidia_peermem</code>/<code>efa_nv_peermem</code>/<code>ib_peer_mem</code> 内核模块，或 DMABUF</td>
+<td>✗ 无 <code>/dev/infiniband</code></td>
+</tr>
+<tr>
+<td>NCCL all-to-all</td>
+<td>NCCL</td>
+<td><code>dist.all_to_all_single</code></td>
+<td>无特殊要求</td>
+<td>✓ 已运行</td>
+</tr>
+</tbody>
+</table>
+<p>DeepEP V2 的两条硬门槛都可以在本机直接判定：<code>setup.py</code> 默认把 <code>TORCH_CUDA_ARCH_LIST</code> 设为 <code>9.0</code> 并校验；README 要求 NCCL 2.30.4 以上，而本机是 2.29.7。这台 L40S（sm_89）不是 DeepEP 的目标平台，<strong>不冒充</strong>。</p>
+<p>L40S 上能跑的只有 NCCL 自己的 <code>all_to_all_single</code>，本章的第 3、4 节就是用它测的。这不是 DeepEP 那种「0-SM、GPU 发起」的实现——它的 dispatch 是由 CPU 逐次提交的集合通信，与 DeepEP 的 SM 占用模型、RDMA 直连路径都不在同一层。<strong>把本章的数字当作「MoE 通信在这台机器上的下界」是错的</strong>：它测的是 NCCL all-to-all 的能力，不是 MoE 通信的极限。</p>
+<hr />
+<h2 id="_3">工程实现 · 源码解析</h2>
+<h3 id="_4">代码入口</h3>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DeepEP <code>docs/legacy.md:7</code></td>
+<td>V1 提供高吞吐与低延迟 all-to-all（MoE dispatch/combine）</td>
+</tr>
+<tr>
+<td>DeepEP <code>docs/legacy.md:125-147</code></td>
+<td>V1 的 <code>Buffer</code> 构造与 <code>set_num_sms</code></td>
+</tr>
+<tr>
+<td>DeepEP <code>docs/legacy.md:52,54,82</code></td>
+<td>V1 跨机需要 RDMA；依赖 NVSHMEM；未设 <code>NVSHMEM_DIR</code> 时跨机与低延迟特性全部关闭</td>
+</tr>
+<tr>
+<td>DeepEP <code>README:9,14-18</code></td>
+<td>V2 从 NVSHMEM 换成 NCCL Gin 后端；复用已有 NCCL communicator；统一到 <code>ElasticBuffer</code></td>
+</tr>
+<tr>
+<td>DeepEP <code>README:65-72</code></td>
+<td>V2 的硬性要求：SM90+、CUDA 12.3+、NCCL 2.30.4+</td>
+</tr>
+<tr>
+<td>DeepEP <code>README:29-30</code></td>
+<td>V2 的 buffer 占用大于 V1；不再支持 0-SM RDMA 低延迟 EP</td>
+</tr>
+<tr>
+<td>DeepEP <code>setup.py:130-148</code></td>
+<td>架构门控：默认 <code>TORCH_CUDA_ARCH_LIST=9.0</code> 并按 9.0 校验</td>
+</tr>
+<tr>
+<td>UCCL <code>ep/README.md:3</code></td>
+<td>与 DeepEP 同接口，面向异构 GPU/NIC</td>
+</tr>
+<tr>
+<td>UCCL <code>ep/README.md:23-26</code></td>
+<td>默认用 <code>ibv_reg_mr_iova2</code> 注册显存，需要 peer-memory 内核模块</td>
+</tr>
+<tr>
+<td>vLLM <code>model_executor/layers/fused_moe/expert_map_manager.py</code></td>
+<td>专家到 rank 的映射与 EPLB 的落点</td>
+</tr>
+<tr>
+<td>vLLM <code>config/parallel.py:165</code></td>
+<td><code>enable_expert_parallel</code>；<code>:520-521</code> EPLB 要求它先打开</td>
+</tr>
+</tbody>
+</table>
+<p>来源版本与文件位置见 <a href="../raw/results/worldvln/6.3/20260914-moe/C/capability_matrix.json">capability_matrix.json</a>。</p>
+<h3 id="_5">设计取舍</h3>
+<p><strong>为什么反排列要带 <code>(token_id, k)</code> 而不是位置。</strong> 位置在跨 rank 之后会变（接收端的顺序由发送端与网络决定），而 <code>(token_id, k)</code> 是全局唯一的语义键。代价是每行多 2 个整数——这也是为什么本章的字节账里把 header 单列（<code>(H+3)</code> 而不是 <code>H</code>）。</p>
+<p><strong>为什么接收端要再做一次局部重排。</strong> 发送方按目标 rank 分段，接收端拿到的自然是「按发送方分段」的布局；而 grouped GEMM 要的是「按专家分段」。把行在本地搬一次比让 GEMM 处理多段便宜得多，所以真实实现都选前者。这一步不发通信，但会多占一份等长缓冲。</p>
+<p><strong>为什么 all-to-all 的字节随 top-k 走，all-gather 随 rank 数走。</strong> 这不是实现细节，是两种算法的定义：all-to-all 发的是「每个 (token,k) 一次」，all-gather 发的是「每个 token 到每个 rank 一次」。知道这个差别就能在选路线之前先算一遍，不必先跑。</p>
+<p><strong>为什么 DeepEP 要 0-SM 与 RDMA。</strong> 它的目标是让通信不占 SM、让 GPU 直接发起传输（IBGDA/NVSHMEM），从而在小 batch decode 上把 CPU 提交与 SM 竞争都去掉。这些机制依赖 SM90 的 PTX 能力与 RDMA 网卡的 peer-memory 注册，所以在 SM89 + PCIe 上无法复现其收益模型。</p>
+<hr />
+<h2 id="_6">工程实现 · 自己写一遍</h2>
+<p><code>labs/L6/moe_dispatch.py</code> 的计划构造是纯整数逻辑，可以脱离 GPU 单独验证：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 80</span> <span class="k">def</span><span class="w"> </span><span class="nf">build_plan</span><span class="p">(</span><span class="n">expert_ids</span><span class="p">,</span> <span class="n">ep_size</span><span class="p">,</span> <span class="n">num_experts</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 81</span> <span class="w">    </span><span class="sd">"""由路由结果算出 dispatch 计划：send/recv counts、offsets 与两组排列。</span>
+<span class="linenos" aria-hidden="true"> 82</span> 
+<span class="linenos" aria-hidden="true"> 83</span> <span class="sd">    排列用 (token_id, k_index) 作为唯一键，这是能证明「无错位」的最小信息量：</span>
+<span class="linenos" aria-hidden="true"> 84</span> <span class="sd">    接收端靠它把结果放回原来的位置。</span>
+<span class="linenos" aria-hidden="true"> 85</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true"> 86</span>     <span class="n">T</span><span class="p">,</span> <span class="n">K</span> <span class="o">=</span> <span class="n">expert_ids</span><span class="o">.</span><span class="n">shape</span>
+<span class="linenos" aria-hidden="true"> 87</span>     <span class="n">owner</span> <span class="o">=</span> <span class="p">(</span><span class="n">expert_ids</span> <span class="o">*</span> <span class="n">ep_size</span> <span class="o">//</span> <span class="n">num_experts</span><span class="p">)</span>          <span class="c1"># (T,K) 目标 rank</span>
+<span class="linenos" aria-hidden="true"> 88</span>     <span class="c1"># 本 rank 需要发往各 rank 的 (token,k) 个数</span>
+<span class="linenos" aria-hidden="true"> 89</span>     <span class="n">send_counts</span> <span class="o">=</span> <span class="p">[</span><span class="nb">int</span><span class="p">((</span><span class="n">owner</span> <span class="o">==</span> <span class="n">r</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">ep_size</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true"> 90</span>     <span class="n">send_offsets</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 91</span>     <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">send_counts</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 92</span>         <span class="n">send_offsets</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">send_offsets</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">c</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 93</span>     <span class="c1"># 发送顺序：按目标 rank 分段，段内按 (token,k) 原始顺序</span>
+<span class="linenos" aria-hidden="true"> 94</span>     <span class="n">order</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true"> 95</span>     <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">ep_size</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 96</span>         <span class="n">idx</span> <span class="o">=</span> <span class="p">(</span><span class="n">owner</span> <span class="o">==</span> <span class="n">r</span><span class="p">)</span><span class="o">.</span><span class="n">nonzero</span><span class="p">(</span><span class="n">as_tuple</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 97</span>         <span class="n">order</span><span class="o">.</span><span class="n">extend</span><span class="p">([(</span><span class="nb">int</span><span class="p">(</span><span class="n">t</span><span class="p">),</span> <span class="nb">int</span><span class="p">(</span><span class="n">k</span><span class="p">))</span> <span class="k">for</span> <span class="n">t</span><span class="p">,</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">idx</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 98</span>     <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">order</span><span class="p">)</span> <span class="o">==</span> <span class="nb">sum</span><span class="p">(</span><span class="n">send_counts</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 99</span>     <span class="c1"># 每个 (token,k) 的发送位置</span>
+<span class="linenos" aria-hidden="true">100</span>     <span class="n">src_pos</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true">101</span>     <span class="k">for</span> <span class="n">pos</span><span class="p">,</span> <span class="n">key</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">order</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">102</span>         <span class="n">src_pos</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">pos</span>
+<span class="linenos" aria-hidden="true">103</span>     <span class="c1"># 接收侧：按 (专家) 分组，专家内部按到达顺序</span>
+<span class="linenos" aria-hidden="true">104</span>     <span class="n">recv_experts</span> <span class="o">=</span> <span class="p">[</span><span class="n">e</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_experts</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">105</span>                     <span class="k">if</span> <span class="n">expert_owner</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="n">num_experts</span><span class="p">,</span> <span class="n">ep_size</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">106</span>     <span class="k">return</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">107</span>         <span class="s2">"owner"</span><span class="p">:</span> <span class="n">owner</span><span class="p">,</span> <span class="s2">"send_counts"</span><span class="p">:</span> <span class="n">send_counts</span><span class="p">,</span> <span class="s2">"send_offsets"</span><span class="p">:</span> <span class="n">send_offsets</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">108</span>         <span class="s2">"order"</span><span class="p">:</span> <span class="n">order</span><span class="p">,</span> <span class="s2">"src_pos"</span><span class="p">:</span> <span class="n">src_pos</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">109</span>     <span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/moe_dispatch.py 第 80–110 行</code><a href="../code/labs/L6/moe_dispatch.py.html#labs-L6-moe_dispatch-py-L-80">在完整文件中打开 &rarr;</a></div></div>
+<p>真实通信那一侧的关键是「接收端按 (发送方, 专家) 计数做局部重排」，这一段决定了 grouped GEMM 能不能直接吃连续段：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">331</span>         <span class="n">recv_e</span> <span class="o">=</span> <span class="n">out</span><span class="p">[:,</span> <span class="mi">2</span><span class="p">]</span><span class="o">.</span><span class="n">long</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">332</span>         <span class="n">local_expert_counts</span> <span class="o">=</span> <span class="n">all_counts</span><span class="p">[:,</span> <span class="p">:]</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>      <span class="c1"># 每个专家总行数</span>
+<span class="linenos" aria-hidden="true">333</span>         <span class="n">offsets</span><span class="p">,</span> <span class="n">acc</span> <span class="o">=</span> <span class="p">{},</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true">334</span>         <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">my_experts</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">335</span>             <span class="n">c</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">local_expert_counts</span><span class="p">[</span><span class="n">e</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">336</span>             <span class="n">offsets</span><span class="p">[</span><span class="n">e</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">acc</span><span class="p">,</span> <span class="n">acc</span> <span class="o">+</span> <span class="n">c</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">337</span>             <span class="n">acc</span> <span class="o">+=</span> <span class="n">c</span>
+<span class="linenos" aria-hidden="true">338</span>         <span class="n">perm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">recv_total</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">339</span>         <span class="n">cursor</span> <span class="o">=</span> <span class="p">{</span><span class="n">e</span><span class="p">:</span> <span class="n">offsets</span><span class="p">[</span><span class="n">e</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">my_experts</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">340</span>         <span class="c1"># 到达顺序是 (发送方, 专家)，按这个顺序逐个填进 expert-major 的空位</span>
+<span class="linenos" aria-hidden="true">341</span>         <span class="n">pos</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true">342</span>         <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">world_size</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">343</span>             <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">my_experts</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">344</span>                 <span class="n">c</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">all_counts</span><span class="p">[</span><span class="n">s</span><span class="p">,</span> <span class="n">e</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">345</span>                 <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">c</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">346</span>                     <span class="n">perm</span><span class="p">[</span><span class="n">cursor</span><span class="p">[</span><span class="n">e</span><span class="p">]]</span> <span class="o">=</span> <span class="n">pos</span>
+<span class="linenos" aria-hidden="true">347</span>                     <span class="n">cursor</span><span class="p">[</span><span class="n">e</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">348</span>                     <span class="n">pos</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">349</span>         <span class="k">assert</span> <span class="n">pos</span> <span class="o">==</span> <span class="n">recv_total</span>
+<span class="linenos" aria-hidden="true">350</span>         <span class="n">packed</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="n">perm</span><span class="p">]</span>                                      <span class="c1"># expert-major 布局</span>
+<span class="linenos" aria-hidden="true">351</span>         <span class="n">packed_e</span> <span class="o">=</span> <span class="n">packed</span><span class="p">[:,</span> <span class="mi">2</span><span class="p">]</span><span class="o">.</span><span class="n">long</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">352</span>         <span class="c1"># 分组校验：每个本地专家的段必须连续且全部属于该专家</span>
+<span class="linenos" aria-hidden="true">353</span>         <span class="n">groups_ok</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="linenos" aria-hidden="true">354</span>         <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">my_experts</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">355</span>             <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="o">=</span> <span class="n">offsets</span><span class="p">[</span><span class="n">e</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">356</span>             <span class="k">if</span> <span class="n">b</span> <span class="o">&gt;</span> <span class="n">a</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">bool</span><span class="p">((</span><span class="n">packed_e</span><span class="p">[</span><span class="n">a</span><span class="p">:</span><span class="n">b</span><span class="p">]</span> <span class="o">==</span> <span class="n">e</span><span class="p">)</span><span class="o">.</span><span class="n">all</span><span class="p">()):</span>
+<span class="linenos" aria-hidden="true">357</span>                 <span class="n">groups_ok</span> <span class="o">=</span> <span class="kc">False</span>
+<span class="linenos" aria-hidden="true">358</span>         <span class="c1"># 专家计算：按专家 id 定的确定性缩放，便于精确对拍</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/moe_dispatch.py 第 331–358 行</code><a href="../code/labs/L6/moe_dispatch.py.html#labs-L6-moe_dispatch-py-L-331">在完整文件中打开 &rarr;</a></div></div>
+<p><code>labs/L6/moe_placement_bench.py</code> 把「复制热专家」与「迁移代价」放在同一个模型里算，负载分流对副本数敏感：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">59</span> <span class="k">def</span><span class="w"> </span><span class="nf">rank_loads_replicated</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="n">placement</span><span class="p">,</span> <span class="n">replicas</span><span class="p">,</span> <span class="n">ranks</span><span class="p">,</span> <span class="n">experts</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">60</span> <span class="w">    </span><span class="sd">"""把每个专家的 token 均分给它的所有持有者（主副本 + 复制副本）。</span>
+<span class="linenos" aria-hidden="true">61</span> 
+<span class="linenos" aria-hidden="true">62</span> <span class="sd">    这是「理想分流」下的负载：真实 router 不会把 token 精确均分，所以这条曲线给出的是</span>
+<span class="linenos" aria-hidden="true">63</span> <span class="sd">    EPLB 收益的乐观上界，实际收益要打折。</span>
+<span class="linenos" aria-hidden="true">64</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true">65</span>     <span class="n">counts</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bincount</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">),</span> <span class="n">minlength</span><span class="o">=</span><span class="n">experts</span><span class="p">)</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">66</span>     <span class="n">loads</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">ranks</span>
+<span class="linenos" aria-hidden="true">67</span>     <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">experts</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">68</span>         <span class="n">holders</span> <span class="o">=</span> <span class="p">[</span><span class="n">placement</span><span class="p">[</span><span class="n">e</span><span class="p">]]</span> <span class="o">+</span> <span class="nb">list</span><span class="p">(</span><span class="n">replicas</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">[]))</span>
+<span class="linenos" aria-hidden="true">69</span>         <span class="n">per</span><span class="p">,</span> <span class="n">rem</span> <span class="o">=</span> <span class="nb">divmod</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">e</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="n">holders</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">70</span>         <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">holders</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">71</span>             <span class="n">loads</span><span class="p">[</span><span class="n">r</span><span class="p">]</span> <span class="o">+=</span> <span class="n">per</span> <span class="o">+</span> <span class="p">(</span><span class="mi">1</span> <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">rem</span> <span class="k">else</span> <span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">72</span>     <span class="k">return</span> <span class="n">loads</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/moe_placement_bench.py 第 59–73 行</code><a href="../code/labs/L6/moe_placement_bench.py.html#labs-L6-moe_placement_bench-py-L-59">在完整文件中打开 &rarr;</a></div></div>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="_7">命令</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 任务 A：计划构造与正确性（单进程，纯整数）</span>
+python<span class="w"> </span>labs/L6/moe_dispatch.py<span class="w"> </span>A<span class="w"> </span>--tokens<span class="w"> </span><span class="m">512</span><span class="w"> </span>--experts<span class="w"> </span><span class="m">8</span><span class="w"> </span>--topk<span class="w"> </span><span class="m">2</span><span class="w"> </span>--ranks<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>results/local/6.3/run/A
+
+<span class="c1"># 任务 B：真实通信（4 卡），两条路线</span>
+python<span class="w"> </span>labs/L6/moe_dispatch.py<span class="w"> </span>B<span class="w"> </span>--world-size<span class="w"> </span><span class="m">4</span><span class="w"> </span>--tokens<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--topk<span class="w"> </span><span class="m">8</span><span class="w"> </span>--skew<span class="w"> </span><span class="m">0</span>.0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--hidden<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--route<span class="w"> </span>alltoall<span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.3/run/B
+python<span class="w"> </span>labs/L6/moe_dispatch.py<span class="w"> </span>B<span class="w"> </span>--world-size<span class="w"> </span><span class="m">4</span><span class="w"> </span>--tokens<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--topk<span class="w"> </span><span class="m">8</span><span class="w"> </span>--skew<span class="w"> </span><span class="m">0</span>.0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--hidden<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--route<span class="w"> </span>allgather<span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.3/run/B
+
+<span class="c1"># 任务 C：支持矩阵</span>
+python<span class="w"> </span>labs/L6/moe_dispatch.py<span class="w"> </span>capability<span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.3/run/C
+
+<span class="c1"># 任务 D：静态布局与 EPLB 对照</span>
+python<span class="w"> </span>labs/L6/moe_placement_bench.py<span class="w"> </span>D<span class="w"> </span>--tokens<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--skew<span class="w"> </span><span class="m">0</span>.3<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--replicas<span class="w"> </span><span class="m">1</span>,2<span class="w"> </span>--rebalance-periods<span class="w"> </span><span class="m">1</span>,4,16<span class="w"> </span>--out<span class="w"> </span>results/local/6.3/run/D
+</code></pre></div>
+
+<h3 id="_8">实测数字</h3>
+<ul>
+<li><strong>正确性</strong>：5 个用例、18 次真实通信运行，全部「无丢失/重复/错位」与「往返正确」，expert-major 分组全部连续。</li>
+<li><strong>固定成本</strong>：counts 交换 42–104 µs，与 token 数无关；32 token 时它比载荷还贵。</li>
+<li><strong>载荷</strong>：4 卡 top-8 下从 32 token 的 259 KiB/rank 涨到 4096 token 的 33152 KiB/rank，dispatch 从 55 µs 涨到 3576 µs。</li>
+<li><strong>路线翻转</strong>：K=8、N=4 时 all-gather 字节少 37%、时间快 31%（H=2048）；K=2、N=4 时 all-to-all 字节少 2.5×。</li>
+<li><strong>峰值</strong>：H=2048、4096 token、top-8 时 all-to-all 1.96 GiB、all-gather 3.16 GiB。</li>
+<li><strong>EPLB</strong>：1 份副本把最差层的 max/mean 从 1.50 降到 1.08，第 2 份副本只多花一倍迁移、中位数反而升到 1.11。</li>
+<li><strong>迁移周期</strong>：每 1 层重平衡 = 1152 MiB/epoch，每 16 层 = 72 MiB/epoch。</li>
+</ul>
+<h3 id="_9">消融建议</h3>
+<ol>
+<li>把 <code>--hidden</code> 从 2048 降到 256 再跑一次两条路线，观察「字节账主导」与「固定开销主导」两个区间的分界。</li>
+<li>把 top-k 从 8 调到 2、EP 从 4 调到 8，验证 <code>K = 1.5N</code> 这个翻转点是否真的落在实测的换边位置上。</li>
+<li>在任务 A 里把 <code>(token_id, k, expert_id)</code> 的 header 去掉，只靠 counts 推断归属，观察空专家与零 token rank 两个用例是否还能通过。</li>
+<li>在任务 D 里把 <code>replicas</code> 加到 4，看均衡指标是否继续改善——用来确认「收益上界由最差层决定」这个解释。</li>
+</ol>
+<hr />
+<h2 id="_10">原始现场</h2>
+<p><strong>一次 4 卡 all-to-all 的分段与字节</strong>（<code>results/worldvln/6.3/20260914-moe/B/alltoall_t4096_k8_s0_n4_h256.json</code>）</p>
+<div class="highlight"><pre><span></span><code>发送段=[8101, 8224, 8143, 8300]   接收段=[8101, 8101, 8101, 8101]   本地专家=16
+counts=46.1 us  dispatch=3575.8 us  combine=4536.3 us
+字节/rank=33152 KiB  expert-major连续=True  往返正确=True  峰值=0.249 GiB
+</code></pre></div>
+
+<p><strong>H=2048 的两条路线</strong>（<code>.../alltoall_t4096_k8_s0_n4_h2048.json</code> 与 <code>.../allgather_t4096_k8_s0_n4_h2048.json</code>）</p>
+<div class="highlight"><pre><span></span><code>all_to_all: counts=42.0 us  dispatch=29186.0 us  combine=34103.3 us  字节/rank=262528 KiB  峰值=1.964 GiB
+all_gather: meta=172.0 us   gather=10715.1 us    allreduce=32804.9 us 字节/rank=164224 KiB  峰值=3.159 GiB
+</code></pre></div>
+
+<p><strong>4.4 采集的真实不均衡</strong>（<code>results/crater/ckpt/44_moe.txt</code>，OLMoE 985 token、64 专家、top-8）</p>
+<div class="highlight"><pre><span></span><code>总体：最热/最冷 = 3.7×，CV = 0.295
+逐层：层 0 最热 9.51% / 最冷 0.00% / 749.0×，层 2 最热 11.37% / 896.0×
+     每层 985 token × top-8 = 7880 次选择，均匀应为每专家 123 个；
+     实测最热专家拿到该层 11.8%，即 933 个 token —— 是均匀值的 7.6 倍
+</code></pre></div>
+
+<p><strong>支持矩阵的判定依据</strong>（<code>results/worldvln/6.3/20260914-moe/C/capability_matrix.json</code>）</p>
+<div class="highlight"><pre><span></span><code>平台：sm_89  NCCL 2.29.7  CUDA 13.0  /dev/infiniband=False  IB=['irdma0','irdma1']
+      NVLink=False  EFA=False
+deep_ep_v2  可运行=False  架构门控：sm_89 &lt; SM90；NCCL 2.29.7 &lt; 2.30.4；跨机还需 RDMA
+uccl_ep     可运行=False  需要 RDMA NIC 与 peer-memory 内核模块
+nccl_alltoall 可运行=True  不需要 RDMA 与 NVSHMEM
+</code></pre></div>
+
+<p><strong>本轮工件的完整入口</strong></p>
+<ul>
+<li>计划与正确性：<a href="../raw/results/local/6.3/20260914-moe/A/dispatch_plan.json">dispatch_plan.json</a></li>
+<li>真实通信（4 卡，H=256 全网格）：<a href="../raw/results/worldvln/6.3/20260914-moe/B/alltoall_t4096_k8_s0_n4_h256.json">B 目录</a> 中的 17 份 <code>*.json</code>，另加 <a href="../raw/results/worldvln/6.3/20260914-moe/B/alltoall_t4096_k8_s0_n4_h256.json">H=256 的 all-to-all</a>、<a href="../raw/results/worldvln/6.3/20260914-moe/B/alltoall_t4096_k8_s0_n4_h2048.json">H=2048 的 all-to-all</a> 与 <a href="../raw/results/worldvln/6.3/20260914-moe/B/allgather_t4096_k8_s0_n4_h2048.json">H=2048 的 all-gather</a></li>
+<li>扫描原始日志：<a href="../raw/results/worldvln/6.3/20260914-moe/sweep.log">sweep.log</a></li>
+<li>支持矩阵：<a href="../raw/results/worldvln/6.3/20260914-moe/C/capability_matrix.json">capability_matrix.json</a></li>
+<li>布局与迁移：<a href="../raw/results/local/6.3/20260914-moe/D/placement.json">placement.json</a></li>
+</ul>
+<hr />
+<h2 id="_11">前沿</h2>
+<p><strong>GPU 发起通信与 0-SM。</strong> DeepEP 的核心卖点是通信不占 SM、由 GPU 直接发起传输，从而在小 batch decode 上把 CPU 提交与 SM 竞争一起去掉。这条路线要求 SM90+ 与 RDMA（或 NVLink），本机两者都不具备，保持 <code>UNVERIFIED</code>。</p>
+<p><strong>EPLB 与在线重平衡。</strong> 本章的 EPLB 是离线的、按层静态求解的。生产系统更关心在线重平衡：在不打断服务的前提下迁移专家权重、在迁移期间保持路由正确。这需要「新旧布局并存 + 逐步切换」的机制，本章没有覆盖。</p>
+<p><strong>分层的 EP 通信库。</strong> 6.1 已经说明 NCCL、NVSHMEM、DeepEP、UCCL 不是同一抽象层的四个可互换库：NCCL 提供集合通信原语，NVSHMEM 提供 PGAS 内存模型，DeepEP 与 UCCL-EP 是建立在它们之上的 MoE 专用运行时。选型要按抽象层与硬件条件，不能按峰值带宽排名。</p>
+<p><strong>MoE 的批次与稀疏性。</strong> 4.4 已经量到 batch≥64 时每层所有专家都会被读到，稀疏性在带宽角度消失。这意味着 MoE 的通信优化重点在小 batch（decode）——也正是 DeepEP 那类实现的目标场景，而本章的测量都在 token 数较大的 prefill 侧。</p>
+<hr />
+<h2 id="_12">陷阱</h2>
+<p><strong>1. 以为 MoE 就该用 all-to-all。</strong> 字节账是 <code>2K·T·H</code> 对 <code>3N·T·H</code>。当 <code>K &lt; 1.5N</code> 时 all-to-all 更省，当 <code>K &gt; 1.5N</code> 时 all-gather 更省。K=2、N=4 与 K=8、N=4 落在两侧，实测证实了翻转。</p>
+<p><strong>2. 以为字节少就快。</strong> H=256、K=8、N=4 时 all-gather 字节少 37% 却慢 31%（固定开销主导）；H=2048 时同一对配置才反过来。小载荷下必须把启动开销算进去。</p>
+<p><strong>3. 忽略 counts 交换这个固定成本。</strong> 42–104 µs，与 token 数无关。在 32 token 的 decode 场景它比载荷还贵，成为主项。</p>
+<p><strong>4. 少了接收端的局部重排。</strong> 发送方按目标 rank 分段，接收端拿到的是按发送方分段的布局。不重排就直接喂 grouped GEMM，同一个专家的行会散落多段，分段 GEMM 的效率直接掉下去。</p>
+<p><strong>5. 用位置做反排列的键。</strong> 跨 rank 之后位置会变。键必须是 <code>(token_id, k)</code> 这样的语义标识。</p>
+<p><strong>6. 只测均匀路由。</strong> 均匀分布下所有实现都好看。必须覆盖空专家与零 token rank——本章的 64 专家 / 8 token 用例里有 50 个空专家槽，全部倾斜用例里有 3 个 rank 一行都收不到。</p>
+<p><strong>7. 假定倾斜会增加通信时间。</strong> 倾斜只改变行的分布，不改变总行数，实测 dispatch 时间在噪声内（301/377/210 µs，非单调）。倾斜的代价在负载不均衡上，不在通信量上。</p>
+<p><strong>8. 认为 EPLB 副本越多越均衡。</strong> 收益上界由最差层决定。1 份副本把最差层从 1.50 降到 1.08，第 2 份只多花一倍迁移、中位数反而变差。而且本章的分流模型是理想均分，是收益上界。</p>
+<p><strong>9. 把 NCCL all-to-all 的数字当成 MoE 通信的下界。</strong> 它测的是 NCCL 集合通信在这台机器上的能力，不是 DeepEP 那类 0-SM、GPU 发起实现的能力。两者不在同一层。</p>
+<hr />
+<h2 id="_13">自测题</h2>
+<details class="fold">
+<summary>1. 4 卡、top-8、T=4096、H=2048，两条路线每 rank 各搬多少字节？</summary>
+<p>all-to-all：每 rank 发出 <code>K·T·H·2</code> 字节（FP16 载荷）再加 header，实测发送 256 MiB/rank；合起来收发各 256 MiB。
+all-gather：gather 阶段收 <code>(N-1)·T·H·2</code> = 3×4096×2048×2 = 48 MiB，all_reduce 阶段对 <code>N·T·H·2</code> = 64 MiB 收发各一次，合计约 160 MiB/rank。</p>
+</details>
+<details class="fold">
+<summary>2. 什么条件下 all-gather 路线比 all-to-all 更省字节？</summary>
+<p><code>2K·T·H &gt; 3N·T·H</code>，即 <code>K &gt; 1.5·N</code>。K=8、N=4 时 8 &gt; 6 成立；K=2、N=4 时 2 &lt; 6 不成立。注意 all-gather 的字节与 top-k 无关，all-to-all 的与 rank 数无关，两者随不同自变量增长。</p>
+</details>
+<details class="fold">
+<summary>3. 为什么接收端还要做一次局部重排？</summary>
+<p>发送方按 <code>(目标 rank, 专家)</code> 排序，所以接收端收到的是「按发送方分段」的布局，同一个专家的行会分散在多个发送方段里。grouped GEMM 需要「按专家分段」的连续布局，所以接收端用交换来的 <code>(发送方, 专家)</code> 计数把行本地搬一次。这一步不发通信，但要多占一份等长缓冲。</p>
+</details>
+<details class="fold">
+<summary>4. 一个 64 专家、top-8 的模型在 8 个 token 上运行，EP=4。有多少个专家会拿到 0 个 token？</summary>
+<p>最多 64 个里的大部分。8 token × top-8 = 64 个 (token,k) 对，最极端情况恰好覆盖 64 个不同专家、一个不空；实测（随机路由）64 个专家槽里 50 个是空的。所以 counts 里大量为 0，offset 构造必须能处理零长度段。</p>
+</details>
+<details class="fold">
+<summary>5. 为什么倾斜 50% 的 dispatch 时间没有明显变长？</summary>
+<p>倾斜改变的是行落到哪个目标 rank，不改变总行数（T×K 不变）、也不改变每行的字节数。总字节数不变，所以 all-to-all 的时间基本不变。倾斜的代价出现在 rank 之间的负载差上（实测每 rank 负载 <code>[638,123,131,132]</code>，max/min = 5.2×），表现为「某些卡在算、某些卡在等」。</p>
+</details>
+<details class="fold">
+<summary>6. EPLB 给热专家加第 2 份副本，为什么均衡指标反而变差？</summary>
+<p>因为收益的上界由最差层决定。静态布局下大多数层的 max/mean 已经在 1.10 附近（路由本身近似均匀），只有少数层有 1.5 以上的尖峰。削掉尖峰后已经接近下界，再加副本只是把均匀层上的 token 也拆开，指标不再改善；同时副本数增加使每次求解的迁移字节翻倍。本章的分流模型还是理想均分，实际收益只会更低。</p>
+</details>
+<details class="fold">
+<summary>7. 本机为什么跑不了 DeepEP V2？</summary>
+<p>两条硬门槛：架构上要求 SM90+（本机 L40S 是 sm_89），源码 <code>setup.py</code> 默认把 <code>TORCH_CUDA_ARCH_LIST</code> 设为 9.0 并校验；依赖上要求 NCCL ≥ 2.30.4（本机 2.29.7）。跨机还需要 RDMA，本机没有 <code>/dev/infiniband</code>。所以只能做协议与源码分析，不冒充其目标平台。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L6/6.2-inference-parallelism.html">&#8592; 6.2 推理并行：TP / PP / EP / CP</a><a class="nav-next" href="../L6/6.4-pd-disaggregation.html">6.4 PD 分离：KV cache 成为数据平面 &#8594;</a></nav>
+</main>
+</body>
+</html>

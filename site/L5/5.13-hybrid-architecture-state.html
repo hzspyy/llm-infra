@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.13 混合架构的状态管理</title>
-<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
-<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
 
 </head>
 <body>
@@ -20,6 +20,7 @@
 <li><a href="#_3">机制拆解与推导</a><ul>
 <li><a href="#1">1. 逐层状态的实际形状</a></li>
 <li><a href="#2">2. 容量增长的实测对照</a></li>
+<li><a href="#2b-8100">2b. 把上下文推到 8100：上面那条「次线性」不成立</a></li>
 <li><a href="#3">3. 前缀复用：定长状态能否参与哈希？</a></li>
 <li><a href="#4">4. 投机解码的回滚：定长状态怎么恢复？</a></li>
 </ul>
@@ -29,8 +30,12 @@
 </ul>
 </li>
 <li><a href="#lab">动手 lab：检查混合架构的状态分布</a></li>
+<li><a href="#sglang-recurrentgemma">SGLang 上的混合架构支持：本版本明确拒绝 RecurrentGemma</a></li>
 <li><a href="#_5">原始现场</a><ul>
 <li><a href="#1_1">1. 逐层状态配置</a></li>
+<li><a href="#1d-sglang">1d. SGLang 混合架构支持核查</a></li>
+<li><a href="#1c-40968100">1c. 超长上下文扫描（4096/8100）</a></li>
+<li><a href="#1b-c">1b. 投机回滚的实测（任务 C）</a></li>
 <li><a href="#2_1">2. 前缀复用原始记录</a></li>
 <li><a href="#3_1">3. 容量扫描原始数据</a></li>
 </ul>
@@ -60,6 +65,7 @@
 <li><a href="#_3">机制拆解与推导</a><ul>
 <li><a href="#1">1. 逐层状态的实际形状</a></li>
 <li><a href="#2">2. 容量增长的实测对照</a></li>
+<li><a href="#2b-8100">2b. 把上下文推到 8100：上面那条「次线性」不成立</a></li>
 <li><a href="#3">3. 前缀复用：定长状态能否参与哈希？</a></li>
 <li><a href="#4">4. 投机解码的回滚：定长状态怎么恢复？</a></li>
 </ul>
@@ -69,8 +75,12 @@
 </ul>
 </li>
 <li><a href="#lab">动手 lab：检查混合架构的状态分布</a></li>
+<li><a href="#sglang-recurrentgemma">SGLang 上的混合架构支持：本版本明确拒绝 RecurrentGemma</a></li>
 <li><a href="#_5">原始现场</a><ul>
 <li><a href="#1_1">1. 逐层状态配置</a></li>
+<li><a href="#1d-sglang">1d. SGLang 混合架构支持核查</a></li>
+<li><a href="#1c-40968100">1c. 超长上下文扫描（4096/8100）</a></li>
+<li><a href="#1b-c">1b. 投机回滚的实测（任务 C）</a></li>
 <li><a href="#2_1">2. 前缀复用原始记录</a></li>
 <li><a href="#3_1">3. 容量扫描原始数据</a></li>
 </ul>
@@ -100,7 +110,7 @@
   <div class="mod-id">5.13</div>
   <h1>混合架构的状态管理</h1>
   <p class="lede">管理混合模型中的 KV cache、循环状态和窗口状态，介绍前缀复用、快照及投机回滚。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · RecurrentGemma-2B · vLLM 0.29.0</span><span class="chip">前置 3.4（稀疏与线性 attention）· 5.2（KV 分页）· 5.5（投机解码）</span></div>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · RecurrentGemma-2B · Qwen3.5-4B · vLLM 0.29.0 · SGLang 0.5.19</span><span class="chip">前置 3.4（稀疏与线性 attention）· 5.2（KV 分页）· 5.5（投机解码）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>混合模型中的层不一定都保存 KV cache。循环层或线性 attention 可以使用定长状态，局部 attention 则保留窗口内的 KV。不同状态的更新方式，也决定了前缀复用和投机回滚的实现。</p>
 <ol>
@@ -337,18 +347,85 @@
 </tr>
 </tbody>
 </table>
-<p><strong>Token 增长 7.95×，时间只增长 3.53×。</strong></p>
-<p>这是<strong>次线性增长</strong>：固定的 recurrent state（360 KB）占主导，KV cache 的线性增长被摊薄。</p>
-<p>对比纯 attention 模型（Qwen3-1.7B，28 层 MHA）：</p>
-<div class="highlight"><pre><span></span><code><span class="c1"># 每层 KV cache</span>
-<span class="n">kv_per_layer</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">num_kv_heads</span> <span class="o">*</span> <span class="n">head_dim</span> <span class="o">*</span> <span class="n">seq_len</span> <span class="o">*</span> <span class="n">dtype_bytes</span>
-             <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="mi">128</span> <span class="o">*</span> <span class="mi">128</span> <span class="o">*</span> <span class="mi">2048</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">=</span> <span class="mf">16.8</span> <span class="n">MB</span> <span class="n">per</span> <span class="n">layer</span>
-
-<span class="c1"># 28 层</span>
-<span class="n">total_kv</span> <span class="o">=</span> <span class="mi">28</span> <span class="o">*</span> <span class="mf">16.8</span> <span class="n">MB</span> <span class="o">=</span> <span class="mi">468</span> <span class="n">MB</span>  <span class="p">(</span><span class="n">context</span><span class="o">=</span><span class="mi">2048</span><span class="p">)</span>
+<p><strong>Token 增长 7.95×，prefill 时间只增长 3.53×</strong>（111.0 → 391.3 ms）。
+这条次线性是<strong>时间</strong>性质，来自大矩阵乘对权重读取的摊薄，不能归因到状态大小：
+同一张表里，状态估算从 2.4 MB 涨到 16.7 MB，是随上下文<strong>线性</strong>的，
+因为其中 2/4/8/16 MB 都是 attention 层的 KV。
+固定的 360 KB recurrent state 在 2048 上下文时只占状态总量的 2.2%。
+两件事要分开说：<strong>固定状态摊薄的是每 token 的时间，不是每 token 的显存。</strong></p>
+<p>对比纯 attention 模型，用 0.2 账本里同一个 checkpoint 的数（<code>ledger_qwen3_1.7b_ctx4096.json</code>）：
+Qwen3-1.7B 是 28 层 GQA，8 个 KV head、head_dim 128、bf16，合计</p>
+<div class="highlight"><pre><span></span><code>kv_bytes_per_token = 2(K,V) × 28(层) × 8(KV head) × 128(head_dim) × 2 byte = 114 688 byte
+context = 2048 时 total_kv = 114 688 × 2048 = 235 MB
 </code></pre></div>
 
-<p>混合架构在 context=2048 时只需 <strong>16.7 MB</strong>，是纯 attention 的 <strong>3.6%</strong>。</p>
+<p>（该文件的 <code>bytes_per_token = 114688</code>、<code>bytes_at_ctx</code> 在 ctx=4096 时是 469 762 048 byte，与上式一致；
+<code>gqa_saving = 2.0</code> 指 16 个 Q head 对 8 个 KV head。）</p>
+<p>所以混合架构在 context=2048 时要 <strong>16.7 MB</strong>，是纯 attention 的 <strong>7.1%</strong>。
+这个比例随后续上下文线性上升：KV 是线性项，360 KB 是常数项，
+上下文越长，混合架构省下的比例越接近「attention 层数占比」而不是「1 减去一个小数」。</p>
+<h3 id="2b-8100">2b. 把上下文推到 8100：上面那条「次线性」不成立</h3>
+<p>上表只到 2048，且 256 与 512 两个点几乎一样（111.0 与 111.5 ms）——
+这个形状更像是<strong>固定开销占了主导</strong>，而不是算力摊薄。把它推到 8100 再看
+（<code>labs/L5/run_hybrid_longctx.sh</code> + <code>hybrid_longctx_scan.py</code>，
+<code>results/crater/hybrid/longctx-20260913/</code>，每种长度 3 次取中位）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">目标长度</th>
+<th style="text-align: right;">实际 token</th>
+<th style="text-align: right;">prefill 中位</th>
+<th style="text-align: right;">每 token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">514</td>
+<td style="text-align: right;">205.8 ms</td>
+<td style="text-align: right;">0.400 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2050</td>
+<td style="text-align: right;">819.9 ms</td>
+<td style="text-align: right;">0.400 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">4098</td>
+<td style="text-align: right;">1 678.6 ms</td>
+<td style="text-align: right;">0.410 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">8100</td>
+<td style="text-align: right;">8 102</td>
+<td style="text-align: right;">3 056.9 ms</td>
+<td style="text-align: right;">0.377 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>token 涨 15.8×，时间涨 14.9×</strong>——在这段范围里 prefill 时间基本是<strong>线性</strong>的，
+每 token 成本只在最长一点上降了约 6%。所以 256→2048 那段的「次线性」
+来自小上下文处的固定开销（256 与 512 都停在 111 ms），不是随上下文增长的摊薄效应；
+2048 以内的结论不能外推到 4096+。</p>
+<p>同一台服务上固定 4096 上下文量 decode：TTFT 1 543 ms，之后 15 步共 148 ms，
+<strong>每 token 9.88 ms</strong>。这个数接近常数，与「递推状态定长、不随上下文增长」一致
+（随上下文增长的只有 8 层 attention 的 KV）。</p>
+<p><strong>三个必须先固定的配置事实</strong>（否则量到的不是 prefill）：</p>
+<ol>
+<li>RecurrentGemma 在本版本走 <strong>Transformers 回退后端</strong>
+   （日志：<code>TransformersForCausalLM has no vLLM implementation, falling back to
+   Transformers implementation</code>）。默认还会做 torch.compile 与 51 个图捕获尺寸，
+   启动超过 600 s 起不来；这里显式 <code>--enforce-eager</code>。上述绝对耗时因此是
+   回退路径的数字，不能当 vLLM 原生 kernel 的性能。</li>
+<li><code>--gpu-memory-utilization</code> 给 0.35 会直接以
+   <code>No available memory for the cache blocks</code> 失败；本机独占时用 0.6
+   （引擎自报 KV 容量 703 490 token，8192 上下文下并发上限 85.88×）。</li>
+<li><strong>必须关掉前缀缓存</strong>。同一长度重复三次时，第二次起会命中缓存：
+   开着缓存时 512 的后两次是 16.1 / 15.0 ms，关掉后是 205.8 / 204.0 ms。
+   本节的三个数都是关掉之后的。</li>
+</ol>
 <hr />
 <h3 id="3">3. 前缀复用：定长状态能否参与哈希？</h3>
 <p>5.2 讲了 vLLM 的前缀缓存：通过哈希 <code>(token_ids, ...)</code> 复用相同前缀的 KV 块。
@@ -409,61 +486,167 @@
 </ol>
 <hr />
 <h3 id="4">4. 投机解码的回滚：定长状态怎么恢复？</h3>
-<p>5.5 讲了投机解码：draft model 生成 K 个候选，target model 验证。验证失败时需要<strong>回滚到验证前的状态</strong>。</p>
-<p><strong>KV cache 的回滚（纯 attention）：</strong></p>
-<div class="highlight"><pre><span></span><code><span class="c1"># 验证前：seq_len = L</span>
-<span class="c1"># 生成了 K 个 draft token，验证失败，只接受前 k 个</span>
-<span class="c1"># 回滚：把 seq_len 截断到 L + k</span>
-
-<span class="c1"># vLLM 实现：调整块表，释放多余的块</span>
-<span class="n">block_table</span> <span class="o">=</span> <span class="n">block_table</span><span class="p">[:</span><span class="n">num_accepted_blocks</span><span class="p">]</span>
-</code></pre></div>
-
-<p>回滚只涉及<strong>块引用的调整</strong>，不需要恢复张量内容——因为后续 decode 会覆盖那些位置。</p>
-<p><strong>Recurrent state 的回滚（混合架构）：</strong></p>
-<p>Recurrent state 是定长的，没有"截断"的概念。验证前后的状态是<strong>两个不同的张量</strong>：</p>
-<div class="highlight"><pre><span></span><code><span class="c1"># 验证前：state_before = (batch, heads, conv_width, head_dim)</span>
-<span class="c1"># 生成 K 个 draft token，每步更新 state</span>
-<span class="c1"># state_after ≠ state_before（已经被覆盖）</span>
-
-<span class="c1"># 回滚：需要恢复整个 state_before</span>
-<span class="n">state</span> <span class="o">=</span> <span class="n">state_before</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>  <span class="c1"># 需要提前保存</span>
-</code></pre></div>
-
-<p><strong>代价对比：</strong></p>
+<p>5.5 讲了投机解码：草稿模型生成 K 个候选，目标模型一次前向验证。验证失败时要<strong>回滚到验证前的状态</strong>。</p>
+<p><strong>KV cache 的回滚（纯 attention）：</strong> 回滚只调整块表引用与有效长度，不搬运张量内容——
+后续 decode 会覆盖那些位置。这是 5.2/5.8 已经验证过的路径。</p>
+<p><strong>递推状态的回滚（混合架构）：</strong> 递推状态是定长的，没有"截断"可言，
+验证前向已经把它覆盖掉了，所以要真正把旧值取回来。代价不是靠公式估的，下面按
+RecurrentGemma-2B 的真实层配置（18 层 recurrent、状态 <code>[batch,10,4,256]</code> bf16，
+即 368 640 byte/batch；8 层 attention、KV <code>[2,1,256]</code>/token/层）建<strong>真张量</strong>状态池实测
+（<code>labs/L5/hybrid_rollback_cost.py</code>，<code>results/crater/hybrid/rollback-cost-20260913/</code>）。
+状态写入是合成的，但快照/回滚的拷贝内核、字节与耗时都是真实 GPU 测量：</p>
 <table>
 <thead>
 <tr>
-<th>操作</th>
-<th>KV cache（attention）</th>
-<th>Recurrent state</th>
+<th style="text-align: right;">batch</th>
+<th style="text-align: right;">recurrent 状态</th>
+<th style="text-align: right;">快照（clone）</th>
+<th style="text-align: right;">回滚（逐层 copy_）</th>
+<th style="text-align: right;">折合带宽</th>
+<th style="text-align: right;">不投机单步的状态更新</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>验证前保存</td>
-<td>无需保存，块引用即可</td>
-<td>需要 clone 整个 state（360 KB/batch）</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0.37 MB</td>
+<td style="text-align: right;">0.078 ms</td>
+<td style="text-align: right;">0.052 ms</td>
+<td style="text-align: right;">6.5 GB/s</td>
+<td style="text-align: right;">0.055 ms</td>
 </tr>
 <tr>
-<td>回滚</td>
-<td>调整块表指针</td>
-<td>恢复 state 张量</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">2.95 MB</td>
+<td style="text-align: right;">0.071 ms</td>
+<td style="text-align: right;">0.052 ms</td>
+<td style="text-align: right;">57.2 GB/s</td>
+<td style="text-align: right;">0.054 ms</td>
 </tr>
 <tr>
-<td>字节搬运</td>
-<td>0（只改指针）</td>
-<td>360 KB × batch_size</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">11.80 MB</td>
+<td style="text-align: right;">0.166 ms</td>
+<td style="text-align: right;">0.052 ms</td>
+<td style="text-align: right;">221.5 GB/s</td>
+<td style="text-align: right;">0.054 ms</td>
 </tr>
 </tbody>
 </table>
-<p>对于 batch=8 的投机解码，纯 attention 的回滚几乎零成本；混合架构需要恢复 <strong>2.8 MB</strong> 的 recurrent state。</p>
+<p><strong>回滚时间不随搬运字节变化</strong>——batch 1 到 32 字节数涨 32 倍，时间纹丝不动，
+"折合带宽"从 6.5 涨到 221.5 GB/s 只是把常数时间除以了更大的分子。
+把同一形状换成三种对照就看得出来它到底卡在哪：</p>
+<table>
+<thead>
+<tr>
+<th>对照（batch=32）</th>
+<th style="text-align: right;">耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>18 次逐层 <code>copy_</code>（一层一次）</td>
+<td style="text-align: right;">0.053 ms</td>
+</tr>
+<tr>
+<td>18 次空核的启动地板</td>
+<td style="text-align: right;">0.058 ms</td>
+</tr>
+<tr>
+<td>拼成一个连续张量后<strong>单次</strong>拷贝</td>
+<td style="text-align: right;">0.006 ms</td>
+</tr>
+<tr>
+<td>把 18 次拷贝捕进一张 CUDA Graph 回放</td>
+<td style="text-align: right;">0.018 ms</td>
+</tr>
+</tbody>
+</table>
+<p>逐层拷贝的时间与 18 次空核的启动地板一致，说明<strong>这一版实现是启动受限的</strong>：
+每次回滚付 18 次 kernel launch，与状态多大无关。把它融合成一次拷贝能降到 1/9，
+图捕获能降到 1/3。</p>
+<p><strong>协议正确性同时被验证，而不是只测时间。</strong> 四种拒绝位置（第 1 位、第 2 位、末位、全部接受）
+下，回滚后的张量与快照<strong>逐元素完全相等</strong>（<code>torch.equal</code>，不是容差比较）；
+回滚后按接受数再施加 <code>accepted+1</code> 次写入，结果与"从基准只施加 <code>accepted+1</code> 次写入"的参照
+逐元素相等。也就是说被拒位置从来没有留进状态里。</p>
+<p><strong>快照成本必须计入整轮。</strong> 每轮投机要在验证前保存一次状态，恢复一次；
+在本实现下两者相加是 0.13–0.22 ms，其中 batch=32 时快照（0.166 ms）比回滚（0.052 ms）还贵，
+因为 <code>clone()</code> 还要分配一块新内存。</p>
+<p><strong>引擎的真实做法不同。</strong> vLLM 0.29.0 的混合模型投机路径并不逐层 clone：</p>
+<ul>
+<li>状态张量的布局是 <code>[num_groups, max_num_reqs, 1 + num_speculative_blocks]</code>
+  （<code>vllm/v1/worker/mamba_utils.py:816</code>）：<strong>每个请求预留 <code>1 + num_speculative_blocks</code> 个状态槽</strong>，
+  快照因此不是运行时分配，而是写进另一个已有槽位；</li>
+<li><code>MambaSpecDecodeGPUContext</code>（同文件 <code>:771</code>）只在「混合模型 + 投机解码 + <code>mamba_cache_config</code> 为 align 模式」
+  时启用，它把基址、步长、元素大小这些布局元数据预先算成张量，
+  让 GPU 端拷贝<strong>不需要 CPU-GPU 同步</strong>；</li>
+<li>拷贝本身是融合的 Triton 内核：<code>postprocess_mamba_fused_kernel</code>（<code>:370</code>）、
+  <code>precopy_mamba_align_fused_kernel</code>（<code>:552</code>），共享拷贝体 <code>_copy_mamba_state_block</code>（<code>:192</code>），
+  并按 <code>conv_width</code> 区分两类状态——<code>conv_width&gt;0</code> 是滑动窗口的偏移拷贝，<code>0</code> 是整块拷贝；
+  字节搬运走 u64 向量化路径 <code>_memcpy_u64_tiled</code>（<code>:104</code>），只在亚 8 字节不对齐时退到逐字节慢路径。</li>
+</ul>
+<p>把三条放在一起看：<strong>「回滚要抄回整个状态」是对的，「抄回来很贵」取决于实现——</strong>
+逐层 <code>copy_</code> 的版本贵在 18 次启动，融合成一次拷贝后 12 MB 只需 6 µs；
+而引擎用「预留槽位 + 一个融合内核 + 无同步」把快照和回滚都压到了单次 kernel 的量级。</p>
 <p><strong>实际影响：</strong></p>
 <ul>
-<li>投机接受率高（&gt;80%）时，回滚频率低，影响有限。</li>
-<li>投机接受率低（&lt;40%）时，频繁回滚会拖累吞吐。5.5 测得自由创作任务的接受率只有 37%，混合架构在这类负载下投机收益更小。</li>
+<li>拒绝发生在第几位不改变单次回滚成本（四种位置实测都是 0.052 ms 量级），
+  改变的是这一轮还能提交多少 token，以及后续是否要重新验证。</li>
+<li>高接受率时回滚次数少；接受率低于 40%（5.5 的自由创作任务实测 31.1%）时，
+  每轮几乎都要回滚，快照 + 回滚 ≈ 一次额外的前向时间量级，会明显吃掉投机收益。</li>
 </ul>
-<hr />
+<p><strong>真实引擎上的混合架构投机：Qwen3.5-4B 的内置 MTP。</strong> 合成张量池给出了回滚成本，
+"回滚之后输出还对不对"要在真实模型上验。Qwen3.5-4B 正好覆盖两类状态：24 层
+<code>linear_attention</code>（递推状态）+ 8 层 <code>full_attention</code>（KV），外加 1 个 MTP 块。
+在 vLLM 0.29.0 上用 <code>method=qwen3_5_mtp</code> 打开内置 MTP，同一 prompt、贪心、
+<code>ignore_eos</code>、输出 192 token（<code>results/crater/5.5/spec-draft-20260922/mtp/</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align: right;">B=1 tok/s</th>
+<th style="text-align: right;">B=4 tok/s</th>
+<th style="text-align: right;">平均前进</th>
+<th>输出 sha1（B=1 / B=4）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>普通 decode</td>
+<td style="text-align: right;">104.7</td>
+<td style="text-align: right;">386.4</td>
+<td style="text-align: right;">—</td>
+<td>456600e3ce11 / 4e75d6ff419a</td>
+</tr>
+<tr>
+<td>MTP k=1</td>
+<td style="text-align: right;">176.5</td>
+<td style="text-align: right;">630.0</td>
+<td style="text-align: right;">1.96</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>MTP k=2</td>
+<td style="text-align: right;">226.0</td>
+<td style="text-align: right;">690.3</td>
+<td style="text-align: right;">2.82</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>MTP k=4</td>
+<td style="text-align: right;">270.4</td>
+<td style="text-align: right;">1039.9</td>
+<td style="text-align: right;">4.31</td>
+<td>同上</td>
+</tr>
+</tbody>
+</table>
+<p>四个配置的整条输出 sha1 与不投机逐位相同。投机的拒绝与回滚要发生在<strong>每一层</strong>：
+attention 层可以只截断 KV 长度，24 层递推状态却无法靠缩短长度恢复，必须走引擎预留的
+状态槽位。输出逐位一致说明这条路径在这批负载与该 revision 上没有把被拒草稿留进状态；
+<strong>它验证的是端到端一致性，不是每种拒绝位置的内部状态</strong>——后者仍由上面的合成张量池
+逐元素对拍覆盖。vLLM 对混合架构的 MTP 有独立的模型实现（<code>qwen3_5_mtp</code>），
+说明这条路线是"权重 + 引擎实现 + 状态布局"三者配套，不是只换一个配置名。</p>
 <h2 id="vllm">工程实现：vLLM 的混合缓存管理</h2>
 <h3 id="_4">源码解析：状态分配与池化</h3>
 <p>vLLM 对混合架构的支持位于 <code>vllm/attention/backends/</code> 和 cache 管理层。
@@ -560,6 +743,57 @@ python3<span class="w"> </span>labs/L5/hybrid_state_audit.py
 <li><strong>投机解码回滚：</strong> 模拟高拒绝率场景（acceptance_rate &lt; 40%），测量 recurrent state 恢复的开销。</li>
 </ol>
 <hr />
+<h2 id="sglang-recurrentgemma">SGLang 上的混合架构支持：本版本明确拒绝 RecurrentGemma</h2>
+<p>5.13 的载体是 RecurrentGemma。要在 SGLang 上做同一件事，先得问这个版本支持什么。
+静态核查 + 一次真实启动（<code>labs/L5/sglang_hybrid_probe.py</code>、<code>run_sglang_hybrid.sh</code>，
+<code>results/crater/hybrid/sglang-hybrid-20260913/</code>）：</p>
+<p><strong>SGLang 0.5.19 有混合架构的运行时设施，但没有 RecurrentGemma 的实现。</strong></p>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>包内 <code>RecurrentGemma</code> / <code>recurrent_gemma</code> 命中</td>
+<td><strong>0 个文件</strong></td>
+</tr>
+<tr>
+<td><code>srt/models/</code> 下的 gemma 变体</td>
+<td><code>gemma</code>、<code>gemma2</code>、<code>gemma3*</code>、<code>gemma4*</code>，没有 recurrent</td>
+</tr>
+<tr>
+<td>混合设施</td>
+<td><code>mem_cache/hybrid_cache/{hybrid_cache_controller,hybrid_pool_assembler,linker_pool_assembler}.py</code>、<code>mamba_radix_cache.py</code>、<code>mamba_slot_fused.py</code>、<code>mamba_checkpoint_pool.py</code>；引用 mamba/hybrid 缓存的文件 <strong>26 个</strong></td>
+</tr>
+<tr>
+<td>本版本支持的混合架构</td>
+<td><code>Qwen3NextForCausalLM</code>、<code>NemotronHForCausalLM</code>、<code>BailingMoeV2ForCausalLM</code>、<code>GraniteMoeHybridForCausalLM</code></td>
+</tr>
+<tr>
+<td>缺席的混合架构</td>
+<td><code>MambaForCausalLM</code>、<code>Mamba2ForCausalLM</code>、<code>ZambaForCausalLM</code>、<code>JambaForCausalLM</code></td>
+</tr>
+</tbody>
+</table>
+<p>真实启动尝试给出的是<strong>明确拒绝</strong>，不是崩溃：</p>
+<div class="highlight"><pre><span></span><code>ValueError: RecurrentGemmaForCausalLM has no Sglang implementation
+and the Transformers implementation is not compatible with SGLang.
+</code></pre></div>
+
+<p>错误来自 <code>sglang/srt/model_loader/utils.py:184</code> 的 <code>resolve_transformers_arch</code>。
+<strong>这正是两个引擎的分水岭</strong>：vLLM 0.29.0 会走 Transformers 回退
+（日志：<code>TransformersForCausalLM has no vLLM implementation, falling back to
+Transformers implementation</code>），所以 RecurrentGemma 在 vLLM 上能跑——
+上一节的 8100 token 扫描就是这么跑出来的；SGLang 选择直接拒绝这条回退。</p>
+<p><strong>结论（给读者用的那一条）</strong>：混合架构的对照实验要落在<strong>两边都实现</strong>的模型上，
+本版本可选 <code>Qwen3-Next</code> / <code>NemotronH</code> / <code>Bailing-MoE</code> / <code>Granite-MoE-Hybrid</code>；
+RecurrentGemma 只能在 vLLM 侧跑，SGLang 侧的"同模型对照"在当前版本上不存在。
+这也意味着上一节所有耗时的引擎是 <strong>Transformers 回退路径</strong>，
+换成两边都支持的混合模型才会有可比的 kernel 级数字。</p>
+<hr />
 <h2 id="_5">原始现场</h2>
 <h3 id="1_1">1. 逐层状态配置</h3>
 <details class="fold">
@@ -599,6 +833,492 @@ python3<span class="w"> </span>labs/L5/hybrid_state_audit.py
 </code></pre></div>
 
 </details>
+<h3 id="1d-sglang">1d. SGLang 混合架构支持核查</h3>
+<details class="fold srcfold"><summary>results/crater/hybrid/sglang-hybrid-20260913/sglang_hybrid_survey.json 全文（63 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 1</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 2</span> <span class="w">  </span><span class="nt">"sglang_version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"0.5.19"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 3</span> <span class="w">  </span><span class="nt">"site_packages"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/scratch/learn/envs/sgl/lib/python3.12/site-packages"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 4</span> <span class="w">  </span><span class="nt">"target_arch_hits"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 5</span> <span class="w">    </span><span class="nt">"RecurrentGemma"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 6</span> <span class="w">    </span><span class="nt">"recurrent_gemma"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="linenos" aria-hidden="true"> 7</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 8</span> <span class="w">  </span><span class="nt">"hybrid_arch_hits"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 9</span> <span class="w">    </span><span class="nt">"MambaForCausalLM"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">10</span> <span class="w">    </span><span class="nt">"Mamba2ForCausalLM"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">11</span> <span class="w">    </span><span class="nt">"Qwen3NextForCausalLM"</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">12</span> <span class="w">    </span><span class="nt">"NemotronHForCausalLM"</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">13</span> <span class="w">    </span><span class="nt">"ZambaForCausalLM"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">14</span> <span class="w">    </span><span class="nt">"JambaForCausalLM"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">15</span> <span class="w">    </span><span class="nt">"BailingMoeV2ForCausalLM"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">16</span> <span class="w">    </span><span class="nt">"GraniteMoeHybridForCausalLM"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span>
+<span class="linenos" aria-hidden="true">17</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">18</span> <span class="w">  </span><span class="nt">"facility_dirs"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">19</span> <span class="w">    </span><span class="nt">"hybrid_cache"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">20</span> <span class="w">    </span><span class="nt">"mamba_radix_cache"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">21</span> <span class="w">    </span><span class="nt">"mamba_slot_fused"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">22</span> <span class="w">    </span><span class="nt">"mamba_checkpoint_pool"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="linenos" aria-hidden="true">23</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">24</span> <span class="w">  </span><span class="nt">"hybrid_cache_dir"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">25</span> <span class="w">    </span><span class="s2">"__pycache__"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">26</span> <span class="w">    </span><span class="s2">"hybrid_cache_controller.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">27</span> <span class="w">    </span><span class="s2">"hybrid_pool_assembler.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">28</span> <span class="w">    </span><span class="s2">"linker_pool_assembler.py"</span>
+<span class="linenos" aria-hidden="true">29</span> <span class="w">  </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">30</span> <span class="w">  </span><span class="nt">"files_referencing_mamba_or_hybrid_cache"</span><span class="p">:</span><span class="w"> </span><span class="mi">26</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">31</span> <span class="w">  </span><span class="nt">"gemma_variants_present"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">32</span> <span class="w">    </span><span class="s2">"gemma.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">33</span> <span class="w">    </span><span class="s2">"gemma2.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">34</span> <span class="w">    </span><span class="s2">"gemma2_reward.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">35</span> <span class="w">    </span><span class="s2">"gemma3_causal.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">36</span> <span class="w">    </span><span class="s2">"gemma3_mm.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">37</span> <span class="w">    </span><span class="s2">"gemma3n_audio.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">38</span> <span class="w">    </span><span class="s2">"gemma3n_causal.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">39</span> <span class="w">    </span><span class="s2">"gemma3n_mm.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">40</span> <span class="w">    </span><span class="s2">"gemma4_audio.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">41</span> <span class="w">    </span><span class="s2">"gemma4_causal.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">42</span> <span class="w">    </span><span class="s2">"gemma4_mm.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">43</span> <span class="w">    </span><span class="s2">"gemma4_mtp.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">44</span> <span class="w">    </span><span class="s2">"gemma4_unified.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">45</span> <span class="w">    </span><span class="s2">"gemma4_vision.py"</span>
+<span class="linenos" aria-hidden="true">46</span> <span class="w">  </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">47</span> <span class="w">  </span><span class="nt">"conclusion"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">48</span> <span class="w">    </span><span class="nt">"recurrent_gemma_supported"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">49</span> <span class="w">    </span><span class="nt">"hybrid_machinery_present"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">50</span> <span class="w">    </span><span class="nt">"supported_hybrid_archs"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">51</span> <span class="w">      </span><span class="s2">"Qwen3NextForCausalLM"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">52</span> <span class="w">      </span><span class="s2">"NemotronHForCausalLM"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">53</span> <span class="w">      </span><span class="s2">"BailingMoeV2ForCausalLM"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">54</span> <span class="w">      </span><span class="s2">"GraniteMoeHybridForCausalLM"</span>
+<span class="linenos" aria-hidden="true">55</span> <span class="w">    </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">56</span> <span class="w">    </span><span class="nt">"unsupported_hybrid_archs"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">57</span> <span class="w">      </span><span class="s2">"MambaForCausalLM"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">58</span> <span class="w">      </span><span class="s2">"Mamba2ForCausalLM"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">59</span> <span class="w">      </span><span class="s2">"ZambaForCausalLM"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">60</span> <span class="w">      </span><span class="s2">"JambaForCausalLM"</span>
+<span class="linenos" aria-hidden="true">61</span> <span class="w">    </span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">62</span> <span class="w">  </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">63</span> <span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/hybrid/sglang-hybrid-20260913/sglang_hybrid_survey.json 全文（63 行）</code><a href="../code/results/crater/hybrid/sglang-hybrid-20260913/sglang_hybrid_survey.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p>启动尝试的拒绝原因（<code>launch-errors.txt</code>）：</p>
+<details class="fold srcfold"><summary>results/crater/hybrid/sglang-hybrid-20260913/launch-errors.txt 全文（2 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>51:    raise ValueError(
+52:ValueError: RecurrentGemmaForCausalLM has no SGlang implementation and the Transformers implementation is not compatible with SGLang.
+</pre></div>
+<div class="srcref"><code>results/crater/hybrid/sglang-hybrid-20260913/launch-errors.txt 全文（2 行）</code><a href="../code/results/crater/hybrid/sglang-hybrid-20260913/launch-errors.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h3 id="1c-40968100">1c. 超长上下文扫描（4096/8100）</h3>
+<details class="fold srcfold"><summary>results/crater/hybrid/longctx-20260913/longctx_scan.json 全文（129 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="w">  </span><span class="nt">"rows"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">  3</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">  4</span> <span class="w">      </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"prefill"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="w">      </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="w">      </span><span class="nt">"reps"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">514</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 11</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">225.97</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">514</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">205.78</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 19</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">514</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 24</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 25</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">204.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<span class="linenos" aria-hidden="true"> 27</span> <span class="w">        </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="w">      </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="w">      </span><span class="nt">"median_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">205.78</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="w">      </span><span class="nt">"actual_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">514</span>
+<span class="linenos" aria-hidden="true"> 31</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 32</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 33</span> <span class="w">      </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"prefill"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 34</span> <span class="w">      </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 35</span> <span class="w">      </span><span class="nt">"reps"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 36</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 37</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 38</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">2050</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 39</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 40</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">842.94</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 41</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="linenos" aria-hidden="true"> 42</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 43</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 44</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 45</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">2050</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 46</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 47</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">793.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 48</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="linenos" aria-hidden="true"> 49</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 50</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 51</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 52</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">2050</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 53</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 54</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">819.9</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 55</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<span class="linenos" aria-hidden="true"> 56</span> <span class="w">        </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 57</span> <span class="w">      </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 58</span> <span class="w">      </span><span class="nt">"median_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">819.9</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 59</span> <span class="w">      </span><span class="nt">"actual_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">2050</span>
+<span class="linenos" aria-hidden="true"> 60</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 61</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 62</span> <span class="w">      </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"prefill"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 63</span> <span class="w">      </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 64</span> <span class="w">      </span><span class="nt">"reps"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 65</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 66</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 67</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">4098</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 68</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 69</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1795.19</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 70</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="linenos" aria-hidden="true"> 71</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 72</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 73</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 74</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">4098</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 75</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 76</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1678.59</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 77</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="linenos" aria-hidden="true"> 78</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 79</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 80</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 81</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">4098</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 82</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 83</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1555.89</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 84</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<span class="linenos" aria-hidden="true"> 85</span> <span class="w">        </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 86</span> <span class="w">      </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 87</span> <span class="w">      </span><span class="nt">"median_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1678.59</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 88</span> <span class="w">      </span><span class="nt">"actual_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">4098</span>
+<span class="linenos" aria-hidden="true"> 89</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 90</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 91</span> <span class="w">      </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"prefill"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 92</span> <span class="w">      </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">8100</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 93</span> <span class="w">      </span><span class="nt">"reps"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 94</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 95</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">8100</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 96</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">8102</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 97</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 98</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">3028.39</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 99</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="linenos" aria-hidden="true">100</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">101</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">102</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">8100</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">103</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">8102</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">104</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">105</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">3056.94</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">106</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="linenos" aria-hidden="true">107</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">108</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">109</span> <span class="w">          </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">8100</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">110</span> <span class="w">          </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">8102</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">111</span> <span class="w">          </span><span class="nt">"completion_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">112</span> <span class="w">          </span><span class="nt">"elapsed_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">3069.36</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">113</span> <span class="w">          </span><span class="nt">"rep"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<span class="linenos" aria-hidden="true">114</span> <span class="w">        </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">115</span> <span class="w">      </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">116</span> <span class="w">      </span><span class="nt">"median_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">3056.94</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">117</span> <span class="w">      </span><span class="nt">"actual_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">8102</span>
+<span class="linenos" aria-hidden="true">118</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">119</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">120</span> <span class="w">      </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"decode"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">121</span> <span class="w">      </span><span class="nt">"target"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">122</span> <span class="w">      </span><span class="nt">"ttft_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1542.96</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">123</span> <span class="w">      </span><span class="nt">"total16_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1691.22</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">124</span> <span class="w">      </span><span class="nt">"per_token_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.884</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">125</span> <span class="w">      </span><span class="nt">"prompt_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">4098</span>
+<span class="linenos" aria-hidden="true">126</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">127</span> <span class="w">  </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">128</span> <span class="w">  </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"prompt 用 'Token ' 重复构造，实际 token 数由 usage.prompt_tokens 给出；decode 每 token 时间由 16 与 1 两次调用差分，扣掉 prefill"</span>
+<span class="linenos" aria-hidden="true">129</span> <span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/hybrid/longctx-20260913/longctx_scan.json 全文（129 行）</code><a href="../code/results/crater/hybrid/longctx-20260913/longctx_scan.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h3 id="1b-c">1b. 投机回滚的实测（任务 C）</h3>
+<details class="fold srcfold"><summary>results/crater/hybrid/rollback-cost-20260913/rollback_cost.json 全文（280 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="w">  </span><span class="nt">"layer_config"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">  3</span> <span class="w">    </span><span class="nt">"n_recurrent"</span><span class="p">:</span><span class="w"> </span><span class="mi">18</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  4</span> <span class="w">    </span><span class="nt">"n_attention"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="w">    </span><span class="nt">"rec_shape"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="w">      </span><span class="mi">10</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="w">      </span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="w">      </span><span class="mi">256</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="w">    </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="w">    </span><span class="nt">"kv_shape"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 11</span> <span class="w">      </span><span class="mi">2</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="w">      </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="w">      </span><span class="mi">256</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="w">    </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="w">    </span><span class="nt">"block_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="w">    </span><span class="nt">"dtype"</span><span class="p">:</span><span class="w"> </span><span class="s2">"bfloat16"</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="w">  </span><span class="nt">"draft"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 19</span> <span class="w">  </span><span class="nt">"context"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="w">  </span><span class="nt">"rounds"</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="w">  </span><span class="nt">"results"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 24</span> <span class="w">      </span><span class="nt">"rec_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 25</span> <span class="w">      </span><span class="nt">"kv_bytes_per_token"</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="w">      </span><span class="nt">"snapshot_bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 27</span> <span class="w">      </span><span class="nt">"cases"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在第 1 位"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 31</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.09657599776983261</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 32</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.056352000683546066</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 33</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05907199904322624</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 34</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 35</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 36</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.5417375697121845</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 37</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 38</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 39</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 40</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.012575999833643436</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 41</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.01744000054895878</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 42</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 43</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0838719978928566</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 44</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span>
+<span class="linenos" aria-hidden="true"> 45</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 46</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 47</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在第 2 位"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 48</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 49</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.08310399949550629</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 50</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.052352000027894974</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 51</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05488000065088272</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 52</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 53</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 54</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.041564788424047</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 55</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 56</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 57</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 58</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.007807999849319458</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 59</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.01651199907064438</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 60</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 61</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05939200147986412</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 62</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span>
+<span class="linenos" aria-hidden="true"> 63</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 64</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 65</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在末位（第 5 位）"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 66</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 67</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.07238399982452393</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 68</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.052639998495578766</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 69</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05510399863123894</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 70</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 71</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 72</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.003039713820701</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 73</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 74</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 75</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 76</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.007391999941319227</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 77</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.014368000440299511</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 78</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 79</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05830400064587593</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 80</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span>
+<span class="linenos" aria-hidden="true"> 81</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 82</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 83</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"全部接受"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 84</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 85</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.06755200028419495</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 86</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.050944000482559204</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 87</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05385600030422211</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 88</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 89</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 90</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.236180835979003</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 91</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 92</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 93</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 94</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.006752000190317631</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 95</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.014495999552309513</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 96</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 97</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.056992001831531525</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 98</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span>
+<span class="linenos" aria-hidden="true"> 99</span> <span class="w">        </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">100</span> <span class="w">      </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">101</span> <span class="w">      </span><span class="nt">"median"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">102</span> <span class="w">        </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0777439996600151</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">103</span> <span class="w">        </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05249599926173687</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">104</span> <span class="w">        </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05499199964106083</span>
+<span class="linenos" aria-hidden="true">105</span> <span class="w">      </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">106</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">107</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">108</span> <span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">109</span> <span class="w">      </span><span class="nt">"rec_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">110</span> <span class="w">      </span><span class="nt">"kv_bytes_per_token"</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">111</span> <span class="w">      </span><span class="nt">"snapshot_bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">112</span> <span class="w">      </span><span class="nt">"cases"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">113</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">114</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在第 1 位"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">115</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">116</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.06777600198984146</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">117</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05158400163054466</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">118</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.054336000233888626</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">119</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">120</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">121</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">57.17121407373957</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">122</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">123</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">124</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">125</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.007935999892652035</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">126</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.014816000126302242</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">127</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">128</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05859199911355972</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">129</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span>
+<span class="linenos" aria-hidden="true">130</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">131</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">132</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在第 2 位"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">133</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">134</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.11913599818944931</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">135</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05190400034189224</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">136</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0541439987719059</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">137</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">138</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">139</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">56.818741919199155</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">140</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">141</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">142</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">143</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.007104000076651573</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">144</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.014495999552309513</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">145</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">146</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05820799991488457</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">147</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span>
+<span class="linenos" aria-hidden="true">148</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">149</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">150</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在末位（第 5 位）"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">151</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">152</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.07020799815654755</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">153</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0504320003092289</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">154</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05430399999022484</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">155</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">156</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">157</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">58.4771570018475</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">158</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">159</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">160</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">161</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.007199999876320362</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">162</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.01583999954164028</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">163</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">164</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05817599967122078</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">165</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span>
+<span class="linenos" aria-hidden="true">166</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">167</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">168</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"全部接受"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">169</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">170</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.07168000191450119</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">171</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0517439991235733</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">172</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05766399949789047</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">173</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">174</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">175</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">56.9944351026485</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">176</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">177</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">178</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">179</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.007199999876320362</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">180</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.014336000196635723</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">181</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">182</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05827200040221214</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">183</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">2949120</span>
+<span class="linenos" aria-hidden="true">184</span> <span class="w">        </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">185</span> <span class="w">      </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">186</span> <span class="w">      </span><span class="nt">"median"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">187</span> <span class="w">        </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.07094400003552437</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">188</span> <span class="w">        </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05166400037705898</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">189</span> <span class="w">        </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05432000011205673</span>
+<span class="linenos" aria-hidden="true">190</span> <span class="w">      </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">191</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">192</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">193</span> <span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">194</span> <span class="w">      </span><span class="nt">"rec_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">368640</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">195</span> <span class="w">      </span><span class="nt">"kv_bytes_per_token"</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">196</span> <span class="w">      </span><span class="nt">"snapshot_bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">197</span> <span class="w">      </span><span class="nt">"cases"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">198</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">199</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在第 1 位"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">200</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">201</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.15516799688339233</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">202</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.053247999399900436</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">203</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.054368000477552414</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">204</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">205</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">206</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">221.53846403517758</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">207</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">208</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">209</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">210</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.005824000108987093</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">211</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.018464000895619392</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">212</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">213</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05849599838256836</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">214</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span>
+<span class="linenos" aria-hidden="true">215</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">216</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">217</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在第 2 位"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">218</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">219</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.17561599612236023</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">220</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0525440014898777</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">221</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05375999957323074</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">222</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">223</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">224</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">224.50669278152566</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">225</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">226</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">227</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">228</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.009184000082314014</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">229</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.022592000663280487</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">230</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">231</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05827200040221214</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">232</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span>
+<span class="linenos" aria-hidden="true">233</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">234</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">235</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"拒绝在末位（第 5 位）"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">236</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">237</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.17660799622535706</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">238</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0517439991235733</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">239</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05363199859857559</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">240</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">241</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">242</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">227.977740410594</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">243</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">244</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">245</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">246</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.01568000018596649</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">247</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.018400000408291817</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">248</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">249</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05769599974155426</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">250</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span>
+<span class="linenos" aria-hidden="true">251</span> <span class="w">        </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">252</span> <span class="w">        </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">253</span> <span class="w">          </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="s2">"全部接受"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">254</span> <span class="w">          </span><span class="nt">"accepted"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">255</span> <span class="w">          </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.15673600137233734</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">256</span> <span class="w">          </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05167999863624573</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">257</span> <span class="w">          </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05593600124120712</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">258</span> <span class="w">          </span><span class="nt">"snapshot_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">259</span> <span class="w">          </span><span class="nt">"rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">260</span> <span class="w">          </span><span class="nt">"rollback_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">228.2600679429304</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">261</span> <span class="w">          </span><span class="nt">"kv_rollback_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">262</span> <span class="w">          </span><span class="nt">"values_exact_after_rollback"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">263</span> <span class="w">          </span><span class="nt">"values_consistent_with_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">264</span> <span class="w">          </span><span class="nt">"fused_copy_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.009568000212311745</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">265</span> <span class="w">          </span><span class="nt">"graph_replay_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.018624000251293182</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">266</span> <span class="w">          </span><span class="nt">"graph_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">267</span> <span class="w">          </span><span class="nt">"launch_floor_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05766399949789047</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">268</span> <span class="w">          </span><span class="nt">"bytes_per_copy"</span><span class="p">:</span><span class="w"> </span><span class="mi">11796480</span>
+<span class="linenos" aria-hidden="true">269</span> <span class="w">        </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">270</span> <span class="w">      </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">271</span> <span class="w">      </span><span class="nt">"median"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">272</span> <span class="w">        </span><span class="nt">"snapshot_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.16617599874734879</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">273</span> <span class="w">        </span><span class="nt">"rollback_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0521440003067255</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">274</span> <span class="w">        </span><span class="nt">"base_step_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05406400002539158</span>
+<span class="linenos" aria-hidden="true">275</span> <span class="w">      </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">276</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">277</span> <span class="w">  </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">278</span> <span class="w">  </span><span class="nt">"scope"</span><span class="p">:</span><span class="w"> </span><span class="s2">"状态写入是合成的；snapshot/rollback 的拷贝内核、字节与耗时是真实 GPU 测量"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">279</span> <span class="w">  </span><span class="nt">"acceptance"</span><span class="p">:</span><span class="w"> </span><span class="s2">"每个案例都检查回滚后与快照逐元素相等、并与'只施加 accepted+1 次写入'的参照一致"</span>
+<span class="linenos" aria-hidden="true">280</span> <span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/hybrid/rollback-cost-20260913/rollback_cost.json 全文（280 行）</code><a href="../code/results/crater/hybrid/rollback-cost-20260913/rollback_cost.json.html">在完整文件中打开 &rarr;</a></div></div></details>
 <h3 id="2_1">2. 前缀复用原始记录</h3>
 <p>共享前缀：<code>"The RecurrentGemma architecture combines recurrent layers with local attention. "</code></p>
 <div class="highlight"><pre><span></span><code><span class="p">{</span>
@@ -642,7 +1362,8 @@ Mamba 把序列建模完全线性化，没有 attention 层，状态大小完全
 <h3 id="3_2">3. 投机解码的适配</h3>
 <p>5.5 测得 ngram draft 在工具调用任务上接受率 95.7%、加速 4.12×，自由创作只有 37% / 1.47×。
 混合架构下，低接受率场景的回滚成本更高（需要恢复整块 recurrent state），
-投机收益会进一步降低。</p>
+投机收益会进一步降低。本章在 Qwen3.5-4B 上补了真实引擎的实测：自带 MTP 在 k=1/2/4 上
+平均前进 1.96/2.82/4.31、吞吐 1.63–2.58×，且输出与不投机逐位相同（见第 4 节末尾）。</p>
 <p>适配方向：</p>
 <ul>
 <li><strong>分层投机：</strong> 只对 attention 层做投机，recurrent 层直接执行（避免回滚）。</li>
@@ -679,15 +1400,15 @@ Mamba 把序列建模完全线性化，没有 attention 层，状态大小完全
 <p>实际：RecurrentGemma 的 18/26 层是 recurrent，batch 收益被稀释。
 测量前需要分离 recurrent 层和 attention 层的计时。</p>
 <h3 id="3_3">3. 把投机回滚当零成本</h3>
-<p>5.5 的结论（"回滚只是调整块表指针，几乎零成本"）<strong>只适用于纯 attention 模型</strong>。</p>
-<p>混合架构的 recurrent state 回滚需要：</p>
-<ol>
-<li>在验证前 <code>clone()</code> 整个 state（360 KB × batch）。</li>
-<li>验证失败时恢复：<code>state = state_snapshot</code>。</li>
-</ol>
-<p>Batch=8 的投机解码，每次回滚搬运 <strong>2.8 MB</strong>。
-高拒绝率场景（接受率 &lt;40%）下，回滚成本会抵消投机收益。</p>
-<hr />
+<p>5.5 的结论（"回滚只是调整块表指针"）<strong>只适用于纯 attention 模型</strong>。混合架构的递推状态
+是定长的，验证前向已经覆盖了旧值，必须真正取回来。</p>
+<p>但<strong>成本不能用状态字节数直接换算</strong>。实测（18 层 recurrent、batch 1/8/32）
+回滚时间恒在 0.052 ms，而搬运字节从 0.37 MB 涨到 11.8 MB——
+逐层 <code>copy_</code> 的实现受 18 次 kernel 启动支配（启动地板 0.058 ms），
+不是带宽受限。把它融合成一次拷贝降到 0.006 ms，图捕获降到 0.018 ms。</p>
+<p>也不要只算回滚：<strong>快照同样要计入整轮</strong>，本实现下两者相加 0.13–0.22 ms，
+batch=32 时快照（clone）比回滚还贵。引擎的真实实现用「预留 <code>1 + num_speculative_blocks</code>
+个状态槽 + 一个融合 Triton 拷贝内核」避免这两项开销。</p>
 <h2 id="_8">自测题</h2>
 <ol>
 <li>RecurrentGemma-2B 的 26 层中，有多少层是 recurrent、多少层是 attention？它们的状态分别是什么形状？</li>
@@ -733,7 +1454,7 @@ Mamba 把序列建模完全线性化，没有 attention 层，状态大小完全
 <li>Batch 策略需要考虑 recurrent 层不参与权重摊薄的事实。</li>
 </ul>
 <p>下一步（L6）进入分布式：当模型跨卡分布时，recurrent state 的通信模式和 KV cache 完全不同——
-定长状态不能像 KV 一样分片传输，需要全量广播或点对点同步。</p></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.12-non-generative-serving.html">&#8592; 5.12 非生成模型的服务</a><a class="nav-next" href="../L7/7.0-autograd-anatomy.html">7.0 PyTorch autograd 引擎：反向图、调度与保存值 &#8594;</a></nav>
+定长状态不能像 KV 一样分片传输，需要全量广播或点对点同步。</p></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.12-non-generative-serving.html">&#8592; 5.12 非生成模型的服务</a><a class="nav-next" href="../L6/6.0-concurrency-semantics.html">6.0 并发与通信语义：rank、进程组、张量归属与次序 &#8594;</a></nav>
 </main>
 </body>
 </html>

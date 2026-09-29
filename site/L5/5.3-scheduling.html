@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.3 调度：continuous batching 与 chunked prefill</title>
-<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
-<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
 
 </head>
 <body>
@@ -20,22 +20,22 @@
 <li><a href="#_3">机制拆解与推导</a><ul>
 <li><a href="#token">token 数比请求数更接近本轮工作量</a></li>
 <li><a href="#step">step 时间与逐请求输出间隔不同</a></li>
+<li><a href="#_4">预测单步耗时为什么容易错</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 源码解析</a><ul>
-<li><a href="#prompt-step">长 prompt 插入实验只记录了 step 耗时</a></li>
-<li><a href="#_5">“总时间”实际覆盖固定观察窗口</a></li>
-<li><a href="#decode">decode 吞吐列包含一个未核验假设</a></li>
-<li><a href="#_6">设计取舍</a></li>
+<li><a href="#_5">工程实现 · 源码解析</a><ul>
+<li><a href="#_6">预算从哪里来、阶段怎么判</a></li>
+<li><a href="#_7">设计取舍</a></li>
 </ul>
 </li>
 <li><a href="#mini">工程实现 · mini 实现</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_7">一轮请求的状态计数</a></li>
-<li><a href="#prompt">插入长 prompt 的时间尖峰</a></li>
-<li><a href="#token-step">token 预算影响最长 step</a></li>
-<li><a href="#_8">预算跨越并发数的扫描</a></li>
-<li><a href="#_9">建议的消融</a></li>
+<li><a href="#a-gpu">A：策略对照（不需要 GPU）</a></li>
+<li><a href="#b">B：预算扫描（真实引擎）</a></li>
+<li><a href="#c-gpu">C：预测模型与误差注入（不需要 GPU）</a></li>
+<li><a href="#_8">建议的消融</a></li>
+<li><a href="#darrival">D：ARRIVAL 协议下的过载拐点（两引擎真实服务）</a></li>
+<li><a href="#_9">过载区的准入：抢占次数才是两引擎真正的差别</a></li>
 </ul>
 </li>
 <li><a href="#_10">原始现场</a></li>
@@ -53,22 +53,22 @@
 <li><a href="#_3">机制拆解与推导</a><ul>
 <li><a href="#token">token 数比请求数更接近本轮工作量</a></li>
 <li><a href="#step">step 时间与逐请求输出间隔不同</a></li>
+<li><a href="#_4">预测单步耗时为什么容易错</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 源码解析</a><ul>
-<li><a href="#prompt-step">长 prompt 插入实验只记录了 step 耗时</a></li>
-<li><a href="#_5">“总时间”实际覆盖固定观察窗口</a></li>
-<li><a href="#decode">decode 吞吐列包含一个未核验假设</a></li>
-<li><a href="#_6">设计取舍</a></li>
+<li><a href="#_5">工程实现 · 源码解析</a><ul>
+<li><a href="#_6">预算从哪里来、阶段怎么判</a></li>
+<li><a href="#_7">设计取舍</a></li>
 </ul>
 </li>
 <li><a href="#mini">工程实现 · mini 实现</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_7">一轮请求的状态计数</a></li>
-<li><a href="#prompt">插入长 prompt 的时间尖峰</a></li>
-<li><a href="#token-step">token 预算影响最长 step</a></li>
-<li><a href="#_8">预算跨越并发数的扫描</a></li>
-<li><a href="#_9">建议的消融</a></li>
+<li><a href="#a-gpu">A：策略对照（不需要 GPU）</a></li>
+<li><a href="#b">B：预算扫描（真实引擎）</a></li>
+<li><a href="#c-gpu">C：预测模型与误差注入（不需要 GPU）</a></li>
+<li><a href="#_8">建议的消融</a></li>
+<li><a href="#darrival">D：ARRIVAL 协议下的过载拐点（两引擎真实服务）</a></li>
+<li><a href="#_9">过载区的准入：抢占次数才是两引擎真正的差别</a></li>
 </ul>
 </li>
 <li><a href="#_10">原始现场</a></li>
@@ -86,13 +86,14 @@
   <div class="mod-id">5.3</div>
   <h1>调度：continuous batching 与 chunked prefill</h1>
   <p class="lede">通过逐步调度记录，分析 token 预算、连续批处理和长 prompt 对其他请求的影响。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · vLLM 0.29.0 · Qwen3-1.7B</span><span class="chip">前置 5.1（prefill 与 decode）· 5.2（KV 分页）· 0.1（请求流程）</span></div>
+  <div class="chips"><span class="chip">实测机器 crater（RTX 5090 D, sm_120）与 crater2（RTX 5090）· vLLM 0.29.0 · SGLang 0.5.19 · Qwen3-1.7B</span><span class="chip">前置 5.1（prefill 与 decode）· 5.2（KV 分页）· 0.1（请求流程）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
-<p>调度器决定每轮处理哪些请求、每条请求处理多少 token，并协调 KV 分配。长 prefill 与正在生成的请求共用 GPU 时，调度预算同时影响首 token 延迟、输出间隔和吞吐。</p>
+<p>调度器决定每轮处理哪些请求、每条请求处理多少 token，并协调 KV 分配。长 prefill 与
+正在生成的请求共用 GPU 时，调度预算同时影响首 token 延迟、输出间隔和吞吐。</p>
 <ol>
 <li>一次 step 的请求状态与 token 预算怎样对应？</li>
 <li>插入长 prompt 后，怎样区分 step 变慢与请求没有被调度？</li>
-<li><code>max_num_batched_tokens</code> 在什么区间限制工作量，已有实验测到了什么？</li>
+<li>长 prompt 与正在生成的请求争用时，不同策略把代价推给谁？</li>
 </ol>
 <h2 id="_2">心智模型：先分配预算，再执行一轮</h2>
 <figure>
@@ -117,278 +118,691 @@
 
 <h2 id="_3">机制拆解与推导</h2>
 <h3 id="token">token 数比请求数更接近本轮工作量</h3>
-<p>普通 decode 每条请求通常新增一个位置；prefill 可能新增数千个位置。仅限制请求条数，无法区分两类工作的规模。设本轮请求 i 被分配 n_i 个新 token、总预算为 M，则</p>
+<p>普通 decode 每条请求通常新增一个位置；prefill 可能新增数千个位置。仅限制请求条数，
+无法区分两类工作的规模。设本轮请求 i 被分配 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>n</mi><mi>i</mi></msub></mrow></math></span> 个新 token、总预算为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>M</mi></mrow></math></span>，则</p>
 <p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><munder><mo>&#x02211;</mo><mi>i</mi></munder><msub><mi>n</mi><mi>i</mi></msub><mo>&#x02264;</mo><mi>M</mi><mo>&#x0002E;</mo></mrow></math></div></p>
-<p>这只是调度约束。相同新增 token 数，在历史长度、模型架构、投机配置或 attention 后端不同的情况下，耗时仍可能不同。</p>
-<p>chunked prefill 将长 prompt 分成多个轮次处理。它能限制单轮新增位置数，让 decode 有机会在轮次之间推进；代价包括重复调度、较小的 GEMM 形状和历史 KV 读取。分块不保证吞吐不变。</p>
+<p>这只是调度约束。相同新增 token 数，在历史长度、模型架构、投机配置或 attention 后端
+不同的情况下，耗时仍可能不同（5.1 的 step 账给了同一个模型内的例子）。</p>
+<p>chunked prefill 将长 prompt 分成多个轮次处理。它能限制单轮新增位置数，让 decode 有机会
+在轮次之间推进；代价包括重复调度、较小的 GEMM 形状和历史 KV 读取。<strong>分块不保证吞吐不变</strong>，
+下面 lab 的预算扫描给出两端的具体代价。</p>
 <h3 id="step">step 时间与逐请求输出间隔不同</h3>
-<p>step 变长时，该轮完成的输出通常更晚返回。但仅记录 <code>step()</code> 调用耗时，不能判断这一步是否给某条请求生成了 token。要区分“仍在推进，只是每步更慢”和“没有被调度”，必须同时保存每请求的调度 token 数及输出。</p>
-<p><code>running</code> 和 <code>waiting</code> 的长度也不是调度器的全部状态。请求还包含已计算长度、待处理输入、停止条件、优先级、块引用和可能的抢占状态。5.7 和 5.8 会把这些状态展开。</p>
-<h2 id="_4">工程实现 · 源码解析</h2>
-<p>以下行号对应本章 lab，它调用 vLLM 0.29.0 的底层 <code>add_request</code> 与 <code>step()</code> 接口。真实引擎 scheduler 的固定版本核心源码与 SGLang 对照仍需补齐，不能将本节视作完整引擎源码审查。</p>
-<h3 id="prompt-step">长 prompt 插入实验只记录了 step 耗时</h3>
-<p><code>section_B()</code> 先运行 30 步，用后 20 步的中位数作参照，再插入长请求，记录接下来的最多 40 步。循环没有保存 <code>step()</code> 的返回对象：</p>
-<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">147</span>         <span class="n">warm</span> <span class="o">=</span> <span class="p">[]</span>
-<span class="linenos" aria-hidden="true">148</span>         <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">30</span><span class="p">):</span>
-<span class="linenos" aria-hidden="true">149</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
-<span class="linenos" aria-hidden="true">150</span>             <span class="n">warm</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">151</span>         <span class="n">base_ms</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">warm</span><span class="p">[</span><span class="mi">10</span><span class="p">:])[</span><span class="nb">len</span><span class="p">(</span><span class="n">warm</span><span class="p">[</span><span class="mi">10</span><span class="p">:])</span> <span class="o">//</span> <span class="mi">2</span><span class="p">]</span>
-<span class="linenos" aria-hidden="true">152</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    稳态每步中位数 </span><span class="si">{</span><span class="n">base_ms</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms（8 条 decode）"</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">153</span> 
-<span class="linenos" aria-hidden="true">154</span>         <span class="c1"># 插入一条超长 prefill</span>
-<span class="linenos" aria-hidden="true">155</span>         <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="s2">"LONG"</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="n">LONG</span><span class="p">,</span> <span class="n">rng</span><span class="p">)),</span>
-<span class="linenos" aria-hidden="true">156</span>                         <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
-<span class="linenos" aria-hidden="true">157</span>                                        <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
-<span class="linenos" aria-hidden="true">158</span>         <span class="n">after</span> <span class="o">=</span> <span class="p">[]</span>
-<span class="linenos" aria-hidden="true">159</span>         <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">40</span><span class="p">):</span>
-<span class="linenos" aria-hidden="true">160</span>             <span class="k">if</span> <span class="ow">not</span> <span class="n">eng</span><span class="o">.</span><span class="n">has_unfinished_requests</span><span class="p">():</span>
-<span class="linenos" aria-hidden="true">161</span>                 <span class="k">break</span>
-<span class="linenos" aria-hidden="true">162</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
-<span class="linenos" aria-hidden="true">163</span>             <span class="n">after</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">164</span>         <span class="n">mx</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">after</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">165</span>         <span class="n">spike_steps</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="mi">1</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">after</span> <span class="k">if</span> <span class="n">x</span> <span class="o">&gt;</span> <span class="n">base_ms</span> <span class="o">*</span> <span class="mi">2</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">166</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    插入一条 </span><span class="si">{</span><span class="n">LONG</span><span class="si">}</span><span class="s2"> token 的 prefill 之后："</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">167</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      最慢的一步 </span><span class="si">{</span><span class="n">mx</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> ms（是稳态的 </span><span class="si">{</span><span class="n">mx</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">base_ms</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">×）"</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">168</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      超过稳态 2 倍的步数：</span><span class="si">{</span><span class="n">spike_steps</span><span class="si">}</span><span class="s2"> / </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">after</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">169</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"      前 12 步: </span><span class="si">{</span><span class="p">[</span><span class="nb">round</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">after</span><span class="p">[:</span><span class="mi">12</span><span class="p">]]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-</pre></div>
-<div class="srcref"><code>labs/L5/scheduling.py 第 147–169 行</code><a href="../code/labs/L5/scheduling.py.html#labs-L5-scheduling-py-L-147">在完整文件中打开 &rarr;</a></div></div>
-<p>因此该记录能说明 step 出现尖峰，不能说明“8 条 decode 连续 5 步都没有输出”。也不能用 8192 除以尖峰步数反推出每块大小；某些轮次可能是混合批，且尖峰阈值不等于 prefill 边界。</p>
-<h3 id="_5">“总时间”实际覆盖固定观察窗口</h3>
-<p>C 组在插入请求后计时最多 80 步，不是等长请求完成后立即停止：</p>
-<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">206</span>         <span class="n">eng</span><span class="o">.</span><span class="n">add_request</span><span class="p">(</span><span class="s2">"LONG"</span><span class="p">,</span> <span class="n">TokensPrompt</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">rand_ids</span><span class="p">(</span><span class="n">LONG</span><span class="p">,</span> <span class="n">rng</span><span class="p">)),</span>
-<span class="linenos" aria-hidden="true">207</span>                         <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
-<span class="linenos" aria-hidden="true">208</span>                                        <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
-<span class="linenos" aria-hidden="true">209</span>         <span class="n">after</span> <span class="o">=</span> <span class="p">[]</span>
-<span class="linenos" aria-hidden="true">210</span>         <span class="n">t_start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
-<span class="linenos" aria-hidden="true">211</span>         <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">80</span><span class="p">):</span>
-<span class="linenos" aria-hidden="true">212</span>             <span class="k">if</span> <span class="ow">not</span> <span class="n">eng</span><span class="o">.</span><span class="n">has_unfinished_requests</span><span class="p">():</span>
-<span class="linenos" aria-hidden="true">213</span>                 <span class="k">break</span>
-<span class="linenos" aria-hidden="true">214</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
-<span class="linenos" aria-hidden="true">215</span>             <span class="n">after</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">216</span>         <span class="n">total</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t_start</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
-<span class="linenos" aria-hidden="true">217</span>         <span class="n">results</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">base_ms</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span><span class="n">after</span><span class="p">),</span> <span class="n">total</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">after</span><span class="p">))</span>
-</pre></div>
-<div class="srcref"><code>labs/L5/scheduling.py 第 206–217 行</code><a href="../code/labs/L5/scheduling.py.html#labs-L5-scheduling-py-L-206">在完整文件中打开 &rarr;</a></div></div>
-<p>原始列名“吸收长 prefill 共用 ms”不准确。下文按其实际定义称为“插入后观察窗口耗时”，保留原始数字。仅凭该列不能得出 prefill 时延或吞吐没有损失。</p>
-<h3 id="decode">decode 吞吐列包含一个未核验假设</h3>
-<p>D 组按 <code>min(M,64)</code> 除以 step 中位时间计算吞吐，并没有逐步统计真实输出 token：</p>
-<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">259</span>         <span class="n">ts</span> <span class="o">=</span> <span class="p">[]</span>
-<span class="linenos" aria-hidden="true">260</span>         <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">80</span><span class="p">):</span>
-<span class="linenos" aria-hidden="true">261</span>             <span class="k">if</span> <span class="ow">not</span> <span class="n">eng</span><span class="o">.</span><span class="n">has_unfinished_requests</span><span class="p">():</span>
-<span class="linenos" aria-hidden="true">262</span>                 <span class="k">break</span>
-<span class="linenos" aria-hidden="true">263</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">();</span> <span class="n">eng</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
-<span class="linenos" aria-hidden="true">264</span>             <span class="n">ts</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">265</span>         <span class="n">tail</span> <span class="o">=</span> <span class="n">ts</span><span class="p">[</span><span class="mi">25</span><span class="p">:]</span> <span class="ow">or</span> <span class="n">ts</span>
-<span class="linenos" aria-hidden="true">266</span>         <span class="n">steady</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">tail</span><span class="p">)[</span><span class="nb">len</span><span class="p">(</span><span class="n">tail</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">]</span>
-<span class="linenos" aria-hidden="true">267</span>         <span class="c1"># 每步真正出多少 token：受 mnbt 限制时只有 mnbt 条能前进</span>
-<span class="linenos" aria-hidden="true">268</span>         <span class="n">eff</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">mnbt</span><span class="p">,</span> <span class="n">B</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">269</span>         <span class="n">tps</span> <span class="o">=</span> <span class="n">eff</span> <span class="o">/</span> <span class="p">(</span><span class="n">steady</span> <span class="o">/</span> <span class="mi">1000</span><span class="p">)</span>
-<span class="linenos" aria-hidden="true">270</span>         <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">mnbt</span><span class="p">,</span> <span class="n">steady</span><span class="p">,</span> <span class="n">tps</span><span class="p">))</span>
-</pre></div>
-<div class="srcref"><code>labs/L5/scheduling.py 第 259–270 行</code><a href="../code/labs/L5/scheduling.py.html#labs-L5-scheduling-py-L-259">在完整文件中打开 &rarr;</a></div></div>
-<p>预算很小时，前 25 步未必足以让所有请求完成 prefill。因此这组数是按“纯 decode、每步推进 min(M,64) 条请求”的假设计算的估计值；需要补实际调度与输出计数才能确认。</p>
-<h3 id="_6">设计取舍</h3>
-<ul>
-<li><strong>不变量。</strong> 分配的 token 数不超预算，写入 KV 前已有对应物理槽位，完成或取消的请求不再被调度。</li>
-<li><strong>状态归属。</strong> 调度器管理请求进度与块引用；执行器按本轮计划构造张量。执行结果必须更新同一请求，不能仅用 batch 位置标识请求身份。</li>
-<li><strong>优先级。</strong> 优先推进 running 请求可以减少重复工作，但过度偏向它们会增加新请求等待时间。需要同时观察 TTFT、输出间隔和公平性。</li>
-<li><strong>预算大小。</strong> 小预算限制单轮工作量，也可能减少并发推进数；大预算提高组合自由度，却可能让长 prefill 拉长一轮。</li>
-<li><strong>增加后端。</strong> 应明确其支持的混合批、长度布局、KV 容量和返回状态；不能只替换模型调用而保留不适用的预算假设。</li>
-</ul>
-<p>这些是依据接口和实验代码作出的设计分析。vLLM/SGLang 同负载下的公平性与调度开销对照为 <code>UNVERIFIED</code>。</p>
-<h2 id="mini">工程实现 · mini 实现</h2>
-<p>下面实现一个仅用于理解预算的分配器。真实系统还需处理抢占、前缀缓存、块粒度及失败清理。</p>
-<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="n">budget</span><span class="p">,</span> <span class="n">decode_ids</span><span class="p">,</span> <span class="n">prefill_remaining</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">budget</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"budget must be nonnegative"</span><span class="p">)</span>
-    <span class="n">assigned</span> <span class="o">=</span> <span class="p">{}</span>
-    <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">decode_ids</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">budget</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">break</span>
-        <span class="n">assigned</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
-        <span class="n">budget</span> <span class="o">-=</span> <span class="mi">1</span>
-    <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">remaining</span> <span class="ow">in</span> <span class="n">prefill_remaining</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">assigned</span> <span class="ow">or</span> <span class="n">remaining</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"invalid request state"</span><span class="p">)</span>
-        <span class="n">n</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">remaining</span><span class="p">,</span> <span class="n">budget</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">n</span><span class="p">:</span>
-            <span class="n">assigned</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">n</span>
-            <span class="n">budget</span> <span class="o">-=</span> <span class="n">n</span>
-    <span class="k">return</span> <span class="n">assigned</span>
-
-<span class="n">plan</span> <span class="o">=</span> <span class="n">allocate</span><span class="p">(</span><span class="mi">512</span><span class="p">,</span> <span class="p">[</span><span class="sa">f</span><span class="s2">"d</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">)],</span> <span class="p">[(</span><span class="s2">"long"</span><span class="p">,</span> <span class="mi">8192</span><span class="p">)])</span>
-<span class="k">assert</span> <span class="nb">sum</span><span class="p">(</span><span class="n">plan</span><span class="o">.</span><span class="n">values</span><span class="p">())</span> <span class="o">==</span> <span class="mi">512</span>
-<span class="k">assert</span> <span class="n">plan</span><span class="p">[</span><span class="s2">"long"</span><span class="p">]</span> <span class="o">==</span> <span class="mi">504</span>
-</code></pre></div>
-
-<p>将预算改为 4，只能推进前四条 decode。每轮保持相同顺序会造成饥饿；可以加入轮转游标，再检查各请求的最大等待轮数。</p>
-<h2 id="lab">动手 lab</h2>
-<p>在项目根目录、匹配版本的独立环境中运行。需要 CUDA GPU 与 Qwen3-1.7B 本地缓存；运行前检查 GPU 占用及脚本显存预算。</p>
-<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/scheduling.py
-</code></pre></div>
-
-<h3 id="_7">一轮请求的状态计数</h3>
-<p>三条请求，各含 64-token prompt、生成 6 token，原始记录如下：</p>
+<p>step 变长时，该轮完成的输出通常更晚返回。但仅记录 <code>step()</code> 调用耗时，不能判断这一步
+是否给某条请求生成了 token。要区分"仍在推进，只是每步更慢"和"没有被调度"，必须同时
+保存每请求的调度 token 数及输出。</p>
+<p><code>running</code> 和 <code>waiting</code> 的长度也不是调度器的全部状态。请求还包含已计算长度、待处理输入、
+停止条件、优先级、块引用和可能的抢占状态。5.7 和 5.8 会把这些状态展开。</p>
+<h3 id="_4">预测单步耗时为什么容易错</h3>
+<p>按 token 数分配预算的前提是"这一步大概要跑多久"。用本章预算扫描的 885 个 step 拟合
+一个最简模型 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x0003D;</mo><mi>c</mi><mo>&#x0002B;</mo><mi>b</mi><mo>&#x000B7;</mo><mi>n</mi></mrow></math></span>，结果分两段：</p>
 <table>
 <thead>
 <tr>
-<th style="text-align: right;">step</th>
-<th style="text-align: right;">耗时 ms</th>
-<th style="text-align: right;">运行中</th>
-<th style="text-align: right;">等待中</th>
+<th>步的类型</th>
+<th style="text-align: right;">样本数</th>
+<th>模型</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">6.051</td>
-<td style="text-align: right;">3</td>
-<td style="text-align: right;">0</td>
+<td>纯 decode 步（8 条 decode）</td>
+<td style="text-align: right;">507</td>
+<td>中位 3.36 ms，与 token 数无关</td>
 </tr>
 <tr>
-<td style="text-align: right;">1</td>
-<td style="text-align: right;">5.064</td>
-<td style="text-align: right;">3</td>
-<td style="text-align: right;">0</td>
-</tr>
-<tr>
-<td style="text-align: right;">2</td>
-<td style="text-align: right;">4.692</td>
-<td style="text-align: right;">3</td>
-<td style="text-align: right;">0</td>
-</tr>
-<tr>
-<td style="text-align: right;">3</td>
-<td style="text-align: right;">4.632</td>
-<td style="text-align: right;">3</td>
-<td style="text-align: right;">0</td>
-</tr>
-<tr>
-<td style="text-align: right;">4</td>
-<td style="text-align: right;">4.583</td>
-<td style="text-align: right;">3</td>
-<td style="text-align: right;">0</td>
-</tr>
-<tr>
-<td style="text-align: right;">5</td>
-<td style="text-align: right;">4.631</td>
-<td style="text-align: right;">3</td>
-<td style="text-align: right;">0</td>
-</tr>
-<tr>
-<td style="text-align: right;">6</td>
-<td style="text-align: right;">0.300</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0</td>
+<td>含 prefill 的步</td>
+<td style="text-align: right;">378</td>
+<td><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x0003D;</mo><mn>9.92</mn><mo>&#x0002B;</mo><mn>0.00114</mn><mi>n</mi></mrow></math></span>，残差极差 [−15.0, +148.0] ms</td>
 </tr>
 </tbody>
 </table>
-<p>计数读取于每次 <code>step()</code> 返回之后。最后一行显示运行集已清空；它不提供 GPU kernel 级的时间分解。</p>
-<h3 id="prompt">插入长 prompt 的时间尖峰</h3>
-<p>8 条短请求进入生成阶段后，插入 8192-token prompt。原始记录：</p>
+<p><strong>一个线性式跨不了三个数量级的分块大小。</strong> 含 prefill 的步从 128 token 到 8184 token，
+固定开销、GEMM 效率与 attention 的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>n</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 项在不同区间各占一段，单一斜率必然在某一端失真。
+用它预测 mini 调度器的计数轨迹，长请求 TTFT 的偏差在 −83% 到 +34% 之间
+（<code>results/local/5.3/schedule-prediction/schedule_prediction.txt</code>）。</p>
+<p>结论不是"模型没用"，而是<strong>预测式策略必须带误差范围</strong>：控制器按估计的斜率选分块时，
+斜率低估 50% 会把真实单步推到目标的 1.30 倍，高估 50% 会把分块切到 229 token，
+长请求多等 36 个 step。误差的代价是双向的。</p>
+<h2 id="_5">工程实现 · 源码解析</h2>
+<h3 id="_6">预算从哪里来、阶段怎么判</h3>
+<p>vLLM 0.29.0 的 <code>Scheduler.schedule()</code>（<code>v1/core/sched/scheduler.py:501</code>）先取两个数：
+<code>token_budget = self.max_num_scheduled_tokens</code>（<code>:521</code>）与
+<code>input_budget = self.scheduler_config.max_num_batched_tokens</code>（<code>:524</code>）。
+然后逐请求决定本轮推进多少 token（<code>:585-594</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">num_new_tokens</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="n">request</span><span class="o">.</span><span class="n">num_tokens_with_spec</span>
+    <span class="o">+</span> <span class="n">request</span><span class="o">.</span><span class="n">num_output_placeholders</span>
+    <span class="o">-</span> <span class="n">request</span><span class="o">.</span><span class="n">num_computed_tokens</span>
+<span class="p">)</span>
+<span class="k">if</span> <span class="mi">0</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">scheduler_config</span><span class="o">.</span><span class="n">long_prefill_token_threshold</span> <span class="o">&lt;</span> <span class="n">num_new_tokens</span><span class="p">:</span>
+    <span class="n">num_new_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">scheduler_config</span><span class="o">.</span><span class="n">long_prefill_token_threshold</span>
+<span class="n">num_new_tokens</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">num_new_tokens</span><span class="p">,</span> <span class="n">token_budget</span><span class="p">,</span> <span class="n">input_budget</span> <span class="o">-</span> <span class="n">draft_slots</span><span class="p">)</span>
+</code></pre></div>
+
+<p>已经算完 prompt 的请求 <code>num_tokens_with_spec</code> 只比 <code>num_computed_tokens</code> 多一个，
+于是自然得到 1——<strong>decode 每步一个 token 不是特判，而是同一个式子的结果</strong>。
+<code>long_prefill_token_threshold</code>（<code>config/scheduler.py:70</code>，默认 0）是主动切长 prefill 的开关；
+本章 lab 扫的是总预算 <code>max_num_batched_tokens</code>。</p>
+<p>KV 不够时 <code>_preempt_request</code>（<code>v1/core/sched/scheduler.py:1405</code>）把请求放回等待队列并释放块，
+被抢占的请求 <code>num_computed_tokens</code> 归零，下次重新 prefill。换出与重算的对照见 5.8。</p>
+<h3 id="_7">设计取舍</h3>
 <ul>
-<li>稳态 step 中位数：4.735 ms。</li>
-<li>最慢 step：53.326 ms，为稳态的 11.3×。</li>
-<li>超过稳态两倍的 step：5 / 40。</li>
-<li>前 12 步：<code>[4.76, 31.38, 41.02, 47.18, 53.33, 49.86, 5.39, 4.9, 4.81, 5.03, 4.77, 4.9]</code>。</li>
+<li><strong>不变量。</strong> 分配的 token 数不超预算；写入 KV 前已有对应物理槽位；完成、取消或
+  被抢占的请求不再被调度。</li>
+<li><strong>状态归属。</strong> 调度器管理请求进度与块引用；执行器按本轮计划构造张量。执行结果必须
+  更新同一请求，不能仅用 batch 位置标识请求身份。</li>
+<li><strong>准入顺序就是策略。</strong> vLLM 的 <code>waiting</code> 是 FIFO 队列，running 请求先被调度；
+  想让优先级生效，可以在 <code>_schedule</code> 里换顺序，也可以在 <code>add()</code> 时排序——5.7 的
+  nanoserve 实测显示这两者的差别在于抢占路径会把请求 <code>appendleft</code> 回队列，绕过入队时的排序。</li>
+<li><strong>预算大小。</strong> 小预算限制单轮工作量，也减少并发推进数；大预算提高组合自由度，
+  却可能让长 prefill 拉长一轮。两端都有代价，下一节的曲线给出具体数值。</li>
 </ul>
-<p>这表明该负载出现了连续慢轮次。没有逐请求输出记录，不能据此恢复每条请求的 TPOT 分布。</p>
-<h3 id="token-step">token 预算影响最长 step</h3>
+<hr />
+<h2 id="mini">工程实现 · mini 实现</h2>
+<p><code>labs/L5/mini_scheduler.py</code> 把预算 mini 扩成一个离散事件调度器：请求带 arrival、
+computed/output token、KV 块、deadline 与取消状态；三种策略共用同一条轨迹。</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">candidates</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span> <span class="o">==</span> <span class="s2">"fcfs"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">waiting</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">r</span><span class="p">:</span> <span class="p">(</span><span class="n">r</span><span class="o">.</span><span class="n">arrival</span><span class="p">,</span> <span class="n">r</span><span class="o">.</span><span class="n">rid</span><span class="p">))</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span> <span class="o">==</span> <span class="s2">"decode_priority"</span><span class="p">:</span>
+        <span class="n">in_decode</span> <span class="o">=</span> <span class="p">[</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="k">if</span> <span class="n">r</span><span class="o">.</span><span class="n">computed</span> <span class="o">&gt;=</span> <span class="n">r</span><span class="o">.</span><span class="n">prompt</span><span class="p">]</span>
+        <span class="n">rest</span> <span class="o">=</span> <span class="p">[</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="k">if</span> <span class="n">r</span><span class="o">.</span><span class="n">computed</span> <span class="o">&lt;</span> <span class="n">r</span><span class="o">.</span><span class="n">prompt</span><span class="p">]</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">waiting</span>
+        <span class="k">return</span> <span class="n">in_decode</span> <span class="o">+</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">rest</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">r</span><span class="p">:</span> <span class="p">(</span><span class="n">r</span><span class="o">.</span><span class="n">arrival</span><span class="p">,</span> <span class="n">r</span><span class="o">.</span><span class="n">rid</span><span class="p">))</span>
+    <span class="c1"># round_robin：waiting 队列用游标轮转</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<p>每个 step 的顺序是：新到达 → deadline 取消 → 按策略与预算切分工作量（KV 不够就按策略
+抢占）→ 执行并更新状态。每一步都检查四条不变量：本步 token 不超预算、块使用不超容量、
+已结束请求不占块、请求的块装得下已计算长度。</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/mini_scheduler.py<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;
+</code></pre></div>
+
+<p><strong>同一轨迹、三种策略</strong>（A/B 各剩 2/8 个 token，C 在 t=2 到达，预算 1）：</p>
 <table>
 <thead>
 <tr>
-<th style="text-align: right;">token 预算</th>
-<th style="text-align: right;">稳态 ms</th>
-<th style="text-align: right;">最慢 step ms</th>
-<th style="text-align: right;">尖峰倍数</th>
-<th style="text-align: right;">插入后观察窗口耗时 ms</th>
+<th>策略</th>
+<th style="text-align: right;">步数</th>
+<th style="text-align: right;">最大 TTFT</th>
+<th>完成顺序</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: right;">16384</td>
-<td style="text-align: right;">4.607</td>
-<td style="text-align: right;">165.852</td>
-<td style="text-align: right;">36.0×</td>
-<td style="text-align: right;">529.5</td>
+<td>FCFS</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">13</td>
+<td>A, B, C</td>
+</tr>
+<tr>
+<td>decode 优先</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">13</td>
+<td>A, B, C</td>
+</tr>
+<tr>
+<td>轮转</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">15</td>
+<td>A, C, B</td>
+</tr>
+</tbody>
+</table>
+<p>轮转把等待最久的 C 提前，代价是 B 多等两步。FCFS 与 decode 优先在这条轨迹上一致——
+因为所有请求都是 prefill，两者的排序相同；它们真正分开需要"某个已在 decode 的请求
+比另一个正在 prefill 的请求到达更早"的场合，即没有 head-of-line 阻塞的轨迹。</p>
+<p><strong>长 prompt 插入 + 到达过程</strong>（8 条 decode 生成 64，t=8 插入 8192；以及
+prompt 256、生成 64、预算 64、KV 40 块下的到达扫描）：</p>
+<div class="highlight"><pre><span></span><code>=== 轨迹 3：prompt 256、生成 64，预算 64，KV 40 块 = 640 token；SLO：TTFT ≤ 30 步 ===
+      到达率策略                 完成   取消  SLO内     最长排队    最大TTFT      最大完成步    抢占   重算token
+      0.1fcfs               18   22     2      195       201        631   210     53760
+      0.1decode_priority    18   22     2      195       201        631   210     53760
+      0.1round_robin        18   22     5      180       204        645   170     44300
+      0.2round_robin        14   26     4      192       171        494   196     50934
+      0.4round_robin        12   28     5      199       195        432   150     39050
+</code></pre></div>
+
+<p>三件事同时可读：<strong>过载</strong>（40 条请求只完成 10–18 条）、<strong>饥饿</strong>（FCFS 的 TTFT 中位 193 步，
+轮转 81 步）、<strong>抢占成本</strong>（FCFS 210 次抢占、53760 个重算 token，轮转 170 次、44300 个）。
+轮转在 SLO 内多留下 1–3 条请求，代价是最大完成步略高。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<p>在项目根目录、匹配版本的独立环境中运行。需要 CUDA GPU 与 Qwen3-1.7B 本地缓存；
+运行前检查 GPU 占用及脚本显存预算。</p>
+<h3 id="a-gpu">A：策略对照（不需要 GPU）</h3>
+<p>见上一节。<code>mini_scheduler.py</code> 的三条轨迹分别是：正文的两槽位例子、
+与真实实验同构的长 prompt 插入、以及到达过程下的饥饿与 deadline 检查。</p>
+<h3 id="b">B：预算扫描（真实引擎）</h3>
+<p>8 条 prompt 64、生成 64 的请求先跑到稳态，再插入一条 8192 token 的 prompt，
+扫 <code>max_num_batched_tokens</code>，每档 3 次重复、每次一个独立进程：</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/chunked_prefill_scan.py<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;<span class="w"> </span>--single<span class="w"> </span><span class="m">512</span>:0<span class="w">   </span><span class="c1"># 由 run_chunked_budget.sh 驱动</span>
+python<span class="w"> </span>labs/L5/chunked_prefill_scan.py<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;<span class="w"> </span>--merge
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">预算</th>
+<th style="text-align: right;">长 prompt 分块数</th>
+<th style="text-align: right;">LONG 首 token ms</th>
+<th style="text-align: right;">decode 最大间隔 ms</th>
+<th style="text-align: right;">最慢 step ms</th>
+<th style="text-align: right;">长请求完成 ms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">68</td>
+<td style="text-align: right;">511.4</td>
+<td style="text-align: right;">9.1</td>
+<td style="text-align: right;">10.5</td>
+<td style="text-align: right;">508.3</td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">34</td>
+<td style="text-align: right;">307.5</td>
+<td style="text-align: right;">11.7</td>
+<td style="text-align: right;">11.7</td>
+<td style="text-align: right;">370.2</td>
+</tr>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">215.0</td>
+<td style="text-align: right;">15.1</td>
+<td style="text-align: right;">15.1</td>
+<td style="text-align: right;">344.3</td>
 </tr>
 <tr>
 <td style="text-align: right;">2048</td>
-<td style="text-align: right;">4.679</td>
-<td style="text-align: right;">53.624</td>
-<td style="text-align: right;">11.5×</td>
-<td style="text-align: right;">539.6</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">187.9</td>
+<td style="text-align: right;">52.8</td>
+<td style="text-align: right;">52.8</td>
+<td style="text-align: right;">360.7</td>
 </tr>
 <tr>
-<td style="text-align: right;">512</td>
-<td style="text-align: right;">4.651</td>
-<td style="text-align: right;">15.926</td>
-<td style="text-align: right;">3.4×</td>
-<td style="text-align: right;">514.6</td>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">172.6</td>
+<td style="text-align: right;">158.0</td>
+<td style="text-align: right;">158.0</td>
+<td style="text-align: right;">355.5</td>
 </tr>
 </tbody>
 </table>
-<p>所测点上，预算减小伴随最长 step 缩短。最后一列覆盖固定的最多 80 步，不是长请求独立耗时，也不是等工作量吞吐比较；缺少重复样本，不能宣称三档“差异都在噪声内”。</p>
-<h3 id="_8">预算跨越并发数的扫描</h3>
+<p>每一档三次重复的 TTFT 极差都小于 2 ms（如 128 档 [511.4, 511.5]）。
+实际分块大小 = 预算 − 8 条 decode 的 1 个 token（128 → 每块 120，2048 → 2040）。
+<strong>长请求完成时间几乎不变（344–371 ms）</strong>，说明总工作量没变，变的只是排队顺序：
+分块越细，decode 的停顿越小（158.0 → 9.1 ms，17×），长请求的首 token 越晚
+（172.6 → 511.4 ms，3.0×）。</p>
+<h3 id="c-gpu">C：预测模型与误差注入（不需要 GPU）</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/schedule_prediction.py<span class="w"> </span>--results<span class="w"> </span>&lt;预算扫描目录&gt;<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;
+</code></pre></div>
+
+<p>用预算扫描的逐 step 记录拟合、再用 mini 的计数轨迹预测，结果见"机制拆解"的最后一节。
+核心是三条：</p>
+<ol>
+<li>纯 decode 步约 3.36 ms，与 token 数无关；含 prefill 的步从 10.5 ms 涨到 157.9 ms。</li>
+<li>单一线性模型跨不了这个范围，长请求 TTFT 的预测偏差在 −83% 到 +34% 之间。</li>
+<li>斜率误差 ±50% 时，按"单步 15 ms"选出的分块在真实曲线上落在 11.5–19.5 ms
+   （0.76×–1.30×），分块数 12–36 个。<strong>低估伤尾延迟，高估伤 TTFT。</strong></li>
+</ol>
+<h3 id="_8">建议的消融</h3>
+<ol>
+<li>把预算扫到 64 与 16384，看两侧极端的单步与 TTFT 各到哪里。</li>
+<li>在 mini 调度器里把抢占受害者从"最新"改成"最老"，对照重算 token 与最长等待。</li>
+<li>给 mini 的 deadline 收紧到 50 步，观察取消率随到达率的变化。</li>
+<li>打开真实引擎的前缀缓存重跑预算扫描，看长 prompt 的首 token 是否随命中下降（5.2）。</li>
+</ol>
+<h3 id="darrival">D：ARRIVAL 协议下的过载拐点（两引擎真实服务）</h3>
+<p>预算扫描是固定负载下的对照；真实服务还要回答"到达率超过容量时会怎样"。
+按统一协议（同一模型、同一 prompt 2048 / 输出 128、关闭前缀缓存、泊松到达、
+到达率为闭环基线的 0.3/0.6/0.9/1.1 倍、每档 3 个 120 秒窗口）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 服务已在 8100 端口就绪；扫描期间每 2 s 抓一次 /metrics（SGLang 需 --enable-metrics）</span>
+python<span class="w"> </span>labs/L5/arrival_scan.py<span class="w"> </span>--engine<span class="w"> </span>vllm<span class="w">  </span>--base-url<span class="w"> </span>http://127.0.0.1:8100<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;
+python<span class="w"> </span>labs/L5/arrival_scan.py<span class="w"> </span>--engine<span class="w"> </span>sglang<span class="w"> </span>--base-url<span class="w"> </span>http://127.0.0.1:8100<span class="w"> </span>--out<span class="w"> </span>&lt;dir&gt;
+</code></pre></div>
+
+<p>两台同型号机器上各跑一个引擎（vLLM 0.29.0 在 crater、SGLang 0.5.19 在 crater2）：</p>
 <table>
 <thead>
 <tr>
-<th style="text-align: right;">token 预算</th>
-<th style="text-align: right;">step 中位数 ms</th>
-<th style="text-align: right;">原脚本估计 tok/s</th>
-<th style="text-align: right;">相对最高估计值</th>
+<th>引擎</th>
+<th style="text-align: right;">闭环基线 QPS</th>
+<th style="text-align: right;">基线 TTFT p50 ms</th>
+<th style="text-align: right;">0.3× goodput</th>
+<th style="text-align: right;">0.9× goodput</th>
+<th style="text-align: right;">1.1× goodput</th>
+<th style="text-align: right;">1.1× SLO 内</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: right;">16</td>
-<td style="text-align: right;">4.387</td>
-<td style="text-align: right;">3647</td>
-<td style="text-align: right;">0.26×</td>
+<td>vLLM</td>
+<td style="text-align: right;">15.30</td>
+<td style="text-align: right;">1096.6</td>
+<td style="text-align: right;">4.79</td>
+<td style="text-align: right;">14.26</td>
+<td style="text-align: right;">17.37</td>
+<td style="text-align: right;">0.181</td>
 </tr>
 <tr>
-<td style="text-align: right;">32</td>
-<td style="text-align: right;">4.436</td>
-<td style="text-align: right;">7214</td>
-<td style="text-align: right;">0.52×</td>
-</tr>
-<tr>
-<td style="text-align: right;">64</td>
-<td style="text-align: right;">4.574</td>
-<td style="text-align: right;">13993</td>
-<td style="text-align: right;">1.00×</td>
-</tr>
-<tr>
-<td style="text-align: right;">128</td>
-<td style="text-align: right;">5.247</td>
-<td style="text-align: right;">12197</td>
-<td style="text-align: right;">0.87×</td>
-</tr>
-<tr>
-<td style="text-align: right;">512</td>
-<td style="text-align: right;">5.178</td>
-<td style="text-align: right;">12361</td>
-<td style="text-align: right;">0.88×</td>
-</tr>
-<tr>
-<td style="text-align: right;">8192</td>
-<td style="text-align: right;">5.162</td>
-<td style="text-align: right;">12399</td>
-<td style="text-align: right;">0.89×</td>
+<td>SGLang</td>
+<td style="text-align: right;">16.03</td>
+<td style="text-align: right;">1404.8</td>
+<td style="text-align: right;">5.02</td>
+<td style="text-align: right;">14.92</td>
+<td style="text-align: right;">18.10</td>
+<td style="text-align: right;">0.158</td>
 </tr>
 </tbody>
 </table>
-<p>普通纯 decode 的理论预算需求为每条请求一个 token，因此 M=64 是一个值得覆盖的边界。但原脚本没有核对观察区间是否全部为纯 decode，也没有保存真实输出计数。64 以上的数据还相差约一成，不能写成“完全不变”。<strong>这条趋势未解释，不要引用</strong>为真实吞吐的稳定规律。</p>
-<h3 id="_9">建议的消融</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">倍率</th>
+<th>TTFT p50 ms（vLLM / SGLang）</th>
+<th>TTFT p99 ms（vLLM / SGLang）</th>
+<th>TPOT p50 ms（vLLM / SGLang）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0.3</td>
+<td>46.1 / 46.5</td>
+<td>144.6 / 105.4</td>
+<td>5.11 / 5.31</td>
+</tr>
+<tr>
+<td style="text-align: right;">0.6</td>
+<td>50.3 / 50.0</td>
+<td>146.1 / 143.3</td>
+<td>7.30 / 8.70</td>
+</tr>
+<tr>
+<td style="text-align: right;">0.9</td>
+<td>95.7 / 127.7</td>
+<td>1064.1 / 1253.8</td>
+<td>15.83 / 20.45</td>
+</tr>
+<tr>
+<td style="text-align: right;">1.1</td>
+<td>8636.0 / 8669.4</td>
+<td>15631.7 / 16704.1</td>
+<td>20.54 / 20.50</td>
+</tr>
+</tbody>
+</table>
+<p>四条读法：</p>
 <ol>
-<li>在每步同时记录 scheduled token、请求 ID、已计算长度和新增输出；以这些字段区分 prefill、decode 与混合批。</li>
-<li>单独记录长请求从准入到首 token、完成的时间；另用持续到达负载测总吞吐和延迟分布。</li>
-<li>在 16/32/64/128/256/512 等预算上重复运行，确认预热结束和纯 decode 区间；用实际输出计数计算吞吐。</li>
-<li>固定负载，对照 running 优先、轮转与优先级策略，检查最大等待时间及抢占重算量。</li>
+<li><strong>0.3 到 0.9 倍之间，goodput 与到达率同步上涨</strong>（vLLM 4.79 → 14.26、SGLang 5.02 → 14.92 QPS），
+   TTFT p50 在 0.3–0.6 倍上稳定在 46–50 ms——这一段排队是线性的。</li>
+<li><strong>0.9 倍的 p99 先跳两个数量级</strong>（vLLM 146 → 1064 ms，SGLang 143 → 1254 ms），
+   而 p50 只涨到 96/128 ms。服务还没垮，尾延迟先垮。</li>
+<li><strong>1.1 倍时 goodput 只比各自基线高 13%</strong>（17.37 对 15.30、18.10 对 16.03 QPS），
+   TTFT p50 却到 8.6 s；SLO 内比例从 1.000 掉到 0.18/0.16。超发的那一部分全部堆成队列。</li>
+<li><strong>TPOT 在 0.9 与 1.1 倍上几乎一样</strong>（vLLM 15.83/20.54、SGLang 20.45/20.50 ms）：
+   饱和之后 decode 每步的成本由批大小决定，与到达率无关——这是"准入控制买的是
+   被接收请求的尾延迟，不是吞吐"的实测依据。</li>
 </ol>
+<p>两个引擎在这条曲线上的差别小于 5%（容量 15.30 对 16.03 QPS；过载区 p50 8636 对 8669 ms）。
+低倍率下 vLLM 的 p99 略高（0.3 倍 144.6 对 105.4 ms），三次窗口极差分别是 [106, 243] 与
+[103, 109]——vLLM 那一档的窗口间波动更大，单看一个窗口会得出更强的结论。</p>
+<p>样本量：vLLM 合计 5512 条、SGLang 合计 5753 条，<strong>都不足 10000 条</strong>，
+p99 只作同口径排序（窗口极差已在原始汇总里列出）。</p>
+<h3 id="_9">过载区的准入：抢占次数才是两引擎真正的差别</h3>
+<p>客户端曲线在两引擎上几乎重合，但"过载时牺牲谁"要看服务端计数。把
+<code>labs/L5/arrival_scan.py</code> 扩成在每档窗口内每 2 秒抓一次 <code>/metrics</code>，1.1× 与 1.3× 的结果：</p>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>倍率</th>
+<th style="text-align: right;">到达 QPS</th>
+<th style="text-align: right;">样本</th>
+<th style="text-align: right;">超时</th>
+<th style="text-align: right;">goodput</th>
+<th style="text-align: right;">SLO 内</th>
+<th style="text-align: right;">TTFT p50 ms</th>
+<th style="text-align: right;">溢出计数</th>
+<th style="text-align: right;">等待峰值</th>
+<th style="text-align: right;">运行峰值</th>
+<th style="text-align: right;">KV 峰值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vLLM</td>
+<td>1.1</td>
+<td style="text-align: right;">16.83</td>
+<td style="text-align: right;">2051</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">17.09</td>
+<td style="text-align: right;">0.147</td>
+<td style="text-align: right;">7470</td>
+<td style="text-align: right;"><strong>抢占 75.5</strong></td>
+<td style="text-align: right;">201.5</td>
+<td style="text-align: right;">44.0</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+<tr>
+<td>vLLM</td>
+<td>1.3</td>
+<td style="text-align: right;">19.89</td>
+<td style="text-align: right;">2390</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">19.91</td>
+<td style="text-align: right;">0.066</td>
+<td style="text-align: right;">18444</td>
+<td style="text-align: right;"><strong>抢占 81.0</strong></td>
+<td style="text-align: right;">214.0</td>
+<td style="text-align: right;">44.0</td>
+<td style="text-align: right;">0.9996</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td>1.1</td>
+<td style="text-align: right;">17.63</td>
+<td style="text-align: right;">2132</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">17.77</td>
+<td style="text-align: right;">0.130</td>
+<td style="text-align: right;">7979</td>
+<td style="text-align: right;"><strong>retract 0</strong></td>
+<td style="text-align: right;">217.0</td>
+<td style="text-align: right;">46.5</td>
+<td style="text-align: right;">0.995</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td>1.3</td>
+<td style="text-align: right;">20.83</td>
+<td style="text-align: right;">2489</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">20.74</td>
+<td style="text-align: right;">0.063</td>
+<td style="text-align: right;">18745</td>
+<td style="text-align: right;"><strong>retract 0</strong></td>
+<td style="text-align: right;">232.0</td>
+<td style="text-align: right;">45.5</td>
+<td style="text-align: right;">0.995</td>
+</tr>
+<tr>
+<td>SGLang</td>
+<td>2.0</td>
+<td style="text-align: right;">31.91</td>
+<td style="text-align: right;">3771</td>
+<td style="text-align: right;"><strong>2660</strong></td>
+<td style="text-align: right;">9.26</td>
+<td style="text-align: right;">0.024</td>
+<td style="text-align: right;">17689</td>
+<td style="text-align: right;"><strong>retract 0</strong></td>
+<td style="text-align: right;">256.0</td>
+<td style="text-align: right;">54.0</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+</tbody>
+</table>
+<p>四点：</p>
+<ol>
+<li><strong>1.1×/1.3× 的客户端指标几乎逐格相同</strong>（TTFT p50 差 &lt;3%、p99 差 &lt;2%、TPOT 都在
+   20–21 ms），但引擎内部走了两条路：vLLM 分别抢占 75.5 与 81.0 次——被抢占的请求
+   释放 KV、<code>num_computed_tokens</code> 归零，下一轮从头重算（5.8 的 <code>_preempt_request</code>）；
+   SGLang 的 retract 计数始终为 0，请求停在等待队列里等 KV 自然释放。</li>
+<li><strong>两者的等待与运行峰值也接近</strong>（等待 201–232、运行 44–46），KV 都到 0.995–1.000：
+   池子都被打满。差别不在"谁更满"，而在满的时候是<strong>牺牲在跑的请求</strong>还是<strong>让新请求排队</strong>。</li>
+<li><strong>SGLang 推到 2.0× 仍不 retract</strong>，代价转成超时：3771 条里 2660 条在 120 s 窗口内没
+   完成，goodput 掉到 9.26 QPS，等待峰值顶到 256（队列上限），TTFT p50 17.7 s、
+   p99 51.1 s。<strong>准入策略改变的是"谁被牺牲"，不是"能否撑住"。</strong></li>
+<li><strong>要判断一台引擎在过载下会牺牲谁，必须读引擎侧计数。</strong> 只报 TTFT 与 goodput 时，
+   两种完全不同的准入实现可以给出同一条曲线。</li>
+</ol>
+<p>采集口径本身有一个坑：vLLM 的 <code>vllm:num_preemptions_total</code> 是 Counter，取窗口首末差；
+SGLang 只导出 <code>sglang:num_retracted_reqs</code> 这一个 <strong>Gauge</strong>，每次上报后复位，取首末差
+恒为 0，必须按采样点累加。两侧的原始 <code>/metrics</code> 各存了一份
+（<code>results/crater/5.3/arrival-overload-20260922/vllm/*/metrics_end.txt</code>）。</p>
+<hr />
 <h2 id="_10">原始现场</h2>
-<p>原始输出中的列名与解释性打印保留不改；其中“无输出”“吞吐无损”和预算上方“完全平坦”等判断超出了采集范围，按本章重新限定后的口径阅读。</p>
+<details>
+<summary>① 预算扫描：逐档汇总与逐请求明细</summary>
+<details class="fold srcfold"><summary>results/crater/5.3/budget-20260921/chunked_budget.txt 全文（27 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>模型 Qwen/Qwen3-1.7B；8 条 decode（prompt 64，生成 64） + 1 条长 prompt 8192（生成 8）；每档 3 次重复
+
+    预算     长TTFT中位 ms               长TTFT极差       长完成中位 ms     长分块数    decode TPOT中位 ms      decode 最大间隔 ms   总device ms    最慢step ms    峰等待    总调度token
+   128          511.4        [511.4, 511.5]          508.3       68                5.88                 9.1        535.4         10.5      0        8622
+  2048          187.9        [187.0, 188.1]          360.7        5                3.36                52.8        379.8         52.8      0        8639
+   256          307.5        [307.2, 309.0]          370.2       34                5.79                11.7        391.5         11.7      0        8628
+   512          215.0        [214.9, 215.3]          344.3       17                3.49                15.1        362.6         15.1      0        8639
+  8192          172.6        [172.6, 172.6]          355.5        2                3.36               158.0        375.8        158.0      0        8639
+
+长 prompt 的实际分块（每档取一次重复，列出 prefill 各步的调度 token 数）：
+  预算   128：68 步 -&gt; [120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120] ...
+  预算  2048：5 步 -&gt; [2040, 2040, 2040, 2040, 32]
+  预算   256：34 步 -&gt; [248, 248, 248, 248, 248, 248, 248, 248, 248, 248, 248, 248] ...
+  预算   512：17 步 -&gt; [504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504, 504] ...
+  预算  8192：2 步 -&gt; [8184, 8]
+
+逐请求明细（第 1 次重复）：
+  预算   128  LONG 引擎TTFT 511.5 ms（来源 engine_ts），prefill 68 步，首输出在第 81 步（prefill 完成于第 80 步）
+          8 条 decode：TPOT 中位 5.89 ms，最大单次间隔 9.1 ms（稳态 3.34 ms/步）
+  预算  2048  LONG 引擎TTFT 187.0 ms（来源 engine_ts），prefill 5 步，首输出在第 14 步（prefill 完成于第 13 步）
+          8 条 decode：TPOT 中位 3.22 ms，最大单次间隔 52.4 ms（稳态 3.21 ms/步）
+  预算   256  LONG 引擎TTFT 307.5 ms（来源 engine_ts），prefill 34 步，首输出在第 45 步（prefill 完成于第 44 步）
+          8 条 decode：TPOT 中位 5.79 ms，最大单次间隔 11.6 ms（稳态 3.44 ms/步）
+  预算   512  LONG 引擎TTFT 214.9 ms（来源 engine_ts），prefill 17 步，首输出在第 26 步（prefill 完成于第 25 步）
+          8 条 decode：TPOT 中位 3.49 ms，最大单次间隔 15.1 ms（稳态 3.40 ms/步）
+  预算  8192  LONG 引擎TTFT 172.6 ms（来源 engine_ts），prefill 2 步，首输出在第 11 步（prefill 完成于第 10 步）
+          8 条 decode：TPOT 中位 3.36 ms，最大单次间隔 157.9 ms（稳态 3.36 ms/步）
+</pre></div>
+<div class="srcref"><code>results/crater/5.3/budget-20260921/chunked_budget.txt 全文（27 行）</code><a href="../code/results/crater/5.3/budget-20260921/chunked_budget.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>② mini 调度器：三条轨迹 × 三种策略</summary>
+<details class="fold srcfold"><summary>results/local/5.3/20260921-mini-scheduler/mini_scheduler.txt 全文（83 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.3-A 离散事件调度器：三条轨迹 × 三种策略（不跑模型，只看计数与顺序）
+
+=== 轨迹 1：A(rem2) B(rem8) C(t=2, rem4)，预算 1 ===
+  策略                  步数   完成   取消    峰块    最大TTFT      最大完成步    抢占   重算token
+  fcfs                17    3    0     1        13         16     0         0
+  decode_priority     17    3    0     1        13         16     0         0
+  round_robin         17    3    0     1        15         16     0         0
+    fcfs 完成顺序 ['A', 'B', 'C']
+    decode_priority 完成顺序 ['A', 'B', 'C']
+    round_robin 完成顺序 ['A', 'C', 'B']
+
+=== 轨迹 1：A(rem2) B(rem8) C(t=2, rem4)，预算 2 ===
+  策略                  步数   完成   取消    峰块    最大TTFT      最大完成步    抢占   重算token
+  fcfs                 9    3    0     2         5          8     0         0
+  decode_priority      9    3    0     2         5          8     0         0
+  round_robin          9    3    0     2         5          8     0         0
+    fcfs 完成顺序 ['A', 'B', 'C']
+    decode_priority 完成顺序 ['A', 'B', 'C']
+    round_robin 完成顺序 ['A', 'B', 'C']
+
+=== 轨迹 2：8 条 decode（prompt 64、生成 64）+ t=8 插入 8192 长 prompt ===
+      预算策略                  步数 LONG TTFT   LONG 完成  d0 TPOT    最大TTFT   抢占
+     128fcfs                83        67        82     1.00        67    0
+     128decode_priority     83        67        82     1.00        67    0
+     128round_robin         83        67        82     1.00        67    0
+     256fcfs                66        33        48     1.00        33    0
+     256decode_priority     66        33        48     1.00        33    0
+     256round_robin         66        33        48     1.00        33    0
+     512fcfs                64        16        31     1.00        16    0
+     512decode_priority     64        16        31     1.00        16    0
+     512round_robin         64        16        31     1.00        16    0
+    2048fcfs                64         4        19     1.00         4    0
+    2048decode_priority     64         4        19     1.00         4    0
+    2048round_robin         64         4        19     1.00         4    0
+    8192fcfs                64         1        16     1.00         1    0
+    8192decode_priority     64         1        16     1.00         1    0
+    8192round_robin         64         1        16     1.00         1    0
+
+=== 轨迹 2b：长 prompt t=0 到达，8 条 decode t=2 到达（预算 512，KV 充足）===
+  策略               LONG TTFT   LONG 完成   decode TTFT中位     decode 最大间隔      decode 完成步中位    抢占
+  fcfs                    15        22              14               1                79     0
+  decode_priority         15        22              14               1                79     0
+  round_robin             15        22              14               1                79     0
+
+=== 轨迹 2c：8 条 decode 先跑，t=8 插入长 prompt（预算 512，KV 充足）===
+  计划要求的三条策略 + 一条反事实策略 prefill_priority（所有 prefill 排在 decode 前）
+  策略                 LONG TTFT   LONG 完成     decode 最大间隔  decode TTFT p90    抢占
+  fcfs                      16        31               1                0     0
+  decode_priority           16        31               1                0     0
+  round_robin               16        31               1                0     0
+  prefill_priority          15        30              17                0     0
+
+=== 轨迹 3：到达过程（prompt 256、生成 64，预算 64，KV 40 块 = 640 token；SLO：TTFT ≤ 30 步）===
+      到达率策略                 完成   取消  SLO内     最长排队    最大TTFT      最大完成步    抢占   重算token
+      0.1fcfs               18   22     2      195       201        631   210     53760
+          取消原因 {'deadline': 22}
+      0.1decode_priority    18   22     2      195       201        631   210     53760
+          取消原因 {'deadline': 22}
+      0.1round_robin        18   22     5      180       204        645   170     44300
+          取消原因 {'deadline': 22}
+      0.2fcfs               12   28     2      200       203        416   169     43264
+          取消原因 {'deadline': 28}
+      0.2decode_priority    12   28     2      200       203        416   169     43264
+          取消原因 {'deadline': 28}
+      0.2round_robin        14   26     4      192       171        494   196     50934
+          取消原因 {'deadline': 26}
+      0.4fcfs               10   30     2      200       204        345   133     34048
+          取消原因 {'deadline': 30}
+      0.4decode_priority    10   30     2      200       204        345   133     34048
+          取消原因 {'deadline': 30}
+      0.4round_robin        12   28     5      199       195        432   150     39050
+          取消原因 {'deadline': 28}
+
+=== 饥饿检查（轨迹 3）：各策略的 TTFT 分布（步）===
+  到达率 0.1  fcfs             n= 18  最小    3  中位  193  p90  200  最大  201
+  到达率 0.1  decode_priority  n= 18  最小    3  中位  193  p90  200  最大  201
+  到达率 0.1  round_robin      n= 18  最小    3  中位   81  p90  135  最大  204
+  到达率 0.2  fcfs             n= 12  最小    3  中位  178  p90  201  最大  203
+  到达率 0.2  decode_priority  n= 12  最小    3  中位  178  p90  201  最大  203
+  到达率 0.2  round_robin      n= 14  最小    3  中位  104  p90  153  最大  171
+  到达率 0.4  fcfs             n= 10  最小    3  中位  131  p90  202  最大  204
+  到达率 0.4  decode_priority  n= 10  最小    3  中位  131  p90  202  最大  204
+  到达率 0.4  round_robin      n= 12  最小    3  中位   70  p90  164  最大  195
+</pre></div>
+<div class="srcref"><code>results/local/5.3/20260921-mini-scheduler/mini_scheduler.txt 全文（83 行）</code><a href="../code/results/local/5.3/20260921-mini-scheduler/mini_scheduler.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>③ 预测模型与误差注入</summary>
+<details class="fold srcfold"><summary>results/local/5.3/schedule-prediction/schedule_prediction.txt 全文（28 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>step 时间模型（Qwen3-1.7B，8 条 decode + 一条 8192 prompt，885 个 step 样本）
+
+  纯 decode 步（n=507）：中位 3.36 ms
+  含 prefill 的步（n=378）：t = 9.92 + 0.00114 × tokens（ms）
+  只用最慢步的对照拟合：t = 8.70 + 0.01838 × tokens —— 截距被抬高到 2.6 倍，因为样本里没有 decode 步。
+
+  残差（ms）：纯 decode 步 中位 +0.00，极差 [-2.79, +7.70]；含 prefill 步 中位 -2.05，极差 [-14.96, +148.02]
+
+  用这套模型预测 mini 计数轨迹的结果（含 prefill 步用拟合式，纯 decode 步用中位数）：
+      预算   预测 LONG TTFT ms    实测 ms       偏差       预测 decode 最大间隔 ms    实测 ms       偏差
+     128             684.6    511.4    +34%                    10.1      9.1    +11%
+     256             347.0    307.5    +13%                    10.2     11.6    -12%
+     512             178.2    215.0    -17%                    10.5     15.0    -30%
+    2048              59.0    187.9    -69%                    12.3     52.7    -77%
+    8192              29.2    172.6    -83%                    19.2    157.9    -88%
+
+预测误差注入：控制器用估计的斜率选分块，目标是预测单步 ≈ 15.0 ms。
+  控制器模型是 5 点最小二乘 t = 8.70 + 0.01838 × n；真实单步由实测折线插值给出。
+      斜率误差       控制器用的 b      选出的分块     真实单步 ms      相对目标       长请求分块数
+      -50%       0.00919        686        19.5     1.30×         12.0
+      -25%       0.01379        457        14.4     0.96×         17.9
+         0       0.01838        343        12.9     0.86×         23.9
+      +25%       0.02298        274        12.0     0.80×         29.9
+      +50%       0.02757        229        11.5     0.76×         35.9
+
+  斜率低估 50%：控制器以为 686 token 只要 15 ms，实测 19.5 ms（1.30 倍），decode 的停顿随之拉长；
+  高估 50%：单步只有 11.5 ms，看起来更安全，但分块被切到 229 token，长请求要多等 36 个 step。
+  预测误差的代价是双向的：低估伤尾延迟，高估伤长请求的 TTFT。
+</pre></div>
+<div class="srcref"><code>results/local/5.3/schedule-prediction/schedule_prediction.txt 全文（28 行）</code><a href="../code/results/local/5.3/schedule-prediction/schedule_prediction.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>④ ARRIVAL 协议：vLLM 侧与 SGLang 侧的过载扫描</summary>
+<details class="fold srcfold"><summary>results/crater/5.3/arrival-vllm-20260921/arrival_scan.txt 全文（10 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>ARRIVAL 协议 · 引擎 vllm · prompt 2048 / 输出 128 · 每档 3 个 120 s 窗口
+闭环基线：并发 64、600 条，可持续 15.30 QPS（输出 1959 tok/s），TTFT p50 1096.6 ms，窗口 39.2 s
+
+     倍率   到达 QPS     样本    完成   错误   超时   拒绝 goodput QPS   SLO 内 TTFT p50 ms TTFT p99 ms       p99 极差 ms TPOT p50 ms e2e p99 s
+    0.3     4.59    575   575    0    0    0        4.79   1.000        46.1       144.6      [106, 243]        5.11      1.49
+    0.6     9.18   1142  1142    0    0    0        9.52   1.000        50.3       146.1      [140, 155]        7.30      1.56
+    0.9    13.77   1711  1711    0    0    0       14.26   1.000        95.7      1064.1     [909, 1170]       15.83      3.61
+    1.1    16.84   2084  2084    0    0    0       17.37   0.181      8636.0     15631.7  [11788, 16256]       20.54     17.98
+
+全部窗口合计计划请求 5512 条，单档平均 1378 条 —— 不足 10000 条，p99 只作同口径排序，不外推为稳定尾延迟。
+</pre></div>
+<div class="srcref"><code>results/crater/5.3/arrival-vllm-20260921/arrival_scan.txt 全文（10 行）</code><a href="../code/results/crater/5.3/arrival-vllm-20260921/arrival_scan.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/crater2/5.3/arrival-sglang-20260921/arrival_scan.txt 全文（10 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>ARRIVAL 协议 · 引擎 sglang · prompt 2048 / 输出 128 · 每档 3 个 120 s 窗口
+闭环基线：并发 64、600 条，可持续 16.03 QPS（输出 2051 tok/s），TTFT p50 1404.8 ms，窗口 37.4 s
+
+     倍率   到达 QPS     样本    完成   错误   超时   拒绝 goodput QPS   SLO 内 TTFT p50 ms TTFT p99 ms       p99 极差 ms TPOT p50 ms e2e p99 s
+    0.3     4.81    602   602    0    0    0        5.02   1.000        46.5       105.4      [103, 109]        5.31      1.11
+    0.6     9.62   1189  1189    0    0    0        9.91   1.000        50.0       143.3      [136, 144]        8.70      1.90
+    0.9    14.42   1790  1790    0    0    0       14.92   1.000       127.7      1253.8    [1180, 1383]       20.45      4.00
+    1.1    17.63   2172  2172    0    0    0       18.10   0.158      8669.4     16704.1  [12117, 16797]       20.50     19.13
+
+全部窗口合计计划请求 5753 条，单档平均 1438 条 —— 不足 10000 条，p99 只作同口径排序，不外推为稳定尾延迟。
+</pre></div>
+<div class="srcref"><code>results/crater2/5.3/arrival-sglang-20260921/arrival_scan.txt 全文（10 行）</code><a href="../code/results/crater2/5.3/arrival-sglang-20260921/arrival_scan.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑤ 过载区的引擎侧计数（1.1×/1.3×，两侧并排）</summary>
+<details class="fold srcfold"><summary>results/crater/5.3/arrival-overload-20260922/vllm/arrival_scan.txt 全文（14 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>ARRIVAL 协议 · 引擎 vllm · prompt 2048 / 输出 128 · 每档 2 个 120 s 窗口
+闭环基线：并发 64、600 条，可持续 15.30 QPS（输出 1959 tok/s），TTFT p50 1096.0 ms，窗口 39.2 s
+
+     倍率   到达 QPS     样本    完成   错误   超时   拒绝 goodput QPS   SLO 内 TTFT p50 ms TTFT p99 ms       p99 极差 ms TPOT p50 ms e2e p99 s
+    1.1    16.83   2051  2051    0    0    0       17.09   0.147      7470.2     14152.0  [12323, 15981]       20.81     16.42
+    1.3    19.89   2390  2390    0    0    0       19.91   0.066     18444.0     36030.4  [33807, 38254]       20.97     38.39
+
+全部窗口合计计划请求 4440 条，单档平均 2220 条 —— 不足 10000 条，p99 只作同口径排序，不外推为稳定尾延迟。
+
+引擎侧（窗口内 counter 增量 / gauge 峰值）：
+     倍率     抢占或 retract      等待峰值      运行峰值     KV 峰值        命中增量
+    1.1            75.5     201.5      44.0       1.0         0.0
+    1.3            81.0     214.0      44.00.9996499999999999         0.0
+  抢占/retract = 0 表示这批负载下引擎没有触发 KV 回收；等待峰值上升而抢占为 0 说明压力停在队列而不是运行集。
+</pre></div>
+<div class="srcref"><code>results/crater/5.3/arrival-overload-20260922/vllm/arrival_scan.txt 全文（14 行）</code><a href="../code/results/crater/5.3/arrival-overload-20260922/vllm/arrival_scan.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/crater2/5.3/arrival-overload-20260922/sglang/arrival_scan.txt 全文（15 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>ARRIVAL 协议 · 引擎 sglang · prompt 2048 / 输出 128 · 每档 2 个 120 s 窗口
+闭环基线：并发 64、600 条，可持续 16.03 QPS（输出 2051 tok/s），TTFT p50 1404.2 ms，窗口 37.4 s
+
+     倍率   到达 QPS     样本    完成   错误   超时   拒绝 goodput QPS   SLO 内 TTFT p50 ms TTFT p99 ms       p99 极差 ms TPOT p50 ms e2e p99 s
+    1.1    17.63   2132  2132    0    0    0       17.77   0.130      7978.9     14351.0  [12385, 16317]       20.43     16.83
+    1.3    20.83   2489  2489    0    0    0       20.74   0.063     18744.6     35351.3  [33911, 36792]       19.88     37.23
+
+全部窗口合计计划请求 4622 条，单档平均 2311 条 —— 不足 10000 条，p99 只作同口径排序，不外推为稳定尾延迟。
+
+引擎侧（窗口内事件累计 / gauge 峰值）：
+     倍率     抢占或 retract      等待峰值      运行峰值       KV 峰值        命中增量
+    1.1             0.0     217.0      46.5       0.995         0.0
+    1.3             0.0     232.0      45.5       0.995         0.0
+  口径：vLLM 的抢占是 Counter，取窗口首末差；SGLang 只导出 Gauge 且每次上报后复位，按采样点累加。
+  抢占/retract = 0 表示这批负载下引擎没有触发 KV 回收；等待峰值上升而抢占为 0 说明压力停在队列而不是运行集。
+</pre></div>
+<div class="srcref"><code>results/crater2/5.3/arrival-overload-20260922/sglang/arrival_scan.txt 全文（15 行）</code><a href="../code/results/crater2/5.3/arrival-overload-20260922/sglang/arrival_scan.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑥ SGLang 推到 2.0×：仍不 retract，代价转为超时</summary>
+<details class="fold srcfold"><summary>results/crater2/5.3/arrival-overload-20260922/sglang-2x/arrival_scan.txt 全文（13 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>ARRIVAL 协议 · 引擎 sglang · prompt 2048 / 输出 128 · 每档 1 个 120 s 窗口
+闭环基线：并发 64、600 条，可持续 15.96 QPS（输出 2042 tok/s），TTFT p50 1418.7 ms，窗口 37.6 s
+
+     倍率   到达 QPS     样本    完成   错误   超时   拒绝 goodput QPS   SLO 内 TTFT p50 ms TTFT p99 ms       p99 极差 ms TPOT p50 ms e2e p99 s
+    2.0    31.91   3771  1111    0 2660    0        9.26   0.024     17688.5     51131.2  [51131, 51131]       20.89    172.83
+
+全部窗口合计计划请求 3771 条，单档平均 3771 条 —— 不足 10000 条，p99 只作同口径排序，不外推为稳定尾延迟。
+
+引擎侧（窗口内事件累计 / gauge 峰值）：
+     倍率     抢占或 retract      等待峰值      运行峰值       KV 峰值        命中增量
+    2.0             0.0     256.0      54.0         1.0         0.0
+  口径：vLLM 的抢占是 Counter，取窗口首末差；SGLang 只导出 Gauge 且每次上报后复位，按采样点累加。
+  抢占/retract = 0 表示这批负载下引擎没有触发 KV 回收；等待峰值上升而抢占为 0 说明压力停在队列而不是运行集。
+</pre></div>
+<div class="srcref"><code>results/crater2/5.3/arrival-overload-20260922/sglang-2x/arrival_scan.txt 全文（13 行）</code><a href="../code/results/crater2/5.3/arrival-overload-20260922/sglang-2x/arrival_scan.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<details>
+<summary>⑦ 早期按调用计时的现场（现行结论以上面几份为准）</summary>
 <details class="fold srcfold"><summary>results/crater/engine/53_scheduling.txt 全文（95 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>torch 2.13.0+cu130  model Qwen/Qwen3-1.7B
 
 ==============================================================================
@@ -779,33 +1193,72 @@
 <span class="linenos" aria-hidden="true">291</span>     <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 </pre></div>
 <div class="srcref"><code>labs/L5/scheduling.py 全文（291 行）</code><a href="../code/labs/L5/scheduling.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
+<hr />
 <h2 id="_11">前沿</h2>
-<p>调度预算可以进一步结合历史 KV 长度、预测 step 时长和请求期限，而不只按新增 token 数分配。其收益需要在持续到达的负载下检查，特别是预测误差、饥饿与过载后的行为。相关策略及 SGLang 对照在本章均为 <code>UNVERIFIED</code>。</p>
+<p>调度预算可以进一步结合历史 KV 长度、预测 step 时长和请求期限，而不只按新增 token 数分配。
+三条正在被使用的路线：</p>
+<ul>
+<li><strong>按轮调度（iteration-level scheduling）</strong>：Orca 把"一个请求一个 batch"改成"每轮重组 batch"，
+  本章的 continuous batching 就是它的当代形态；代价是每轮都要重算成员与 KV 归属。</li>
+<li><strong>按预测的 step 时长分配预算</strong>：先估计这一步要跑多久，再决定放多少 token 进去。
+  本章的误差注入给出了这条路线的前提：斜率估计必须带误差界，否则两端都会付代价。</li>
+<li><strong>任务级优先级与准入</strong>：把优先级从"serving 请求"提到"任务图"上（Autellix、Parrot 等），
+  在 agent 负载里按剩余任务价值排序。这一层由 <a href="../L9/9.7-agent-workflow-scheduling.html">9.7</a> 承担，
+  它复用本章的引擎接口与预算语义。</li>
+</ul>
+<p>上表中除本章实测外的机制来自各自论文与源码，<strong>加速比尚未在本机复现</strong><span class="unverified">未实测</span>。</p>
+<hr />
 <h2 id="_12">陷阱</h2>
 <ol>
 <li><strong>把 step 耗时当作每请求输出记录。</strong> 是否推进必须看实际调度与输出。</li>
-<li><strong>把固定 80 步计时称为 prefill 总时长。</strong> 观察窗口与请求生命周期不同。</li>
+<li><strong>用固定观察窗口代替请求生命周期。</strong> 长请求没跑完时的"总时间"只是窗口时间，
+   本章的预算扫描一直跑到所有请求结束。</li>
 <li><strong>用预算代替真实产出。</strong> prefill 消耗 token 预算，却未必产生输出 token。</li>
-<li><strong>把 token 预算当作延迟保证。</strong> 上下文长度和后端改变每 token 成本。</li>
+<li><strong>把 token 预算当作延迟保证。</strong> 上下文长度和后端改变每 token 成本；
+   同样的分块大小在训练与推理、不同 attention 后端下的耗时不同。</li>
 <li><strong>只测边界一侧。</strong> 扫描需覆盖预算低于、等于和高于实际需求的情况。</li>
-<li><strong>把单次差异归为噪声。</strong> 先保存重复样本，再报告区间。</li>
+<li><strong>拿一个超参数式预测 step 时间。</strong> 纯 decode 步与含 prefill 的步不落在同一条直线上；
+   只用最慢步拟合会把截距抬高 2.6 倍。</li>
+<li><strong>假设"切得更细更安全"。</strong> 低估斜率时细切确实压住尾延迟，但长请求的 TTFT
+   从 172.6 ms 涨到 511.4 ms；预算选择取决于服务更在意哪一端。</li>
+<li><strong>把 gauge 当 counter 读。</strong> SGLang 的 <code>sglang:num_retracted_reqs</code> 是 Gauge，
+   每次上报后复位，窗口首末差恒为 0；只有按采样点累加才能看到窗口内的事件数。
+   直接相减会得出"引擎从不回收 KV"的错误结论。</li>
+<li><strong>用客户端指标推断准入策略。</strong> 抢占与排队可以让 TTFT/goodput 曲线重合；
+   要判断"过载时牺牲谁"，必须同时读引擎侧的抢占/retract 计数与运行/等待峰值。</li>
 </ol>
+<hr />
 <h2 id="_13">自测题</h2>
 <details>
 <summary>1. 预算 512，8 条普通 decode 都获调度，最多还能安排多少 prefill token？</summary>
-<p>在不考虑其他约束时为 504。还需确认块池、请求长度和后端是否允许这份混合批。</p>
+<p>在不考虑其他约束时为 504。实测里每块是 504 而不是 512：<code>max_num_batched_tokens=512</code>
+要减去 8 条 decode 各占的 1 个 token。还需确认块池、请求长度和后端是否允许这份混合批。</p>
 </details>
 <details>
 <summary>2. 连续五步变慢，是否说明这五步 decode 全部停止？</summary>
-<p>不能。它们可能是混合批，仍在生成输出。需要逐请求调度与输出记录才能区分。</p>
+<p>不能。它们可能是混合批，仍在生成输出。需要逐请求调度与输出记录才能区分。
+本章的采集器把每步每请求的调度 token 数与产出都存了下来，可以逐条核对。</p>
 </details>
 <details>
-<summary>3. 三档预算的 80 步总时间接近，能否证明分块没有吞吐代价？</summary>
-<p>不能。相同步数不保证相同有效工作量；观察窗口也没有精确覆盖长请求的生命周期。应以实际处理和产出的 token 数计量，并做重复对照。</p>
+<summary>3. 三档预算下长请求的完成时间几乎相同，能否证明分块没有代价？</summary>
+<p>不能。完成时间不变只说明<strong>总工作量</strong>没变。代价在两端：预算 128 时长请求的首 token
+是 8192 档的 3.0 倍（511.4 对 172.6 ms），而预算 8192 时 8 条 decode 的最大停顿
+是 128 档的 17 倍（158.0 对 9.1 ms）。分块改变的是代价在谁身上。</p>
 </details>
 <details>
-<summary>4. 为什么纯 decode 时预算超过并发数仍可能改变实测时间？</summary>
-<p>它不再直接限制每轮新增 token 数，但配置可能影响其他执行选择；实验也可能包含 prefill 或状态差异。应先确认工作量和实际路径，不能将所有变化归为噪声。</p>
+<summary>4. 为什么纯 decode 步的时间与 token 数无关，而含 prefill 的步强烈相关？</summary>
+<p>纯 decode 步每条请求只新增 1 个位置，本轮工作量由权重读取主导——权重字节是常数，
+batch 从 8 变到 9 只让 GEMM 的 M 维动一格。含 prefill 的步新增的位置从 128 到 8184，
+既要读长度成正比的历史 KV，attention 还有 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>n</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span> 项，所以时间随分块大小快速增长。</p>
+<p>本章实测：纯 decode 步 507 个样本中位 3.36 ms；含 prefill 的步从 10.5 涨到 157.9 ms。</p>
+</details>
+<details>
+<summary>5. 如果 step 时间预测的斜率低估了 50%，调度器会犯什么错？怎么发现？</summary>
+<p>它会以为一个 686 token 的分块只要 15 ms，实际要 19.5 ms（1.30 倍），于是 decode 的
+停顿被拉长到目标之上；反之高估 50% 会把分块切到 229 token，长请求多等 36 个 step。</p>
+<p>发现方法：同时记录<strong>预测的单步时长</strong>与<strong>实际墙钟</strong>，按分块大小分桶看残差。
+只报平均值会把两个方向的误差抵消掉——本章的残差极差是 [−15.0, +148.0] ms。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.2-kv-cache-paged.html">&#8592; 5.2 KV cache 管理：PagedAttention 与 prefix cache</a><a class="nav-next" href="../L5/5.4-execution-layer.html">5.4 执行层：CUDA Graph 与流水重叠 &#8594;</a></nav>
 </main>
 </body>

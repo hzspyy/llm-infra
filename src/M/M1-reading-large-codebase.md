@@ -1,6 +1,5 @@
 ---
 machine: 本地源码阅读；动态轨迹按章节硬件
-measured: 2026-09-12
 deps: 0.0（最小完整模型）
 ---
 
@@ -86,7 +85,7 @@ $$Y_{i,o}=\sum_{k=0}^{2}X_{i,k}W_{o,k}+b_o.$$
 
 ## 工程实现：入口、注册与真实源码
 
-本例运行在 PyTorch **2.14.0 CPU**，构建记录中的提交为 `08187d9e0fba026dc8217405802ab5381dc88d90`。源码按这个提交获取并保存 SHA256；版本号、实际 Python 解释器及输入配置见原始现场。源码文件不是运行 trace，注册表也只说明已安装构建的分发规则。
+本例运行在 PyTorch **2.14.0 CPU**。源码按该构建对应的提交获取并保存校验值，具体提交、Python 解释器和输入配置见原始现场。源码文件不是运行 trace，注册表也只说明已安装构建的分发规则。
 
 | 查找对象 | 固定提交内的位置 | 能回答的问题 |
 |---|---|---|
@@ -200,13 +199,13 @@ python labs/M/dispatch_evidence.py --output results/local/M1/my-new-run
 
 {{srcfold:results/local/M1/20260913-source-pin/manifest.json}}
 
-源码可由 manifest 内的 commit URL 重新获取并比对 SHA256。Python 环境取自 `sys.executable` 和当前进程的版本，不用 PATH 中另一个 `python3` 代替实际运行解释器。
+源码可由 manifest 内的地址重新获取并比对校验值。Python 环境取自 `sys.executable` 和当前进程的版本，不用 PATH 中另一个 `python3` 代替实际运行解释器。
 
 ## 前沿：把定位方法迁移到引擎和多模态 pipeline
 
 ### SDPA：同一 API 的成功分支与拒绝分支
 
-SDPA 的分支预测固定为 `B=1, H=2, S=7, D=8`、causal、dropout=0，seed=0/1/2。运行使用 RTX 5090 D、PyTorch `2.13.0+cu130`，构建提交 `cf30153c4c131c8164ee7798e5022d810682e2cb`；它与前文 CPU linear 的构建不同，分别保存源码与 manifest。
+SDPA 的分支预测固定为 `B=1, H=2, S=7, D=8`、causal、dropout=0，seed=0/1/2。运行使用 RTX 5090 D 与 **PyTorch 2.13.0（cu130）**；它与前文 CPU linear 是两个不同的构建，源码与 manifest 分别保存。
 
 入口在 `attention.cpp:715`，CUDA 分支选择在 `sdp_utils.cpp:1049`。选择函数遍历 `priority_order`，逐一检查能力和用户开关；没有可用路线时报告错误。低精度检查在 `sdp_utils.cpp:803`，当前目标架构下允许 Half/BFloat16，不能把 FP32 输入强行交给这一 Flash 路线。
 
@@ -243,7 +242,7 @@ python labs/M/sdpa_branch_probe.py --output results/crater/M1/my-sdpa-run
 
 ### 引擎迁移：同一个请求应在哪里找状态
 
-以下复用 5.11 保存的 vLLM 0.29.0、SGLang 0.5.19 **安装源码**，本轮逐文件计算 SHA256；这是静态关系对照，不新增请求时延或跨进程 trace 结论。
+以下复用 5.11 保存的 **vLLM 0.29.0**、**SGLang 0.5.19** 安装源码，并逐文件核对校验值；这是静态关系对照，不新增请求时延或跨进程 trace 结论。
 
 | 问题 | vLLM | SGLang |
 |---|---|---|
@@ -264,7 +263,7 @@ python labs/M/sdpa_branch_probe.py --output results/crater/M1/my-sdpa-run
 
 ### 迁移案例：Cosmos3-Edge 的生成入口与状态边界
 
-这里固定 Diffusers 提交 `c419dac0152186060246c93a095bc1bfaea342b3`，模型配置固定 `nvidia/Cosmos3-Edge@a9d944e2c6a1bf9f48b92ad16348e70c5f1836ba`。两者分别标识**实现**和**模型配置**，不能用 model card 的库版本字段替代代码提交。本节是源码分析与独立输入契约实验；权重未加载，完整视频生成与任务质量为 **UNVERIFIED**，留给 10.4 的固定配方实验。
+这里把 **Diffusers 的实现**与 **Cosmos3-Edge 的模型配置**分别固定到具体版本（记录在 manifest 中）。两者标识的是不同东西，不能用 model card 的库版本字段替代代码版本。本节是源码分析与独立输入契约实验；权重未加载，完整视频生成与任务质量为 **UNVERIFIED**，留给 10.4 的固定配方实验。
 
 先读 `model_index.json`：`_class_name` 是 `Cosmos3OmniPipeline`，scheduler 为 `UniPCMultistepScheduler`，transformer 为 `Cosmos3OmniTransformer`，VAE 为 `AutoencoderKLWan`。配置中的 `use_native_flow_schedule=true` 和 `default_use_system_prompt=false` 会影响运行路径；文件只是组件配置，不证明已成功加载这些组件。
 
@@ -296,7 +295,7 @@ rg -n 'def step|model_outputs|last_sample|_step_index' "$SOURCE/scheduling_unipc
 
 选择 scheduler 作为扩展点，先检查谁决定时间步、谁推进 solver、谁持有历史。当前 pipeline 的 native flow 分支构造从 $1-1/N$ 到 0 的线性 sigma 序列并去掉末项，其中 $N$ 为 scheduler 的训练时间步数，然后调用 `set_timesteps(..., sigmas=sigmas)`。这只是传入 scheduler 的序列；scheduler 内的变换仍须继续分析，不能直接把它写成最终步长。
 
-原始 [PR #14181：Cosmos3 edge support](https://github.com/huggingface/diffusers/pull/14181) 已合并，merge commit 为 `db44fe6638a5c462f3ea521fb065aaa42bee17ce`。它的实际 diff 添加了 `default_use_system_prompt`、`use_native_flow_schedule` 及相应分支。这支持“Edge 的默认模板和时间步策略有显式实现”的源码结论；PR 正文只有简短支持说明，不能据此编造某种 solver 更快、质量更好或上游否决替代方案的理由。完整 PR 响应和 diff 见原始文件。
+原始 [PR #14181：Cosmos3 edge support](https://github.com/huggingface/diffusers/pull/14181) 已合并。它的实际 diff 添加了 `default_use_system_prompt`、`use_native_flow_schedule` 及相应分支。这支持“Edge 的默认模板和时间步策略有显式实现”的源码结论；PR 正文只有简短支持说明，不能据此编造某种 solver 更快、质量更好或上游否决替代方案的理由。完整 PR 响应和 diff 见原始文件。
 
 **设计分析：** 单纯替换 `pipe.scheduler` 很方便，但还必须保持 `prediction_type`、sigma/时间步约定、输入 batch 维和重置协议一致。复制配置只解决参数传递，不证明 solver 数学等价。需要改 callback 来复用 latent 时，应检查每个去噪步开始时的状态是否仍符合 solver 历史；只复制 `latents` 而漏掉多步历史不能保证精确恢复。以上是根据代码提出的检查要求，不是上游给出的否决意见。
 

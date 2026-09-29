@@ -1,0 +1,1241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.4 数据、checkpoint 与容错</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">7.4</div>
+  <div class="sidebar-title">数据、checkpoint 与容错</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型：一次保存要跨过四个时刻</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#_4">训练里实际存在的状态</a></li>
+<li><a href="#async_save">四个时刻：async_save 返回不等于保存完成</a></li>
+<li><a href="#dcp">重新分片：DCP 存的是逻辑张量加区间</a></li>
+<li><a href="#consumed-acknowledged">两个游标：consumed 与 acknowledged</a></li>
+<li><a href="#_5">严格恢复：五项同时对上才算</a></li>
+<li><a href="#_6">一个只有实测才会发现的坑</a></li>
+<li><a href="#_7">保存频率的预算</a></li>
+<li><a href="#checkpoint">阶段产物：同样叫 checkpoint，用途完全不同</a></li>
+</ul>
+</li>
+<li><a href="#74-h">完整教学项目：真实训练的中断与恢复（7.4-H）</a></li>
+<li><a href="#_8">工程实现：源码解析</a><ul>
+<li><a href="#latest">latest 选择器的判据</a></li>
+<li><a href="#_9">恢复必须从只读快照出发</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a></li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a><ul>
+<li><a href="#1-async_save">陷阱 1：把 async_save 返回当成保存完成</a></li>
+<li><a href="#2-mtime-latest">陷阱 2：按 mtime 或目录名选 latest</a></li>
+<li><a href="#3-except-exception-dcp">陷阱 3：用 except Exception 兜 DCP 的错误</a></li>
+<li><a href="#4">陷阱 4：把"已读取"当恢复点</a></li>
+<li><a href="#5iterable-worker">陷阱 5：iterable 数据集不按 worker 分片</a></li>
+<li><a href="#6-loss">陷阱 6：用 loss 判断恢复是否正确</a></li>
+<li><a href="#7-scheduler">陷阱 7：以为恢复不了 scheduler 也没关系</a></li>
+<li><a href="#8-checkpoint">陷阱 8：把权重导出当训练 checkpoint</a></li>
+</ul>
+</li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型：一次保存要跨过四个时刻</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#_4">训练里实际存在的状态</a></li>
+<li><a href="#async_save">四个时刻：async_save 返回不等于保存完成</a></li>
+<li><a href="#dcp">重新分片：DCP 存的是逻辑张量加区间</a></li>
+<li><a href="#consumed-acknowledged">两个游标：consumed 与 acknowledged</a></li>
+<li><a href="#_5">严格恢复：五项同时对上才算</a></li>
+<li><a href="#_6">一个只有实测才会发现的坑</a></li>
+<li><a href="#_7">保存频率的预算</a></li>
+<li><a href="#checkpoint">阶段产物：同样叫 checkpoint，用途完全不同</a></li>
+</ul>
+</li>
+<li><a href="#74-h">完整教学项目：真实训练的中断与恢复（7.4-H）</a></li>
+<li><a href="#_8">工程实现：源码解析</a><ul>
+<li><a href="#latest">latest 选择器的判据</a></li>
+<li><a href="#_9">恢复必须从只读快照出发</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a></li>
+<li><a href="#_10">原始现场</a></li>
+<li><a href="#_11">前沿</a></li>
+<li><a href="#_12">陷阱</a><ul>
+<li><a href="#1-async_save">陷阱 1：把 async_save 返回当成保存完成</a></li>
+<li><a href="#2-mtime-latest">陷阱 2：按 mtime 或目录名选 latest</a></li>
+<li><a href="#3-except-exception-dcp">陷阱 3：用 except Exception 兜 DCP 的错误</a></li>
+<li><a href="#4">陷阱 4：把"已读取"当恢复点</a></li>
+<li><a href="#5iterable-worker">陷阱 5：iterable 数据集不按 worker 分片</a></li>
+<li><a href="#6-loss">陷阱 6：用 loss 判断恢复是否正确</a></li>
+<li><a href="#7-scheduler">陷阱 7：以为恢复不了 scheduler 也没关系</a></li>
+<li><a href="#8-checkpoint">陷阱 8：把权重导出当训练 checkpoint</a></li>
+</ul>
+</li>
+<li><a href="#_13">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L7 · 训练与后训练基础设施</div>
+  <div class="mod-id">7.4</div>
+  <h1>数据、checkpoint 与容错</h1>
+  <p class="lede">训练状态 schema、数据游标、分片 checkpoint、异步 staging、原子提交、短恢复和阶段产物转换，区分 warm start 与完整 resume。</p>
+  
+</header><article class="prose"><p>"保存了 checkpoint"是一句信息量很低的话。它可能意味着一份能严格接着训的完整状态，也可能只是一份能加载进推理框架的权重；可能已经落盘，也可能只是被拷进了一块暂存内存。这一章把这些含义分开。</p>
+<p>三条线索：训练里<strong>实际存在</strong>哪些状态、它们在磁盘上是<strong>什么时候</strong>变得可用的、以及少了其中任何一项会<strong>具体坏掉什么</strong>。全部用可运行的最小例子验证：真实的 <code>torch.distributed.checkpoint</code>、真实的 DataLoader 游标、真实的两步恢复对拍。</p>
+<p>判据只有一条：<strong>恢复之后跑一步，样本 ID、loss、梯度范数、LR 和参数要同时与不中断的参照一致。</strong></p>
+<hr />
+<h2 id="_1">本章回答的三个问题</h2>
+<ol>
+<li>一次训练里到底有哪些状态？哪些必须保存、哪些可重建、哪些是外部不可变依赖？</li>
+<li>异步保存返回、暂存完成、文件写完、提交生效——这四件事分别在什么时候发生？崩在中间会留下什么？</li>
+<li>换一个 world size 还能不能接着训？少了 RNG 或数据游标，训练轨迹会怎么变？</li>
+</ol>
+<hr />
+<h2 id="_2">心智模型：一次保存要跨过四个时刻</h2>
+<div class="diagram-scroll" role="region" aria-label="机制图，可横向滚动" tabindex="0" style="--diagram-min-width:880px">
+
+
+<svg viewBox="0 0 880 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="异步保存的四个时刻与三类状态">
+<rect width="880" height="300" rx="12" fill="#f1f5f9"/>
+<g font-family="system-ui,sans-serif" fill="#0f172a">
+<text x="24" y="28" font-size="13" font-weight="600">一次异步保存跨过的四个时刻</text>
+<rect x="24" y="40" width="184" height="52" rx="7" fill="#dbeafe" stroke="#2563eb"/>
+<text x="116" y="62" font-size="13" text-anchor="middle">async_save 返回</text>
+<text x="116" y="80" font-size="11" text-anchor="middle">拿到一个 Future</text>
+<rect x="222" y="40" width="184" height="52" rx="7" fill="#dcfce7" stroke="#15803d"/>
+<text x="314" y="62" font-size="13" text-anchor="middle">staging 完成</text>
+<text x="314" y="80" font-size="11" text-anchor="middle">参数可以被改写了</text>
+<rect x="420" y="40" width="184" height="52" rx="7" fill="#fef3c7" stroke="#b45309"/>
+<text x="512" y="62" font-size="13" text-anchor="middle">分片文件写完</text>
+<text x="512" y="80" font-size="11" text-anchor="middle">.distcp 落盘</text>
+<rect x="618" y="40" width="238" height="52" rx="7" fill="#fed7aa" stroke="#c2410c"/>
+<text x="737" y="62" font-size="13" text-anchor="middle">.metadata 写入 = 提交</text>
+<text x="737" y="80" font-size="11" text-anchor="middle">这一刻之后才算可用</text>
+<text x="210" y="70" font-size="14">→</text><text x="408" y="70" font-size="14">→</text><text x="606" y="70" font-size="14">→</text>
+<text x="24" y="112" font-size="11" fill="#b91c1c">崩在任意一段，磁盘上留下的都是"看起来像 checkpoint 的目录"；latest 选择器必须按元数据判断</text>
+
+<rect x="24" y="132" width="404" height="150" rx="8" fill="#fff" stroke="#94a3b8"/>
+<text x="42" y="154" font-size="12" font-weight="600">三类状态，三种处理方式</text>
+<text x="42" y="178" font-size="12">必须保存：参数 · m/v · scheduler · scaler · RNG · 游标 · EMA</text>
+<text x="42" y="200" font-size="12">可重建：teacher 特征缓存（记住缓存键即可）</text>
+<text x="42" y="222" font-size="12">外部不可变依赖：base 权重 · teacher · 数据版本</text>
+<text x="42" y="246" font-size="11" fill="#475569">第三类不进 checkpoint，但 checkpoint 必须记住指向它们的标识</text>
+<text x="42" y="268" font-size="11" fill="#475569">字节最多的一项和最关键的一项往往不是同一项</text>
+
+<rect x="444" y="132" width="412" height="150" rx="8" fill="#fff" stroke="#94a3b8" stroke-dasharray="5 4"/>
+<text x="462" y="154" font-size="12" font-weight="600">两个游标不能混用</text>
+<text x="462" y="178" font-size="12">consumed：worker 已经取出来的样本（含预取队列）</text>
+<text x="462" y="200" font-size="12">acknowledged：已经参与过一次 optimizer 更新的样本</text>
+<text x="462" y="224" font-size="11" fill="#475569">恢复点只能用后者；用前者会跳过从未训练过的样本</text>
+<text x="462" y="252" font-size="12" font-weight="600">保存权重 ≠ 可以恢复训练</text>
+<text x="462" y="272" font-size="11" fill="#475569">SmolLM3 的 133 个公开分支只有权重，能冷启动，不能严格恢复</text>
+</g></svg>
+
+
+</div>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="_4">训练里实际存在的状态</h3>
+<p>在一个真实的小训练里把每个对象的 <code>state_dict()</code> 取出来，能看到一张很不均衡的表：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>归属</th>
+<th style="text-align: right;">字节</th>
+<th>缺失后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model.state_dict()</code></td>
+<td>模型</td>
+<td style="text-align: right;">1,051,648</td>
+<td>没有它就没有模型</td>
+</tr>
+<tr>
+<td><code>optimizer.state_dict()['state']</code></td>
+<td>optimizer</td>
+<td style="text-align: right;">2,103,312</td>
+<td>m/v 归零，下一步的更新量与中断前不同</td>
+</tr>
+<tr>
+<td><code>optimizer.state_dict()['param_groups']</code></td>
+<td>optimizer</td>
+<td style="text-align: right;">0</td>
+<td>LR、weight decay、参数分组丢失</td>
+</tr>
+<tr>
+<td><code>scheduler.state_dict()</code></td>
+<td>scheduler</td>
+<td style="text-align: right;">0</td>
+<td>LR 曲线位置错位</td>
+</tr>
+<tr>
+<td><code>scaler.state_dict()</code></td>
+<td>AMP</td>
+<td style="text-align: right;">0</td>
+<td>scale 与增长计数复位</td>
+</tr>
+<tr>
+<td>EMA 缓冲区</td>
+<td>训练脚本</td>
+<td style="text-align: right;">1,051,648</td>
+<td>推理用的那份权重丢失</td>
+</tr>
+<tr>
+<td>RNG 状态</td>
+<td>全局</td>
+<td style="text-align: right;">5,056</td>
+<td>dropout、增强、采样序列全部改变</td>
+</tr>
+<tr>
+<td>sampler / dataloader 游标</td>
+<td>数据层</td>
+<td style="text-align: right;">0</td>
+<td>重复或跳过样本</td>
+</tr>
+<tr>
+<td>global_step / 消费 token</td>
+<td>训练脚本</td>
+<td style="text-align: right;">0</td>
+<td>日志、调度与预算对不上</td>
+</tr>
+<tr>
+<td>FP8 amax 历史 / 量化 scale</td>
+<td>低精度模块</td>
+<td style="text-align: right;">0</td>
+<td>delayed scaling 从头估计</td>
+</tr>
+<tr>
+<td>adapter / teacher 引用</td>
+<td>配方</td>
+<td style="text-align: right;">0</td>
+<td>合并到错的 base 上，静默产出错模型</td>
+</tr>
+</tbody>
+</table>
+<p>optimizer 状态是参数的两倍（m 和 v），这是字节的大头；而 <code>scheduler</code>、<code>scaler</code>、游标和引用加起来不到 100 字节，缺了却直接破坏"这是同一次训练"的保证。<strong>按字节排序和按重要性排序是两张完全不同的表。</strong></p>
+<p>按训练类型再切一刀，需求并不一样：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>预训练</th>
+<th>SFT</th>
+<th>KD</th>
+<th>RL</th>
+<th>flow/扩散</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EMA 权重</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>必须（常是最终产物）</td>
+</tr>
+<tr>
+<td>adapter 权重</td>
+<td>—</td>
+<td>LoRA 时必须</td>
+<td>学生用 adapter 时必须</td>
+<td>必须</td>
+<td>LoRA 时必须</td>
+</tr>
+<tr>
+<td>base / teacher 引用</td>
+<td>—</td>
+<td>必须记 revision</td>
+<td>必须记 teacher revision</td>
+<td>必须记 reference 模型</td>
+<td>必须记 VAE / 文本编码器</td>
+</tr>
+<tr>
+<td>reward / critic 状态</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>必须（各自的参数与 optimizer）</td>
+<td>—</td>
+</tr>
+<tr>
+<td>rollout 队列与策略版本</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>必须</td>
+<td>—</td>
+</tr>
+<tr>
+<td>teacher 特征缓存</td>
+<td>—</td>
+<td>—</td>
+<td>可重建（记住缓存键即可）</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<h3 id="async_save">四个时刻：async_save 返回不等于保存完成</h3>
+<p>用真实 DCP 跑一次，四个时刻看得很清楚：</p>
+<div class="highlight"><pre><span></span><code>async_save 立刻返回 Future，此时目录内容：[]
+Future 是否已完成：False
+result() 之后：['.metadata', '__0_0.distcp']，完整性=True
+</code></pre></div>
+
+<p>同步保存写完就是完整的；异步保存返回时目录还是空的。中间有两个独立的完成信号：<strong>staging 完成</strong>表示张量已经被拷进暂存缓冲，训练可以继续改参数；<strong>Future 完成</strong>表示文件真的落盘。TorchTitan 的训练循环在 <code>optimizers.step()</code> 之前调 <code>checkpointer.maybe_wait_for_staging()</code>，等的正是第一个信号而不是第二个——参数不能在暂存完成前被改写，但也没必要等磁盘。</p>
+<p>四个时刻各自崩一次，磁盘上留下的东西完全不同：</p>
+<table>
+<thead>
+<tr>
+<th>注入的失败</th>
+<th>目录状态</th>
+<th>latest 选择器的判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>保存前崩溃</td>
+<td>目录不存在</td>
+<td>拒绝：缺少 <code>.metadata</code></td>
+</tr>
+<tr>
+<td>staging 后、写文件前崩溃</td>
+<td>空目录</td>
+<td>拒绝：缺少 <code>.metadata</code></td>
+</tr>
+<tr>
+<td>分片写入中断（删掉 <code>__0_0.distcp</code>）</td>
+<td>有 <code>.metadata</code>，少一个分片</td>
+<td>拒绝：分片文件缺失</td>
+</tr>
+<tr>
+<td>提交前崩溃（删掉 <code>.metadata</code>）</td>
+<td>分片齐全，没有元数据</td>
+<td>拒绝：缺少 <code>.metadata</code></td>
+</tr>
+</tbody>
+</table>
+<p>第三行是最危险的一种：目录里有元数据、有文件、时间戳也最新，<strong>按 mtime 或按目录名取最大都会选中它</strong>。判据必须是"元数据存在，且它 <code>storage_data</code> 里引用的每个分片文件都在"。</p>
+<p>真去加载残缺目录，两种情况都抛 <code>CheckpointException</code>。这里有个容易踩的细节：</p>
+<div class="highlight"><pre><span></span><code>注意 CheckpointException 的基类是 BaseException，不是 Exception——只写 except Exception 抓不到它。
+</code></pre></div>
+
+<p>训练脚本里那种"包一层 try/except Exception 然后回退到上一个 checkpoint"的写法，遇到它会直接让进程退出。</p>
+<h3 id="dcp">重新分片：DCP 存的是逻辑张量加区间</h3>
+<p>用 2 个 rank 保存、4 个 rank 加载，同一份 checkpoint：</p>
+<div class="highlight"><pre><span></span><code>[save] world=2：本 rank 的 local shape=(4, 8)
+  文件：['.metadata', '__0_0.distcp', '__1_0.distcp']
+  元数据里的 2 个 chunk：
+    offsets=(0, 0) sizes=(4, 8)
+    offsets=(4, 0) sizes=(4, 8)
+
+[load] world=4：每 rank 现在持有 (2, 8)，保存时的 chunk 数=2
+  还原出的完整张量与原始张量相等：True；step=7
+</code></pre></div>
+
+<p>元数据里存的是<strong>逻辑张量的形状加上每片的 offsets/sizes</strong>，不是"rank0 的文件"和"rank1 的文件"。加载时每个 rank 按自己要的区间去读，读的是哪几个文件、跨不跨文件边界都由 planner 算出来。所以 2→4 不需要先合并再切分，4→3 这种不整除的情况也成立。</p>
+<p>这解释了两条边界：</p>
+<ul>
+<li><strong>布局能恢复，不代表训练轨迹能接上。</strong> 参数和 optimizer 状态确实按新布局还原了，但数据分片方式、每 rank 的有效 batch、以及依赖 world size 的 RNG 流都变了。换 world size 之后是"从这个权重和 optimizer 状态开始的一段新训练"，不是"接着上次那条轨迹"。</li>
+<li><strong>不是所有实现都支持。</strong> 能不能重新分片取决于状态是不是以 DTensor / sharded tensor 的形式交给 DCP 的。把整份 optimizer 状态 <code>torch.save</code> 成一个 pickle 的实现，换 world size 时只能自己写转换脚本。</li>
+</ul>
+<h3 id="consumed-acknowledged">两个游标：consumed 与 acknowledged</h3>
+<p>12 条带 ID 的样本、batch=2，几件事一次看清：</p>
+<div class="highlight"><pre><span></span><code>map 数据集，worker=0：[[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11]]
+map 数据集，worker=2：[[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11]]
+iterable，worker=2，自行分片=True：[[0, 2], [4, 6], [8, 10], [1, 3], [5, 7], [9, 11]]
+iterable，worker=2，自行分片=False：共 24 条，去重后 12 条 ← 每个 worker 都重放了全部样本
+</code></pre></div>
+
+<p>map 数据集的顺序由 sampler 决定，worker 数不影响它；iterable 数据集必须自己按 <code>worker_id</code> 分片，否则每个 worker 都会把整个数据集再放一遍——<strong>数据量悄悄翻倍，loss 曲线还很正常</strong>。</p>
+<p>预取把第二个游标引了出来：<code>worker&gt;0</code> 时，消费第 1 个 batch 的同时 worker 已经在准备后面的。崩溃时预取队列里的样本一次更新都没参与过，把"已读取"当恢复点就会跳过它们。checkpoint 只能记"已提交"。</p>
+<p>跨 rank 分配还有尾 batch 问题：12 条样本、2 个 rank、batch=2 时两 rank 各 3 个 batch；样本数不能整除时必须补齐或让所有 rank 一起丢，否则某个 rank 会多进入一次 collective，整个作业卡住。</p>
+<h3 id="_5">严格恢复：五项同时对上才算</h3>
+<p>训练两步，在第一步之后保存，恢复后跑第二步：</p>
+<div class="highlight"><pre><span></span><code>不中断：step1 [0, 1] loss=1.58313155 lr=0.005
+        step2 [2, 3] loss=0.92658472 grad_norm=1.24410689 lr=0.0025
+恢复后：step2 [2, 3] loss=0.92658472 grad_norm=1.24410689 lr=0.0025
+与参照的 fc1.weight 最大差=0.000e+00
+</code></pre></div>
+
+<p>逐项拿掉一个状态，坏的方式各不相同：</p>
+<table>
+<thead>
+<tr>
+<th>拿掉的状态</th>
+<th>样本 ID</th>
+<th style="text-align: right;">loss</th>
+<th style="text-align: right;">grad_norm</th>
+<th style="text-align: right;">lr</th>
+<th style="text-align: right;">参数最大差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>（完整恢复）</td>
+<td>[2, 3]</td>
+<td style="text-align: right;">0.92658472</td>
+<td style="text-align: right;">1.24410689</td>
+<td style="text-align: right;">0.00250</td>
+<td style="text-align: right;">0.000e+00</td>
+</tr>
+<tr>
+<td>optimizer</td>
+<td>[2, 3]</td>
+<td style="text-align: right;">0.92658472</td>
+<td style="text-align: right;">1.24410689</td>
+<td style="text-align: right;">0.00500</td>
+<td style="text-align: right;">1.258e-02</td>
+</tr>
+<tr>
+<td>scheduler</td>
+<td>[2, 3]</td>
+<td style="text-align: right;">0.92658472</td>
+<td style="text-align: right;">1.24410689</td>
+<td style="text-align: right;">0.00250</td>
+<td style="text-align: right;">0.000e+00</td>
+</tr>
+<tr>
+<td>RNG</td>
+<td>[2, 3]</td>
+<td style="text-align: right;">1.01567888</td>
+<td style="text-align: right;">1.24302387</td>
+<td style="text-align: right;">0.00250</td>
+<td style="text-align: right;">6.877e-03</td>
+</tr>
+<tr>
+<td>数据游标</td>
+<td>[0, 1]</td>
+<td style="text-align: right;">1.44408584</td>
+<td style="text-align: right;">1.97442365</td>
+<td style="text-align: right;">0.00250</td>
+<td style="text-align: right;">7.607e-03</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>optimizer</strong>：样本和 loss 都对，m/v 归零，而且 LR 也跟着回到初值——因为当前 LR 就住在 <code>param_groups</code> 里。</li>
+<li><strong>RNG</strong>：dropout 掩码变了，loss 当场就不一样。</li>
+<li><strong>数据游标</strong>：重放了已经训练过的样本，loss 看起来更低，其实是重复训练。</li>
+<li><strong>scheduler</strong>：这一步完全看不出来。</li>
+</ul>
+<p>最后一项值得追一句。StepLR 每步把 <code>param_groups</code> 里的 lr 乘 0.5，所以恢复 optimizer 顺带救回了当前 LR；但按 <code>last_epoch</code> 计算的调度没有这个巧合：</p>
+<table>
+<thead>
+<tr>
+<th>scheduler</th>
+<th>完整恢复后三步的 LR</th>
+<th>缺 scheduler 状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>StepLR(gamma=0.5)</td>
+<td>[0.000313, 0.000156, 7.8e-05]</td>
+<td>相同</td>
+</tr>
+<tr>
+<td>CosineAnnealingLR(T=10)</td>
+<td>[0.005, 0.003455, 0.002061]</td>
+<td>[0.006385, 0.00592, 0.005196]</td>
+</tr>
+<tr>
+<td>LambdaLR(warmup 5 步)</td>
+<td>[0.01, 0.01, 0.01]</td>
+<td>[0.004, 0.006, 0.008]</td>
+</tr>
+</tbody>
+</table>
+<p>cosine 与 warmup 立刻跳回曲线的错误位置。<strong>"我的恢复看起来没问题"往往只是因为用的调度恰好把状态藏在了别处。</strong></p>
+<h3 id="_6">一个只有实测才会发现的坑</h3>
+<p>写这套对拍时有一个必须处理的细节：<code>Optimizer.load_state_dict</code> 在 dtype 与 device 相同时会<strong>直接持有传进来的张量</strong>，不做拷贝。于是"从同一个快照恢复两次"的第二次会读到被第一次的 <code>optimizer.step()</code> 原地改过的 m/v。表现是两次完整恢复的结果不一致——判据从"参数逐元素相同"变成了"看运气"。恢复时对 state dict 做一次深拷贝，或者每次从磁盘重新读，才能保证快照是只读的。</p>
+<h3 id="_7">保存频率的预算</h3>
+<p>同步保存的开销随间隔变小而上升，故障时的期望重算随间隔变大而上升，两者之和有最小值。7B 模型（BF16 权重 + FP32 master + m/v = 14 字节/参数，单次 98.0 GB）、每步 3 秒、MTBF 6 小时：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">写带宽</th>
+<th style="text-align: right;">写一次</th>
+<th style="text-align: right;">最优间隔</th>
+<th style="text-align: right;">保存开销</th>
+<th style="text-align: right;">期望重算</th>
+<th style="text-align: right;">总浪费</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0.5 GB/s</td>
+<td style="text-align: right;">196.0 s</td>
+<td style="text-align: right;">每 1000 步</td>
+<td style="text-align: right;">6.53%</td>
+<td style="text-align: right;">6.94%</td>
+<td style="text-align: right;">13.48%</td>
+</tr>
+<tr>
+<td style="text-align: right;">2.0 GB/s</td>
+<td style="text-align: right;">49.0 s</td>
+<td style="text-align: right;">每 500 步</td>
+<td style="text-align: right;">3.27%</td>
+<td style="text-align: right;">3.47%</td>
+<td style="text-align: right;">6.74%</td>
+</tr>
+<tr>
+<td style="text-align: right;">8.0 GB/s</td>
+<td style="text-align: right;">12.2 s</td>
+<td style="text-align: right;">每 200 步</td>
+<td style="text-align: right;">2.04%</td>
+<td style="text-align: right;">1.39%</td>
+<td style="text-align: right;">3.43%</td>
+</tr>
+</tbody>
+</table>
+<p>这组数字是公式推演，不是任何一次真实 I/O 测量，但结构是可靠的：<strong>保存越频繁 goodput 不一定越高</strong>，最优点随写带宽移动。异步 staging 把第一项压到接近零，代价是暂存期间多占一份完整状态（分片后按 rank 均摊），而且 <code>optimizer.step</code> 必须等暂存完成。</p>
+<p>三类存储要分开记账：本地临时保存最快但节点挂了就没了，只能救进程级故障；共享盘能救节点故障，带宽通常是瓶颈；异地容灾能救机房故障，一般只留少量里程碑。恢复时间（读 checkpoint + 重建进程组 + 预热）与保存频率无关，但它是每次故障的固定损失，必须和期望重算量一起算。</p>
+<h3 id="checkpoint">阶段产物：同样叫 checkpoint，用途完全不同</h3>
+<table>
+<thead>
+<tr>
+<th>产物</th>
+<th>内容</th>
+<th>用途</th>
+<th>边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练 checkpoint（DCP 目录）</td>
+<td>参数 + optimizer + scheduler + RNG + 游标，按 rank 分片</td>
+<td>严格恢复这次训练</td>
+<td>不能直接被推理框架加载</td>
+</tr>
+<tr>
+<td>权重导出（safetensors / HF 目录）</td>
+<td>只有参数与 config、tokenizer</td>
+<td>冷启动、评测、部署</td>
+<td>不能恢复训练轨迹</td>
+</tr>
+<tr>
+<td>adapter（PEFT 目录）</td>
+<td>低秩增量 + base 名与 revision、rank、target 模块</td>
+<td>挂在匹配的 base 上</td>
+<td>换 base 会静默产出错模型</td>
+</tr>
+<tr>
+<td>merged 权重</td>
+<td>base 与 adapter 合并后的完整参数</td>
+<td>当普通模型部署</td>
+<td>失去单独更新 adapter 的能力；量化 base 合并需重新量化</td>
+</tr>
+<tr>
+<td>EMA 权重</td>
+<td>另一份参数，不含 optimizer</td>
+<td>推理与评测</td>
+<td>与训练权重不同，不能互相替代</td>
+</tr>
+<tr>
+<td>量化产物</td>
+<td>packed weight + scale/zero-point + 量化配置</td>
+<td>低精度部署</td>
+<td>反量化不回原始权重</td>
+</tr>
+<tr>
+<td>草稿模型导出</td>
+<td>draft 结构 + 词表映射 + 与 target 的对应</td>
+<td>投机解码部署</td>
+<td>与 target 不匹配就完全失效</td>
+</tr>
+</tbody>
+</table>
+<p>一个真实例子：SmolLM3 公开的 133 个分支全部是 Transformers 权重导出，可以冷启动、可以评测，但没有 optimizer/RNG/游标，<strong>不能严格恢复那次训练</strong>——原训练的 checkpoint 在作者的 S3 上。这条区别在 <a href="7.3-training-frameworks.html">7.3</a> 的配方里也能直接读到：<code>long_context_32k_to_64.yaml</code> 把 <code>load_optimizer</code> 与 <code>load_lr_scheduler</code> 设成 <code>False</code>，那一段就是从权重冷启动的新训练。</p>
+<hr />
+<h2 id="74-h">完整教学项目：真实训练的中断与恢复（7.4-H）</h2>
+<p>上面那张表是在 CPU 小例上做的，两步、五项状态、逐项拿掉。教学项目要在真实训练上做同一件事，并且要回答一个更硬的问题：<strong>恢复的验收判据到底是什么</strong>。</p>
+<p>实验用 63.91M 参数的 MiniMind 配置、seq 512、micro-batch 32、600 步的 cosine 计划（见 <a href="7.1-training-loop-systems.html">7.1</a> 的 F 任务），每 50 步保存一次完整状态（参数 + optimizer + scaler + RNG + 数据游标）。三条运行：</p>
+<ul>
+<li><strong>A</strong>：连续跑完 600 步；</li>
+<li><strong>B</strong>：跑到第 15 秒被 <code>SIGKILL</code>（最后一个已提交 checkpoint 在第 100 步），把该 checkpoint 冻结成 <code>ckpt-before-resume.pt</code>，再从它恢复到 600 步；</li>
+<li><strong>C</strong>：另起一个进程，从<strong>同一个</strong> <code>ckpt-before-resume.pt</code> 恢复到 600 步。</li>
+</ul>
+<p>C 的作用是分离两件事：B 与 C 的差异只来自"恢复机制 + 进程重启"，A 与 B 的差异里还混着"被杀之前那 100 步本来就是另一次运行"。</p>
+<table>
+<thead>
+<tr>
+<th>对比</th>
+<th style="text-align: right;">共同步数</th>
+<th style="text-align: right;">max |Δloss|</th>
+<th style="text-align: right;">mean |Δloss|</th>
+<th style="text-align: right;">max |Δgrad_norm|</th>
+<th style="text-align: right;">max |Δw|</th>
+<th>第 600 步 val / test</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A vs B（独立运行 + 恢复）</td>
+<td style="text-align: right;">61</td>
+<td style="text-align: right;">0.00968</td>
+<td style="text-align: right;">0.00303</td>
+<td style="text-align: right;">0.152</td>
+<td style="text-align: right;">0.0736</td>
+<td>4.06642 / 4.07987 对 4.06823 / 4.08583</td>
+</tr>
+<tr>
+<td>A vs C（独立运行 + 同一恢复点重放）</td>
+<td style="text-align: right;">51</td>
+<td style="text-align: right;">0.00957</td>
+<td style="text-align: right;">0.00339</td>
+<td style="text-align: right;">0.143</td>
+<td style="text-align: right;">0.0732</td>
+<td>同上对 4.06807 / 4.08574</td>
+</tr>
+<tr>
+<td>B vs C（同一恢复点，两次恢复）</td>
+<td style="text-align: right;">51</td>
+<td style="text-align: right;">0.00107</td>
+<td style="text-align: right;">0.00027</td>
+<td style="text-align: right;">0.017</td>
+<td style="text-align: right;">0.0121</td>
+<td>4.06823 对 4.06807</td>
+</tr>
+</tbody>
+</table>
+<p>三条运行的收尾状态字段完全一致：<code>cursor=19200</code>、<code>tokens_seen=9830400</code>、<code>targets_seen=9811200</code>，第 600 步的 LR 都是 <code>5.000e-05</code>。也就是说<strong>数据消费连续性、时钟位置和状态字段都严格对上了</strong>。</p>
+<p>但参数不是逐位相同的。即使 B 和 C 从同一个文件出发、用同一个窗口顺序和同一个种子，500 步之后仍有 <code>max|Δw|=0.0121</code>、<code>max|Δloss|=0.00107</code> 的差距——这是在 BF16 autocast + SDPA 下、同一台机器、同一批 kernel 上测到的运行间差异。独立运行之间（A vs B）的差距是它的 6–9 倍。</p>
+<p>结论有两条，第二条更重要：</p>
+<ol>
+<li>本项目<strong>不把"与另一条连续运行的最终权重逐位相同"作为恢复的验收判据</strong>，因为在这套数值设置下它本来就不成立。能严格验收的是：恢复点状态字段逐项相等、数据游标连续、LR 时钟回到正确位置、重放差距比独立运行小一个数量级。</li>
+<li>"恢复正确"与"重放可复现"是两个问题。前者靠状态清单和字段对拍，后者要靠确定性 kernel（确定性算法、固定规约顺序、<code>torch.use_deterministic_algorithms</code>）；本项目的规模不需要为后者付代价，但必须把这条差异写清楚，否则一次"恢复后 loss 差 0.001"会被误读成 bug。</li>
+</ol>
+<p>中断的成本也量到了：A 共 58.33 s；B 的两次进程合计 15 s（被杀）+ 55.98 s（恢复后 500 步）＝ 70.98 s，比连续运行多 21.7%。多出来的部分由两半构成：被杀进程自己耗掉的 15 s，以及最后一个已提交 checkpoint（第 100 步）到崩溃点（约第 154 步）之间被重放的约 54 步。恢复进程的第一步还比稳态贵——首个 step 含 CUDA 上下文与 kernel 预热，稳态约 0.097 s/step，恢复进程平均 0.112 s/step。</p>
+<p>对应的可运行入口：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">RUN</span><span class="o">=</span>/scratch/learn/work/out/teaching-lm-20260922
+bash<span class="w"> </span>labs/L7/run_teaching_checks.sh<span class="w"> </span>resume<span class="w">     </span><span class="c1"># A/B/C 三条 + 三份 compare.json</span>
+</code></pre></div>
+
+<p><code>ckpt-before-resume.pt</code> 是刻意冻结的：B 与 C 必须从同一个文件读取，否则"两次恢复是否一致"就退化成"两次训练是否一致"。这也是上游 DCP 的 <code>latest</code> 选择器之外必须自己保证的一条——恢复的起点要是一个只读快照。</p>
+<hr />
+<h2 id="_8">工程实现：源码解析</h2>
+<h3 id="latest">latest 选择器的判据</h3>
+<p>判断一个 checkpoint 目录能不能用，唯一可靠的方法是读元数据并核对它引用的文件：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">62</span> <span class="k">def</span><span class="w"> </span><span class="nf">is_complete</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">63</span> <span class="w">    </span><span class="sd">"""latest 选择器：只有元数据齐全且引用的分片都在，才认为可用。"""</span>
+<span class="linenos" aria-hidden="true">64</span>     <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">path</span> <span class="o">/</span> <span class="s2">".metadata"</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">65</span>         <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">"缺少 .metadata（提交未完成）"</span>
+<span class="linenos" aria-hidden="true">66</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">67</span>         <span class="n">md</span> <span class="o">=</span> <span class="n">FileSystemReader</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">))</span><span class="o">.</span><span class="n">read_metadata</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">68</span>     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">69</span>         <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"元数据不可读：</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">70</span>     <span class="n">referenced</span> <span class="o">=</span> <span class="p">{</span><span class="n">item</span><span class="o">.</span><span class="n">relative_path</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">md</span><span class="o">.</span><span class="n">storage_data</span><span class="o">.</span><span class="n">values</span><span class="p">()}</span>
+<span class="linenos" aria-hidden="true">71</span>     <span class="n">missing</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">referenced</span> <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">path</span> <span class="o">/</span> <span class="n">r</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">72</span>     <span class="k">if</span> <span class="n">missing</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">73</span>         <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"分片文件缺失：</span><span class="si">{</span><span class="n">missing</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">74</span>     <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">md</span><span class="o">.</span><span class="n">state_dict_metadata</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个条目，</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">referenced</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个分片文件"</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/dcp_checkpoint_contract.py 第 62–75 行</code><a href="../code/labs/L7/dcp_checkpoint_contract.py.html#labs-L7-dcp_checkpoint_contract-py-L-62">在完整文件中打开 &rarr;</a></div></div>
+<p><code>md.storage_data</code> 里每个条目带一个 <code>relative_path</code>，把它们收集起来逐个检查存在性，就能挡住"分片写到一半"的目录。只看目录是否存在、只看 <code>.metadata</code> 是否存在、或者按 mtime 取最新，都会在这一类失败上选错。</p>
+<h3 id="_9">恢复必须从只读快照出发</h3>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">156</span> <span class="k">def</span><span class="w"> </span><span class="nf">restore</span><span class="p">(</span><span class="n">snap</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">drop</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">157</span>     <span class="n">model</span><span class="p">,</span> <span class="n">opt</span><span class="p">,</span> <span class="n">sched</span> <span class="o">=</span> <span class="n">build</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">158</span>     <span class="c1"># 必须深拷贝：Optimizer.load_state_dict 在 dtype/device 相同时会直接持有</span>
+<span class="linenos" aria-hidden="true">159</span>     <span class="c1"># 传进来的张量，之后的 step 会原地改写它们——也就是改写你的"备份"。</span>
+<span class="linenos" aria-hidden="true">160</span>     <span class="n">snap</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">snap</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">161</span>     <span class="n">model</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">snap</span><span class="p">[</span><span class="s2">"model"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">162</span>     <span class="k">if</span> <span class="n">drop</span> <span class="o">!=</span> <span class="s2">"optimizer"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">163</span>         <span class="n">opt</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">snap</span><span class="p">[</span><span class="s2">"optimizer"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">164</span>     <span class="k">if</span> <span class="n">drop</span> <span class="o">!=</span> <span class="s2">"scheduler"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">165</span>         <span class="n">sched</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">snap</span><span class="p">[</span><span class="s2">"scheduler"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">166</span>     <span class="k">if</span> <span class="n">drop</span> <span class="o">!=</span> <span class="s2">"rng"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">167</span>         <span class="n">torch</span><span class="o">.</span><span class="n">set_rng_state</span><span class="p">(</span><span class="n">snap</span><span class="p">[</span><span class="s2">"rng"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">168</span>     <span class="n">cursor</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">drop</span> <span class="o">==</span> <span class="s2">"cursor"</span> <span class="k">else</span> <span class="n">snap</span><span class="p">[</span><span class="s2">"cursor"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">169</span>     <span class="k">return</span> <span class="n">model</span><span class="p">,</span> <span class="n">opt</span><span class="p">,</span> <span class="n">sched</span><span class="p">,</span> <span class="n">cursor</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/resumable_training.py 第 156–169 行</code><a href="../code/labs/L7/resumable_training.py.html#labs-L7-resumable_training-py-L-156">在完整文件中打开 &rarr;</a></div></div>
+<p>三行注释背后是一个实测到的行为：不深拷贝时，第一次恢复后的 <code>optimizer.step()</code> 会原地改写快照里的 m/v。</p>
+<hr />
+<h2 id="mini">工程实现：mini 实现</h2>
+<p>状态清单的价值在于它同时列出<strong>归属、保存时刻、恢复入口和缺失后果</strong>四栏——只列字段名的清单没法用来判断"少了这个会怎样"：</p>
+<details class="fold srcfold"><summary>labs/L7/checkpoint_state_schema.py 全文（198 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""训练状态清单：谁拥有它、什么时候写、缺了会坏哪一条保证。</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">四段：</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">  A 实际状态   从真实对象里取 state_dict，列出字段、dtype 与字节</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="sd">  B 按训练类型 预训练 / SFT / KD / RL / flow 各自必须保存什么</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="sd">  C 阶段产物   训练 checkpoint、adapter、merged、EMA、量化与导出格式的区别</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">  D 预算       保存频率、staging 峰值、带宽、恢复时间与故障损失的关系</span>
+<span class="linenos" aria-hidden="true">  9</span> 
+<span class="linenos" aria-hidden="true"> 10</span> <span class="sd">Usage:</span>
+<span class="linenos" aria-hidden="true"> 11</span> <span class="sd">    python labs/L7/checkpoint_state_schema.py &gt; "$RUN_DIR/state-schema.txt"</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos" aria-hidden="true"> 14</span> 
+<span class="linenos" aria-hidden="true"> 15</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+<span class="linenos" aria-hidden="true"> 17</span> 
+<span class="linenos" aria-hidden="true"> 18</span> <span class="n">MiB</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">**</span> <span class="mi">20</span>
+<span class="linenos" aria-hidden="true"> 19</span> 
+<span class="linenos" aria-hidden="true"> 20</span> 
+<span class="linenos" aria-hidden="true"> 21</span> <span class="k">def</span><span class="w"> </span><span class="nf">head</span><span class="p">(</span><span class="n">title</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 22</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="s1">'='</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">78</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">title</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="s1">'='</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">78</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 23</span> 
+<span class="linenos" aria-hidden="true"> 24</span> 
+<span class="linenos" aria-hidden="true"> 25</span> <span class="k">def</span><span class="w"> </span><span class="nf">nbytes</span><span class="p">(</span><span class="n">t</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 26</span>     <span class="k">return</span> <span class="n">t</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">t</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">t</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true"> 27</span> 
+<span class="linenos" aria-hidden="true"> 28</span> 
+<span class="linenos" aria-hidden="true"> 29</span> <span class="c1"># ------------------------------------------------------------------ A 实际状态</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_a</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 31</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"A 一次真实训练里实际存在的状态"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 32</span>     <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 33</span>     <span class="n">model</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Sequential</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">),</span> <span class="n">nn</span><span class="o">.</span><span class="n">GELU</span><span class="p">(),</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">512</span><span class="p">,</span> <span class="mi">256</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 34</span>     <span class="n">opt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">1e-3</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 35</span>     <span class="n">sched</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">lr_scheduler</span><span class="o">.</span><span class="n">CosineAnnealingLR</span><span class="p">(</span><span class="n">opt</span><span class="p">,</span> <span class="n">T_max</span><span class="o">=</span><span class="mi">1000</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 36</span>     <span class="n">scaler</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">amp</span><span class="o">.</span><span class="n">GradScaler</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">,</span> <span class="n">enabled</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 37</span>     <span class="n">ema</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+<span class="linenos" aria-hidden="true"> 38</span> 
+<span class="linenos" aria-hidden="true"> 39</span>     <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">256</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 40</span>     <span class="n">loss</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 41</span>     <span class="n">scaler</span><span class="o">.</span><span class="n">scale</span><span class="p">(</span><span class="n">loss</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 42</span>     <span class="n">scaler</span><span class="o">.</span><span class="n">unscale_</span><span class="p">(</span><span class="n">opt</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 43</span>     <span class="n">scaler</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">opt</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 44</span>     <span class="n">scaler</span><span class="o">.</span><span class="n">update</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 45</span>     <span class="n">sched</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 46</span> 
+<span class="linenos" aria-hidden="true"> 47</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true"> 48</span>     <span class="n">params</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">nbytes</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true"> 49</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"model.state_dict()"</span><span class="p">,</span> <span class="s2">"模型"</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">())</span><span class="si">}</span><span class="s2"> 个张量"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 50</span>                  <span class="n">params</span><span class="p">,</span> <span class="s2">"每次保存"</span><span class="p">,</span> <span class="s2">"load_state_dict"</span><span class="p">,</span> <span class="s2">"没有它就没有模型"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 51</span>     <span class="n">opt_sd</span> <span class="o">=</span> <span class="n">opt</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 52</span>     <span class="n">opt_bytes</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">nbytes</span><span class="p">(</span><span class="n">t</span><span class="p">)</span> <span class="k">for</span> <span class="n">st</span> <span class="ow">in</span> <span class="n">opt_sd</span><span class="p">[</span><span class="s2">"state"</span><span class="p">]</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">st</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true"> 53</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"optimizer.state_dict()['state']"</span><span class="p">,</span> <span class="s2">"optimizer"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 54</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">opt_sd</span><span class="p">[</span><span class="s1">'state'</span><span class="p">])</span><span class="si">}</span><span class="s2"> 组 m/v/step"</span><span class="p">,</span> <span class="n">opt_bytes</span><span class="p">,</span> <span class="s2">"每次保存"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 55</span>                  <span class="s2">"load_state_dict"</span><span class="p">,</span> <span class="s2">"m/v 归零，下一步的更新量与中断前不同"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 56</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"optimizer.state_dict()['param_groups']"</span><span class="p">,</span> <span class="s2">"optimizer"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 57</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">opt_sd</span><span class="p">[</span><span class="s1">'param_groups'</span><span class="p">])</span><span class="si">}</span><span class="s2"> 组超参"</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"每次保存"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 58</span>                  <span class="s2">"load_state_dict"</span><span class="p">,</span> <span class="s2">"LR、weight decay、参数分组丢失"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 59</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"scheduler.state_dict()"</span><span class="p">,</span> <span class="s2">"scheduler"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 60</span>                  <span class="nb">str</span><span class="p">(</span><span class="n">sched</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()),</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"每次保存"</span><span class="p">,</span> <span class="s2">"load_state_dict"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 61</span>                  <span class="s2">"LR 回到起点，warmup 与衰减位置错位"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 62</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"scaler.state_dict()"</span><span class="p">,</span> <span class="s2">"AMP"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">scaler</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()),</span> <span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 63</span>                  <span class="s2">"每次保存"</span><span class="p">,</span> <span class="s2">"load_state_dict"</span><span class="p">,</span> <span class="s2">"scale 与增长计数复位，可能立刻溢出或长期偏小"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 64</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"EMA 缓冲区"</span><span class="p">,</span> <span class="s2">"训练脚本"</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">ema</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个张量"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 65</span>                  <span class="nb">sum</span><span class="p">(</span><span class="n">nbytes</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">ema</span><span class="o">.</span><span class="n">values</span><span class="p">()),</span> <span class="s2">"每次保存"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 66</span>                  <span class="s2">"自定义"</span><span class="p">,</span> <span class="s2">"推理用的那份权重丢失（F5-TTS 这类配方的最终产物）"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 67</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"torch RNG / CUDA RNG"</span><span class="p">,</span> <span class="s2">"全局"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 68</span>                  <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">get_rng_state</span><span class="p">()</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2"> 的 ByteTensor"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 69</span>                  <span class="n">nbytes</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">get_rng_state</span><span class="p">()),</span> <span class="s2">"每次保存"</span><span class="p">,</span> <span class="s2">"set_rng_state"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 70</span>                  <span class="s2">"dropout、数据增强、采样序列全部改变"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 71</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"sampler / dataloader 游标"</span><span class="p">,</span> <span class="s2">"数据层"</span><span class="p">,</span> <span class="s2">"已提交样本号或 shard+offset"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 72</span>                  <span class="mi">0</span><span class="p">,</span> <span class="s2">"更新提交后"</span><span class="p">,</span> <span class="s2">"自定义或 StatefulDataLoader"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 73</span>                  <span class="s2">"重复或跳过样本，epoch 边界错位"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 74</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"global_step / 消费 token 数"</span><span class="p">,</span> <span class="s2">"训练脚本"</span><span class="p">,</span> <span class="s2">"标量"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 75</span>                  <span class="mi">0</span><span class="p">,</span> <span class="s2">"每次保存"</span><span class="p">,</span> <span class="s2">"自定义"</span><span class="p">,</span> <span class="s2">"日志、调度与预算全部对不上"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 76</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"FP8 amax 历史 / 量化 scale"</span><span class="p">,</span> <span class="s2">"低精度模块"</span><span class="p">,</span> <span class="s2">"每张量一段定长 buffer"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 77</span>                  <span class="mi">0</span><span class="p">,</span> <span class="s2">"每次保存"</span><span class="p">,</span> <span class="s2">"模块自身"</span><span class="p">,</span> <span class="s2">"delayed scaling 的缩放因子从头估计"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 78</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"adapter / teacher 的引用"</span><span class="p">,</span> <span class="s2">"配方"</span><span class="p">,</span> <span class="s2">"base revision、adapter 路径"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 79</span>                  <span class="mi">0</span><span class="p">,</span> <span class="s2">"每次保存"</span><span class="p">,</span> <span class="s2">"配置"</span><span class="p">,</span> <span class="s2">"合并到错的 base 上，静默产出错模型"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 80</span> 
+<span class="linenos" aria-hidden="true"> 81</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'状态'</span><span class="si">:</span><span class="s2">&lt;38</span><span class="si">}{</span><span class="s1">'归属'</span><span class="si">:</span><span class="s2">&lt;12</span><span class="si">}{</span><span class="s1">'内容'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}{</span><span class="s1">'字节'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 82</span>     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">owner</span><span class="p">,</span> <span class="n">content</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="o">*</span><span class="n">_</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 83</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;38</span><span class="si">}{</span><span class="n">owner</span><span class="si">:</span><span class="s2">&lt;12</span><span class="si">}{</span><span class="n">content</span><span class="p">[:</span><span class="mi">26</span><span class="p">]</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}{</span><span class="n">size</span><span class="si">:</span><span class="s2">&gt;10,</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 84</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="s1">'状态'</span><span class="si">:</span><span class="s2">&lt;38</span><span class="si">}{</span><span class="s1">'保存时刻'</span><span class="si">:</span><span class="s2">&lt;12</span><span class="si">}{</span><span class="s1">'恢复入口'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2">缺失后果"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 85</span>     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">when</span><span class="p">,</span> <span class="n">how</span><span class="p">,</span> <span class="n">cost</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 86</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;38</span><span class="si">}{</span><span class="n">when</span><span class="si">:</span><span class="s2">&lt;12</span><span class="si">}{</span><span class="n">how</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}{</span><span class="n">cost</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 87</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">注意 scheduler 与 scaler 的 state_dict 只有几个标量，字节可以忽略，"</span>
+<span class="linenos" aria-hidden="true"> 88</span>           <span class="s2">"但缺了它们恢复出来的就不是同一次训练。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 89</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"字节多的项和重要的项不是同一批。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 90</span> 
+<span class="linenos" aria-hidden="true"> 91</span> 
+<span class="linenos" aria-hidden="true"> 92</span> <span class="c1"># ------------------------------------------------------------------ B 按类型</span>
+<span class="linenos" aria-hidden="true"> 93</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_b</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 94</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"B 按训练类型分列：必须保存 / 可重建 / 外部不可变依赖"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 95</span>     <span class="n">columns</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"预训练"</span><span class="p">,</span> <span class="s2">"SFT"</span><span class="p">,</span> <span class="s2">"KD"</span><span class="p">,</span> <span class="s2">"RL"</span><span class="p">,</span> <span class="s2">"flow/扩散"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 96</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 97</span>         <span class="p">(</span><span class="s2">"模型参数"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"必须"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">5</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true"> 98</span>         <span class="p">(</span><span class="s2">"optimizer m/v"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"必须"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">5</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true"> 99</span>         <span class="p">(</span><span class="s2">"scheduler 位置"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"必须"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">5</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">100</span>         <span class="p">(</span><span class="s2">"AMP scale"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">101</span>         <span class="p">(</span><span class="s2">"RNG"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须（噪声与时间采样）"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">102</span>         <span class="p">(</span><span class="s2">"数据游标"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"按 rollout 定义"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">103</span>         <span class="p">(</span><span class="s2">"EMA 权重"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"必须（常是最终产物）"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">104</span>         <span class="p">(</span><span class="s2">"adapter 权重"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"—"</span><span class="p">,</span> <span class="s2">"LoRA 时必须"</span><span class="p">,</span> <span class="s2">"学生用 adapter 时必须"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"LoRA 时必须"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">105</span>         <span class="p">(</span><span class="s2">"base / teacher 引用"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"—"</span><span class="p">,</span> <span class="s2">"必须记 revision"</span><span class="p">,</span> <span class="s2">"必须记 teacher revision"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">106</span>                                  <span class="s2">"必须记 reference 模型"</span><span class="p">,</span> <span class="s2">"必须记 VAE/文本编码器"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">107</span>         <span class="p">(</span><span class="s2">"reward / critic 状态"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"必须（各自的参数与 optimizer）"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">108</span>         <span class="p">(</span><span class="s2">"rollout 队列与策略版本"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"必须"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">109</span>         <span class="p">(</span><span class="s2">"teacher 特征缓存"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"可重建（记住缓存键即可）"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">,</span> <span class="s2">"—"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">110</span>         <span class="p">(</span><span class="s2">"量化 / FP8 scale 状态"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"有则必须"</span><span class="p">,</span> <span class="s2">"有则必须"</span><span class="p">,</span> <span class="s2">"有则必须"</span><span class="p">,</span> <span class="s2">"有则必须"</span><span class="p">,</span> <span class="s2">"有则必须"</span><span class="p">]),</span>
+<span class="linenos" aria-hidden="true">111</span>     <span class="p">]</span>
+<span class="linenos" aria-hidden="true">112</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'状态'</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">c</span><span class="si">:</span><span class="s2">&lt;16</span><span class="si">}</span><span class="s2">"</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">columns</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">113</span>     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">cells</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">114</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">c</span><span class="si">:</span><span class="s2">&lt;16</span><span class="si">}</span><span class="s2">"</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">cells</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">115</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">三类要分开：必须保存（丢了就不是同一次训练）、可重建（有键就能再算）、"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">116</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"外部不可变依赖（base 权重、teacher、数据版本——它们不进 checkpoint，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">117</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"但 checkpoint 必须记住指向它们的标识）。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">118</span> 
+<span class="linenos" aria-hidden="true">119</span> 
+<span class="linenos" aria-hidden="true">120</span> <span class="c1"># ------------------------------------------------------------------ C 阶段产物</span>
+<span class="linenos" aria-hidden="true">121</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_c</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">122</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"C 阶段产物：同样叫 checkpoint，用途完全不同"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">123</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos" aria-hidden="true">124</span>         <span class="p">(</span><span class="s2">"训练 checkpoint（DCP 目录）"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">125</span>          <span class="s2">"参数 + optimizer + scheduler + RNG + 游标，按 rank 分片"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">126</span>          <span class="s2">"严格恢复这次训练"</span><span class="p">,</span> <span class="s2">"不能直接被推理框架加载"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">127</span>         <span class="p">(</span><span class="s2">"权重导出（safetensors / HF 目录）"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">128</span>          <span class="s2">"只有参数与 config、tokenizer"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">129</span>          <span class="s2">"冷启动、评测、部署"</span><span class="p">,</span> <span class="s2">"不能恢复训练轨迹"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">130</span>         <span class="p">(</span><span class="s2">"adapter（PEFT 目录）"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">131</span>          <span class="s2">"低秩增量 + adapter_config（base 名与 revision、rank、target 模块）"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">132</span>          <span class="s2">"挂在匹配的 base 上服务或继续训练"</span><span class="p">,</span> <span class="s2">"换 base 会静默产出错模型"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">133</span>         <span class="p">(</span><span class="s2">"merged 权重"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">134</span>          <span class="s2">"base 与 adapter 合并后的完整参数"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">135</span>          <span class="s2">"当作普通模型部署"</span><span class="p">,</span> <span class="s2">"失去单独更新 adapter 的能力；量化 base 合并需重新量化"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">136</span>         <span class="p">(</span><span class="s2">"EMA 权重"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">137</span>          <span class="s2">"另一份参数，不含 optimizer"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">138</span>          <span class="s2">"推理与评测（扩散/TTS 常用）"</span><span class="p">,</span> <span class="s2">"与训练权重不同，不能互相替代"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">139</span>         <span class="p">(</span><span class="s2">"量化产物"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">140</span>          <span class="s2">"packed weight + scale/zero-point + 量化配置"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">141</span>          <span class="s2">"低精度部署"</span><span class="p">,</span> <span class="s2">"反量化不回原始权重；QAT 的训练态与部署态是两份"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">142</span>         <span class="p">(</span><span class="s2">"草稿模型导出"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">143</span>          <span class="s2">"draft 结构 + 词表映射 + 与 target 的对应关系"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">144</span>          <span class="s2">"投机解码部署"</span><span class="p">,</span> <span class="s2">"与 target 不匹配就完全失效"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">145</span>     <span class="p">]</span>
+<span class="linenos" aria-hidden="true">146</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'产物'</span><span class="si">:</span><span class="s2">&lt;30</span><span class="si">}{</span><span class="s1">'内容'</span><span class="si">:</span><span class="s2">&lt;42</span><span class="si">}{</span><span class="s1">'用途'</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2">边界"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">147</span>     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">content</span><span class="p">,</span> <span class="n">use</span><span class="p">,</span> <span class="n">limit</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">148</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;30</span><span class="si">}{</span><span class="n">content</span><span class="si">:</span><span class="s2">&lt;42</span><span class="si">}{</span><span class="n">use</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}{</span><span class="n">limit</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">149</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">一条实际存在的例子：SmolLM3 公开的 133 个分支是 Transformers 权重导出，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">150</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"可以冷启动、可以评测，但没有 optimizer/RNG/游标，不能严格恢复那次训练。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">151</span> 
+<span class="linenos" aria-hidden="true">152</span> 
+<span class="linenos" aria-hidden="true">153</span> <span class="c1"># ------------------------------------------------------------------ D 预算</span>
+<span class="linenos" aria-hidden="true">154</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_d</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">155</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"D 保存频率的预算：goodput 不是越频繁越高"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">156</span>     <span class="n">params_b</span> <span class="o">=</span> <span class="mf">7.0</span>
+<span class="linenos" aria-hidden="true">157</span>     <span class="n">bytes_per_param</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">4</span> <span class="o">+</span> <span class="mi">8</span>            <span class="c1"># BF16 权重 + FP32 master + m/v</span>
+<span class="linenos" aria-hidden="true">158</span>     <span class="n">ckpt_bytes</span> <span class="o">=</span> <span class="n">params_b</span> <span class="o">*</span> <span class="mf">1e9</span> <span class="o">*</span> <span class="n">bytes_per_param</span>
+<span class="linenos" aria-hidden="true">159</span>     <span class="n">step_seconds</span> <span class="o">=</span> <span class="mf">3.0</span>
+<span class="linenos" aria-hidden="true">160</span>     <span class="n">write_bw</span> <span class="o">=</span> <span class="p">[</span><span class="mf">0.5e9</span><span class="p">,</span> <span class="mf">2e9</span><span class="p">,</span> <span class="mf">8e9</span><span class="p">]</span>           <span class="c1"># 共享盘 / 本地 NVMe / 并行文件系统</span>
+<span class="linenos" aria-hidden="true">161</span>     <span class="n">mtbf_hours</span> <span class="o">=</span> <span class="mf">6.0</span>
+<span class="linenos" aria-hidden="true">162</span> 
+<span class="linenos" aria-hidden="true">163</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  7B 模型、BF16 权重 + FP32 master + m/v = </span><span class="si">{</span><span class="n">bytes_per_param</span><span class="si">}</span><span class="s2"> 字节/参数"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">164</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  单次 checkpoint </span><span class="si">{</span><span class="n">ckpt_bytes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB；每步 </span><span class="si">{</span><span class="n">step_seconds</span><span class="si">}</span><span class="s2"> 秒；"</span>
+<span class="linenos" aria-hidden="true">165</span>           <span class="sa">f</span><span class="s2">"平均故障间隔 </span><span class="si">{</span><span class="n">mtbf_hours</span><span class="si">}</span><span class="s2"> 小时"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">166</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="s1">'写带宽'</span><span class="si">:</span><span class="s2">&lt;14</span><span class="si">}{</span><span class="s1">'写一次'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}{</span><span class="s1">'每 N 步保存'</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}{</span><span class="s1">'保存开销'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">167</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'期望重算'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}{</span><span class="s1">'总浪费'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}{</span><span class="s1">'最优 N'</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">168</span>     <span class="k">for</span> <span class="n">bw</span> <span class="ow">in</span> <span class="n">write_bw</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">169</span>         <span class="n">write_s</span> <span class="o">=</span> <span class="n">ckpt_bytes</span> <span class="o">/</span> <span class="n">bw</span>
+<span class="linenos" aria-hidden="true">170</span>         <span class="n">best</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">171</span>         <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">50</span><span class="p">,</span> <span class="mi">100</span><span class="p">,</span> <span class="mi">200</span><span class="p">,</span> <span class="mi">500</span><span class="p">,</span> <span class="mi">1000</span><span class="p">,</span> <span class="mi">2000</span><span class="p">,</span> <span class="mi">5000</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">172</span>             <span class="n">save_overhead</span> <span class="o">=</span> <span class="n">write_s</span> <span class="o">/</span> <span class="p">(</span><span class="n">n</span> <span class="o">*</span> <span class="n">step_seconds</span><span class="p">)</span>          <span class="c1"># 同步保存的时间占比</span>
+<span class="linenos" aria-hidden="true">173</span>             <span class="n">expected_lost</span> <span class="o">=</span> <span class="p">(</span><span class="n">n</span> <span class="o">*</span> <span class="n">step_seconds</span> <span class="o">/</span> <span class="mi">2</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">mtbf_hours</span> <span class="o">*</span> <span class="mi">3600</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">174</span>             <span class="n">total</span> <span class="o">=</span> <span class="n">save_overhead</span> <span class="o">+</span> <span class="n">expected_lost</span>
+<span class="linenos" aria-hidden="true">175</span>             <span class="k">if</span> <span class="n">best</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">total</span> <span class="o">&lt;</span> <span class="n">best</span><span class="p">[</span><span class="mi">1</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">176</span>                 <span class="n">best</span> <span class="o">=</span> <span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">total</span><span class="p">,</span> <span class="n">save_overhead</span><span class="p">,</span> <span class="n">expected_lost</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">177</span>         <span class="n">n</span><span class="p">,</span> <span class="n">total</span><span class="p">,</span> <span class="n">save_o</span><span class="p">,</span> <span class="n">lost</span> <span class="o">=</span> <span class="n">best</span>
+<span class="linenos" aria-hidden="true">178</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">bw</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">1e9</span><span class="si">:</span><span class="s2">&gt;6.1f</span><span class="si">}</span><span class="s2"> GB/s  </span><span class="si">{</span><span class="n">write_s</span><span class="si">:</span><span class="s2">&gt;9.1f</span><span class="si">}</span><span class="s2">s</span><span class="si">{</span><span class="n">n</span><span class="si">:</span><span class="s2">&gt;12</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">179</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">save_o</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">100</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2">%</span><span class="si">{</span><span class="n">lost</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">100</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2">%</span><span class="si">{</span><span class="n">total</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">100</span><span class="si">:</span><span class="s2">&gt;9.2f</span><span class="si">}</span><span class="s2">%</span><span class="si">{</span><span class="n">n</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">180</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  同步保存的开销随 N 反比下降，故障时的期望重算随 N 线性上升，两者之和有最小值。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">181</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  异步 staging 把第一项压到接近零，代价是 staging 期间的额外显存/内存峰值："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">182</span>     <span class="n">staging</span> <span class="o">=</span> <span class="n">ckpt_bytes</span> <span class="o">/</span> <span class="mf">1e9</span>
+<span class="linenos" aria-hidden="true">183</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    staging 峰值 ≈ 一份完整状态 </span><span class="si">{</span><span class="n">staging</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB（分片后按 rank 均摊），"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">184</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    并且在 staging 完成之前不能改写参数——所以 optimizer.step 要等它。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">185</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  三类存储要分开记账："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">186</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    本地临时保存  最快，节点挂了就没了，只能救进程级故障"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">187</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    共享盘持久化  能救节点故障，带宽通常是瓶颈"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">188</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    异地容灾      能救机房故障，延迟高，通常只保留少量里程碑"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">189</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  恢复时间 = 读 checkpoint + 重建进程组 + 预热，它与保存频率无关，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">190</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  但它决定了一次故障的固定损失，必须与期望重算量一起算。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">191</span> 
+<span class="linenos" aria-hidden="true">192</span> 
+<span class="linenos" aria-hidden="true">193</span> <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">194</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2"> | CPU"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">195</span>     <span class="n">section_a</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">196</span>     <span class="n">section_b</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">197</span>     <span class="n">section_c</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">198</span>     <span class="n">section_d</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/checkpoint_state_schema.py 全文（198 行）</code><a href="../code/labs/L7/checkpoint_state_schema.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L7/checkpoint_state_schema.py<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/state-schema.txt"</span>
+python<span class="w"> </span>labs/L7/resumable_training.py<span class="w">      </span>&gt;<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/resume.txt"</span>
+python<span class="w"> </span>labs/L7/dcp_checkpoint_contract.py<span class="w"> </span>--mode<span class="w"> </span>single<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--workdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/ckpt"</span><span class="w"> </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/dcp"</span>
+torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">2</span><span class="w"> </span>labs/L7/dcp_checkpoint_contract.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mode<span class="w"> </span>shard<span class="w"> </span>--phase<span class="w"> </span>save<span class="w"> </span>--workdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/ckpt"</span>
+torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">4</span><span class="w"> </span>labs/L7/dcp_checkpoint_contract.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mode<span class="w"> </span>shard<span class="w"> </span>--phase<span class="w"> </span>load<span class="w"> </span>--workdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/ckpt"</span>
+</code></pre></div>
+
+<p>真实训练上的中断恢复用教学项目入口（需要 GPU 与 7.8 的数据产品）：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">RUN</span><span class="o">=</span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/teaching-lm"</span>
+bash<span class="w"> </span>labs/L7/run_teaching_checks.sh<span class="w"> </span>resume<span class="w">     </span><span class="c1"># A/B/C + 三份 compare.json</span>
+</code></pre></div>
+
+<p><code>--workdir</code> 指向学习盘上的目录；重新分片的两条命令在 CPU 上用 gloo 就能跑。实测读数见上文各表。三个可做的消融：</p>
+<ul>
+<li>把 <code>is_complete</code> 换成"只看目录是否存在"，再跑一次失败注入，看 latest 会选中哪个目录。</li>
+<li>在 <code>--mode shard</code> 里把保存的 world size 改成 3、加载改成 2，确认不整除也能还原。</li>
+<li>在 <code>resumable_training.py</code> 的 <code>restore</code> 里去掉深拷贝，连续恢复两次，观察两次结果不再相同。</li>
+</ul>
+<hr />
+<h2 id="_10">原始现场</h2>
+<ul>
+<li><a href="../raw/results/local/7.4/20260915-checkpoint/state-schema.txt">训练状态清单与预算推演</a></li>
+<li><a href="../raw/results/local/7.4/20260915-checkpoint/dcp-single.txt">DCP 的同步/异步、四种失败注入与 latest 选择</a>（<a href="../raw/results/local/7.4/20260915-checkpoint/dcp/single.json">结构化结果</a>）</li>
+<li><a href="../raw/results/worldvln/7.4/20260915-reshard/shard.txt">2→4 重新分片</a>（<a href="../raw/results/worldvln/7.4/20260915-reshard/shard_save_2.json">save</a>、<a href="../raw/results/worldvln/7.4/20260915-reshard/shard_load_4.json">load</a>）</li>
+<li><a href="../raw/results/local/7.4/20260915-checkpoint/resume.txt">数据游标与严格恢复的逐项反例</a></li>
+<li><a href="../raw/results/local/7.4/20260915-checkpoint/manifest.json">运行环境与口径</a></li>
+<li><a href="../raw/results/crater2/7.4/20260922-teaching-resume/compare-B-vs-C/compare.json">真实训练的中断恢复对拍：A/B/C 三条与三份 compare.json</a>（<a href="../raw/results/crater2/7.4/20260922-teaching-resume/compare-A-vs-B/compare.json">A vs B</a>、<a href="../raw/results/crater2/7.4/20260922-teaching-resume/compare-A-vs-C/compare.json">A vs C</a>）</li>
+</ul>
+<details class="fold srcfold"><summary>labs/L7/dcp_checkpoint_contract.py 全文（265 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""DCP 的保存契约：同步保存、异步 staging、四种失败注入与 2→4 重新分片。</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">两种模式：</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">  single  单进程：真实 dcp.save / dcp.async_save，注入四种失败，</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="sd">          再用一个只认完整 checkpoint 的 latest 选择器验证结果</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="sd">  shard   torchrun 下用 DTensor 分片保存，换一个 world size 加载，</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">          比较分片元数据与还原后的张量</span>
+<span class="linenos" aria-hidden="true">  9</span> 
+<span class="linenos" aria-hidden="true"> 10</span> <span class="sd">写入目录由 --workdir 指定（必须在学习盘上）。</span>
+<span class="linenos" aria-hidden="true"> 11</span> 
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">Usage:</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="sd">    python labs/L7/dcp_checkpoint_contract.py --mode single --workdir "$RUN_DIR/ckpt"</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="sd">    torchrun --standalone --nproc_per_node=2 labs/L7/dcp_checkpoint_contract.py \\</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="sd">        --mode shard --phase save --workdir "$RUN_DIR/ckpt"</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="sd">    torchrun --standalone --nproc_per_node=4 labs/L7/dcp_checkpoint_contract.py \\</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="sd">        --mode shard --phase load --workdir "$RUN_DIR/ckpt"</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 19</span> <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos" aria-hidden="true"> 20</span> 
+<span class="linenos" aria-hidden="true"> 21</span> <span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos" aria-hidden="true"> 24</span> <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
+<span class="linenos" aria-hidden="true"> 25</span> <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="linenos" aria-hidden="true"> 26</span> 
+<span class="linenos" aria-hidden="true"> 27</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed.checkpoint</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dcp</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.checkpoint</span><span class="w"> </span><span class="kn">import</span> <span class="n">FileSystemReader</span>
+<span class="linenos" aria-hidden="true"> 31</span> 
+<span class="linenos" aria-hidden="true"> 32</span> 
+<span class="linenos" aria-hidden="true"> 33</span> <span class="k">def</span><span class="w"> </span><span class="nf">head</span><span class="p">(</span><span class="n">title</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 34</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="s1">'='</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">78</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">title</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="s1">'='</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">78</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 35</span> 
+<span class="linenos" aria-hidden="true"> 36</span> 
+<span class="linenos" aria-hidden="true"> 37</span> <span class="c1"># ------------------------------------------------------------------ 训练状态</span>
+<span class="linenos" aria-hidden="true"> 38</span> <span class="k">def</span><span class="w"> </span><span class="nf">make_state</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 39</span>     <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 40</span>     <span class="n">model</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 41</span>     <span class="n">opt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">(),</span> <span class="n">lr</span><span class="o">=</span><span class="mf">1e-3</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 42</span>     <span class="n">model</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 43</span>     <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="mi">1</span><span class="p">)):</span>          <span class="c1"># 至少一次 step，让 m/v 存在</span>
+<span class="linenos" aria-hidden="true"> 44</span>         <span class="n">opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 45</span>     <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>                          <span class="c1"># step=0 表示"空状态"，用于加载目标</span>
+<span class="linenos" aria-hidden="true"> 46</span>         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 47</span>             <span class="n">model</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">zero_</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 48</span>     <span class="n">sd</span> <span class="o">=</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 49</span>         <span class="s2">"model"</span><span class="p">:</span> <span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true"> 50</span>         <span class="s2">"optim"</span><span class="p">:</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">opt</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()[</span><span class="s2">"state"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 51</span>                   <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">v</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true"> 52</span>         <span class="s2">"global_step"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">step</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true"> 53</span>         <span class="s2">"data_cursor"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">step</span> <span class="o">*</span> <span class="mi">4</span><span class="p">),</span>      <span class="c1"># 已提交的样本数</span>
+<span class="linenos" aria-hidden="true"> 54</span>     <span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 55</span>     <span class="k">return</span> <span class="n">sd</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">opt</span>
+<span class="linenos" aria-hidden="true"> 56</span> 
+<span class="linenos" aria-hidden="true"> 57</span> 
+<span class="linenos" aria-hidden="true"> 58</span> <span class="k">def</span><span class="w"> </span><span class="nf">checkpoint_files</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true"> 59</span>     <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">path</span><span class="o">.</span><span class="n">iterdir</span><span class="p">())</span> <span class="k">if</span> <span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">()</span> <span class="k">else</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true"> 60</span> 
+<span class="linenos" aria-hidden="true"> 61</span> 
+<span class="linenos" aria-hidden="true"> 62</span> <span class="k">def</span><span class="w"> </span><span class="nf">is_complete</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true"> 63</span> <span class="w">    </span><span class="sd">"""latest 选择器：只有元数据齐全且引用的分片都在，才认为可用。"""</span>
+<span class="linenos" aria-hidden="true"> 64</span>     <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">path</span> <span class="o">/</span> <span class="s2">".metadata"</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 65</span>         <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">"缺少 .metadata（提交未完成）"</span>
+<span class="linenos" aria-hidden="true"> 66</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 67</span>         <span class="n">md</span> <span class="o">=</span> <span class="n">FileSystemReader</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">))</span><span class="o">.</span><span class="n">read_metadata</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 68</span>     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 69</span>         <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"元数据不可读：</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true"> 70</span>     <span class="n">referenced</span> <span class="o">=</span> <span class="p">{</span><span class="n">item</span><span class="o">.</span><span class="n">relative_path</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">md</span><span class="o">.</span><span class="n">storage_data</span><span class="o">.</span><span class="n">values</span><span class="p">()}</span>
+<span class="linenos" aria-hidden="true"> 71</span>     <span class="n">missing</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">referenced</span> <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">path</span> <span class="o">/</span> <span class="n">r</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true"> 72</span>     <span class="k">if</span> <span class="n">missing</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 73</span>         <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"分片文件缺失：</span><span class="si">{</span><span class="n">missing</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true"> 74</span>     <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">md</span><span class="o">.</span><span class="n">state_dict_metadata</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个条目，</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">referenced</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个分片文件"</span>
+<span class="linenos" aria-hidden="true"> 75</span> 
+<span class="linenos" aria-hidden="true"> 76</span> 
+<span class="linenos" aria-hidden="true"> 77</span> <span class="k">def</span><span class="w"> </span><span class="nf">pick_latest</span><span class="p">(</span><span class="n">root</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Path</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]]:</span>
+<span class="linenos" aria-hidden="true"> 78</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true"> 79</span>     <span class="n">best</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true"> 80</span>     <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">root</span><span class="o">.</span><span class="n">iterdir</span><span class="p">()):</span>
+<span class="linenos" aria-hidden="true"> 81</span>         <span class="k">if</span> <span class="ow">not</span> <span class="n">d</span><span class="o">.</span><span class="n">is_dir</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 82</span>             <span class="k">continue</span>
+<span class="linenos" aria-hidden="true"> 83</span>         <span class="n">ok</span><span class="p">,</span> <span class="n">why</span> <span class="o">=</span> <span class="n">is_complete</span><span class="p">(</span><span class="n">d</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 84</span>         <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">d</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">ok</span><span class="p">,</span> <span class="n">why</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 85</span>         <span class="k">if</span> <span class="n">ok</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 86</span>             <span class="n">best</span> <span class="o">=</span> <span class="n">d</span>
+<span class="linenos" aria-hidden="true"> 87</span>     <span class="k">return</span> <span class="n">best</span><span class="p">,</span> <span class="n">rows</span>
+<span class="linenos" aria-hidden="true"> 88</span> 
+<span class="linenos" aria-hidden="true"> 89</span> 
+<span class="linenos" aria-hidden="true"> 90</span> <span class="c1"># ------------------------------------------------------------------ single</span>
+<span class="linenos" aria-hidden="true"> 91</span> <span class="k">def</span><span class="w"> </span><span class="nf">run_single</span><span class="p">(</span><span class="n">args</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 92</span>     <span class="n">root</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">workdir</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 93</span>     <span class="k">if</span> <span class="n">root</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 94</span>         <span class="n">shutil</span><span class="o">.</span><span class="n">rmtree</span><span class="p">(</span><span class="n">root</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 95</span>     <span class="n">root</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 96</span>     <span class="n">report</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"cases"</span><span class="p">:</span> <span class="p">[]}</span>
+<span class="linenos" aria-hidden="true"> 97</span> 
+<span class="linenos" aria-hidden="true"> 98</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"A 同步保存：写完就是完整的"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 99</span>     <span class="n">sd</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">make_state</span><span class="p">(</span><span class="n">step</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">100</span>     <span class="n">path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"step-0001-sync"</span>
+<span class="linenos" aria-hidden="true">101</span>     <span class="n">dcp</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">sd</span><span class="p">,</span> <span class="n">checkpoint_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">102</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">path</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> 的文件：</span><span class="si">{</span><span class="n">checkpoint_files</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">103</span>     <span class="n">ok</span><span class="p">,</span> <span class="n">why</span> <span class="o">=</span> <span class="n">is_complete</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">104</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  完整性：</span><span class="si">{</span><span class="n">ok</span><span class="si">}</span><span class="s2">（</span><span class="si">{</span><span class="n">why</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">105</span>     <span class="n">report</span><span class="p">[</span><span class="s2">"cases"</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"case"</span><span class="p">:</span> <span class="s2">"sync"</span><span class="p">,</span> <span class="s2">"files"</span><span class="p">:</span> <span class="n">checkpoint_files</span><span class="p">(</span><span class="n">path</span><span class="p">),</span> <span class="s2">"ok"</span><span class="p">:</span> <span class="n">ok</span><span class="p">})</span>
+<span class="linenos" aria-hidden="true">106</span> 
+<span class="linenos" aria-hidden="true">107</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"B 异步保存：返回、staging 完成、文件写完是三件事"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">108</span>     <span class="n">sd2</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">make_state</span><span class="p">(</span><span class="n">step</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">109</span>     <span class="n">path2</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"step-0002-async"</span>
+<span class="linenos" aria-hidden="true">110</span>     <span class="n">fut</span> <span class="o">=</span> <span class="n">dcp</span><span class="o">.</span><span class="n">async_save</span><span class="p">(</span><span class="n">sd2</span><span class="p">,</span> <span class="n">checkpoint_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">path2</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">111</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  async_save 立刻返回 </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">fut</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">，此时目录内容："</span>
+<span class="linenos" aria-hidden="true">112</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">checkpoint_files</span><span class="p">(</span><span class="n">path2</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">113</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  Future 是否已完成：</span><span class="si">{</span><span class="n">fut</span><span class="o">.</span><span class="n">done</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">114</span>     <span class="n">fut</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">115</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  result() 之后：</span><span class="si">{</span><span class="n">checkpoint_files</span><span class="p">(</span><span class="n">path2</span><span class="p">)</span><span class="si">}</span><span class="s2">，完整性=</span><span class="si">{</span><span class="n">is_complete</span><span class="p">(</span><span class="n">path2</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">116</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  返回值只说明 staging 已经把张量拷出来、训练可以继续改参数；"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">117</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  文件真正落盘要等 Future 完成。两者之间崩溃就会留下半个 checkpoint。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">118</span>     <span class="n">report</span><span class="p">[</span><span class="s2">"cases"</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"case"</span><span class="p">:</span> <span class="s2">"async"</span><span class="p">,</span> <span class="s2">"files"</span><span class="p">:</span> <span class="n">checkpoint_files</span><span class="p">(</span><span class="n">path2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">119</span>                             <span class="s2">"ok"</span><span class="p">:</span> <span class="n">is_complete</span><span class="p">(</span><span class="n">path2</span><span class="p">)[</span><span class="mi">0</span><span class="p">]})</span>
+<span class="linenos" aria-hidden="true">120</span> 
+<span class="linenos" aria-hidden="true">121</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"C 四种失败注入"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">122</span>     <span class="n">faults</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">123</span> 
+<span class="linenos" aria-hidden="true">124</span>     <span class="c1"># 1. 保存前失败：目录根本没建立</span>
+<span class="linenos" aria-hidden="true">125</span>     <span class="n">p</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"step-0003-before-save"</span>
+<span class="linenos" aria-hidden="true">126</span>     <span class="n">ok</span><span class="p">,</span> <span class="n">why</span> <span class="o">=</span> <span class="n">is_complete</span><span class="p">(</span><span class="n">p</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">127</span>     <span class="n">faults</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"保存前崩溃（目录不存在）"</span><span class="p">,</span> <span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">ok</span><span class="p">,</span> <span class="n">why</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">128</span> 
+<span class="linenos" aria-hidden="true">129</span>     <span class="c1"># 2. staging 之后、写文件之前失败：只有目录，没有任何文件</span>
+<span class="linenos" aria-hidden="true">130</span>     <span class="n">p</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"step-0004-after-staging"</span>
+<span class="linenos" aria-hidden="true">131</span>     <span class="n">p</span><span class="o">.</span><span class="n">mkdir</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">132</span>     <span class="n">ok</span><span class="p">,</span> <span class="n">why</span> <span class="o">=</span> <span class="n">is_complete</span><span class="p">(</span><span class="n">p</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">133</span>     <span class="n">faults</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"staging 后崩溃（空目录）"</span><span class="p">,</span> <span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">ok</span><span class="p">,</span> <span class="n">why</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">134</span> 
+<span class="linenos" aria-hidden="true">135</span>     <span class="c1"># 3. 文件写完前失败：删掉一个分片文件</span>
+<span class="linenos" aria-hidden="true">136</span>     <span class="n">sd3</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">make_state</span><span class="p">(</span><span class="n">step</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">137</span>     <span class="n">p</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"step-0005-partial-shard"</span>
+<span class="linenos" aria-hidden="true">138</span>     <span class="n">dcp</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">sd3</span><span class="p">,</span> <span class="n">checkpoint_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">139</span>     <span class="n">victim</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span><span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">p</span><span class="o">.</span><span class="n">iterdir</span><span class="p">()</span> <span class="k">if</span> <span class="n">f</span><span class="o">.</span><span class="n">suffix</span> <span class="o">==</span> <span class="s2">".distcp"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">140</span>     <span class="n">victim</span><span class="o">.</span><span class="n">unlink</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">141</span>     <span class="n">ok</span><span class="p">,</span> <span class="n">why</span> <span class="o">=</span> <span class="n">is_complete</span><span class="p">(</span><span class="n">p</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">142</span>     <span class="n">faults</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="sa">f</span><span class="s2">"分片写入中断（删除 </span><span class="si">{</span><span class="n">victim</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">）"</span><span class="p">,</span> <span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">ok</span><span class="p">,</span> <span class="n">why</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">143</span> 
+<span class="linenos" aria-hidden="true">144</span>     <span class="c1"># 4. manifest 提交前失败：分片都在，元数据没写</span>
+<span class="linenos" aria-hidden="true">145</span>     <span class="n">sd4</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">make_state</span><span class="p">(</span><span class="n">step</span><span class="o">=</span><span class="mi">6</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">146</span>     <span class="n">p</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"step-0006-no-metadata"</span>
+<span class="linenos" aria-hidden="true">147</span>     <span class="n">dcp</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">sd4</span><span class="p">,</span> <span class="n">checkpoint_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">p</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">148</span>     <span class="p">(</span><span class="n">p</span> <span class="o">/</span> <span class="s2">".metadata"</span><span class="p">)</span><span class="o">.</span><span class="n">unlink</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">149</span>     <span class="n">ok</span><span class="p">,</span> <span class="n">why</span> <span class="o">=</span> <span class="n">is_complete</span><span class="p">(</span><span class="n">p</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">150</span>     <span class="n">faults</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"提交前崩溃（删除 .metadata）"</span><span class="p">,</span> <span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">ok</span><span class="p">,</span> <span class="n">why</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">151</span> 
+<span class="linenos" aria-hidden="true">152</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'注入的失败'</span><span class="si">:</span><span class="s2">&lt;32</span><span class="si">}{</span><span class="s1">'目录'</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}{</span><span class="s1">'可用'</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}</span><span class="s2">原因"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">153</span>     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">dirname</span><span class="p">,</span> <span class="n">ok</span><span class="p">,</span> <span class="n">why</span> <span class="ow">in</span> <span class="n">faults</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">154</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;32</span><span class="si">}{</span><span class="n">dirname</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}{</span><span class="nb">str</span><span class="p">(</span><span class="n">ok</span><span class="p">)</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}{</span><span class="n">why</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">155</span>     <span class="n">report</span><span class="p">[</span><span class="s2">"faults"</span><span class="p">]</span> <span class="o">=</span> <span class="p">[{</span><span class="s2">"fault"</span><span class="p">:</span> <span class="n">n</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">:</span> <span class="n">d</span><span class="p">,</span> <span class="s2">"usable"</span><span class="p">:</span> <span class="n">o</span><span class="p">,</span> <span class="s2">"reason"</span><span class="p">:</span> <span class="n">w</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">156</span>                         <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">d</span><span class="p">,</span> <span class="n">o</span><span class="p">,</span> <span class="n">w</span> <span class="ow">in</span> <span class="n">faults</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">157</span> 
+<span class="linenos" aria-hidden="true">158</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"D 真正加载残缺 checkpoint 会发生什么"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">159</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.checkpoint.api</span><span class="w"> </span><span class="kn">import</span> <span class="n">CheckpointException</span>
+<span class="linenos" aria-hidden="true">160</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  注意 CheckpointException 的基类是 "</span>
+<span class="linenos" aria-hidden="true">161</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">CheckpointException</span><span class="o">.</span><span class="vm">__mro__</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">，不是 Exception——"</span>
+<span class="linenos" aria-hidden="true">162</span>           <span class="sa">f</span><span class="s2">"只写 except Exception 抓不到它。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">163</span>     <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"step-0005-partial-shard"</span><span class="p">,</span> <span class="s2">"step-0006-no-metadata"</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">164</span>         <span class="n">target</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">make_state</span><span class="p">(</span><span class="n">step</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">165</span>         <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">166</span>             <span class="n">dcp</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">checkpoint_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">root</span> <span class="o">/</span> <span class="n">name</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">167</span>             <span class="n">msg</span> <span class="o">=</span> <span class="s2">"加载成功（说明这份残缺没有被发现）"</span>
+<span class="linenos" aria-hidden="true">168</span>         <span class="k">except</span> <span class="ne">BaseException</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">169</span>             <span class="n">msg</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="n">splitlines</span><span class="p">()[</span><span class="mi">0</span><span class="p">][:</span><span class="mi">110</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">170</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  加载 </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">：</span><span class="si">{</span><span class="n">msg</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">171</span>         <span class="n">report</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"load_errors"</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"dir"</span><span class="p">:</span> <span class="n">name</span><span class="p">,</span> <span class="s2">"error"</span><span class="p">:</span> <span class="n">msg</span><span class="p">})</span>
+<span class="linenos" aria-hidden="true">172</span> 
+<span class="linenos" aria-hidden="true">173</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"E latest 选择器只认完整的 checkpoint"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">174</span>     <span class="n">best</span><span class="p">,</span> <span class="n">rows</span> <span class="o">=</span> <span class="n">pick_latest</span><span class="p">(</span><span class="n">root</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">175</span>     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">ok</span><span class="p">,</span> <span class="n">why</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">176</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}{</span><span class="s1">'可用'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'拒绝'</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}{</span><span class="n">why</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">177</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  选中的 latest：</span><span class="si">{</span><span class="n">best</span><span class="o">.</span><span class="n">name</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">best</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'无'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">178</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  按 mtime 或按目录名取最大都会选中残缺目录；判据必须是"</span>
+<span class="linenos" aria-hidden="true">179</span>           <span class="s2">"元数据存在且它引用的分片文件都在。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">180</span>     <span class="n">report</span><span class="p">[</span><span class="s2">"latest"</span><span class="p">]</span> <span class="o">=</span> <span class="n">best</span><span class="o">.</span><span class="n">name</span> <span class="k">if</span> <span class="n">best</span> <span class="k">else</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">181</span> 
+<span class="linenos" aria-hidden="true">182</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"F 恢复之后状态对不对"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">183</span>     <span class="n">target</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">opt</span> <span class="o">=</span> <span class="n">make_state</span><span class="p">(</span><span class="n">step</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">184</span>     <span class="n">dcp</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">checkpoint_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">root</span> <span class="o">/</span> <span class="s2">"step-0002-async"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">185</span>     <span class="n">ref</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">make_state</span><span class="p">(</span><span class="n">step</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">186</span>     <span class="n">same</span> <span class="o">=</span> <span class="nb">all</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">target</span><span class="p">[</span><span class="s2">"model"</span><span class="p">][</span><span class="n">k</span><span class="p">],</span> <span class="n">ref</span><span class="p">[</span><span class="s2">"model"</span><span class="p">][</span><span class="n">k</span><span class="p">])</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">ref</span><span class="p">[</span><span class="s2">"model"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">187</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  model 张量一致：</span><span class="si">{</span><span class="n">same</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">188</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  optimizer 状态一致："</span>
+<span class="linenos" aria-hidden="true">189</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">all</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">target</span><span class="p">[</span><span class="s1">'optim'</span><span class="p">][</span><span class="n">k</span><span class="p">],</span><span class="w"> </span><span class="n">ref</span><span class="p">[</span><span class="s1">'optim'</span><span class="p">][</span><span class="n">k</span><span class="p">])</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">ref</span><span class="p">[</span><span class="s1">'optim'</span><span class="p">])</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">190</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  global_step=</span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">target</span><span class="p">[</span><span class="s1">'global_step'</span><span class="p">])</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos" aria-hidden="true">191</span>           <span class="sa">f</span><span class="s2">"data_cursor=</span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">target</span><span class="p">[</span><span class="s1">'data_cursor'</span><span class="p">])</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">192</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  参数、optimizer 状态、step 与数据游标必须来自同一次保存；"</span>
+<span class="linenos" aria-hidden="true">193</span>           <span class="s2">"任何一项单独恢复都会让训练轨迹与中断前不同。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">194</span>     <span class="k">return</span> <span class="n">report</span>
+<span class="linenos" aria-hidden="true">195</span> 
+<span class="linenos" aria-hidden="true">196</span> 
+<span class="linenos" aria-hidden="true">197</span> <span class="c1"># ------------------------------------------------------------------ shard</span>
+<span class="linenos" aria-hidden="true">198</span> <span class="k">def</span><span class="w"> </span><span class="nf">run_shard</span><span class="p">(</span><span class="n">args</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">199</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.tensor</span><span class="w"> </span><span class="kn">import</span> <span class="n">DTensor</span><span class="p">,</span> <span class="n">Shard</span><span class="p">,</span> <span class="n">distribute_tensor</span><span class="p">,</span> <span class="n">init_device_mesh</span>
+<span class="linenos" aria-hidden="true">200</span>     <span class="n">rank</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">"RANK"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">201</span>     <span class="n">world</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">"WORLD_SIZE"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">202</span>     <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="s2">"gloo"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">203</span>     <span class="n">mesh</span> <span class="o">=</span> <span class="n">init_device_mesh</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">,</span> <span class="p">(</span><span class="n">world</span><span class="p">,))</span>
+<span class="linenos" aria-hidden="true">204</span>     <span class="n">root</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">workdir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"sharded"</span>
+<span class="linenos" aria-hidden="true">205</span> 
+<span class="linenos" aria-hidden="true">206</span>     <span class="n">full</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mf">64.0</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">207</span>     <span class="n">dt</span> <span class="o">=</span> <span class="n">distribute_tensor</span><span class="p">(</span><span class="n">full</span><span class="p">,</span> <span class="n">mesh</span><span class="p">,</span> <span class="p">[</span><span class="n">Shard</span><span class="p">(</span><span class="mi">0</span><span class="p">)])</span>
+<span class="linenos" aria-hidden="true">208</span>     <span class="n">local</span> <span class="o">=</span> <span class="n">dt</span><span class="o">.</span><span class="n">to_local</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">209</span> 
+<span class="linenos" aria-hidden="true">210</span>     <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">phase</span> <span class="o">==</span> <span class="s2">"save"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">211</span>         <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">root</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">212</span>             <span class="n">shutil</span><span class="o">.</span><span class="n">rmtree</span><span class="p">(</span><span class="n">root</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">213</span>         <span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">214</span>         <span class="n">dcp</span><span class="o">.</span><span class="n">save</span><span class="p">({</span><span class="s2">"w"</span><span class="p">:</span> <span class="n">dt</span><span class="p">,</span> <span class="s2">"step"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mi">7</span><span class="p">)},</span> <span class="n">checkpoint_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">root</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">215</span>         <span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">216</span>         <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">217</span>             <span class="n">md</span> <span class="o">=</span> <span class="n">FileSystemReader</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">root</span><span class="p">))</span><span class="o">.</span><span class="n">read_metadata</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">218</span>             <span class="n">chunks</span> <span class="o">=</span> <span class="n">md</span><span class="o">.</span><span class="n">state_dict_metadata</span><span class="p">[</span><span class="s2">"w"</span><span class="p">]</span><span class="o">.</span><span class="n">chunks</span>
+<span class="linenos" aria-hidden="true">219</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"[save] world=</span><span class="si">{</span><span class="n">world</span><span class="si">}</span><span class="s2">：本 rank 的 local shape=</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">local</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">220</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  文件：</span><span class="si">{</span><span class="n">checkpoint_files</span><span class="p">(</span><span class="n">root</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">221</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  元数据里的 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个 chunk："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">222</span>             <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">223</span>                 <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    offsets=</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">offsets</span><span class="p">)</span><span class="si">}</span><span class="s2"> sizes=</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">sizes</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">224</span>         <span class="n">result</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"phase"</span><span class="p">:</span> <span class="s2">"save"</span><span class="p">,</span> <span class="s2">"world"</span><span class="p">:</span> <span class="n">world</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">225</span>                   <span class="s2">"local_shape"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">local</span><span class="o">.</span><span class="n">shape</span><span class="p">)}</span>
+<span class="linenos" aria-hidden="true">226</span>     <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">227</span>         <span class="n">empty</span> <span class="o">=</span> <span class="n">distribute_tensor</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="n">mesh</span><span class="p">,</span> <span class="p">[</span><span class="n">Shard</span><span class="p">(</span><span class="mi">0</span><span class="p">)])</span>
+<span class="linenos" aria-hidden="true">228</span>         <span class="n">state</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"w"</span><span class="p">:</span> <span class="n">empty</span><span class="p">,</span> <span class="s2">"step"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="mi">0</span><span class="p">)}</span>
+<span class="linenos" aria-hidden="true">229</span>         <span class="n">dcp</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">state</span><span class="p">,</span> <span class="n">checkpoint_id</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">root</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">230</span>         <span class="n">got</span> <span class="o">=</span> <span class="n">state</span><span class="p">[</span><span class="s2">"w"</span><span class="p">]</span><span class="o">.</span><span class="n">full_tensor</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">231</span>         <span class="n">ok</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">got</span><span class="p">,</span> <span class="n">full</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">232</span>         <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">233</span>             <span class="n">md</span> <span class="o">=</span> <span class="n">FileSystemReader</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">root</span><span class="p">))</span><span class="o">.</span><span class="n">read_metadata</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">234</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"[load] world=</span><span class="si">{</span><span class="n">world</span><span class="si">}</span><span class="s2">：每 rank 现在持有 "</span>
+<span class="linenos" aria-hidden="true">235</span>                   <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">state</span><span class="p">[</span><span class="s1">'w'</span><span class="p">]</span><span class="o">.</span><span class="n">to_local</span><span class="p">()</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos" aria-hidden="true">236</span>                   <span class="sa">f</span><span class="s2">"保存时的 chunk 数=</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">md</span><span class="o">.</span><span class="n">state_dict_metadata</span><span class="p">[</span><span class="s1">'w'</span><span class="p">]</span><span class="o">.</span><span class="n">chunks</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">237</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  还原出的完整张量与原始张量相等：</span><span class="si">{</span><span class="n">ok</span><span class="si">}</span><span class="s2">；step=</span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">state</span><span class="p">[</span><span class="s1">'step'</span><span class="p">])</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">238</span>             <span class="nb">print</span><span class="p">(</span><span class="s2">"  DCP 保存的是逻辑张量加上每片的 offsets/sizes，不是各 rank 的文件快照；"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">239</span>             <span class="nb">print</span><span class="p">(</span><span class="s2">"  因此换一个 world size 只是换一组读取区间，不需要先合并再切分。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">240</span>         <span class="n">result</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"phase"</span><span class="p">:</span> <span class="s2">"load"</span><span class="p">,</span> <span class="s2">"world"</span><span class="p">:</span> <span class="n">world</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">241</span>                   <span class="s2">"local_shape"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">state</span><span class="p">[</span><span class="s2">"w"</span><span class="p">]</span><span class="o">.</span><span class="n">to_local</span><span class="p">()</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span> <span class="s2">"equal"</span><span class="p">:</span> <span class="nb">bool</span><span class="p">(</span><span class="n">ok</span><span class="p">)}</span>
+<span class="linenos" aria-hidden="true">242</span>     <span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">243</span>     <span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">244</span>     <span class="k">return</span> <span class="n">result</span>
+<span class="linenos" aria-hidden="true">245</span> 
+<span class="linenos" aria-hidden="true">246</span> 
+<span class="linenos" aria-hidden="true">247</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">248</span>     <span class="n">ap</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">249</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--mode"</span><span class="p">,</span> <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="s2">"single"</span><span class="p">,</span> <span class="s2">"shard"</span><span class="p">],</span> <span class="n">default</span><span class="o">=</span><span class="s2">"single"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">250</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--phase"</span><span class="p">,</span> <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="s2">"save"</span><span class="p">,</span> <span class="s2">"load"</span><span class="p">],</span> <span class="n">default</span><span class="o">=</span><span class="s2">"save"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">251</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--workdir"</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">252</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--outdir"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">253</span>     <span class="n">args</span> <span class="o">=</span> <span class="n">ap</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">254</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">255</span>     <span class="n">report</span> <span class="o">=</span> <span class="n">run_single</span><span class="p">(</span><span class="n">args</span><span class="p">)</span> <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">mode</span> <span class="o">==</span> <span class="s2">"single"</span> <span class="k">else</span> <span class="n">run_shard</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">256</span>     <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">outdir</span> <span class="ow">and</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"RANK"</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">257</span>         <span class="n">out</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">outdir</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">258</span>         <span class="n">out</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">259</span>         <span class="n">name</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">mode</span> <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">mode</span> <span class="o">==</span> <span class="s2">"single"</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"shard_</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">phase</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">'WORLD_SIZE'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">260</span>         <span class="p">(</span><span class="n">out</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">.json"</span><span class="p">)</span><span class="o">.</span><span class="n">write_text</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">261</span>             <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">report</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">),</span> <span class="n">encoding</span><span class="o">=</span><span class="s2">"utf-8"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">262</span> 
+<span class="linenos" aria-hidden="true">263</span> 
+<span class="linenos" aria-hidden="true">264</span> <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">265</span>     <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/dcp_checkpoint_contract.py 全文（265 行）</code><a href="../code/labs/L7/dcp_checkpoint_contract.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<hr />
+<h2 id="_11">前沿</h2>
+<p>三个方向本章只做到机制层面：</p>
+<p><strong>异步 staging 的真实峰值。</strong> 本章用小张量验证了"返回 ≠ 落盘"的时序，但没有测过大模型下暂存缓冲的实际内存曲线，也没有测过 staging 与下一步计算的重叠程度。上游把暂存放在 pinned host memory 还是设备内存、是否分块流式写出，都会改变这条曲线，本项目保持 <code>UNVERIFIED</code>。</p>
+<p><strong>跨框架的 checkpoint 转换。</strong> Cosmos 的 DCP→HF→Diffusers、SpecForge 的 runtime→export 都是"训练态"到"部署态"的转换，字段映射、EMA 选择与量化状态的处理各不相同。本章只给出了产物分类，具体转换脚本的核对留给 <a href="7.7-distillation-training-systems.html">7.7</a>，视频侧的产物链接到尚未编写的 10.4。</p>
+<p><strong>弹性 world size。</strong> DCP 的重新分片让"换卡数继续训"在文件层面可行，但数据分片、有效 batch 与 RNG 流都会变。要让它成为真正的弹性训练，还需要数据层的可重放清单与调度层的准入策略，见 <a href="7.11-training-job-orchestration.html">7.11</a>。</p>
+<hr />
+<h2 id="_12">陷阱</h2>
+<h3 id="1-async_save">陷阱 1：把 <code>async_save</code> 返回当成保存完成</h3>
+<p>返回时目录还是空的。staging 完成才允许改写参数，Future 完成才代表落盘，<code>.metadata</code> 写入才代表提交。</p>
+<h3 id="2-mtime-latest">陷阱 2：按 mtime 或目录名选 latest</h3>
+<p>分片写到一半的目录时间戳最新、名字最大。判据必须是元数据存在且它引用的分片文件齐全。</p>
+<h3 id="3-except-exception-dcp">陷阱 3：用 <code>except Exception</code> 兜 DCP 的错误</h3>
+<p><code>CheckpointException</code> 直接继承 <code>BaseException</code>，这样写抓不到它。</p>
+<h3 id="4">陷阱 4：把"已读取"当恢复点</h3>
+<p>预取队列里的样本一次更新都没参与过。checkpoint 只能记已提交的游标。</p>
+<h3 id="5iterable-worker">陷阱 5：iterable 数据集不按 worker 分片</h3>
+<p>每个 worker 会重放整个数据集，数据量悄悄翻倍，而 loss 曲线看不出任何异常。</p>
+<h3 id="6-loss">陷阱 6：用 loss 判断恢复是否正确</h3>
+<p>拿掉 optimizer 状态时 loss 与参照逐位相同，参数已经差了 1.26e-02。判据是样本 ID、loss、梯度范数、LR 和参数一起对上。</p>
+<h3 id="7-scheduler">陷阱 7：以为恢复不了 scheduler 也没关系</h3>
+<p>StepLR 恰好把当前 LR 存在 <code>param_groups</code> 里，所以看起来没事；cosine 与 warmup 会立刻跳回曲线的错误位置。</p>
+<h3 id="8-checkpoint">陷阱 8：把权重导出当训练 checkpoint</h3>
+<p>能加载进推理框架，不代表能接着训。公开的阶段权重几乎都属于前者。</p>
+<hr />
+<h2 id="_13">自测题</h2>
+<ol>
+<li><code>dcp.async_save()</code> 返回之后，训练循环可以立刻执行下一次 <code>optimizer.step()</code> 吗？</li>
+</ol>
+<details class="fold">
+<summary>展开</summary>
+<p>不可以。返回只意味着调用已经发起，参数还可能正在被拷进暂存缓冲。必须等 staging 完成的信号（TorchTitan 里是 <code>checkpointer.maybe_wait_for_staging()</code>）才能改写参数。但不必等 Future 完成——那是文件落盘，与参数是否可写无关。</p>
+</details>
+<ol start="2">
+<li>一个 checkpoint 目录里 <code>.metadata</code> 和所有 <code>.distcp</code> 都在，时间戳也最新，还有什么可能让它不可用？</li>
+</ol>
+<details class="fold">
+<summary>展开</summary>
+<p>元数据本身可能损坏或版本不匹配（读元数据就会失败），也可能这份 checkpoint 缺少训练需要的状态项——例如只保存了模型而没有 optimizer/RNG/游标。文件完整性只是第一层，"状态是否齐全"要按本章的状态清单逐项核对。</p>
+</details>
+<ol start="3">
+<li>用 2 个 rank 保存、4 个 rank 加载成功了，能说"换卡数继续训"没有问题吗？</li>
+</ol>
+<details class="fold">
+<summary>展开</summary>
+<p>不能。参数与 optimizer 状态确实按新布局还原了，但每 rank 的数据分片、有效 batch 与依赖 world size 的 RNG 流都变了。这是"从这份状态开始的一段新训练"，训练轨迹与原来那条不再重合。要接上，数据层还得能按全局样本号重放。</p>
+</details>
+<ol start="4">
+<li>恢复之后第一步的 loss 与不中断的参照完全相同，能证明恢复正确吗？</li>
+</ol>
+<details class="fold">
+<summary>展开</summary>
+<p>不能。实测里拿掉 optimizer 状态时，样本 ID、loss 与梯度范数都逐位相同，只有更新后的参数差了 1.258e-02——因为 m/v 归零改变的是更新量，不是前向。拿掉 scheduler 状态时连参数都相同（StepLR 的 LR 存在 param_groups 里），要再跑几步、或者换成 cosine 才看得出来。判据是五项一起对上，并且尽量用参数的逐元素比较。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L7/7.3-training-frameworks.html">&#8592; 7.3 训练框架架构解析</a><a class="nav-next" href="../L7/7.5-rl-infra.html">7.5 监督微调与偏好优化：SFT、LoRA/QLoRA、DPO &#8594;</a></nav>
+</main>
+</body>
+</html>

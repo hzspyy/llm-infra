@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.3 优化阶梯 I：memory-bound 算子</title>
-<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
-<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
 
 </head>
 <body>
@@ -23,6 +23,10 @@
 <li><a href="#v2-v3">v2 / v3：所测配置未显示额外收益</a></li>
 <li><a href="#v4">v4：每次访存指令读取更多元素</a></li>
 <li><a href="#v5-v6-4">v5 / v6：最后的 4%</a></li>
+<li><a href="#launch">行内归约：行宽 × 行数扫描（什么时候 launch 受限，什么时候带宽受限）</a></li>
+<li><a href="#_4">精度：奇数长度与极端抵消</a></li>
+<li><a href="#cub">与 CUB 对照</a></li>
+<li><a href="#addrmsnorm-dram">融合 add+RMSNorm：收益出现在 DRAM 受限的形状上</a></li>
 <li><a href="#pytorch">在所测连续归约上比较 PyTorch 与专用实现</a></li>
 </ul>
 </li>
@@ -32,15 +36,15 @@
 <li><a href="#3-attention-online-softmax">3. attention 里的 online softmax 也是归约</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#_5">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_5">消融建议</a></li>
+<li><a href="#_6">消融建议</a></li>
 </ul>
 </li>
-<li><a href="#_6">原始现场</a></li>
-<li><a href="#_7">前沿</a></li>
-<li><a href="#_8">陷阱</a></li>
-<li><a href="#_9">自测题</a></li>
+<li><a href="#_7">原始现场</a></li>
+<li><a href="#_8">前沿</a></li>
+<li><a href="#_9">陷阱</a></li>
+<li><a href="#_10">自测题</a></li>
 </ul>
 </div>
 </nav>
@@ -55,6 +59,10 @@
 <li><a href="#v2-v3">v2 / v3：所测配置未显示额外收益</a></li>
 <li><a href="#v4">v4：每次访存指令读取更多元素</a></li>
 <li><a href="#v5-v6-4">v5 / v6：最后的 4%</a></li>
+<li><a href="#launch">行内归约：行宽 × 行数扫描（什么时候 launch 受限，什么时候带宽受限）</a></li>
+<li><a href="#_4">精度：奇数长度与极端抵消</a></li>
+<li><a href="#cub">与 CUB 对照</a></li>
+<li><a href="#addrmsnorm-dram">融合 add+RMSNorm：收益出现在 DRAM 受限的形状上</a></li>
 <li><a href="#pytorch">在所测连续归约上比较 PyTorch 与专用实现</a></li>
 </ul>
 </li>
@@ -64,15 +72,15 @@
 <li><a href="#3-attention-online-softmax">3. attention 里的 online softmax 也是归约</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#_5">工程实现 · 自己写一遍</a></li>
 <li><a href="#lab">动手 lab</a><ul>
-<li><a href="#_5">消融建议</a></li>
+<li><a href="#_6">消融建议</a></li>
 </ul>
 </li>
-<li><a href="#_6">原始现场</a></li>
-<li><a href="#_7">前沿</a></li>
-<li><a href="#_8">陷阱</a></li>
-<li><a href="#_9">自测题</a></li>
+<li><a href="#_7">原始现场</a></li>
+<li><a href="#_8">前沿</a></li>
+<li><a href="#_9">陷阱</a></li>
+<li><a href="#_10">自测题</a></li>
 </ul>
 </div>
 </nav>
@@ -91,7 +99,7 @@
 <li>教科书上的经典优化（warp shuffle、减少 barrier）在现代 GPU 上还有用吗？</li>
 <li>手写 kernel 能打过 PyTorch 吗？</li>
 </ol>
-<p>归约（reduction）是将张量元素按特定算子（如求和、求最大值）聚合成标量或低维结果的核心操作，也是典型的访存密集型（memory-bound）计算范式。本章以大规模连续 fp32 数组求和为例，从最原始的全局原子操作出发，沿经典优化阶梯逐级重构。我们将深入剖析不同优化手段在现代 GPU 架构下的真实增量与瓶颈迁移，并测定手写专用 kernel 对比框架通用算子的性能边界。</p>
+<p>归约（reduction）是将张量元素按特定算子（如求和、求最大值）聚合成标量或低维结果的核心操作，也是典型的访存密集型（memory-bound）计算范式。本章以大规模连续 fp32 数组求和为例，从最原始的全局原子操作出发，沿经典优化阶梯逐级重构。本章深入剖析不同优化手段在现代 GPU 架构下的真实增量与瓶颈迁移，并测定手写专用 kernel 对比框架通用算子的性能边界。</p>
 <hr />
 <h2 id="_2">心智模型：把大量局部和逐级合并</h2>
 <figure>
@@ -168,7 +176,7 @@
 <div class="admonition note">
 <p class="admonition-title">硬件性能计数器的交叉验证</p>
 <p>单凭宏观耗时增加，尚无法严格区分究竟是「全局原子锁冲突」还是「全局访存未合并」导致的性能劣化。</p>
-<p>在 <a class="xref" href="../L2/2.6-profiling.html" title="GPU 性能分析">L2.6</a> 中，我们通过底层硬件性能分析器（NCU）直接采集了该 kernel 的底层计数器：v0 的 <code>sector/request</code> 恒等于 4（即 32 个连续 float 严格合并为 128 字节单次全局内存事务），证实访存合并处于完美状态；而 v0 的 L2 缓存访问事务数是其余版本的 <strong>9 倍</strong>，直接印证了数千万次原子“读-改-写”指令在 L2 缓存控制器端口严重拥塞串行的物理事实。同时，其指令发射利用率（<code>Issue Slots Busy</code>）仅有 0.08%，说明几乎所有 warp 都阻塞在等待原子更新的完成队列中。</p>
+<p>在 <a class="xref" href="../L2/2.6-profiling.html" title="GPU 性能分析">L2.6</a> 中，通过底层硬件性能分析器（NCU）直接采集了该 kernel 的底层计数器：v0 的 <code>sector/request</code> 恒等于 4（即 32 个连续 float 严格合并为 128 字节单次全局内存事务），证实访存合并处于完美状态；而 v0 的 L2 缓存访问事务数是其余版本的 <strong>9 倍</strong>，直接印证了数千万次原子“读-改-写”指令在 L2 缓存控制器端口严重拥塞串行的物理事实。同时，其指令发射利用率（<code>Issue Slots Busy</code>）仅有 0.08%，说明几乎所有 warp 都阻塞在等待原子更新的完成队列中。</p>
 </div>
 <p>该实现还存在数值错误：</p>
 <div class="highlight"><pre><span></span><code>✗ 结果 16777216，应为 67108864（相对误差 75.0%）
@@ -187,6 +195,16 @@ GPU v6 (fp32 分层)   67108864.0   相对误差 0.00e+00
 <p><strong>分层归约天然是"成对求和"（pairwise summation）</strong>——
 每线程算局部和 → warp 内归约 → block 内归约 → 全局。
 每一层的加数量级相近，误差不累积。</p>
+<p><strong>82.9 ms 花在哪：原子串行占 99.8%。</strong> 把同一份 256 MB 数据的三条读法分开量：</p>
+<div class="highlight"><pre><span></span><code>  A 纯读（写不冲突的位置）            0.165 ms   1624.9 GB/s
+  C 共享内存树 + 每 block 一次原子     0.165 ms   1622.3 GB/s   (+0.000 ms)
+  B 每线程一次全局 atomicAdd           82.903 ms      3.2 GB/s   (+82.738 ms)
+</code></pre></div>
+
+<p><strong>每 block 一次原子（1020 次）的代价是 0.000 ms，每线程一次（67,108,864 次）
+是 82.738 ms。</strong> 也就是说 v0 的耗时里 99.8% 是 6710 万次 atomicAdd 在同一个
+地址上排队，访存本身只占 0.2%。这条归因把"原子竞争"和"读内存"彻底分开了 ——
+v0 既不是带宽受限，也不是算力受限，而是<strong>串行化受限</strong>。</p>
 <h3 id="v1253">v1：253 倍提升，来自消除竞争</h3>
 <div class="highlight"><pre><span></span><code><span class="k">extern</span><span class="w"> </span><span class="n">__shared__</span><span class="w"> </span><span class="kt">float</span><span class="w"> </span><span class="n">s</span><span class="p">[];</span>
 <span class="n">s</span><span class="p">[</span><span class="n">t</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">n</span><span class="p">)</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">in</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="mf">0.0f</span><span class="p">;</span>
@@ -291,6 +309,231 @@ v4 用的是 <code>grid = ceil(n4 / 256) = 65536</code> 个 block = 64.3 个波�
 <p>ILP 在这里没用，因为已经完全 memory-bound——
 FADD 的延迟早就被访存延迟掩盖了。<strong>这组对照未观察到收益</strong>：
 <a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 里 ILP 对 compute-bound kernel 很关键，这里没用。</p>
+<h3 id="launch">行内归约：行宽 × 行数扫描（什么时候 launch 受限，什么时候带宽受限）</h3>
+<p>RMSNorm 这类算子是<strong>按行</strong>归约的，形状和"一整块连续数组"完全不同。
+<code>labs/L2/reduce_rows.cu</code> 每行开一个 256 线程 block，
+cols ∈ {128, 1024, 4096, 14336}（14336 = Qwen3 的 hidden）、rows ∈ {1, 8, 128, 2048}，
+并对比"共享内存树（两阶段）"与"warp shuffle + 每 warp 一次 atomicAdd（一阶段）"：</p>
+<div class="highlight"><pre><span></span><code>本卡 L2 = 96 MB；工作集 ≤ L2 的行带宽会超过 DRAM 上限，单独标注
+cols     rows   工作集MB L2内 vec  两阶段ms GB/s     一阶段ms GB/s     最大相对误差
+128      1      0.00     是   4    0.0021   0.2      0.0027   0.2      0.00e+00
+128      2048   1.00     是   4    0.0041   253.1    0.0058   181.4    0.00e+00
+1024     2048   8.00     是   4    0.0041   2033.7   0.0062   1357.2   0.00e+00
+4096     2048   32.00    是   4    0.0081   4120.1   0.0101   3336.8   0.00e+00
+14336    128    7.00     是   1    0.0105   701.9    0.0103   710.1    0.00e+00
+14336    128    7.00     是   4    0.0041   1800.4   0.0051   1432.3   0.00e+00
+14336    2048   112.00   否   1    0.0841   1395.9   0.0880   1334.6   0.00e+00
+14336    2048   112.00   否   4    0.0718   1636.2   0.0737   1593.7   0.00e+00
+</code></pre></div>
+
+<p>三点读法：</p>
+<ol>
+<li><strong>rows=1 时是 launch/占用受限，不是带宽受限</strong>：298 个线程里 256 个只跑一轮，
+   带宽只有 0.2 GB/s。grid 只有 1 个 block 时，讨论"带宽打满没有"没有意义。</li>
+<li><strong>工作集 ≤ 96 MB L2 的格子带宽会超过 DRAM 上限</strong>（4096×2048 的 32 MB 测得
+   4120 GB/s）。这些数字不能当作 DRAM 带宽引用；只有最后两行（112 MB）
+   才在 DRAM 上，vec=4 到 1636 GB/s，接近 <a class="xref" href="../L1/1.1-gpu-microarch.html" title="GPU 微架构与内存层次">L1.1</a> 的 1674 GB/s 上限。</li>
+<li><strong>向量化对宽行最有效</strong>：14336 宽的窄批（rows=128）从 701.9 → 1800.4 GB/s。
+   窄行（128）加不加 float4 没区别，因为每线程本来就只有半个元素可算。</li>
+</ol>
+<p>两阶段与一阶段的差距只在"行内多 warp 需要跨 warp 合并"时才出现：
+cols=4096、rows=2048 时两阶段快 24%（4120 vs 3337 GB/s），
+因为一阶段要发 8 次 atomicAdd 并等一次全局往返。
+行很窄（cols=128，一个 warp 都填不满）时两者没有区别。</p>
+<h3 id="_4">精度：奇数长度与极端抵消</h3>
+<p>归约的正确性不能只看"随机数据下误差很小"。四类构造输入对拍（FP64 参照）：</p>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th style="text-align: right;">n</th>
+<th style="text-align: right;">FP32 结果</th>
+<th style="text-align: right;">FP64 参照</th>
+<th style="text-align: right;">相对误差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>奇数长度</td>
+<td style="text-align: right;">1,000,003</td>
+<td style="text-align: right;">1,000,003.0</td>
+<td style="text-align: right;">1,000,003.0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>完全抵消 ±1</td>
+<td style="text-align: right;">1,048,576</td>
+<td style="text-align: right;">0.0</td>
+<td style="text-align: right;">0.0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>大数吞小数 1e8 / 1</td>
+<td style="text-align: right;">1,048,576</td>
+<td style="text-align: right;">5.242869e13</td>
+<td style="text-align: right;">5.242880e13</td>
+<td style="text-align: right;">2.09e-06</td>
+</tr>
+<tr>
+<td>小量 1e-7 累加</td>
+<td style="text-align: right;">1,048,576</td>
+<td style="text-align: right;">8.289794e17</td>
+<td style="text-align: right;">8.289801e17</td>
+<td style="text-align: right;">8.66e-07</td>
+</tr>
+</tbody>
+</table>
+<p>奇数长度检验尾元素有没有漏，完全抵消检验浮点误差是否被放大成非零。
+后两行是"看起来对"和"确实对"的区别：分层归约的误差是 O(log N) 量级，
+在 2^20 个元素上是 1e-06 级别，而不是 v0 那种 O(N) 的整数量级偏差。</p>
+<h3 id="cub">与 CUB 对照</h3>
+<p>同一结构（每行一个 block）换用 <code>cub::BlockReduce</code>：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">cols</th>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">手写两阶段</th>
+<th style="text-align: right;">CUB</th>
+<th style="text-align: right;">CUB/手写</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">0.0085 ms / 3928.7 GB/s</td>
+<td style="text-align: right;">0.0066 ms / 5050.9 GB/s</td>
+<td style="text-align: right;">0.78×</td>
+</tr>
+<tr>
+<td style="text-align: right;">14336</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">0.0717 ms / 1637.9 GB/s</td>
+<td style="text-align: right;">0.0717 ms / 1638.9 GB/s</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+</tbody>
+</table>
+<p>CUB 的 <code>BlockReduce</code> 与手写树形归约同构（共享内存 + 树），
+在 L2 驻留的形状上快 22%，在 DRAM 受限的形状上完全一致 ——
+<strong>带宽受限时实现细节不再有区别，这正是 2.3 全章的主题。</strong></p>
+<h3 id="addrmsnorm-dram">融合 add+RMSNorm：收益出现在 DRAM 受限的形状上</h3>
+<p>RMSNorm 前面通常紧跟一个残差相加。分开写要多一份中间张量；
+合成一个 kernel 可以少一次写和两次读。四个实现、同一份 fp16 数据
+（hidden=14336，<code>labs/L2/fused_rmsnorm.py</code>）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">工作集</th>
+<th style="text-align: right;">分离实现</th>
+<th style="text-align: right;">手写 CUDA 融合</th>
+<th style="text-align: right;">Triton 融合</th>
+<th style="text-align: right;">vLLM <code>fused_add_rms_norm</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0.0 MB</td>
+<td style="text-align: right;">0.0154 ms</td>
+<td style="text-align: right;">0.0208 ms</td>
+<td style="text-align: right;">0.0122 ms</td>
+<td style="text-align: right;"><strong>0.0101 ms</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0.2 MB</td>
+<td style="text-align: right;">0.0149 ms</td>
+<td style="text-align: right;">0.0228 ms</td>
+<td style="text-align: right;">0.0116 ms</td>
+<td style="text-align: right;"><strong>0.0098 ms</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">3.5 MB</td>
+<td style="text-align: right;">0.0207 ms</td>
+<td style="text-align: right;">0.0250 ms</td>
+<td style="text-align: right;">0.0145 ms</td>
+<td style="text-align: right;">0.0144 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">14.0 MB</td>
+<td style="text-align: right;">0.0310 ms</td>
+<td style="text-align: right;">0.0269 ms</td>
+<td style="text-align: right;"><strong>0.0204 ms</strong></td>
+<td style="text-align: right;">0.0247 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">112.0 MB</td>
+<td style="text-align: right;">0.7460 ms</td>
+<td style="text-align: right;">0.4885 ms</td>
+<td style="text-align: right;"><strong>0.4644 ms</strong></td>
+<td style="text-align: right;">0.6178 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>融合的收益只在 DRAM 受限时出现。</strong> rows ≤ 512 时工作集都在 96 MB L2 里，
+分离实现多出来的那份中间张量几乎不花钱：rows=128 时分离 0.0207 ms 与
+Triton 融合 0.0145 ms 的差距主要来自实现质量，而不是字节数。
+到了 rows=4096（112 MB，超出 L2），字节账直接决定名次：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>每次调用的访存遍数</th>
+<th style="text-align: right;">总字节</th>
+<th style="text-align: right;">实测</th>
+<th style="text-align: right;">相对分离</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分离实现</td>
+<td>7（含中间张量的写 + 两次读）</td>
+<td style="text-align: right;">784 MB</td>
+<td style="text-align: right;">0.7460 ms</td>
+<td style="text-align: right;">1.00×</td>
+</tr>
+<tr>
+<td>手写 CUDA 融合</td>
+<td>5</td>
+<td style="text-align: right;">560 MB</td>
+<td style="text-align: right;">0.4885 ms</td>
+<td style="text-align: right;"><strong>1.53×</strong></td>
+</tr>
+<tr>
+<td>Triton 融合</td>
+<td>5</td>
+<td style="text-align: right;">560 MB</td>
+<td style="text-align: right;">0.4644 ms</td>
+<td style="text-align: right;"><strong>1.61×</strong></td>
+</tr>
+<tr>
+<td>vLLM 引擎 op</td>
+<td>5</td>
+<td style="text-align: right;">560 MB</td>
+<td style="text-align: right;">0.6178 ms</td>
+<td style="text-align: right;">1.21×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>少 2/7 的字节，换来 1.5–1.6 倍。</strong> 这条收益与 2.3 全章一致：
+融合值钱的时候，正是它少搬了字节的时候。</p>
+<p>别名与契约（三个融合实现一致，实测）：</p>
+<ul>
+<li><code>residual</code> <strong>就地更新</strong>为 <code>x + residual</code>，<code>out</code> 是另一块存储（不别名）；</li>
+<li><code>x</code>、<code>weight</code> 只读，<code>weight</code> 形状 <code>[cols]</code>，要求连续；</li>
+<li>三个实现与 FP64 参照的最大绝对误差都是 <code>3.906e-03</code>（fp16 输出量级）。</li>
+</ul>
+<p><strong>扩展限制</strong>：手写版本在 rows 小时比 Triton 和引擎 op 都慢（0.0208 vs 0.0122 /
+0.0101 ms），因为每行只开一个 256 线程 block，14256 个元素要分 14 轮访存，
+尾延迟暴露在外。融合减少的是<strong>字节</strong>，不减少 launch 与同步；
+形状越小，"每行一个 block"的调度开销占比越高。这正是 5.4 要在图与分桶层面
+解决的问题。</p>
 <h3 id="pytorch">在所测连续归约上比较 PyTorch 与专用实现</h3>
 <table>
 <thead>
@@ -304,7 +547,7 @@ FADD 的延迟早就被访存延迟掩盖了。<strong>这组对照未观察到�
 </thead>
 <tbody>
 <tr>
-<td><strong>我们的 v6</strong></td>
+<td><strong>自写实现 v6</strong></td>
 <td><strong>0.160 ms</strong></td>
 <td><strong>1679 GB/s</strong></td>
 <td><strong>100.3%</strong></td>
@@ -383,7 +626,7 @@ RMSNorm 是每行 2048 个元素归约成 1 个，有 batch×seq 行。</p>
 变成<strong>单遍在线更新</strong>，避免把 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x000D7;</mo><mi>S</mi></mrow></math></span> 的中间矩阵写回显存。
 那是 <a class="xref" href="../L3/3.1-attention-memory-wall.html" title="从 attention 数学到内存墙">L3.1</a> 的主题，但机制和本章同源：<strong>归约的代价在访存，不在算术</strong>。</p>
 <hr />
-<h2 id="_4">工程实现 · 自己写一遍</h2>
+<h2 id="_5">工程实现 · 自己写一遍</h2>
 <p>阶梯的关键是<strong>每一步只改一件事</strong>，否则增量无法归因。</p>
 <p><strong>warp shuffle 的标准写法</strong>（v2 起复用）：</p>
 <div class="highlight"><pre><span></span><code><span class="n">__device__</span><span class="w"> </span><span class="n">__forceinline__</span><span class="w"> </span><span class="kt">float</span><span class="w"> </span><span class="n">warp_reduce</span><span class="p">(</span><span class="kt">float</span><span class="w"> </span><span class="n">v</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
@@ -428,7 +671,7 @@ Volta 之后必须用带 <code>_sync</code> 后缀的版本——因为独立线
 python<span class="w"> </span>labs/L2/torch_reduce_ref.py<span class="w"> </span><span class="m">256</span><span class="w">      </span><span class="c1"># 与 PyTorch 对照</span>
 </code></pre></div>
 
-<h3 id="_5">消融建议</h3>
+<h3 id="_6">消融建议</h3>
 <table>
 <thead>
 <tr>
@@ -465,7 +708,7 @@ python<span class="w"> </span>labs/L2/torch_reduce_ref.py<span class="w"> </span
 </table>
 <p>第一项实验改变输入规模，检查最优 kernel 是否随之变化。这也是 autotuning 需要针对不同形状搜索的原因，见 <a class="xref" href="../L2/2.7-compiler-stack.html" title="PyTorch 编译器：捕获、分图与代码生成">L2.7</a>。</p>
 <hr />
-<h2 id="_6">原始现场</h2>
+<h2 id="_7">原始现场</h2>
 <details>
 <summary>① 完整的阶梯输出</summary>
 <div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D  SM=170   数据 256 MB（67108864 个 float）
@@ -536,7 +779,7 @@ python<span class="w"> </span>labs/L2/torch_reduce_ref.py<span class="w"> </span
 （即使输入输出都是 bf16），以及为什么 attention 的累加必须是 fp32。</p>
 </details>
 <hr />
-<h2 id="_7">前沿</h2>
+<h2 id="_8">前沿</h2>
 <table>
 <thead>
 <tr>
@@ -572,7 +815,7 @@ python<span class="w"> </span>labs/L2/torch_reduce_ref.py<span class="w"> </span
 </tbody>
 </table>
 <hr />
-<h2 id="_8">陷阱</h2>
+<h2 id="_9">陷阱</h2>
 <p><strong>1. 照搬 2010 年的优化教程。</strong> v1→v3 那三步在 Fermi 上有效，
 在 Blackwell 上增量为零。<strong>硬件变了，瓶颈也变了。</strong></p>
 <p><strong>2. 不验证结果只测速度。</strong> v0 快不了也就算了，它<strong>结果还是错的</strong>，
@@ -589,7 +832,7 @@ double 在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/Ma
 消费级卡的 fp64 算力只有 fp32 的 1/64。要精度应该用 <strong>fp32 累加 + 分层归约</strong>，
 或者 Kahan 求和。</p>
 <hr />
-<h2 id="_9">自测题</h2>
+<h2 id="_10">自测题</h2>
 <details>
 <summary>1. 我的归约达到了 819 GB/s，占带宽上限 49%。下一步该做什么？</summary>
 <p><strong>先算每线程读多少字节。</strong> 如果是 4 字节（<code>float</code>），
@@ -648,7 +891,7 @@ double 在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/Ma
 沿任意维度子集归约、<code>keepdim</code>、autograd 反向、以及各种边界情况。
 这些在 kernel 里表现为额外的索引计算、分支、和更保守的向量化判断
 （不能假设 16 字节对齐）。</p>
-<p>我们的 v6 只做一件事：<strong>连续 fp32 全归约</strong>，还假设了对齐。</p>
+<p>自写实现 v6 只做一件事：<strong>连续 fp32 全归约</strong>，还假设了对齐。</p>
 <p><strong>这正是专用 kernel 存在的价值</strong>：
 - FlashAttention 之所以快，是因为它只做 attention，不做通用矩阵乘
 - DeepGEMM 之所以快，是因为它只做 fp8 分组 GEMM

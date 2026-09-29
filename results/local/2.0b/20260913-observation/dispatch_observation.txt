@@ -1,0 +1,95 @@
+USDT:2026-09-13 21:19:15 88087:40528476 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-09-13 21:19:15 88087:40528476 SyncActivityProfilerHandler.cpp:46] profiler_stop
+USDT:2026-09-13 21:19:15 88087:40528476 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-09-13 21:19:15 88087:40528476 SyncActivityProfilerHandler.cpp:46] profiler_stop
+torch 2.14.0  device=cpu
+
+================================================================================================
+[C1] 框架自带算子：linear 在 aten 层已经不存在
+================================================================================================
+
+--- baseline：dispatch mode --------------------------------------------------------------
+  aten.t.default aten.addmm.default aten.relu.default
+
+--- baseline：export 图 -------------------------------------------------------------------
+  x                placeholder x
+  w                placeholder w
+  b                placeholder b
+  linear           call_function linear.default
+  relu             call_function relu.default
+  output           output     output
+  graph code:
+    def forward(self, x, w, b):
+        linear = torch.ops.aten.linear.default(x, w, b);  x = w = b = None
+        relu = torch.ops.aten.relu.default(linear);  linear = None
+        return (relu,)
+  再过一遍分解 pass（ep.run_decompositions()）：
+    ['permute.default', 'addmm.default', 'relu.default']
+
+--- baseline：profiler（CPU activity，5 次调用，单位 ms） -----------------------------------------
+  op                                   次数     self    total
+  aten::linear                          5    0.005    0.024
+  aten::addmm                           5    0.007    0.011
+  aten::t                               5    0.005    0.008
+  aten::relu                            5    0.002    0.003
+  aten::transpose                       5    0.002    0.003
+  aten::copy_                           5    0.002    0.002
+  aten::as_strided                     10    0.002    0.002
+  aten::clamp_min                       5    0.002    0.002
+  aten::expand                          5    0.001    0.001
+  aten::resolve_conj                   10    0.000    0.000
+  注意 `aten::linear` 这一行：profiler 在 dispatcher 入口就打了点，
+  所以它既记录复合算子本身，又记录它内部的 `t` / `addmm`。
+  `total` 一列把子调用的时间也算了进去，逐行相加会重复计数；
+  比较算子开销要看 `self`，或者只看叶子算子。
+
+================================================================================================
+[C2] 自定义算子：同一程序，三层都只剩一个名字
+================================================================================================
+
+--- custom：dispatch mode ----------------------------------------------------------------
+  l2b_obs.fused_linear_relu.default
+
+--- custom：export 图 ---------------------------------------------------------------------
+  x                placeholder x
+  w                placeholder w
+  b                placeholder b
+  fused_linear_relu call_function fused_linear_relu.default
+  output           output     output
+  graph code:
+    def forward(self, x, w, b):
+        fused_linear_relu = torch.ops.l2b_obs.fused_linear_relu.default(x, w, b);  x = w = b = None
+        return (fused_linear_relu,)
+  再过一遍分解 pass（ep.run_decompositions()）：
+    ['fused_linear_relu.default']
+
+--- custom：profiler ---------------------------------------------------------------------
+  op                                   次数     self    total
+  l2b_obs::fused_linear_relu            5    0.009    0.033
+  aten::linear                          5    0.003    0.021
+  aten::addmm                           5    0.007    0.013
+  aten::t                               5    0.002    0.006
+  aten::copy_                           5    0.004    0.004
+  aten::transpose                       5    0.002    0.004
+  aten::relu                            5    0.001    0.003
+  aten::as_strided                     10    0.002    0.002
+  aten::clamp_min                       5    0.002    0.002
+  aten::expand                          5    0.001    0.001
+  aten::resolve_conj                   10    0.000    0.000
+  自定义算子自己出现在表里（`l2b_obs::fused_linear_relu`），
+  它的 Python 实现内部的 aten 调用同样会被记录 —— profiler 看执行，不看图的边界。
+
+--- 数值对拍：自定义算子与分解实现必须一致 -----------------------------------------------------------------
+  baseline = [0.0, 0.0, 0.0, 1.7101991176605225]
+  custom   = [0.0, 0.0, 0.0, 1.7101991176605225]
+  max |diff| = 0.000e+00
+
+================================================================================================
+[C3] 反例：没有 fake 实现的自定义算子进不了 export
+================================================================================================
+dispatch mode 里它可以正常执行：
+  l2b_obs.no_fake.default
+
+export 却会失败，因为形状推导拿不到 fake 实现：
+  [UnsupportedOperatorException] l2b_obs.no_fake.default
+  [NotImplementedError] l2b_obs::no_fake: attempted to run this operator with Meta tensors, but there was no fake impl or Meta kernel 

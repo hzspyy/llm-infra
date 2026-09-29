@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.3 可观测性与正确的压测</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">8.3</div>
+  <div class="sidebar-title">可观测性与正确的压测</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：事件链与两类发生器</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 一条请求的六个事件</a></li>
+<li><a href="#2">2. 协调遗漏：闭环为什么会漏掉卡顿</a></li>
+<li><a href="#3-09-11">3. 过载拐点：0.9 倍还很稳，1.1 倍就雪崩</a></li>
+<li><a href="#4-goodput">4. goodput：分母纪律 + 冻结门槛</a></li>
+<li><a href="#5">5. 分位数与样本量</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析与设计取舍</a><ul>
+<li><a href="#vllm">vLLM 侧暴露了什么</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#a-toy-server">A. 在已知真值的 toy server 上正视失效源</a></li>
+<li><a href="#bc">B/C. 在真实引擎上跑到达率阶梯</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：事件链与两类发生器</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 一条请求的六个事件</a></li>
+<li><a href="#2">2. 协调遗漏：闭环为什么会漏掉卡顿</a></li>
+<li><a href="#3-09-11">3. 过载拐点：0.9 倍还很稳，1.1 倍就雪崩</a></li>
+<li><a href="#4-goodput">4. goodput：分母纪律 + 冻结门槛</a></li>
+<li><a href="#5">5. 分位数与样本量</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析与设计取舍</a><ul>
+<li><a href="#vllm">vLLM 侧暴露了什么</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#a-toy-server">A. 在已知真值的 toy server 上正视失效源</a></li>
+<li><a href="#bc">B/C. 在真实引擎上跑到达率阶梯</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L8 · 集群、生产与前沿</div>
+  <div class="mod-id">8.3</div>
+  <h1>可观测性与正确的压测</h1>
+  <p class="lede">TTFT/TPOT/goodput/SLO attainment、开环 vs 闭环、Poisson 到达、分位数、DCGM、分布式 trace。含滚动更新与租户边界。 复用 4.11 的音画负载，纳入首音频、RTF、播放断流、音画偏差和打断延迟；按任务质量门槛统计 goodput。</p>
+  <div class="chips"><span class="chip">实测机器 worldvln（L40S 48 GB）· Qwen3-1.7B · vLLM 0.29.0 · 本机 macOS 跑 toy server</span><span class="chip">前置 0.1（请求生命周期）· 0.2（资源账本）· 5.11（服务端事件与流水）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><strong>一次请求的"完整时延"由哪些事件组成？</strong> 计划到达、实际发送、首字节、首个有效 token、每个输出 token、完成或错误——少记哪一个，后面的结论就会偏。</li>
+<li><strong>开环与闭环发生器为什么会对同一台服务给出完全不同的排队结论？</strong> 同一个 2 秒卡顿，闭环压测报出的 TTFT p99 是 61 ms，开环报出 2.13 s。</li>
+<li><strong>质量、SLO、错误与样本量怎样共同决定 goodput？</strong> 谁进分母、SLO 什么时候冻结、多少样本才配叫 p99。</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的立场</p>
+<p>吞吐（token/s）和 QPS 都是<strong>过程指标</strong>。服务能不能用，取决于"在什么时延门槛下、有多少请求真正拿到了合格输出"。8.3 定义的这套事件口径会被 8.1、8.4、8.6、8.7、8.8 直接复用，所以它必须先把三件事做对：<strong>分母不删样本、时间戳可回溯到计划到达、SLO 在比较策略之前冻结</strong>。</p>
+</div>
+<hr />
+<h2 id="_2">心智模型：事件链与两类发生器</h2>
+<figure>
+
+
+<svg viewBox="0 0 760 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="请求事件链与开环闭环发生器的差别">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="20" font-size="13" font-weight="600">同一条请求的事件链，以及两种发生器在同一卡顿下的观测范围</text>
+
+    <line x1="30" y1="58" x2="730" y2="58" stroke="currentColor" stroke-width="1.2" opacity="0.65"/>
+    <text x="30" y="48" font-size="10.5" opacity="0.9">planned_arrival</text>
+    <text x="150" y="48" font-size="10.5" opacity="0.9">actual_send</text>
+    <text x="268" y="48" font-size="10.5" opacity="0.9">first_byte</text>
+    <text x="372" y="48" font-size="10.5" opacity="0.9">first_token</text>
+    <text x="500" y="48" font-size="10.5" opacity="0.9">tokens…</text>
+    <text x="618" y="48" font-size="10.5" opacity="0.9">finish</text>
+    <circle cx="30" cy="58" r="4" fill="#e06c75"/>
+    <circle cx="150" cy="58" r="4" fill="#e06c75"/>
+    <circle cx="268" cy="58" r="4" fill="#e5c07b"/>
+    <circle cx="372" cy="58" r="4" fill="#98c379"/>
+    <circle cx="500" cy="58" r="4" fill="#98c379"/>
+    <circle cx="618" cy="58" r="4" fill="#61afef"/>
+
+    <path d="M 30 74 L 150 74" stroke="#e06c75" stroke-width="1.4" marker-end="url(#a1)"/>
+    <text x="34" y="88" font-size="10" fill="#e06c75">客户端排队 client_queue_delay</text>
+    <path d="M 150 100 L 372 100" stroke="#98c379" stroke-width="1.4" marker-end="url(#a1)"/>
+    <text x="188" y="114" font-size="10" fill="#98c379">observed TTFT（常规口径）</text>
+    <path d="M 30 126 L 372 126" stroke="#61afef" stroke-width="1.4" marker-end="url(#a1)"/>
+    <text x="150" y="140" font-size="10" fill="#61afef">true TTFT（修正协调遗漏）</text>
+    <path d="M 372 152 L 618 152" stroke="currentColor" stroke-width="1.4" marker-end="url(#a1)"/>
+    <text x="430" y="166" font-size="10" opacity="0.85">解码段：TPOT = (finish − first_token)/(token 数 − 1)</text>
+
+    <rect x="30" y="188" width="330" height="132" rx="6" fill="none" stroke="#e06c75" stroke-width="1.2"/>
+    <text x="42" y="208" font-size="12" font-weight="600" fill="#e06c75">闭环：固定并发，发完才发下一条</text>
+    <line x1="46" y1="262" x2="348" y2="262" stroke="currentColor" stroke-width="1" opacity="0.5"/>
+    <rect x="60" y="252" width="70" height="20" fill="#e06c75" opacity="0.45"/>
+    <rect x="140" y="252" width="70" height="20" fill="#e06c75" opacity="0.45"/>
+    <rect x="250" y="232" width="96" height="20" fill="#e06c75" opacity="0.25"/>
+    <text x="252" y="248" font-size="9.5" fill="#e06c75">服务端卡顿 2 s</text>
+    <text x="42" y="288" font-size="10">卡顿期间客户端停发 → 这 2 s 内本应到达的请求</text>
+    <text x="42" y="303" font-size="10" font-weight="600" fill="#e06c75">从未进入样本，TTFT p99 只有 61 ms</text>
+
+    <rect x="392" y="188" width="338" height="132" rx="6" fill="none" stroke="#61afef" stroke-width="1.2"/>
+    <text x="404" y="208" font-size="12" font-weight="600" fill="#61afef">开环：按计划到达时刻派发</text>
+    <line x1="408" y1="262" x2="712" y2="262" stroke="currentColor" stroke-width="1" opacity="0.5"/>
+    <g fill="#61afef" opacity="0.5">
+      <rect x="412" y="252" width="14" height="20"/><rect x="434" y="252" width="14" height="20"/>
+      <rect x="456" y="252" width="14" height="20"/><rect x="478" y="252" width="14" height="20"/>
+      <rect x="500" y="252" width="14" height="20"/><rect x="522" y="252" width="14" height="20"/>
+      <rect x="578" y="252" width="14" height="20"/><rect x="600" y="252" width="14" height="20"/>
+      <rect x="622" y="252" width="14" height="20"/><rect x="644" y="252" width="14" height="20"/>
+    </g>
+    <text x="404" y="288" font-size="10">卡顿期间照常投入 → 队列在 TTFT 里显形</text>
+    <text x="404" y="303" font-size="10" font-weight="600" fill="#61afef">同一台服务，TTFT p99 = 2.13 s</text>
+
+    <defs>
+      <marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 z" fill="currentColor"/>
+      </marker>
+    </defs>
+  </g>
+</svg>
+
+
+<figcaption>事件链定义了每个时延指标的起点和终点；开环与闭环的区别不在服务端，而在这条链的起点是否由客户端"等响应"决定。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1">1. 一条请求的六个事件</h3>
+<table>
+<thead>
+<tr>
+<th>事件</th>
+<th>含义</th>
+<th>时间戳来源</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>planned_arrival</code></td>
+<td>发生器计划让这条请求到达的时刻</td>
+<td>客户端预先排好的清单</td>
+</tr>
+<tr>
+<td><code>actual_send</code></td>
+<td>请求真正写出去的时刻</td>
+<td>客户端</td>
+</tr>
+<tr>
+<td><code>first_byte</code></td>
+<td>读到 HTTP 响应体的第一个字节</td>
+<td>客户端</td>
+</tr>
+<tr>
+<td><code>first_token</code></td>
+<td>第一个<strong>带内容的</strong>输出 token</td>
+<td>客户端（服务端 usage 只给总数，不给时刻）</td>
+</tr>
+<tr>
+<td><code>token_timestamps</code></td>
+<td>后续每个 SSE 数据块的到达时刻</td>
+<td>客户端</td>
+</tr>
+<tr>
+<td><code>finish</code></td>
+<td>正常结束 / 超时 / 拒绝 / 连接错误</td>
+<td>客户端</td>
+</tr>
+</tbody>
+</table>
+<p>由这些事件导出的量：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>client\_queue\_delay</mtext><mo>&#x0003D;</mo><mtext>actual\_send</mtext><mo>&#x02212;</mo><mtext>planned\_arrival</mtext></mrow></math></div></p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>observed\_TTFT</mtext><mo>&#x0003D;</mo><mtext>first\_token</mtext><mo>&#x02212;</mo><mtext>actual\_send</mtext><mo>&#x0002C;</mo><mspace width="2em" /><mtext>true\_TTFT</mtext><mo>&#x0003D;</mo><mtext>first\_token</mtext><mo>&#x02212;</mo><mtext>planned\_arrival</mtext></mrow></math></div></p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>TPOT</mtext><mo>&#x0003D;</mo><mfrac><mrow><mtext>finish</mtext><mo>&#x02212;</mo><mtext>first\_token</mtext></mrow><mrow><msub><mi>N</mi><mrow><mtext>token</mtext></mrow></msub><mo>&#x02212;</mo><mn>1</mn></mrow></mfrac></mrow></math></div></p>
+<p>两个必须写清楚的边界。<strong>一，token 数只能信 usage。</strong> 高负载下引擎会把多个 token 合并进一个 SSE 数据块，用块数当 token 数会把完整的响应误判成截断。实测里 128 token 的请求出现 127 个数据块，而 <code>usage.completion_tokens</code> 始终是 128。<strong>二，TPOT 的分母与粒度不一致。</strong> 标准计算以 usage 返回的 token 数为分母，以首 token 到 <code>finish</code> 的跨度为分子；客户端能逐块观测到的是块间隔（ITL），块内多个 token 的间隔无法从流式协议里还原。</p>
+<h3 id="2">2. 协调遗漏：闭环为什么会漏掉卡顿</h3>
+<p>wrk2 的作者把这件事说得很直白：闭环负载发生器"会与服务端协调，在服务端高延迟的时段里停止测量"（<code>giltene/wrk2</code> README，commit <code>44a94c1</code>）。设并发 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi></mrow></math></span>、单请求服务时间 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi></mrow></math></span>，闭环的稳态完成速率是 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi><mo>&#x0002F;</mo><mi>S</mi></mrow></math></span>。注入一段时长 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 的全局卡顿时：</p>
+<ul>
+<li><strong>闭环</strong>：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi></mrow></math></span> 个在途请求全部被卡住，客户端不再发新请求；这段时间内<strong>本应到达</strong>的 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x000B7;</mo><mi>C</mi><mo>&#x0002F;</mo><mi>S</mi></mrow></math></span> 条请求没有任何记录。</li>
+<li><strong>开环</strong>：到达过程与响应无关，这 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi></mrow></math></span> 秒内照常投入请求，它们全部排队，等待时间直接进入 TTFT。</li>
+</ul>
+<p>将实测参数代入：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi><mo>&#x0003D;</mo><mn>2</mn></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>S</mi><mo>&#x0003D;</mo><mn>0.3214</mn></mrow></math></span> s、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>D</mi><mo>&#x0003D;</mo><mn>2.0</mn></mrow></math></span> s，则 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi><mo>&#x0002F;</mo><mi>S</mi><mo>&#x0003D;</mo><mn>6.22</mn></mrow></math></span> QPS，漏掉的请求约 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>12.4</mn></mrow></math></span> 条。实测闭环完成时间线上的最大空档是 <strong>2.344 s</strong>，按 6.22 QPS 折算约 <strong>14.6 条</strong>请求从未被任何记录覆盖。</p>
+<p>修正的标准做法是 HdrHistogram 的 <code>recordValueWithExpectedInterval</code>（commit <code>de84b0a</code>）：已知测量的期望间隔 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>E</mi></mrow></math></span> 时，一个记录为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math></span> 的样本要补记 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x0230A;</mi><mi>L</mi><mo>&#x0002F;</mo><mi>E</mi><mi>&#x0230B;</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span> 个 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>E</mi></mrow></math></span>。wrk2 走的是等价路线——延迟从"请求<strong>应该</strong>发出的时刻"开始算。本章基准测试同时涵盖两种修正机制：开环将计时起点锚定在 <code>planned_arrival</code>，闭环则额外给出 expected-interval 修正后的分位数。</p>
+<p>这里有一个容易被忽略的细节：<strong>修正在哪个指标上生效，取决于卡顿打在哪一段</strong>。本次实验的卡顿发生在请求已经拿到首 token 之后，所以：</p>
+<table>
+<thead>
+<tr>
+<th>口径</th>
+<th style="text-align: right;">闭环</th>
+<th style="text-align: right;">开环</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TTFT p50 / p99</td>
+<td style="text-align: right;">41.8 ms / 61.4 ms</td>
+<td style="text-align: right;">1.296 s / 2.135 s</td>
+</tr>
+<tr>
+<td>真实端到端 p99</td>
+<td style="text-align: right;"><strong>2.381 s</strong></td>
+<td style="text-align: right;">2.468 s</td>
+</tr>
+<tr>
+<td>goodput（SLO 1 s / 50 ms）</td>
+<td style="text-align: right;">0.973</td>
+<td style="text-align: right;">0.412</td>
+</tr>
+</tbody>
+</table>
+<p>闭环的 TTFT 修正前后都是 61 ms——因为受影响的 2 条请求早已越过首 token；卡顿只出现在端到端时延里。也就是说，<strong>"闭环没看出问题"不等于修正后就能看出来</strong>：当卡顿只影响解码段时，闭环的 TTFT 分布结构性缺失，任何后处理都补不回来。</p>
+<h3 id="3-09-11">3. 过载拐点：0.9 倍还很稳，1.1 倍就雪崩</h3>
+<p>把服务看成一个服务率 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003BC;</mi></mrow></math></span> 的队列，到达率 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003BB;</mi></mrow></math></span>，利用率 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C1;</mi><mo>&#x0003D;</mo><mi>&#x003BB;</mi><mo>&#x0002F;</mo><mi>&#x003BC;</mi></mrow></math></span>。<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C1;</mi><mo>&#x0003C;</mo><mn>1</mn></mrow></math></span> 时排队长度有界，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C1;</mi><mo>&#x0003E;</mo><mn>1</mn></mrow></math></span> 时队长以 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BB;</mi><mo>&#x02212;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 的速度线性增长，等待时间随窗口长度无界上升。Little 定律给出在途请求数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>&#x0003D;</mo><mi>&#x003BB;</mi><mi>W</mi></mrow></math></span>，所以过载时<strong>吞吐不再涨，时延线性涨</strong>。</p>
+<p>实测（Qwen3-1.7B，输入 2048 token，输出固定 128，关前缀缓存，单张 L40S）：</p>
+<table>
+<thead>
+<tr>
+<th>档位</th>
+<th style="text-align: right;">到达率</th>
+<th style="text-align: right;">完成数/窗口</th>
+<th style="text-align: right;">true TTFT p50</th>
+<th style="text-align: right;">p95</th>
+<th style="text-align: right;">p99</th>
+<th style="text-align: right;">输出 tok/s</th>
+<th style="text-align: right;">goodput 0.5s/25ms</th>
+<th style="text-align: right;">1s/50ms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0.3×</td>
+<td style="text-align: right;">3.10</td>
+<td style="text-align: right;">353–381</td>
+<td style="text-align: right;">0.060 s</td>
+<td style="text-align: right;">0.092 s</td>
+<td style="text-align: right;">0.116 s</td>
+<td style="text-align: right;">395</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+<tr>
+<td>0.6×</td>
+<td style="text-align: right;">6.19</td>
+<td style="text-align: right;">719–773</td>
+<td style="text-align: right;">0.072 s</td>
+<td style="text-align: right;">0.130 s</td>
+<td style="text-align: right;">0.168 s</td>
+<td style="text-align: right;">798</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+<tr>
+<td>0.9×</td>
+<td style="text-align: right;">9.29</td>
+<td style="text-align: right;">1096–1155</td>
+<td style="text-align: right;">0.110 s</td>
+<td style="text-align: right;">0.198 s</td>
+<td style="text-align: right;">0.241 s</td>
+<td style="text-align: right;">1210</td>
+<td style="text-align: right;">0.805</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+<tr>
+<td>1.1×</td>
+<td style="text-align: right;">11.35</td>
+<td style="text-align: right;">1350–1396</td>
+<td style="text-align: right;"><strong>0.199–12.392 s</strong></td>
+<td style="text-align: right;"><strong>8.138–32.886 s</strong></td>
+<td style="text-align: right;"><strong>10.245–34.697 s</strong></td>
+<td style="text-align: right;">1466</td>
+<td style="text-align: right;">0.076</td>
+<td style="text-align: right;">0.323</td>
+</tr>
+<tr>
+<td>突发</td>
+<td style="text-align: right;">0.6×（每 2 s 20 条）</td>
+<td style="text-align: right;">1220</td>
+<td style="text-align: right;">0.566 s</td>
+<td style="text-align: right;">0.977 s</td>
+<td style="text-align: right;">0.999 s</td>
+<td style="text-align: right;">1301</td>
+<td style="text-align: right;">0.342</td>
+<td style="text-align: right;">0.989</td>
+</tr>
+<tr>
+<td>长短混合</td>
+<td style="text-align: right;">0.6×（512/4096 交替）</td>
+<td style="text-align: right;">719–773</td>
+<td style="text-align: right;">0.113 s</td>
+<td style="text-align: right;">0.170 s</td>
+<td style="text-align: right;">0.210 s</td>
+<td style="text-align: right;">798</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+</tbody>
+</table>
+<p>三个可以直接读出来的结论：</p>
+<ol>
+<li><strong>0.9× 到 1.1× 之间是悬崖，不是斜坡。</strong> 吞吐只从 1210 涨到 1466 tok/s（+21%），p99 从 0.24 s 涨到 10–35 s（41× 到 146×）。用 tokens/s 看，"1.1 倍负载还能多吐 21% 的 token"；用 SLO goodput 看，能满足 1 s TTFT 的请求只剩 32.3%。</li>
+<li><strong>过载档的 p50 跨种子不可复现。</strong> 三个种子分别给出 0.199 s / 10.935 s / 12.392 s——差异来自积压位置，不是测量噪声。所以本档只报区间，不报单一 p99。</li>
+<li><strong>突发与均值同负载不同体验。</strong> 突发档平均到达率与 0.6× 相同（6.19 QPS），但 p50 从 0.072 s 抬到 0.566 s：20 条同时到达把瞬时并发推到 20，超出了稳定区间。</li>
+</ol>
+<h3 id="4-goodput">4. goodput：分母纪律 + 冻结门槛</h3>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>goodput</mtext><mo>&#x0003D;</mo><mfrac><mrow><mi>&#x00023;</mi><mo stretchy="false">&#x0007B;</mo><mi>r</mi><mi>:</mi><mi>r</mi><mtext>&#x000A0;成功</mtext><mo>&#x02227;</mo><mtext>TTFT</mtext><mo>&#x02264;</mo><msub><mi>&#x003C4;</mi><mrow><mtext>ttft</mtext></mrow></msub><mo>&#x02227;</mo><mtext>TPOT</mtext><mo>&#x02264;</mo><msub><mi>&#x003C4;</mi><mrow><mtext>tpot</mtext></mrow></msub><mo>&#x02227;</mo><mtext>输出完整</mtext><mo stretchy="false">&#x0007D;</mo></mrow><mrow><mi>&#x00023;</mi><mo stretchy="false">&#x0007B;</mo><mtext>计划到达的请求</mtext><mo stretchy="false">&#x0007D;</mo></mrow></mfrac></mrow></math></div></p>
+<p>分母是<strong>计划到达数</strong>，不是完成数，也不是成功数。拒绝、超时、取消、连接错误、用量不足、缺少结束标记的请求，全部留在分母里。8.3-C 冻结的三档教学门槛写在 <code>labs/L8/request_metrics.py</code> 的 <code>TEACHING_SLOS</code> 里，在跑任何策略之前确定，之后不允许按结果调整。</p>
+<p>本次实验里引擎一次拒绝都没有（1200–1400 条/窗口全部 200），这说明"没有拒绝"不代表"服务可用"：1.1× 档 67.7% 的请求在 1 s 门槛外，goodput 只有 0.323。</p>
+<h3 id="5">5. 分位数与样本量</h3>
+<p>分位数用最近秩定义：<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mtext>rank</mtext><mo>&#x0003D;</mo><mi>&#x02308;</mi><mi>p</mi><mo>&#x0002F;</mo><mn>100</mn><mo>&#x000B7;</mo><mi>n</mi><mi>&#x02309;</mi><mo>&#x02212;</mo><mn>1</mn></mrow></math></span>，不做线性插值——插值会把尾部的稀疏样本抹平。样本量决定能说什么：</p>
+<ul>
+<li><span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>n</mi><mo>&#x0003C;</mo><mn>100</mn></mrow></math></span> 时 p99 退化成最大值，<code>summarize()</code> 会标 <code>insufficient_tail</code>；</li>
+<li>本次每档每个种子有 353–1396 个样本、3 个时间窗，p99 有值可算；</li>
+<li>但项目实验规范要求"不足 10000 请求不宣称 p99 稳定"。120 秒窗口在这个服务上最多给出约 1400 个样本，<strong>满足可计算，不满足可稳定宣称</strong>。因此上表的尾部分位数一律按"3 个种子的区间"读，不按点值读。</li>
+</ul>
+<hr />
+<h2 id="_4">工程实现：源码解析与设计取舍</h2>
+<h3 id="vllm">vLLM 侧暴露了什么</h3>
+<p>服务端能提供的事件分成三类，来源都在固定版本 vLLM 0.29.0 的 wheel 里：</p>
+<ol>
+<li><strong>聚合计数器</strong>（<code>vllm/v1/metrics/loggers.py</code>）。<code>vllm:num_requests_waiting</code> 在 <code>:504</code>、<code>vllm:num_requests_waiting_by_reason</code> 在 <code>:514</code>（按 <code>capacity</code> / <code>deferred</code> 分因），前缀缓存计数器 <code>vllm:prefix_cache_queries</code> 在 <code>:585</code>、<code>vllm:prefix_cache_hits</code> 在 <code>:596</code>。这些是<strong>进程级累计量</strong>，只能前后取差，不能回答"哪条请求命中了多少"。</li>
+<li><strong>逐请求 usage</strong>。<code>usage.prompt_tokens</code> / <code>completion_tokens</code> 给出准确 token 数，<code>prompt_tokens_details.cached_tokens</code> 给出该请求真实命中的前缀 token 数——8.1 判断路由预测是否假阳性就靠它。</li>
+<li><strong>KV 事件流</strong>（<code>vllm/distributed/kv_events.py</code>）。<code>EventBatch</code> 在 <code>:25</code>，三类事件 <code>BlockStored</code> / <code>BlockRemoved</code> / <code>AllBlocksCleared</code> 在 <code>:50</code> / <code>:101</code> / <code>:122</code>；<code>ZmqEventPublisher</code> 在 <code>:297</code>，用 <code>send_multipart((topic, seq, payload))</code> 发出（<code>:471</code>），payload 是 msgspec 编码的 msgpack。配置项在 <code>vllm/config/kv_events.py</code>：<code>endpoint</code>（默认 <code>tcp://*:5557</code>）、<code>replay_endpoint</code>、<code>buffer_steps</code>（默认 10000）、<code>hwm</code>、<code>topic</code>。事件自带 <code>ts</code> 与单调递增的 seq，订阅端可以据此发现缺口并按 seq 向 <code>replay_endpoint</code> 补拉——这是"目录重建"的真实机制。</li>
+</ol>
+<p><strong>没有的东西</strong>：vLLM 不提供逐请求的服务端时间戳。请求在引擎内部的入队、调度、首 token 时刻都不可见，客户端只能看到自己这一侧的事件。所以任何"服务端处理时间"都必须由客户端时间减出来，并且要把网络和客户端排队单独列出——这正是 <code>client_queue_delay</code> 存在的理由。</p>
+<h3 id="_5">设计取舍</h3>
+<table>
+<thead>
+<tr>
+<th>选择</th>
+<th>代价</th>
+<th>为什么仍然这么选</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>客户端时间戳全部用 <code>time.monotonic</code></td>
+<td>跨进程/跨机不可直接比较</td>
+<td>墙钟会被 NTP 调整；同进程内的时延分解必须用单调时钟。跨机比较另行校准（见 8.3-D）</td>
+</tr>
+<tr>
+<td>SSE 数据块时刻当 token 时刻</td>
+<td>高负载下块内多 token，ITL 被低估</td>
+<td>流式协议只到块粒度；token 数改用 usage 修正，避免把完整响应判成截断</td>
+</tr>
+<tr>
+<td>分母用计划到达数</td>
+<td>需要发生器先排好完整清单</td>
+<td>只有这样，"没发出去的请求"才会被计入；用完成数做分母会把过载洗成健康</td>
+</tr>
+<tr>
+<td>分位数用最近秩</td>
+<td>小样本下 p99 = max</td>
+<td>线性插值会掩盖尾部；宁可让 <code>insufficient_tail</code> 暴露样本不足</td>
+</tr>
+<tr>
+<td>SLO 冻结在代码常量里</td>
+<td>改门槛要改代码</td>
+<td>门槛必须早于结果存在。写在可 diff 的文件里，比写在报告里更难被事后调整</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="mini">工程实现：mini 实现</h2>
+<p>三个文件构成完整闭环，共约 900 行：</p>
+<details class="fold">
+<summary>labs/L8/request_metrics.py 事件 schema 与 goodput 分母</summary>
+<div class="highlight"><pre><span></span><code><span class="nd">@dataclasses</span><span class="o">.</span><span class="n">dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RequestRecord</span><span class="p">:</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">planned_arrival_s</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">actual_send_s</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">first_byte_s</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">first_token_s</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">token_timestamps_s</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">finish_s</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">status</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">STATUS_SUCCESS</span>
+    <span class="o">...</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">client_queue_delay_s</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">actual_send_s</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">planned_arrival_s</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">true_ttft_s</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">first_token_s</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">planned_arrival_s</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">num_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># SSE 块数不等于 token 数: 优先信服务端 usage。</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">server_reported_output_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">server_reported_output_tokens</span>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">token_timestamps_s</span><span class="p">)</span>
+</code></pre></div>
+
+</details>
+<details class="fold">
+<summary>labs/L8/load_generator.py 开环派发与到达过程</summary>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">generate_arrivals</span><span class="p">(</span><span class="n">mode</span><span class="p">,</span> <span class="n">rate_qps</span><span class="p">,</span> <span class="n">duration_s</span><span class="p">,</span> <span class="n">seed</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">burst_size</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span> <span class="n">burst_gap_s</span><span class="o">=</span><span class="mf">2.0</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""poisson: 指数间隔; uniform: 等间隔; burst: 每 burst_gap_s 投入 burst_size 条。"""</span>
+    <span class="o">...</span>
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">run_open_loop</span><span class="p">(</span><span class="n">base_url</span><span class="p">,</span> <span class="n">arrivals</span><span class="p">,</span> <span class="n">prompt_len</span><span class="p">,</span> <span class="n">output_len</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""按计划时刻异步派发, 不等待前序请求完成。"""</span>
+    <span class="n">tasks</span> <span class="o">=</span> <span class="p">[</span><span class="n">asyncio</span><span class="o">.</span><span class="n">create_task</span><span class="p">(</span><span class="n">scheduled</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">p</span><span class="p">))</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">arrivals</span><span class="p">)]</span>
+    <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">*</span><span class="n">tasks</span><span class="p">,</span> <span class="n">return_exceptions</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+</details>
+<p><code>toy_server.py</code> 是一个只依赖标准库的 SSE 服务端，把 prefill 时间、逐 token 间隔、全局卡顿、队列容量和"故意丢事件"都做成显式参数，用来在已知真值的服务上验证上面这套统计。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="a-toy-server">A. 在已知真值的 toy server 上正视失效源</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L8/load_generator.py<span class="w"> </span>--mode<span class="w"> </span>compare-omission<span class="w"> </span>--out-dir<span class="w"> </span>results/local/8.3/omission
+</code></pre></div>
+
+<p>场景：单请求 0.3214 s（prefill 0.036 s + 19 步 decode × 15 ms），闭环并发 2，开环 5 QPS，在 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>t</mi><mo>&#x0003D;</mo><mn>4.0</mn></mrow></math></span> s 注入 2.0 s 全局卡顿。输出（真实运行，非示例）：</p>
+<div class="highlight"><pre><span></span><code>--- closed-loop (传统口径) ---
+planned=75 counts={'SUCCESS': 75, ...}
+observed TTFT p50/p99 = 0.0418 / 0.0614
+true     TTFT p50/p99 = 0.0418 / 0.0615
+goodput(SLO-2s/100ms) = 0.973
+--- open-loop (计划到达口径) ---
+planned=51 counts={'SUCCESS': 51, ...}
+observed TTFT p50/p99 = 1.2960 / 2.1344
+true     TTFT p50/p99 = 1.2966 / 2.1350
+client queue p99      = 0.0012
+goodput(SLO-1s/50ms)  = 0.412
+--- missing-events (服务端丢 done 标记) ---
+counts={'SUCCESS': 20, ...}  event gaps = {'done_marker': 20}
+goodput = 0.0
+闭环完成时间线最大空档 = 2344ms; 按可持续 6.22 QPS 折算, 卡顿期间约有 14.6 个请求从未被任何记录覆盖
+</code></pre></div>
+
+<p>三条要看的对照：闭环的开环侧客户端排队 p99 只有 1.19 ms（说明开环真的没被客户端卡住，2.13 s 是服务端排队）；缺失结束标记的 20 条请求全部被标出来并计入分母（goodput 归零）——<strong>协议层不给正常结束的证据时，不能凭"token 数够了"就当成功</strong>。</p>
+<p><strong>消融建议</strong>：把 <code>--stall-start</code> 提前到请求刚开始时，观察 TTFT 修正的差异；把 <code>--arrival burst</code> 与 <code>poisson</code> 在相同平均速率下对比；把 <code>drop_events</code> 改成丢中间 token，确认截断被计数方式的变化。</p>
+<h3 id="bc">B/C. 在真实引擎上跑到达率阶梯</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># worldvln GPU1, Qwen3-1.7B, 关前缀缓存, 输入 2048 / 输出 128</span>
+vllm<span class="w"> </span>serve<span class="w"> </span>Qwen/Qwen3-1.7B<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span>--gpu-memory-utilization<span class="w"> </span><span class="m">0</span>.80<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--no-enable-prefix-caching<span class="w"> </span>--max-model-len<span class="w"> </span><span class="m">8192</span>
+python<span class="w"> </span>labs/L8/engine_sweep.py<span class="w"> </span>--base-url<span class="w"> </span>http://127.0.0.1:8000<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out-dir<span class="w"> </span>results/worldvln/8.3/20260914-engine<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--baseline-window<span class="w"> </span><span class="m">60</span><span class="w"> </span>--baseline-concurrency<span class="w"> </span><span class="m">32</span><span class="w"> </span>--window<span class="w"> </span><span class="m">120</span><span class="w"> </span>--seeds<span class="w"> </span><span class="m">11</span>,12,13
+</code></pre></div>
+
+<p>参考容量 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>R</mi><mrow><mtext>ref</mtext></mrow></msub></mrow></math></span> 不是理论值：闭环并发 32 跑 60.0 s，完成 640 条 → <strong>10.317 QPS</strong>。6 组配置 × 3 个种子 × 120 s 窗口，共 18 次运行、16 788 条请求，全部记入逐请求 JSONL。结果表见上文第 3 节，原始记录在 <code>results/worldvln/8.3/20260914-engine/records_*.jsonl</code>。</p>
+<p><strong>为什么不做完整笛卡尔积</strong>：项目实验规范要求"先单轴定位拐点，再做必要组合"。这里先用闭环定出 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>R</mi><mrow><mtext>ref</mtext></mrow></msub></mrow></math></span>，再沿到达率单轴扫出悬崖位置，最后补突发与长短混合两个正交负载；请求长度、并发上限、SLO 三档不交叉扫描。</p>
+<hr />
+<h2 id="_6">原始现场</h2>
+<p>阶梯汇总（3 个种子的均值，<code>aggregate.json</code>）：</p>
+<details class="fold">
+<summary>results/worldvln/8.3/20260914-engine/aggregate.json 阶梯扫描聚合</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"r_ref_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">10.317</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"groups"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"0.3x"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"rate_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.10</span><span class="p">,</span><span class="w"> </span><span class="nt">"n_per_run"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">381</span><span class="p">,</span><span class="w"> </span><span class="mi">376</span><span class="p">,</span><span class="w"> </span><span class="mi">353</span><span class="p">],</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.061</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.116</span><span class="p">,</span><span class="w"> </span><span class="nt">"tok_s"</span><span class="p">:</span><span class="w"> </span><span class="mi">395</span><span class="p">,</span><span class="w">  </span><span class="nt">"gp_SLO-1s/50ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.000</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"0.6x"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"rate_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.19</span><span class="p">,</span><span class="w"> </span><span class="nt">"n_per_run"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">773</span><span class="p">,</span><span class="w"> </span><span class="mi">753</span><span class="p">,</span><span class="w"> </span><span class="mi">719</span><span class="p">],</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.072</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.168</span><span class="p">,</span><span class="w"> </span><span class="nt">"tok_s"</span><span class="p">:</span><span class="w"> </span><span class="mi">798</span><span class="p">,</span><span class="w">  </span><span class="nt">"gp_SLO-1s/50ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.000</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"0.9x"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"rate_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.29</span><span class="p">,</span><span class="w"> </span><span class="nt">"n_per_run"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">1155</span><span class="p">,</span><span class="w"> </span><span class="mi">1153</span><span class="p">,</span><span class="w"> </span><span class="mi">1096</span><span class="p">],</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.110</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.241</span><span class="p">,</span><span class="w"> </span><span class="nt">"tok_s"</span><span class="p">:</span><span class="w"> </span><span class="mi">1210</span><span class="p">,</span><span class="w"> </span><span class="nt">"gp_SLO-1s/50ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.000</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"1.1x"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"rate_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.35</span><span class="p">,</span><span class="w"> </span><span class="nt">"n_per_run"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">1378</span><span class="p">,</span><span class="w"> </span><span class="mi">1396</span><span class="p">,</span><span class="w"> </span><span class="mi">1350</span><span class="p">],</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.842</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">25.407</span><span class="p">,</span><span class="w"> </span><span class="nt">"tok_s"</span><span class="p">:</span><span class="w"> </span><span class="mi">1466</span><span class="p">,</span><span class="w"> </span><span class="nt">"gp_SLO-1s/50ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.323</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"burst"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"rate_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.19</span><span class="p">,</span><span class="w"> </span><span class="nt">"n_per_run"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">1220</span><span class="p">,</span><span class="w"> </span><span class="mi">1220</span><span class="p">,</span><span class="w"> </span><span class="mi">1220</span><span class="p">],</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.566</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.999</span><span class="p">,</span><span class="w"> </span><span class="nt">"tok_s"</span><span class="p">:</span><span class="w"> </span><span class="mi">1301</span><span class="p">,</span><span class="w"> </span><span class="nt">"gp_SLO-1s/50ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.989</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"mixed"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"rate_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.19</span><span class="p">,</span><span class="w"> </span><span class="nt">"n_per_run"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">773</span><span class="p">,</span><span class="w"> </span><span class="mi">753</span><span class="p">,</span><span class="w"> </span><span class="mi">719</span><span class="p">],</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.113</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.210</span><span class="p">,</span><span class="w"> </span><span class="nt">"tok_s"</span><span class="p">:</span><span class="w"> </span><span class="mi">798</span><span class="p">,</span><span class="w"> </span><span class="nt">"gp_SLO-1s/50ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.000</span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>基线口径与逐请求原始记录：</p>
+<details class="fold">
+<summary>results/worldvln/8.3/20260914-engine/baseline.json 参考容量 R_ref</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"concurrency"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"window_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">62.0</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"completed"</span><span class="p">:</span><span class="w"> </span><span class="mi">640</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"r_ref_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">10.317</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>一次 1.1× 运行的逐请求记录（每行含计划到达、实际发送、首字节、首 token、每个数据块时刻、完成与状态）：</p>
+<details class="fold">
+<summary>results/worldvln/8.3/20260914-engine/records_1.1x-s11.jsonl 逐请求事件（前 2 行）</summary>
+<div class="highlight"><pre><span></span><code>{"request_id": "open-00000", "prompt_len": 2048, "requested_output_len": 128, "planned_arrival_s": 956416.7658, "actual_send_s": 956416.7664, "first_byte_s": 956416.8117, "first_token_s": 956416.8118, "token_timestamps_s": [...128 个块时刻...], "finish_s": 956418.2912, "status": "SUCCESS", "server_reported_prompt_tokens": 2048, "server_reported_output_tokens": 128, "metadata": {}}
+</code></pre></div>
+
+</details>
+<p>toy server 端的原始时间线（服务端自己记的入队等待、首 token、完成），与客户端记录逐请求对账：</p>
+<details class="fold">
+<summary>results/local/8.3/omission/server_closed.jsonl 服务端时间线（前 2 行）</summary>
+<div class="highlight"><pre><span></span><code>{"request_id": "closed-0-00000", "server_status": "SUCCESS", "recv_s": 0.1280, "admit_s": 0.1285, "queue_wait_s": 4.92e-06, "first_token_s": 0.1667, "finish_s": 0.4940, "tokens_sent": 20}
+{"request_id": "closed-1-00001", "server_status": "SUCCESS", "recv_s": 0.1285, "admit_s": 0.1286, "queue_wait_s": 1.58e-06, "first_token_s": 0.1667, "finish_s": 0.4986, "tokens_sent": 20}
+</code></pre></div>
+
+</details>
+<hr />
+<h2 id="_7">前沿</h2>
+<ol>
+<li><strong>协调遗漏的原始论述与修正。</strong> wrk2（<code>giltene/wrk2</code>，commit <code>44a94c1</code>）在 README 里给出了闭环发生器漏测的完整论证，并改用"从请求应当发出的时刻起算延迟"；HdrHistogram（commit <code>de84b0a</code>）提供 <code>recordValueWithExpectedInterval</code> 作为事后修正，两者互斥、只能选一。</li>
+<li><strong>面向 goodput 的服务评测。</strong> DistServe（<a href="https://arxiv.org/abs/2401.09670">arXiv:2401.09670</a>）把服务目标写成"在 TTFT 与 TPOT 约束下的每 GPU goodput"，并按此拆分解码与预填充；SGLang（<a href="https://arxiv.org/abs/2312.07104">arXiv:2312.07104</a>）与 Preble（<a href="https://arxiv.org/abs/2407.00023">arXiv:2407.00023</a>）分别把前缀复用与提示调度放进同一个 SLO 框架。本章的 SLO 冻结与严格分母沿用这一口径。</li>
+<li><strong>引擎自带的压测入口。</strong> vLLM 0.29 已把压测收进 CLI：<code>vllm bench serve</code>（实现见 <code>vllm/benchmarks/serve.py</code>，commit <code>435c96f</code>），SGLang 对应 <code>python -m sglang.benchmark.serving</code>。两者默认按闭环定并发发压，因此它们的时延分位数同样带协调遗漏，只能用于相对比较；本章的开环发生器是用来补这个缺口的。</li>
+<li><strong>面向多模态与跨实例的统一事件口径（8.3-D，部分完成）。</strong> 同一份 schema 需要覆盖四类"首个可用输出"：文本首个有效 token、语音首个可播放 chunk、视频首个有效帧、跨实例 KV 传输完成。前两者在本项目已有可用锚点——1.7 的实时闭环用"取用/丢弃"事件描述了音频 chunk 的 deadline（含 NTP 式时钟校准，注入 250 ms 被恢复到 0.6 ms）；6.4 定义了 15 字段的 KV 交接描述符并在 worldvln 上实测 GPU→GPU 10.88 GB/s。视频首个有效帧依赖 10.3/10.5 的扩散调度，尚未产出可引用工件。<strong>因此 8.3-D 的"跨机时间段重叠核对"没有执行</strong>：本阶段所有运行都在单机内完成，跨机计时需要先做与 1.7 同口径的时钟校准，条件不具备时保留未完成。</li>
+</ol>
+<p>上述外部材料按固定 commit 拉到 <code>results/worldvln/8.3/20260914-refs/</code>（<code>manifest.txt</code> 记录每个仓库的 commit 与文件字节数）：<code>wrk2</code> <code>44a94c1</code>、<code>HdrHistogram</code> <code>de84b0a</code>、vLLM <code>435c96f</code>（<code>vllm/benchmarks/serve.py</code>、<code>vllm/v1/metrics/loggers.py</code>）、LLMPerf <code>f1d6bed</code>、SGLang <code>5c2de3f</code>，以及三篇论文的 arXiv 摘要页。</p>
+<hr />
+<h2 id="_8">陷阱</h2>
+<ol>
+<li><strong>闭环压测的尾分位数不能跨系统比较。</strong> 它的数值取决于发生器的并发数，而不是服务本身；并发取得越大，漏掉的卡顿越多。要比，就用开环或至少固定同一并发。</li>
+<li><strong>"没有拒绝"不等于"服务可用"。</strong> 1.1× 档 4124 条请求全部返回 200，但只有 32.3% 满足 1 s TTFT。只统计成功率会把雪崩写成满分。</li>
+<li><strong>token 数不要数 SSE 块。</strong> 实测 128 token 的响应出现 127 个块；用块数判截断会产生假失败，用块数算 TPOT 会低估解码成本。</li>
+<li><strong>过载档不要报单点 p99。</strong> 本次 1.1× 三 seed 的 p50 相差 60 倍；样本量够也不代表可复现，因为系统状态本身不可复现。</li>
+<li><strong>客户端排队要单独列。</strong> 本次所有档位的 <code>client_queue_delay</code> p99 都 ≤ 15 ms，所以观测时延没有被发生器污染；如果这个值变大，说明是客户端或网络先撑不住，服务端的结论作废。</li>
+<li><strong>profiler 与计时不要混跑。</strong> 端到端分位数只能从原始请求记录算，不能从 profiler 的 kernel 时间里加出来；两者分开采集。</li>
+</ol>
+<hr />
+<h2 id="_9">自测题</h2>
+<details class="fold">
+<summary>1. 为什么同一台服务在闭环下 TTFT p99 是 61 ms，在开环下变成 2.13 s？</summary>
+<p><strong>答案：</strong>
+闭环发生器在每个连接上"收到响应才发下一个请求"，服务端卡顿的 2 秒里它没有请求可发，于是这段时间本应到达的约 14.6 条请求从未进入样本；开环发生器按预先排好的到达清单派发，卡顿期间的请求照常投入并在队列里等待，等待时间完整进入 TTFT。差别在发生器的到达过程，不在服务端。</p>
+</details>
+<details class="fold">
+<summary>2. 为什么这次闭环的 TTFT 做完 expected-interval 修正后仍然是 61 ms？</summary>
+<p><strong>答案：</strong>
+因为卡顿发生在请求已经拿到首 token 之后（解码段）。expected-interval 修正补的是"被压住没发出去的请求"，而这些补齐的样本即使计入，也只是低延迟样本；受影响请求的 TTFT 早在卡顿之前就测完了。卡顿只出现在端到端时延里（闭环真实 e2e p99 = 2.381 s）。修正能在哪个指标上生效，取决于卡顿打在哪一段。</p>
+</details>
+<details class="fold">
+<summary>3. 0.9× 档 goodput(0.5 s/25 ms) 是 0.805，1.1× 档是 0.076；但吞吐只从 1210 涨到 1466 tok/s。这两个数字矛盾吗？</summary>
+<p><strong>答案：</strong>
+不矛盾。利用率跨过 1 之后，队列长度随时间线性增长，吞吐被服务率钉死（多出来的 21% 来自更大的批处理规模），而等待时间无界上升。过程指标（token/s）看到的是"还能多吐一点"，SLO 指标看到的是"满足门槛的请求占比崩塌"。这正是不能用吞吐替代 goodput 的原因。</p>
+</details>
+<details class="fold">
+<summary>4. 一条请求的 `usage.completion_tokens` 是 128，但客户端只收到 127 个 SSE 数据块。它算不算成功？</summary>
+<p><strong>答案：</strong>
+算成功，输出完整。SSE 数据块只是流式传输的分帧单位，一个块可以携带多个 token；判断输出是否完整必须用服务端 usage 的 token 数，不能用块数。反过来说，如果 usage 缺失，就只能靠块数下界估计，并在事件完整性里标出来。</p>
+</details>
+<details class="fold">
+<summary>5. 为什么 goodput 的分母用&quot;计划到达数&quot;而不是&quot;完成数&quot;？</summary>
+<p><strong>答案：</strong>
+因为对用户而言，一条本该在某个时刻到达的请求没被服务，和它被服务了但很慢，损失是一样的。用完成数做分母，会把"客户端在过载时少发了请求"这件事从统计里抹掉——这正是协调遗漏的另一种形式。计划到达数由发生器预先排定，与响应无关，是唯一不受服务端状态污染的分母。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L8/8.2-orchestration.html">&#8592; 8.2 编排：K8s / Ray / Slurm</a><a class="nav-next" href="../L8/8.4-workload-frontier.html">8.4 混合负载与系统容量边界 &#8594;</a></nav>
+</main>
+</body>
+</html>

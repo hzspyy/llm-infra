@@ -1,0 +1,246 @@
+==============================================================================
+# ProcessGroupNCCL.cpp  (pytorch v2.13.0)  torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp
+==============================================================================
+
+--- 行 151-157：getKeySendRecv：P2P 的 2-rank 通信子键按有序对归一化 ---
+  151  std::string getKeySendRecv(int myRank, int peer) {
+  152    int lowRank = myRank < peer ? myRank : peer;
+  153    int highRank = myRank < peer ? peer : myRank;
+  154    std::string sendRecvPair =
+  155        std::to_string(lowRank) + ":" + std::to_string(highRank);
+  156    return sendRecvPair;
+  157  }
+
+--- 行 811-819：WorkNCCL::synchronize ---
+  811  void ProcessGroupNCCL::WorkNCCL::synchronize() {
+  812    synchronizeStream();
+  813    if (c10d::allow_inflight_collective_as_graph_input()) {
+  814      c10d::unregister_work(
+  815          c10::intrusive_ptr<
+  816              ProcessGroupNCCL::WorkNCCL>::unsafe_reclaim_from_nonowning(this));
+  817    }
+  818  }
+  819  
+
+--- 行 820-828：WorkNCCL::synchronizeStream：只阻塞当前 CUDA 流 ---
+  820  void ProcessGroupNCCL::WorkNCCL::synchronizeStream() {
+  821    auto currentStream = at::cuda::getCurrentCUDAStream(device_.index());
+  822    // Block the current stream on the NCCL stream
+  823    ncclEndEvent_->block(currentStream);
+  824    // Unstage the stashed tensors so that CachingAllocator can recycle them
+  825    // THIS MUST HAPPEN AFTER THE BLOCKING CALL ABOVE
+  826    stashed_for_allocator_safety_->unstash();
+  827  }
+  828  
+
+--- 行 829-866：WorkNCCL::wait：blockingWait_ 为假时不等 CPU ---
+  829  // Same as calling synchronize() when blockingWait_ is false
+  830  bool ProcessGroupNCCL::WorkNCCL::wait(std::chrono::milliseconds timeout) {
+  831    RECORD_PARAM_COMMS(
+  832        std::make_tuple(static_cast<int64_t>(this->seq_), this->isP2P_), // seq
+  833        std::make_tuple(pgUID_, pgDesc_), // PG name tuple
+  834        rank_, // rank
+  835        "wait", // collective name
+  836        0, // inNelems
+  837        0, // outNelems
+  838        at::kByte, // dType
+  839        std::vector<int64_t>(), // inSplitSizes
+  840        std::vector<int64_t>(), // outSplitSizes
+  841        -1,
+  842        -1,
+  843        static_cast<int>(1)); // number of device?
+  844  
+  845    // synchronize() will block the current stream on the NCCL stream
+  846    synchronize();
+  847  
+  848    // In case of blockingWait or a timeout value is specified by the user, we
+  849    // block the CPU thread until the work is completed or timed out.
+  850    if (blockingWait_ || timeout != kNoTimeout) {
+  851      while (!isCompleted()) {
+  852        bool timedOut = checkTimeout(
+  853            timeout == kNoTimeout ? std::nullopt : std::make_optional(timeout));
+  854        // Explicitly abort ncclComms here before throwing this timed out
+  855        // exception to users.
+  856        // If throwing timed out exception without aborting nccl communicators
+  857        // here, it was observed that CUDA GPU will have 100% utilization and
+  858        // can not run new events successfully.
+  859        if (timedOut) {
+  860          std::string exceptionMsg = c10::str(
+  861              logPrefix(), "Work ", (*this), " timed out in blocking wait.");
+  862          LOG(ERROR) << exceptionMsg;
+  863          break;
+  864        }
+  865        // Yield
+  866        std::this_thread::sleep_for(
+
+--- 行 948-954：blockingWait_ 的默认值来自 TORCH_NCCL_BLOCKING_WAIT ---
+  948    this->setUsePgForSymmMemRendezvous(options_->use_pg_for_symm_mem_rendezvous);
+  949    this->localDeviceCount_ = static_cast<int>(at::cuda::getNumGPUs());
+  950    logPrefix_ = createLogPrefix();
+  951    blockingWait_ = getCvarBool(TORCH_NCCL_BLOCKING_WAIT, false);
+  952    asyncErrorHandling_ = static_cast<ErrorHandlingMode>(
+  953        getCvarInt(TORCH_NCCL_ASYNC_ERROR_HANDLING, 3 /*SkipCleanUp*/));
+  954    enableNanCheck_ = getCvarBool(TORCH_NCCL_NAN_CHECK, false);
+
+--- 行 4154-4191：未批量化 P2P 为每对 rank 新建 2-rank 通信子 ---
+ 4154        // bumped in `startCoalescing`.
+ 4155        seqP2P_++;
+ 4156      }
+ 4157    } else if (batchP2P) {
+ 4158      // TODO(whc) - unclear why we special-case batchP2P to avoid this path, but
+ 4159      // I preserved this existing special case.
+ 4160      key = getKeyFromDevice(device);
+ 4161      p2pRank = rank_;
+ 4162      p2pTargetRank = peer;
+ 4163      ncclComm = getNCCLComm(key);
+ 4164    } else {
+ 4165      // We create special 2-rank communicators for each pair of
+ 4166      // send/recv ranks.  This limitation exists for two reasons: (1)
+ 4167      // we use a single stream per communicator, so if multiple
+ 4168      // unbatched p2p operations are issued on the same communicator,
+ 4169      // they would map to the same stream and thus would be serialized;
+ 4170      // and (2) Nvidia NCCL does not allow multiple p2p operations to
+ 4171      // be issued on the same communicator over different streams.
+ 4172  
+ 4173      TORCH_WARN_ONCE(
+ 4174          "An unbatched P2P op (send/recv) was called on this ",
+ 4175          "ProcessGroup with size ",
+ 4176          groupRanks().size(),
+ 4177          ".  In lazy initialization mode, this will result in a new 2-rank",
+ 4178          " NCCL communicator to be created.");
+ 4179  
+ 4180      key = getKeySendRecv(rank_, peer);
+ 4181      /* if we are creating a new comm, reset the p2pRank and
+ 4182       * p2pTargetRank to correspond to this new 2-process communicator */
+ 4183      p2pRank = rank_ <= peer ? 0 : 1;
+ 4184      p2pTargetRank = isSendRecvSelf ? 0 : 1 - p2pRank;
+ 4185      ncclComm = getNCCLComm(key);
+ 4186  
+ 4187      if (!coalescing_state_) {
+ 4188        // Bump P2P sequence number.
+ 4189        seqP2P_++;
+ 4190      }
+ 4191    }
+==============================================================================
+# Work.cpp  (pytorch v2.13.0)  torch/csrc/distributed/c10d/Work.cpp
+==============================================================================
+
+--- 行 121-141：Work::wait：CPU 侧条件变量等待 ---
+  121  bool Work::wait(std::chrono::milliseconds timeout) {
+  122    std::unique_lock<std::mutex> lock(mutex_);
+  123    if (timeout == kNoTimeout) {
+  124      // This waits without a timeout.
+  125      cv_.wait(lock, [&] { return completed_; });
+  126    } else {
+  127      // Waits for the user-provided timeout.
+  128      cv_.wait_for(lock, timeout, [&] { return completed_; });
+  129      if (!completed_) {
+  130        // Throw exception if the wait operation timed out and the work was not
+  131        // completed.
+  132        TORCH_CHECK(false, "Operation timed out!");
+  133      }
+  134    }
+  135    if (exception_) {
+  136      std::rethrow_exception(exception_);
+  137    }
+  138    synchronize();
+  139    // Always return true, because abort API is not implemented.
+  140    return true;
+  141  }
+==============================================================================
+# ProcessGroupGloo.cpp  (pytorch v2.14.0)  torch/csrc/distributed/c10d/ProcessGroupGloo.cpp
+==============================================================================
+
+--- 行 196-215：AsyncWork::execute：后台线程执行 run() ---
+  196  
+  197  // static
+  198  void ProcessGroupGloo::AsyncWork::execute(
+  199      const c10::intrusive_ptr<AsyncWork>& work) {
+  200    if (work->recordFunctionBeforeCallback_) {
+  201      work->recordFunctionBeforeCallback_();
+  202    }
+  203    try {
+  204      at::ThreadLocalStateGuard g(work->getTLS());
+  205      work->run();
+  206    } catch (...) {
+  207      work->finishWorkGlooError(std::current_exception());
+  208      return;
+  209    }
+  210  
+  211    // FIXME: We need to call it here since Future completion requires all
+  212    // the work to be synchronized to CUDA.
+  213    work->synchronize();
+  214    work->finishWorkGloo();
+  215  }
+
+--- 行 721-753：runLoop：Gloo 的工作线程 ---
+  721  void ProcessGroupGloo::runLoop(int workerIndex) {
+  722    c10::setThreadName("pt_gloo_runloop");
+  723    std::unique_lock<std::mutex> lock(workMutex_);
+  724  
+  725    while (!stop_) {
+  726      if (workQueue_.empty()) {
+  727        workProduceCV_.wait(lock);
+  728        continue;
+  729      }
+  730  
+  731      auto work = std::move(workQueue_.front());
+  732      workQueue_.pop_front();
+  733      workInProgress_[workerIndex] = work;
+  734      lock.unlock();
+  735  
+  736      // Notify after releasing the lock so that the waiter
+  737      // does not immediately block.
+  738      workConsumeCV_.notify_one();
+  739  
+  740      AsyncWork::execute(work);
+  741      // TODO: Need to find a way to calculate the difference of duration of two
+  742      // c10d::Event
+  743      pgStatus_->lastCompletedSeq = static_cast<int64_t>(work->seq_);
+  744      pgStatus_->lastCompletedWorkName = opTypeToString(work->opType_);
+  745      // TODO: We need to have numel of tensors for gloo as well.
+  746      pgStatus_->lastCompletedNumelIn = 0;
+  747      pgStatus_->lastCompletedNumelOut = 0;
+  748      FlightRecorder<c10::Event>::get()->retire_id(
+  749          work->trace_id_, work->trace_reset_epoch_, false);
+  750      lock.lock();
+  751      workInProgress_[workerIndex].reset();
+  752    }
+  753  }
+==============================================================================
+# ProcessGroupGloo.hpp  (pytorch v2.14.0)  torch/csrc/distributed/c10d/ProcessGroupGloo.hpp
+==============================================================================
+
+--- 行 49-80：AsyncWork：Gloo 异步工作的三阶段划分 ---
+   49    // AsyncWork is the Gloo specific superclass for asynchronous work items.
+   50    // We can split asynchronous work into 3 phases:
+   51    // 1) Sanity checks and prepare input (e.g. memcpy)
+   52    // 2) Run operation on background thread
+   53    // 3) Synchronize with completion on foreground thread
+   54    //
+   55    // There is state to be shared between these 3 phases and all of this state
+   56    // is captured in the AsyncWork class and its derivatives.
+   57    //
+   58    // Note: while we are porting operations to use new style collectives, there
+   59    // is a split between operations using the existing caching approach and
+   60    // operations using the new AsyncWork base class. Over time we will port
+   61    // all operations and perform needed cleanup.
+   62    //
+   63    // FIXME: This probably should be called WorkGloo since the work is executed
+   64    // in sync mode by a background thread.
+   65    class TORCH_API AsyncWork : public Work {
+   66     public:
+   67      explicit AsyncWork(
+   68          std::shared_ptr<gloo::Context> context,
+   69          std::vector<std::vector<at::Tensor>> outputTensors,
+   70          OpType opType,
+   71          uint64_t seq,
+   72          std::chrono::milliseconds timeout,
+   73          const char* profilingTitle = nullptr,
+   74          const std::optional<std::vector<at::Tensor>>& inputTensors =
+   75              std::nullopt);
+   76  
+   77      ~AsyncWork() override = default;
+   78  
+   79      static void execute(const c10::intrusive_ptr<AsyncWork>& work);
+   80  

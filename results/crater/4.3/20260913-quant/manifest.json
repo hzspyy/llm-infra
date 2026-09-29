@@ -1,0 +1,952 @@
+{
+  "chapter": "4.3",
+  "date": "2026-09-13",
+  "machine": "crater",
+  "gpu": "NVIDIA GeForce RTX 5090 D (sm_120, 580.95.05)",
+  "run_id": "20260913-quant",
+  "tasks": "A（层输出重建目标与 RTN/clipping/GPTQ/AWQ 的 FP64 参照，X=[256,128]、W=[64,128]、group=32）；B（INT4/FP8/MXFP4/NVFP4 的 pack/unpack、scale、bits/weight 与官方算子对齐）；C（真实 shape 的量化线性层：bf16 / INT4 显式反量化 / Marlin 尝试 / FP8 W8A8 / NVFP4 W4A4，M 扫描、L2 轮转与旋转消融）。D（真实分页接口上的 FP8 KV：容量、数值与长上下文）与 E（WikiText-2 固定分块 PPL、C-Eval 分层 199 题）已完成；服务扫描的完整成本曲线仍缺。",
+  "commands": [
+    "python labs/L4/quantize_reference.py --outdir out/4.3/20260913-quant A B",
+    "python labs/L4/quantized_linear_bench.py --outdir out/4.3/20260913-quant",
+    "HF_ENDPOINT=https://hf-mirror.com python labs/L4/quantization_eval.py --model {bf16,awq,gptq} --outdir out/4.3/20260913-quant",
+    "python labs/L4/kv_cache_quant.py --kv {auto,fp8} --outdir out/4.3/20260913-quant",
+    "python labs/L4/kv_cache_quant.py --kv {auto,fp8} --outdir out/4.3/20260913-quant  # --max-model-len 32768，关闭前缀缓存",
+    "python labs/L4/kv_cache_quant.py --kv {turboquant_4bit_nc,int4_per_token_head} --s-values 8192 --outdir out/4.3/20260913-quant",
+    "python labs/L4/kv_cache_quant.py --kv {auto,fp8,int4_per_token_head} --batch 8 --s-values 8192 --outdir out/4.3/20260913-quant",
+    "python labs/L4/quantized_serving_scan.py --model {bf16,awq,gptq} --outdir out/4.3/20260913-quant",
+    "python labs/L4/quantized_serving_scan.py --model {bf16,awq,gptq} --s-len 1024 --batches 1,4,16 --outdir out/4.3/20260913-quant"
+  ],
+  "exit_codes": {
+    "reference_AB": 0,
+    "bench": 0,
+    "eval_bf16": 0,
+    "eval_awq": 0,
+    "eval_gptq": 0,
+    "kv_auto": 0,
+    "kv_fp8": 0
+  },
+  "environment": {
+    "python": "3.12.14",
+    "torch": "2.13.0+cu130",
+    "vllm": "0.29.0",
+    "env_sh": "/scratch/learn/env.sh"
+  },
+  "protocol": {
+    "A": "全部 FP64；校准集 X=[256,128]（每 16 通道一个 ×10 离群通道），W=[64,128]，group_size=32；误差定义：权重误差 ||Ŵ−W||_F/||W||_F，输出误差 ||XŴᵀ−XWᵀ||_F/||XWᵀ||_F",
+    "B": "INT4 用 GPTQ 布局打包并断言逐元素往返；FP8 三档 scale 粒度；MXFP4/NVFP4 按规范实现编码器；官方对照用 vLLM 0.29 的 scaled_fp8_quant / scaled_fp4_quant",
+    "C": "bf16=torch.matmul；INT4 显式反量化=解包到 bf16 后 matmul；FP8/NVFP4 权重离线量化，分别测 kernel-only 与含在线激活量化两种口径；每个配置 10 次预热 + 50 次计时"
+  },
+  "derived": {
+    "A": {
+      "rtn": {
+        "weight": 0.09717183390220831,
+        "output": 0.10018051756951192
+      },
+      "clip": {
+        "ratio": 0.95,
+        "weight": 0.09484975597826623,
+        "output": 0.09431570166744517
+      },
+      "gptq": {
+        "weight": 0.11786537775218354,
+        "output": 0.09658817796545892
+      },
+      "awq": {
+        "p": 0.30000001192092896,
+        "weight": 0.1145004584711147,
+        "output": 0.06481920047368292,
+        "weight_only_output": 0.09855195356451477
+      },
+      "hessian_eig": [
+        25.845386831295375,
+        33390.62080507867
+      ],
+      "calibration_shift": {
+        "同分布": {
+          "rtn": 0.09646356471287584,
+          "clip": 0.09479891779068443,
+          "gptq": 0.11900043173932258,
+          "awq": 0.11409998358452436
+        },
+        "离群通道": {
+          "rtn": 0.10225716263763597,
+          "clip": 0.09685704337392709,
+          "gptq": 0.11631139311784487,
+          "awq": 0.09573901237965671
+        },
+        "通道相关": {
+          "rtn": 0.10127693990346902,
+          "clip": 0.09610835558048325,
+          "gptq": 0.0978641443053202,
+          "awq": 0.08045662715292848
+        }
+      },
+      "intermediate_checks": "Hinv[0,0] 与脚本记录相对差 0.00e+00；两列闭式补偿量相对差 1.25e-16"
+    },
+    "B": {
+      "formats": [
+        {
+          "format": "INT4 g32",
+          "bits_per_weight": 4.5,
+          "weight_error": 0.09856784660272695,
+          "output_error": 0.09846701066960127,
+          "pack_roundtrip_exact": true,
+          "scale_dtype": "fp16"
+        },
+        {
+          "format": "INT4 g64",
+          "bits_per_weight": 4.25,
+          "weight_error": 0.1096254200579629,
+          "output_error": 0.10986047264710812,
+          "pack_roundtrip_exact": true,
+          "scale_dtype": "fp16"
+        },
+        {
+          "format": "INT4 g128",
+          "bits_per_weight": 4.125,
+          "weight_error": 0.12057794201001376,
+          "output_error": 0.11947953748631929,
+          "pack_roundtrip_exact": true,
+          "scale_dtype": "fp16"
+        },
+        {
+          "format": "FP8 per-tensor",
+          "bits_per_weight": 8.00390625,
+          "weight_error": 0.0263501561103075,
+          "output_error": 0.026278608635331654,
+          "scale_bytes": 4
+        },
+        {
+          "format": "FP8 per-channel",
+          "bits_per_weight": 8.25,
+          "weight_error": 0.025453162320101325,
+          "output_error": 0.025471454893388167,
+          "scale_bytes": 256
+        },
+        {
+          "format": "FP8 block-32",
+          "bits_per_weight": 9.0,
+          "weight_error": 0.02391057928040881,
+          "output_error": 0.02377978246675884,
+          "scale_bytes": 1024
+        },
+        {
+          "format": "FP8 block-64",
+          "bits_per_weight": 8.5,
+          "weight_error": 0.02504625713215476,
+          "output_error": 0.025171194105388477,
+          "scale_bytes": 512
+        },
+        {
+          "format": "FP8 block-128",
+          "bits_per_weight": 8.25,
+          "weight_error": 0.025453162320101325,
+          "output_error": 0.025471454893388167,
+          "scale_bytes": 256
+        },
+        {
+          "format": "MXFP4 (E2M1+E8M0/32)",
+          "bits_per_weight": 4.25,
+          "weight_error": 0.2550711635530112,
+          "output_error": 0.25219179700070204,
+          "scale_dtype": "e8m0"
+        },
+        {
+          "format": "NVFP4 (E2M1+E4M3/16)",
+          "bits_per_weight": 4.50390625,
+          "weight_error": 0.09608715453374618,
+          "output_error": 0.09553866005014873,
+          "scale_dtype": "e4m3+fp32global"
+        }
+      ],
+      "fp8_vs_vllm": {
+        "scale_got": 0.0004132820467930287,
+        "scale_ref": 0.0004132820467930287,
+        "same_bytes": 8192,
+        "total": 8192
+      },
+      "nvfp4_vllm": {
+        "q_shape": [
+          64,
+          64
+        ],
+        "scale_shape": [
+          128,
+          8
+        ]
+      }
+    },
+    "C": {
+      "config": {
+        "ms": [
+          1,
+          8,
+          32,
+          128,
+          512,
+          2048
+        ],
+        "group_size": 128,
+        "shapes": {
+          "q_proj": [
+            2048,
+            2048
+          ],
+          "down_proj": [
+            2048,
+            6144
+          ]
+        },
+        "gpu": "NVIDIA GeForce RTX 5090 D",
+        "l2_mib": 96.0
+      },
+      "l2": {
+        "copies": 8,
+        "total_mib": 192.0,
+        "single_ms": 0.02470439299941063,
+        "rotate_ms": 0.27955174446105957,
+        "ratio_per_copy": 1.4144839769374664
+      },
+      "rotation": {
+        "rows": [
+          {
+            "variant": "identity",
+            "fp8_err": 0.03742724367769679,
+            "nvfp4_err": 0.12394582576521918,
+            "x_absmax": 73.0,
+            "w_absmax": 0.4921875
+          },
+          {
+            "variant": "hadamard",
+            "fp8_err": 0.034417994484301585,
+            "nvfp4_err": 0.14002733743258897,
+            "x_absmax": 20.25,
+            "w_absmax": 0.11572265625
+          }
+        ],
+        "rotate_ms": 31.7668579518795
+      },
+      "rows": [
+        {
+          "shape": "q_proj",
+          "N": 2048,
+          "K": 2048,
+          "M": 1,
+          "bf16": {
+            "ms": 0.00838274136185646,
+            "err": 0.0016441363255030562
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.008286740630865097,
+            "err": 0.11324632541296518
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.018021631985902786,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.011289305984973907,
+            "err": 0.035014360963501315
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.033412110060453415,
+            "err": 0.035014360963501315
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.024392567574977875,
+            "err": 0.13348959419839732
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.029520932585000992,
+            "err": 0.13348959419839732
+          }
+        },
+        {
+          "shape": "q_proj",
+          "N": 2048,
+          "K": 2048,
+          "M": 8,
+          "bf16": {
+            "ms": 0.010379310697317123,
+            "err": 0.0016942833400642515
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.010359697043895721,
+            "err": 0.11595134634981828
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.017174463719129562,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.011002495884895325,
+            "err": 0.03747548344174653
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.032148342579603195,
+            "err": 0.03747548344174653
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.024521593004465103,
+            "err": 0.1396785244995603
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.0295979343354702,
+            "err": 0.1396785244995603
+          }
+        },
+        {
+          "shape": "q_proj",
+          "N": 2048,
+          "K": 2048,
+          "M": 32,
+          "bf16": {
+            "ms": 0.008445512503385544,
+            "err": 0.0023569842138910714
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.008449535816907883,
+            "err": 0.11789081549249995
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.01714427024126053,
+            "err": 0.9999999999999999
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.010793302208185196,
+            "err": 0.03788580133023537
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.03198893740773201,
+            "err": 0.03788580133023537
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.023567024618387222,
+            "err": 0.14002778378296554
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.028789564967155457,
+            "err": 0.14002778378296554
+          }
+        },
+        {
+          "shape": "q_proj",
+          "N": 2048,
+          "K": 2048,
+          "M": 128,
+          "bf16": {
+            "ms": 0.014598481357097626,
+            "err": 0.0016566632252122684
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.01447269693017006,
+            "err": 0.11720594767533864
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.017230231314897537,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.010949522256851196,
+            "err": 0.03753884516624661
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.03383992239832878,
+            "err": 0.03753884516624661
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.023806598037481308,
+            "err": 0.14002453640977364
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.029032956808805466,
+            "err": 0.14002453640977364
+          }
+        },
+        {
+          "shape": "q_proj",
+          "N": 2048,
+          "K": 2048,
+          "M": 512,
+          "bf16": {
+            "ms": 0.02676878124475479,
+            "err": 0.0016603630603216066
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.026760771870613098,
+            "err": 0.11723487078286568
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.03345971927046776,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.02690417692065239,
+            "err": 0.03774960199243206
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.045627839863300323,
+            "err": 0.03774960199243206
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.031475331634283066,
+            "err": 0.1400427853496057
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.035578496754169464,
+            "err": 0.1400427853496057
+          }
+        },
+        {
+          "shape": "q_proj",
+          "N": 2048,
+          "K": 2048,
+          "M": 2048,
+          "bf16": {
+            "ms": 0.09860659018158913,
+            "err": 0.0016591760137814912
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.09843137115240097,
+            "err": 0.11735900298117277
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.09034065529704094,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.05293475463986397,
+            "err": 0.03782528893139363
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.08292371407151222,
+            "err": 0.03782528893139363
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.03240091726183891,
+            "err": 0.1401446995737451
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.03770608454942703,
+            "err": 0.1401446995737451
+          }
+        },
+        {
+          "shape": "down_proj",
+          "N": 2048,
+          "K": 6144,
+          "M": 1,
+          "bf16": {
+            "ms": 0.010599922388792038,
+            "err": 0.0023229558469572307
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.010523926466703415,
+            "err": 0.11184962104092738
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.016710665076971054,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.01265350729227066,
+            "err": 0.03618207969777702
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.031859539449214935,
+            "err": 0.03618207969777702
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.03792550414800644,
+            "err": 0.13635210556791363
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.040400680154561996,
+            "err": 0.13635210556791363
+          }
+        },
+        {
+          "shape": "down_proj",
+          "N": 2048,
+          "K": 6144,
+          "M": 8,
+          "bf16": {
+            "ms": 0.024731997400522232,
+            "err": 0.0016364471487328221
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.02470020204782486,
+            "err": 0.11784847460140556
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.01704566180706024,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.012675691395998001,
+            "err": 0.03724288022362777
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.03177173435688019,
+            "err": 0.03724288022362777
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.039011482149362564,
+            "err": 0.13728707813915775
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.04008488729596138,
+            "err": 0.13728707813915775
+          }
+        },
+        {
+          "shape": "down_proj",
+          "N": 2048,
+          "K": 6144,
+          "M": 32,
+          "bf16": {
+            "ms": 0.012502875179052353,
+            "err": 0.002362884491589312
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.012571476399898529,
+            "err": 0.11712493233400417
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.021046437323093414,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.012645702809095383,
+            "err": 0.03769792373300955
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.03388231620192528,
+            "err": 0.03769792373300955
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.03833986818790436,
+            "err": 0.13995648444358133
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.04047544673085213,
+            "err": 0.13995648444358133
+          }
+        },
+        {
+          "shape": "down_proj",
+          "N": 2048,
+          "K": 6144,
+          "M": 128,
+          "bf16": {
+            "ms": 0.024793613702058792,
+            "err": 0.00235719582078677
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.024693384766578674,
+            "err": 0.11782771412561324
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.028932765126228333,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.021464228630065918,
+            "err": 0.03780991783604545
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.041342657059431076,
+            "err": 0.03780991783604545
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.03786267712712288,
+            "err": 0.14021871575672126
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.04064368084073067,
+            "err": 0.14021871575672126
+          }
+        },
+        {
+          "shape": "down_proj",
+          "N": 2048,
+          "K": 6144,
+          "M": 512,
+          "bf16": {
+            "ms": 0.07387498393654823,
+            "err": 0.0016561963517753588
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.07380301132798195,
+            "err": 0.11720699045746866
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.07067320868372917,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.07394557818770409,
+            "err": 0.03762125032793144
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.10226214304566383,
+            "err": 0.03762125032793144
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.06973281502723694,
+            "err": 0.13994676096328051
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.06924442946910858,
+            "err": 0.13994676096328051
+          }
+        },
+        {
+          "shape": "down_proj",
+          "N": 2048,
+          "K": 6144,
+          "M": 2048,
+          "bf16": {
+            "ms": 0.25072474032640457,
+            "err": 0.0023446423733082416
+          },
+          "int4_dequant_bf16": {
+            "ms": 0.25007614865899086,
+            "err": 0.1172455327501367
+          },
+          "int4_marlin_w4a16": {
+            "ms": 0.23600926622748375,
+            "err": 1.0
+          },
+          "fp8_w8a8_kernel": {
+            "ms": 0.14370743185281754,
+            "err": 0.03778322811592325
+          },
+          "fp8_w8a8_online": {
+            "ms": 0.21315284073352814,
+            "err": 0.03778322811592325
+          },
+          "nvfp4_w4a4_kernel": {
+            "ms": 0.06881281733512878,
+            "err": 0.1401445718219628
+          },
+          "nvfp4_w4a4_online": {
+            "ms": 0.06934944540262222,
+            "err": 0.1401445718219628
+          }
+        }
+      ],
+      "marlin_note": "独立调用 apply_gptq_marlin_linear（合成权重与真实 GPTQ 权重都试过）输出范数 ~1e-7（应为数百），相对误差 1.0，布局/零点约定未定位；4.0 已通过真实引擎层验证 Marlin W4A16 路径（相对差 8.66e-3）"
+    },
+    "E": {
+      "ppl": {
+        "bf16": 9.16285086345637,
+        "awq": 9.95824566654452,
+        "gptq": 10.174154093861992
+      },
+      "ppl_tokens": 32752,
+      "ceval_acc": {
+        "bf16": 0.5979899497487438,
+        "awq": 0.5527638190954773,
+        "gptq": 0.5376884422110553
+      },
+      "ceval_n": 199,
+      "ceval_scorer": "logprob_argmax_over_ABCD",
+      "revisions": {
+        "bf16": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+        "awq": "3ecffa0ceb27851800f45519bab9c457a04405e1",
+        "gptq": "4f5a0e31008e2966e8f787964bcc4e1105e03dc3"
+      }
+    },
+    "D": {
+      "kv_tokens_auto": 123728,
+      "kv_tokens_fp8": 247472,
+      "ratio": 2.0,
+      "concurrency_at_32768": {
+        "auto": "3.78x",
+        "fp8": "7.55x"
+      },
+      "prefill_decode_by_S": [
+        {
+          "S": 2048,
+          "prefill_auto": 0.13376874383538961,
+          "prefill_fp8": 0.1380273550748825,
+          "decode_tok_s_auto": 164.79708814565518,
+          "decode_tok_s_fp8": 184.1140098357282,
+          "top1_same": true,
+          "logprob_auto": -4.768360213347478e-06,
+          "logprob_fp8": -7.033323527139146e-06,
+          "logprob_diff": 2.264963313791668e-06,
+          "token_match": 32,
+          "token_n": 32
+        },
+        {
+          "S": 8192,
+          "prefill_auto": 0.16432713624089956,
+          "prefill_fp8": 0.17085024435073137,
+          "decode_tok_s_auto": 105.3473982092713,
+          "decode_tok_s_fp8": 105.84082600189562,
+          "top1_same": true,
+          "logprob_auto": -3.2186455882765586e-06,
+          "logprob_fp8": -5.364403477869928e-06,
+          "logprob_diff": 2.1457578895933693e-06,
+          "token_match": 32,
+          "token_n": 32
+        },
+        {
+          "S": 32768,
+          "prefill_auto": 1.1019406709820032,
+          "prefill_fp8": 1.1259238878265023,
+          "decode_tok_s_auto": 24.857385159791207,
+          "decode_tok_s_fp8": 25.330387693492764,
+          "top1_same": true,
+          "logprob_auto": -0.4395989775657654,
+          "logprob_fp8": -0.3952336609363556,
+          "logprob_diff": 0.04436531662940979,
+          "token_match": 32,
+          "token_n": 32
+        }
+      ],
+      "note": "两次运行均以 enable_prefix_caching=False 与真实 32768 token 提示重跑（此前 S=32768 的提示实际只有约 9k token 且被前缀缓存命中，数据已作废）",
+      "logprob_series": {
+        "auto": [
+          -4.768360213347478e-06,
+          -3.2186455882765586e-06,
+          -0.4395989775657654
+        ],
+        "fp8": [
+          -7.033323527139146e-06,
+          -5.364403477869928e-06,
+          -0.3952336609363556
+        ]
+      }
+    },
+    "D_dtypes": {
+      "S": 8192,
+      "rows": [
+        {
+          "kv": "auto",
+          "kv_tokens": 123728,
+          "concurrency_32768": 3.77587890625,
+          "prefill_s": 0.16432713624089956,
+          "decode_tok_s": 105.3473982092713,
+          "logprob": -3.2186455882765586e-06,
+          "logprob_diff": 0.0,
+          "token_match": "32/32"
+        },
+        {
+          "kv": "fp8",
+          "kv_tokens": 247472,
+          "concurrency_32768": 7.55224609375,
+          "prefill_s": 0.17085024435073137,
+          "decode_tok_s": 105.84082600189562,
+          "logprob": -5.364403477869928e-06,
+          "logprob_diff": 2.1457578895933693e-06,
+          "token_match": "32/32"
+        },
+        {
+          "kv": "turboquant_4bit_nc",
+          "kv_tokens": 336992,
+          "concurrency_32768": 10.2841796875,
+          "prefill_s": 0.25961653888225555,
+          "decode_tok_s": 83.26788083454468,
+          "logprob": -3.4570634852570947e-06,
+          "logprob_diff": 2.3841789698053617e-07,
+          "token_match": "32/32"
+        },
+        {
+          "kv": "int4_per_token_head",
+          "kv_tokens": 465840,
+          "concurrency_32768": 14.21630859375,
+          "prefill_s": 0.6630964139476418,
+          "decode_tok_s": 56.922566122881165,
+          "logprob": -0.000164018536452204,
+          "logprob_diff": 0.00016079989086392743,
+          "token_match": "32/32"
+        }
+      ],
+      "note": "同一提示（8192 token）、同一引擎，只改 kv_cache_dtype；int4_per_token_head 与 turboquant_4bit_nc 是 vLLM 0.29 支持的 4-bit 级 KV 路线"
+    },
+    "D_block_bytes": {
+      "per_dtype": {
+        "auto": {
+          "mem_gib": 13.22,
+          "tokens": 123728,
+          "bytes_per_token": 114726.3910616837
+        },
+        "fp8": {
+          "mem_gib": 13.22,
+          "tokens": 247472,
+          "bytes_per_token": 57359.486783474495
+        },
+        "turboquant_4bit_nc": {
+          "mem_gib": 13.22,
+          "tokens": 336992,
+          "bytes_per_token": 42122.266740100655
+        },
+        "int4_per_token_head": {
+          "mem_gib": 13.22,
+          "tokens": 465840,
+          "bytes_per_token": 30471.550131547312
+        }
+      },
+      "note": "引擎自报的 KV 显存预算 ÷ 引擎自报的 KV token 容量 = 每 token 字节（不依赖内部块结构）"
+    },
+    "E_serving": {
+      "protocol": "S=1024、B=1/8、max_tokens=1 与 32、greedy、enforce_eager、关闭前缀缓存；每个模型独立进程；先预热一次（8 token）",
+      "rows": [
+        {
+          "model": "bf16",
+          "weight_gib": 2.98,
+          "kv_tokens": 383376,
+          "concurrency_4k": 93.6,
+          "warmup_s": 0.08851580694317818,
+          "b1_ttft_ms": 103.96092291921377,
+          "b1_decode_tok_s": 223.3089845050591,
+          "b8_ttft_ms": 116.21271260082722,
+          "b8_total_tok_s": 1026.4901181238165,
+          "b8_per_req_tok_s": 128.31126476547706,
+          "first_top1": 576,
+          "first_logprob": -0.0004368066438473761
+        },
+        {
+          "model": "awq",
+          "weight_gib": 1.1,
+          "kv_tokens": 455696,
+          "concurrency_4k": 111.25,
+          "warmup_s": 0.09520917572081089,
+          "b1_ttft_ms": 104.12133764475584,
+          "b1_decode_tok_s": 196.33924612675318,
+          "b8_ttft_ms": 126.45864859223366,
+          "b8_total_tok_s": 923.8297820045238,
+          "b8_per_req_tok_s": 115.47872275056548,
+          "first_top1": 576,
+          "first_logprob": -0.001077548018656671
+        },
+        {
+          "model": "gptq",
+          "weight_gib": 1.1,
+          "kv_tokens": 455184,
+          "concurrency_4k": 111.13,
+          "warmup_s": 0.09731039684265852,
+          "b1_ttft_ms": 105.04385828971863,
+          "b1_decode_tok_s": 193.7060838115216,
+          "b8_ttft_ms": 121.3099304586649,
+          "b8_total_tok_s": 935.7962615764518,
+          "b8_per_req_tok_s": 116.97453269705647,
+          "first_top1": 576,
+          "first_logprob": -0.00030787018476985395
+        }
+      ]
+    },
+    "E_slo_curve": {
+      "rows": [
+        {
+          "model": "bf16",
+          "batch": 1,
+          "s_len": 1024,
+          "ttft_ms": 104.35705445706844,
+          "decode_tok_s_total": 227.4013421625908,
+          "decode_tok_s_per_req": 227.4013421625908
+        },
+        {
+          "model": "bf16",
+          "batch": 4,
+          "s_len": 1024,
+          "ttft_ms": 61.757104471325874,
+          "decode_tok_s_total": 675.9185400221477,
+          "decode_tok_s_per_req": 168.97963500553692
+        },
+        {
+          "model": "bf16",
+          "batch": 16,
+          "s_len": 1024,
+          "ttft_ms": 225.7974036037922,
+          "decode_tok_s_total": 1413.3233348858173,
+          "decode_tok_s_per_req": 88.33270843036358
+        },
+        {
+          "model": "awq",
+          "batch": 1,
+          "s_len": 1024,
+          "ttft_ms": 103.42136025428772,
+          "decode_tok_s_total": 195.25454628896588,
+          "decode_tok_s_per_req": 195.25454628896588
+        },
+        {
+          "model": "awq",
+          "batch": 4,
+          "s_len": 1024,
+          "ttft_ms": 64.00736328214407,
+          "decode_tok_s_total": 600.4126324948954,
+          "decode_tok_s_per_req": 150.10315812372386
+        },
+        {
+          "model": "awq",
+          "batch": 16,
+          "s_len": 1024,
+          "ttft_ms": 247.66989052295685,
+          "decode_tok_s_total": 1278.7118453528037,
+          "decode_tok_s_per_req": 79.91949033455023
+        },
+        {
+          "model": "gptq",
+          "batch": 1,
+          "s_len": 1024,
+          "ttft_ms": 102.2516954690218,
+          "decode_tok_s_total": 193.93346864152645,
+          "decode_tok_s_per_req": 193.93346864152645
+        },
+        {
+          "model": "gptq",
+          "batch": 4,
+          "s_len": 1024,
+          "ttft_ms": 61.98803521692753,
+          "decode_tok_s_total": 571.739226006206,
+          "decode_tok_s_per_req": 142.9348065015515
+        },
+        {
+          "model": "gptq",
+          "batch": 16,
+          "s_len": 1024,
+          "ttft_ms": 236.67939100414515,
+          "decode_tok_s_total": 1300.8055039332298,
+          "decode_tok_s_per_req": 81.30034399582686
+        }
+      ],
+      "protocol": "S=1024、B=1/4/16、max_tokens=1（TTFT）与 32（解码）、贪心、预热一次、关闭前缀缓存、每模型独立进程",
+      "note": "同协议下的 SLO 读数：B=16 时三精度 TTFT 225.8/247.7/236.7 ms、每请求解码 88.3/79.9/81.3 tok/s——4-bit 没有换来延迟余量，换的是显存与 KV 容量"
+    }
+  },
+  "source_refs": {
+    "vllm": {
+      "_custom_ops.py:824": "cutlass_scaled_mm(a,b,scale_a,scale_b,out_dtype)：b 必须是转置视图，加 contiguous 会被拒",
+      "_custom_ops.py:801": "cutlass_scaled_fp4_mm(a,b,a_scale,b_scale,alpha,out_dtype)：alpha 在 out_dtype 之前",
+      "_custom_ops.py:1900": "scaled_fp8_quant：动态模式不要传静态 scale（传 0 会把输入压成 0）",
+      "marlin_utils.py:698": "apply_gptq_marlin_linear",
+      "marlin.py:129-185": "marlin 的 repack 与 g_idx/zp 处理"
+    }
+  },
+  "artifacts": [
+    "run-ref.log",
+    "run-bench.log",
+    "quantize_reference.json",
+    "quantized_linear_bench.json",
+    "run-eval-bf16.log",
+    "run-eval-awq.log",
+    "run-eval-gptq.log",
+    "quantization_eval.json",
+    "run-kv-auto.log",
+    "run-kv-fp8.log",
+    "kv_cache_quant.json"
+  ],
+  "caveats": [
+    "A 段是 FP64 玩具规模（X 256×128、W 64×128、group 32），结论是机制层面的，不外推到真实模型质量",
+    "B 段的 MXFP4/NVFP4 是自写编码器；官方只对照了 FP8 的 scale 与字节（完全一致）与 NVFP4 算子的输出布局，未逐元素对拍 NVFP4 编码",
+    "C 段 FP8/NVFP4 的权重离线量化不计入 kernel 计时；'online' 一列包含每次调用的激活 amax 与转换",
+    "C 段 Marlin W4A16 独立调用失败，表中该列不可用；W4A16 的真实数据取自 4.0 的引擎层对拍",
+    "E 段的 PPL 用 WikiText-2 test 的前 16 个 2048-token 块（32752 token），非全量 test；C-Eval 取 10 科 199 题（受 val 集条数限制），计分器为 logprob argmax",
+    "D 段的 KV 容量取自引擎日志，未从块池结构直接算字节；单请求解码差异 5.2% 属小模型下的量级，未扫更大 KV 占比的配置",
+    "WikiText-2 与 C-Eval 经由 HF 镜像端点下载（HF_ENDPOINT=https://hf-mirror.com），数据集本体不入库"
+  ]
+}

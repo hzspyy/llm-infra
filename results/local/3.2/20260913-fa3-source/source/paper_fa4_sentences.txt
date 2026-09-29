@@ -1,0 +1,83 @@
+# https://arxiv.org/html/2603.05451
+# 与机制相关的句子摘录（未改写）
+
+The AI industry has rapidly transitioned to deploying Blackwell-based systems such as the B200 and GB200, which exhibit fundamentally different performance characteristics due to asymmetric hardware scaling: tensor core throughput doubles while other functional units (shared memory bandwidth, exponential units) scale more slowly or remain unchanged.
+
+Beyond algorithmic innovations, we implement FlashAttention-4 entirely in CuTe-DSL embedded in Python, achieving 20-30 × \times faster compile times compared to traditional C++ template-based approaches while maintaining full expressivity.
+
+[23] further adapted the algorithm for Hopper GPUs as FlashAttention-3 , exploiting asynchronous execution through warp specialization and incorporating FP8 support.
+
+Recent work has also explored low-precision attention: SageAttention [ 13 ] achieves speedups through INT8 quantization, SageAttention2 [ 12 ] extends this with INT4/FP8 quantization, and SageAttention3 [ 14 ] demonstrates FP4 quantization on Blackwell consumer GPUs.
+
+1 PFLOPS for FP16/BF16), other functional units (shared memory bandwidth, exponential units, and integer/floating point ALUs) scale more slowly or remain unchanged.
+
+Our roofline analysis ( Sections 3.1 and 3.2 ) reveals that for typical attention workloads on Blackwell, surprisingly, shared memory traffic and exponential operations now dominate execution time, exceeding MMA compute by 25-60%.
+
+Additionally, Blackwell introduces new architectural features: 256 KB of tensor memory (TMEM) per SM for storing intermediate tensor core results, 128 × \times 128 MMA tiles (double the area of Hopper’s 64 × \times 128), and fully asynchronous tensor core operations that write directly to TMEM.
+
+Rather than treating hardware as a uniform compute resource, we explicitly identify and mitigate bottlenecks in non-matmul units through algorithmic innovations: 1.
+
+Redesigned pipeline for maximum overlap: We develop new software pipelines for both forward and backward passes that exploit Blackwell’s fully asynchronous MMA operations and larger tile sizes to maximize overlap between tensor cores, softmax computation, and memory operations.
+
+Exponential unit bottleneck mitigation: For the forward pass, we implement software-emulated exponential functions using polynomial approximation on FMA units, increasing exponential throughput.
+
+We also introduce conditional softmax rescaling that skips unnecessary rescaling operations.
+
+We also leverage Blackwell’s 2-CTA MMA mode, so each CTA stages and loads half of operand B to further reduce shared memory traffic, which we exploit to restructure the dQ step to halve the number of atomic reductions.
+
+Beyond algorithmic innovations, we implement FlashAttention-4 entirely in CuTe-DSL embedded in Python, achieving 20-30 × \times faster compile times compared to traditional C++ template-based approaches while maintaining full expressivity.
+
+This framework significantly improves developer productivity and lowers the barrier to entry, enabling researchers to rapidly prototype and deploy new attention variants without deep expertise in C++ template metaprogramming.
+
+Blackwell introduces a new memory level called tensor memory (TMEM), a 256 KB on-chip memory per SM specifically designed for storing intermediate results of tensor core operations.
+
+Unlike shared memory, TMEM is warp-synchronous and tightly coupled with the tensor cores, enabling the matrix multiply-accumulate (MMA) units to write outputs directly to TMEM without consuming registers.
+
+TMEM is allocated in 32-column (16 KB) granules and requires explicit programmer management for allocation, deallocation, and data movement.
+
+Crucially, Blackwell MMAs write their output directly to TMEM asynchronously, whereas Hopper MMAs write to registers.
+
+2-CTA tensor core: Blackwell supports a 2-CTA tensor core MMA mode in which a CTA pair within the same thread block cluster cooperatively executes a single MMA, allowing the operation to read and write tensor memory from both CTAs.
+
+This reduces redundant shared memory capacity and bandwidth, but since these operations touch tensor memory across the CTA pair, kernels must launch CTAs in fixed pairs and use a consistent 2-CTA mode for tensor memory and tensor core operations throughout the kernel.
+
+Blackwell doubles the FP16/BF16 tensor core throughput compared to Hopper (2.25 PFLOPS [ 19 ] vs 1 PFLOPS [ 17 ] per GPU), but shared memory bandwidth and exponential unit throughput remain unchanged or scale more slowly.
+
+This imbalance shifts the performance bottleneck away from matrix multiplication toward shared memory traffic and non-matmul operations like softmax.
+
+We note that B300 and GB300 GPUs have doubled the exponential throughput to 32 ops / clock / SM, though these GPUs are not yet widely available at the time of writing.
+
+3 Algorithm 3.1 Attention forward pass We first do a roofline analysis to show the bottlenecks of attention forward pass, which motivates our new pipeline design, as well as changes in the FlashAttention algorithm to increase the throughput of the exponential unit and avoid most of the softmax rescaling steps.
+
+3.1.1 Feeds and Speeds We provide intuition for our kernel design and optimizations by first analyzing the roofline, based on the throughput of the matmul units (tensor cores), shared memory (smem), and exponential unit.
+
+The exponential unit computes elementwise operations required for the softmax computation.
+
+The forward pass requires exponential operations on M × N M\times N values (corresponding to the attention matrix 𝐒 \mathbf{S} ).
+
+With a throughput of 16 operations per cycle, the exponential unit requires T exp = M ​ N 16 ​ cycles .
+
+T_{\text{exp}}=\frac{MN}{16}\text{ cycles}.
+
+For M = N = d = 128 M=N=d=128 , the resources are well-balanced, with shared memory (768 cycles) being slightly lower than both MMA compute and exponential unit (both 1024 cycles).
+
+For the larger tile size M = 256 , N = d = 128 M=256,N=d=128 , the shared memory traffic increases to 1536 cycles due to reading MMA operands multiple times, while MMA compute and exponential unit double to 2048 cycles.
+
+This analysis motivates our kernel design to (1) use large tile sizes and maximize overlap between MMA operations and softmax computations (2) increase the throughput of exponential by using other hardware units (3) reduce the time of unnecessary non-matmul operations.
+
+Resource 128 3 128^{3} 256 × 128 2 256\times 128^{2} MMA compute 1024 2048 Shared memory 768 1536 Exponential unit 1024 2048 Table 1: Roofline analysis (cycles) for the attention forward pass.
+
+For both tile sizes, MMA compute and exponential unit are the primary bottlenecks.
+
+3.1.2 New pipeline to overlap matmul and softmax Since the Blackwell architecture doubled the tensor core flops again, taking care to overlap softmax and tensor core operations is even more crucial than on Hopper.
+
+While one tile’s tensor core operations are executed, the other tile computes softmax.
+
+Just like with FA-3, we explicitly synchronize the two softmax warpgroups to not overlap in their critical section, which is the part of exponential computation.
+
+Each softmax warpgroup proceeds by first loading the entire row into registers, then computing the maximum, then computing the softmax (i.e., subtract the max, rescale, exponentiate, convert to input precision), and finally computing the row sum.
+
+Another difference from FA-3 is that since we transfer 𝐏 \mathbf{P} via tensor memory rather than register file, we can decouple the rescaling of the output to a separate “correction” warpgroup and thus take it out of the critical path.
+
+We choose the latter because it allows us to start our software pipeline by immediately computing two 𝐒 \mathbf{S} tiles.
+

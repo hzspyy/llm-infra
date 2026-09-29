@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.1 集合通信与成本模型</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">6.1</div>
+  <div class="sidebar-title">集合通信与成本模型</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一份数据，三种口径</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-nccl">1. 成本公式来自 NCCL 自己的步数定义</a></li>
+<li><a href="#2-5">2. 单一 α/β 模型覆盖不了 5 个数量级</a></li>
+<li><a href="#3-nccl">3. 算法与协议由 NCCL 的调优表决定</a></li>
+<li><a href="#4">4. 强制算法与协议的性能对照</a></li>
+<li><a href="#5">5. 近拓扑与远拓扑</a></li>
+<li><a href="#6">6. 通信与计算的重叠</a></li>
+<li><a href="#7-transport">7. 跨机 transport：一条千兆链路把成本模型压成纯字节</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
+<li><a href="#_5">代码入口</a></li>
+<li><a href="#_6">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_8">命令</a></li>
+<li><a href="#_9">实测数字</a></li>
+<li><a href="#_10">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一份数据，三种口径</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-nccl">1. 成本公式来自 NCCL 自己的步数定义</a></li>
+<li><a href="#2-5">2. 单一 α/β 模型覆盖不了 5 个数量级</a></li>
+<li><a href="#3-nccl">3. 算法与协议由 NCCL 的调优表决定</a></li>
+<li><a href="#4">4. 强制算法与协议的性能对照</a></li>
+<li><a href="#5">5. 近拓扑与远拓扑</a></li>
+<li><a href="#6">6. 通信与计算的重叠</a></li>
+<li><a href="#7-transport">7. 跨机 transport：一条千兆链路把成本模型压成纯字节</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
+<li><a href="#_5">代码入口</a></li>
+<li><a href="#_6">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_8">命令</a></li>
+<li><a href="#_9">实测数字</a></li>
+<li><a href="#_10">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L6 · 分布式：通信、并行、分离</div>
+  <div class="mod-id">6.1</div>
+  <h1>集合通信与成本模型</h1>
+  <p class="lede">NCCL ring/tree/NVLS、成本模型、拓扑感知；实测 NODE 与 SYS 链路的 allreduce 带宽差。</p>
+  <div class="chips"><span class="chip">实测机器 worldvln（2×/4× L40S，PCIe，无 NVLink）· NCCL 2.29.7 · torch 2.13.0+cu130；跨机档 crater ↔ crater2（各 1× RTX 5090，net1 1 GbE）</span><span class="chip">前置 6.0（完成语义与失败形态）· 1.3（PCIe 与 NUMA 拓扑）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>6.0 讲清了通信怎么配对、什么时候算完成；这一章讲它有多贵。集合通信的成本模型看起来简单——启动开销加传输时间——但真正难的是口径：同一句「all-reduce 带宽 14.8 GB/s」，在不同文献里可能指每 rank 输入字节、单向链路上的字节，或者双向聚合字节，三者相差 1.5 到 2 倍。口径不统一，跨论文、跨集群的数字就没法比。</p>
+<ol>
+<li>算法和协议在什么条件下切换？切换由谁决定？</li>
+<li>带宽口径怎样统一？算法带宽与总线带宽分别是什么？</li>
+<li>拓扑与消息尺寸怎样共同决定成本？</li>
+</ol>
+<p>这一章有套测量，边界完全不同，数字不能互相代入：</p>
+<table>
+<thead>
+<tr>
+<th>档</th>
+<th>机器与链路</th>
+<th>传输路径</th>
+<th>覆盖内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单机（主体）</td>
+<td>worldvln，2×/4× L40S，PCIe Gen4×16，无 NVLink</td>
+<td><code>SHM/direct/direct</code>，不经网络栈</td>
+<td>口径、α/β、算法与协议、强制组合、重叠</td>
+</tr>
+<tr>
+<td>跨机</td>
+<td>crater ↔ crater2，各 1×RTX 5090，<code>net1</code> 1 GbE</td>
+<td><code>NET/Socket</code>（两机均无 <code>/dev/infiniband</code>）</td>
+<td>链路 β 上限、字节主导区间、裸 TCP 参照、跨传输的完成语义</td>
+</tr>
+</tbody>
+</table>
+<p>单机档的结论是「PCIe 与 NVLink 的量级差异」，跨机档的结论是「网卡与 1 GbE 是硬上限」。跨机档用的是消费级 RTX 5090 与千兆网卡，不代表生产集群的 RDMA 或 NVLink 域，两者都只在自己的条件下成立。</p>
+<hr />
+<h2 id="_2">心智模型：一份数据，三种口径</h2>
+<figure>
+
+
+<svg viewBox="0 0 820 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="集合通信的三种带宽口径">
+  <defs>
+    <marker id="d61" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">M = 每 rank 输入字节，t = 实测时间</text>
+
+    <!-- 三种口径 -->
+    <rect x="12" y="34" width="256" height="120" rx="4" fill="none" stroke="currentColor"/>
+    <text x="24" y="54" font-size="11.5" font-weight="600">口径 1：算法带宽 algbw</text>
+    <text x="24" y="76" font-family="monospace" font-size="10.5">algbw = M / t</text>
+    <text x="24" y="96" font-size="10">每 rank 输入字节除以时间</text>
+    <text x="24" y="112" font-size="10" opacity="0.85">⚠️ N 变化时不可比：N 越大，</text>
+    <text x="24" y="126" font-size="10" opacity="0.85">同样的 algbw 意味着更多总字节</text>
+    <text x="24" y="144" font-size="10" opacity="0.85">本页所有表格都标了 N</text>
+
+    <rect x="282" y="34" width="256" height="120" rx="4" fill="none" stroke="currentColor"/>
+    <text x="294" y="54" font-size="11.5" font-weight="600">口径 2：总线带宽 busbw</text>
+    <text x="294" y="76" font-family="monospace" font-size="10.5">busbw = (每 rank 真实过链字节) / t</text>
+    <text x="294" y="96" font-size="10">按算法实际搬运量折算</text>
+    <text x="294" y="112" font-size="10" opacity="0.85">all_gather/reduce_scatter：(N−1)/N × M</text>
+    <text x="294" y="126" font-size="10" opacity="0.85">all_reduce：2(N−1)/N × M</text>
+    <text x="294" y="144" font-size="10" opacity="0.85">broadcast：M（root 单向发出）</text>
+
+    <rect x="552" y="34" width="256" height="120" rx="4" fill="none" stroke="currentColor"/>
+    <text x="564" y="54" font-size="11.5" font-weight="600">口径 3：链路速率 β</text>
+    <text x="564" y="76" font-family="monospace" font-size="10.5">t = α + bytes / β</text>
+    <text x="564" y="96" font-size="10">从扫描数据拟合出来的渐近速率</text>
+    <text x="564" y="112" font-size="10" opacity="0.85">β 是一段链路的属性，</text>
+    <text x="564" y="126" font-size="10" opacity="0.85">与 op 的搬运倍数无关</text>
+    <text x="564" y="144" font-size="10" opacity="0.85">本节用它比较不同 collective</text>
+
+    <!-- 实测 -->
+    <text x="12" y="186" font-size="11.5" font-weight="600">实测（2×L40S，PCIe，NCCL 2.29.7）：同一块数据，不同 collective 的链路速率</text>
+    <line x1="12" y1="196" x2="808" y2="196" stroke="currentColor" opacity="0.3"/>
+
+    <g font-size="10">
+      <text x="12" y="218">broadcast</text>
+      <rect x="120" y="206" width="605" height="16" rx="2" fill="currentColor" opacity="0.25"/>
+      <text x="735" y="218" font-weight="600">β = 24.18 GB/s</text>
+
+      <text x="12" y="244">all_reduce</text>
+      <rect x="120" y="232" width="371" height="16" rx="2" fill="currentColor" opacity="0.25"/>
+      <text x="501" y="244" font-weight="600">β = 14.82 GB/s</text>
+
+      <text x="12" y="270">sendrecv（环）</text>
+      <rect x="120" y="258" width="367" height="16" rx="2" fill="currentColor" opacity="0.25"/>
+      <text x="497" y="270" font-weight="600">β = 14.66 GB/s</text>
+
+      <text x="12" y="296">reduce_scatter</text>
+      <rect x="120" y="284" width="319" height="16" rx="2" fill="currentColor" opacity="0.25"/>
+      <text x="449" y="296" font-weight="600">β = 12.81 GB/s</text>
+
+      <text x="12" y="322">all_gather</text>
+      <rect x="120" y="310" width="318" height="16" rx="2" fill="currentColor" opacity="0.25"/>
+      <text x="448" y="322" font-weight="600">β = 12.74 GB/s</text>
+    </g>
+
+    <line x1="120" y1="336" x2="120" y2="200" stroke="currentColor" opacity="0.4"/>
+    <text x="12" y="352" font-size="10" opacity="0.85">broadcast 是纯单向流，24.2 GB/s 就是这块 PCIe 链路的单向有效载荷上限；</text>
+    <text x="12" y="368" font-size="10" opacity="0.85">其余几个同时收发，单向速率掉到 12.7–14.8 GB/s，聚合约 25–30 GB/s。</text>
+    <text x="12" y="390" font-size="10" font-weight="600">PCIe Gen4×16：编码后单向理论 31.5 GB/s（128b/130b），实测单向有效载荷 24.18 GB/s（76.8%）。</text>
+    <text x="12" y="408" font-size="10" opacity="0.85">这三个数必须分开写：理论带宽、单向实测、双向聚合，混用会放大或缩小 2 倍。</text>
+  </g>
+</svg>
+
+
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1-nccl">1. 成本公式来自 NCCL 自己的步数定义</h3>
+<p>不用猜 ring 怎么走。NCCL 的调优代码把每种 collective 的步数写死在一个表达式里（<code>src/graph/tuning.cc:269-271</code>，v2.29.7-1）：</p>
+<div class="highlight"><pre><span></span><code><span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">nsteps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">coll</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ncclFuncAllReduce</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="mi">2</span><span class="o">*</span><span class="p">(</span><span class="n">nRanks</span><span class="mi">-1</span><span class="p">)</span><span class="w"> </span><span class="o">:</span>
+<span class="w">      </span><span class="n">coll</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ncclFuncReduceScatter</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">coll</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ncclFuncAllGather</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">nRanks</span><span class="mi">-1</span><span class="w"> </span><span class="o">:</span>
+<span class="w">      </span><span class="n">nRanks</span><span class="p">;</span>
+</code></pre></div>
+
+<p>每次传输的数据量是 <code>M/nRanks</code>。把这两件事乘起来，就是每个 rank 需要收发的字节数：</p>
+<table>
+<thead>
+<tr>
+<th>collective</th>
+<th>步数</th>
+<th>每 rank 过链字节</th>
+<th>时间模型</th>
+<th>busbw</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ring all-reduce</td>
+<td>2(N−1)</td>
+<td>2M(N−1)/N</td>
+<td>2(N−1)α + 2M(N−1)/(Nβ)</td>
+<td>2(N−1)/N × M/t</td>
+</tr>
+<tr>
+<td>all-gather</td>
+<td>N−1</td>
+<td>M(N−1)/N</td>
+<td>(N−1)α + M(N−1)/(Nβ)</td>
+<td>(N−1)/N × M/t</td>
+</tr>
+<tr>
+<td>reduce-scatter</td>
+<td>N−1</td>
+<td>M(N−1)/N</td>
+<td>(N−1)α + M(N−1)/(Nβ)</td>
+<td>(N−1)/N × M/t</td>
+</tr>
+<tr>
+<td>broadcast</td>
+<td>N−1</td>
+<td>M（root 发出）</td>
+<td>(N−1)α + M/β</td>
+<td>M/t</td>
+</tr>
+</tbody>
+</table>
+<p><code>α</code> 是每步的启动/同步开销，<code>β</code> 是链路速率。这张表和公式是本章所有数字的口径基准：<strong><code>M</code> 始终指每 rank 输入字节</strong>，<code>N</code> 单独标出，两者不混用。</p>
+<p>测出来的 α 和 β（最小二乘拟合，只用 ≥1 MiB 的点）：</p>
+<table>
+<thead>
+<tr>
+<th>collective</th>
+<th>N=2 近（α / β）</th>
+<th>N=2 远（α / β）</th>
+<th>N=4（α / β）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all_reduce</td>
+<td>16.02 µs / 14.82 GB/s</td>
+<td>15.85 µs / 14.56 GB/s</td>
+<td>73.38 µs / 6.53 GB/s</td>
+</tr>
+<tr>
+<td>all_gather</td>
+<td>13.90 µs / 12.74 GB/s</td>
+<td>13.79 µs / 12.71 GB/s</td>
+<td>86.59 µs / 3.16 GB/s</td>
+</tr>
+<tr>
+<td>reduce_scatter</td>
+<td>13.36 µs / 12.81 GB/s</td>
+<td>14.15 µs / 12.79 GB/s</td>
+<td>20.13 µs / 3.01 GB/s</td>
+</tr>
+<tr>
+<td>broadcast</td>
+<td>13.16 µs / 24.18 GB/s</td>
+<td>14.09 µs / 23.83 GB/s</td>
+<td>16.94 µs / 11.65 GB/s</td>
+</tr>
+<tr>
+<td>sendrecv（环）</td>
+<td>51.78 µs / 14.66 GB/s</td>
+<td>48.66 µs / 14.44 GB/s</td>
+<td>57.48 µs / 7.81 GB/s</td>
+</tr>
+</tbody>
+</table>
+<p>两条读法：</p>
+<p><strong>β 随 N 下降</strong>。all_reduce 的单向链路速率从 N=2 的 14.82 GB/s 掉到 N=4 的 6.53 GB/s。注意这里的 β 是「每 rank 每方向速率」，N 变大时总端口带宽被更多 rank 分走，而 busbw 已经把 N 的因子折算进去了（N=4 时 all_reduce 的 busbw = 9.79 GB/s，比 β 大 1.5 倍，这个 1.5 就是 2(N−1)/N）。</p>
+<p><strong>β 与 collective 有关</strong>。同一块链路，broadcast 的 β 是 all_gather 的 1.9 倍。原因不是链路有差别，而是流量形态不同：broadcast 是纯单向流，all_gather 是双向同时收发。把 all_gather 的 β（12.74 GB/s）按两个方向算聚合是 25.5 GB/s，与 broadcast 单向的 24.18 GB/s 同量级——<strong>链路的聚合带宽是 ~25–30 GB/s，单向流可以吃满 24 GB/s，双向流每方向只能拿到一半。</strong></p>
+<h3 id="2-5">2. 单一 α/β 模型覆盖不了 5 个数量级</h3>
+<p>把 4 KiB 到 256 MiB 的全部点拿去拟合，最大相对误差是 22%–56%；只用 ≥1 MiB 的点，误差降到 2%–18%：</p>
+<table>
+<thead>
+<tr>
+<th>collective</th>
+<th style="text-align: right;">全区间最大相对误差</th>
+<th style="text-align: right;">≥1 MiB 最大相对误差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all_reduce</td>
+<td style="text-align: right;">0.352</td>
+<td style="text-align: right;">0.069</td>
+</tr>
+<tr>
+<td>all_gather</td>
+<td style="text-align: right;">0.479</td>
+<td style="text-align: right;">0.031</td>
+</tr>
+<tr>
+<td>reduce_scatter</td>
+<td style="text-align: right;">0.389</td>
+<td style="text-align: right;">0.032</td>
+</tr>
+<tr>
+<td>broadcast</td>
+<td style="text-align: right;">0.386</td>
+<td style="text-align: right;">0.022</td>
+</tr>
+<tr>
+<td>sendrecv</td>
+<td style="text-align: right;">0.259</td>
+<td style="text-align: right;">0.158</td>
+</tr>
+</tbody>
+</table>
+<p>小消息段支配时间的不再是传输，而是每步的同步与内核启动；用一个大消息段的 α 去预测 4 KiB 会高估一个数量级。这不是模型错了，而是<strong>两段机制</strong>：小消息看延迟，大消息看带宽。做容量规划时先确认目标消息落在哪一段，再选公式。</p>
+<h3 id="3-nccl">3. 算法与协议由 NCCL 的调优表决定</h3>
+<p>NCCL 在初始化时打印自己的候选成本表，并在每次 collective 时打印最终选择。这两个都是可解析的证据，不需要由「带宽接近某个值」反推算法：</p>
+<div class="highlight"><pre><span></span><code>NCCL INFO AllReduce: 1048576 Bytes -&gt; Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+NCCL INFO AllReduce: 4096 Bytes -&gt; Algo RING proto LL channel{Lo..Hi}={0..0}
+</code></pre></div>
+
+<p>实测的自动选择（2×L40S）：</p>
+<table>
+<thead>
+<tr>
+<th>消息大小</th>
+<th>算法</th>
+<th>协议</th>
+<th>通道数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4 KiB – 256 KiB</td>
+<td>RING</td>
+<td>LL</td>
+<td>1→2（16 KiB 起）</td>
+</tr>
+<tr>
+<td>1 MiB – 256 MiB</td>
+<td>RING</td>
+<td>SIMPLE</td>
+<td>2</td>
+</tr>
+</tbody>
+</table>
+<p>切换点在 256 KiB 与 1 MiB 之间：LL 协议为小消息优化，SIMPLE 从 1 MiB 起接管。强制指定算法/协议后选择随之改变（<code>Algo TREE proto SIMPLE</code>），说明日志里的选择确实来自调优，而不是解析错位。</p>
+<p><strong>哪些强制组合是合法的，源码里写得清清楚楚</strong>（<code>src/graph/tuning.cc:272-275</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="p">((</span><span class="n">coll</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ncclFuncBroadcast</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">coll</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ncclFuncReduce</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">NCCL_ALGO_RING</span><span class="p">)</span><span class="w"> </span><span class="k">continue</span><span class="p">;</span>
+<span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="p">((</span><span class="n">coll</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ncclFuncReduceScatter</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">coll</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ncclFuncAllGather</span><span class="p">)</span>
+<span class="w">          </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">NCCL_ALGO_PAT</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">NCCL_ALGO_RING</span>
+<span class="w">          </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">NCCL_ALGO_NVLS</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">NCCL_ALGO_COLLNET_DIRECT</span><span class="p">)</span><span class="w"> </span><span class="k">continue</span><span class="p">;</span>
+<span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">coll</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ncclFuncAllReduce</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">NCCL_ALGO_PAT</span><span class="p">)</span><span class="w"> </span><span class="k">continue</span><span class="p">;</span>
+</code></pre></div>
+
+<p>强制 <code>NCCL_ALGO=Tree</code> 的实测结果与这段代码完全对应：</p>
+<table>
+<thead>
+<tr>
+<th>collective</th>
+<th>auto</th>
+<th>Ring</th>
+<th>Tree</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all_reduce</td>
+<td>OK</td>
+<td>OK</td>
+<td>OK</td>
+</tr>
+<tr>
+<td>all_gather</td>
+<td>OK</td>
+<td>OK</td>
+<td><strong>FAIL</strong></td>
+</tr>
+<tr>
+<td>reduce_scatter</td>
+<td>OK</td>
+<td>OK</td>
+<td><strong>FAIL</strong></td>
+</tr>
+<tr>
+<td>broadcast</td>
+<td>OK</td>
+<td>OK</td>
+<td><strong>FAIL</strong></td>
+</tr>
+</tbody>
+</table>
+<p>失败不是静默回退，而是直接报错：</p>
+<div class="highlight"><pre><span></span><code>Error : no algorithm/protocol available for function AllGather with datatype ncclInt8.
+NCCL_ALGO was set to Tree. NCCL_PROTO was set to Simple.
+</code></pre></div>
+
+<p>协议侧没有这种硬性限制：1 MiB 的 all_reduce 在 auto / Simple / LL / LL128 四种设置下都能跑，只是性能不同（见下）。</p>
+<h3 id="4">4. 强制算法与协议的性能对照</h3>
+<p>同一个 all_reduce，256 MiB，2×L40S：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align: right;">时间</th>
+<th style="text-align: right;">busbw</th>
+<th>实际选择</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>auto</td>
+<td style="text-align: right;">18.135 ms</td>
+<td style="text-align: right;">14.80 GB/s</td>
+<td>RING / SIMPLE</td>
+</tr>
+<tr>
+<td>强制 Ring / Simple</td>
+<td style="text-align: right;">18.538 ms</td>
+<td style="text-align: right;">14.48 GB/s</td>
+<td>RING / SIMPLE</td>
+</tr>
+<tr>
+<td>强制 Ring / LL128</td>
+<td style="text-align: right;">30.843 ms</td>
+<td style="text-align: right;">8.70 GB/s</td>
+<td>RING / LL128</td>
+</tr>
+<tr>
+<td>强制 Tree / Simple</td>
+<td style="text-align: right;">17.723 ms</td>
+<td style="text-align: right;">15.15 GB/s</td>
+<td>TREE / SIMPLE</td>
+</tr>
+</tbody>
+</table>
+<p>auto 与强制 Ring/Simple 差 2.2%，说明 1 MiB 以上 auto 选的就是 Ring/Simple，日志与实测互证。LL128 在大消息上比 Simple 慢 40%——LL128 的 128 字节粒度在这条 PCIe 链路上没有优势。</p>
+<p>4 卡时反过来：</p>
+<table>
+<thead>
+<tr>
+<th>配置（N=4，256 MiB all_reduce）</th>
+<th style="text-align: right;">时间</th>
+<th style="text-align: right;">busbw</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>auto</td>
+<td style="text-align: right;">41.138 ms</td>
+<td style="text-align: right;">9.79 GB/s</td>
+</tr>
+<tr>
+<td>强制 Tree / Simple</td>
+<td style="text-align: right;">34.717 ms</td>
+<td style="text-align: right;">11.60 GB/s</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Tree 比 auto 选的 Ring 快 18.5%。</strong> 这台机器上 <code>libnccl-tuner.so</code> 不存在，用的是默认拓扑模型；模型对这套「三卡在同一 PCIe host bridge、第四卡跨 NUMA」的非对称拓扑估计不准。这是「先量再调」的直接理由：默认不是最优，而最优随拓扑变化。</p>
+<h3 id="5">5. 近拓扑与远拓扑</h3>
+<p>同一对 GPU 之间的差异：</p>
+<table>
+<thead>
+<tr>
+<th>组合</th>
+<th>位置</th>
+<th style="text-align: right;">all_reduce β</th>
+<th style="text-align: right;">broadcast β</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU0–GPU1</td>
+<td>同 NUMA，PCIe host bridge（NODE / PHB）</td>
+<td style="text-align: right;">14.82 GB/s</td>
+<td style="text-align: right;">24.18 GB/s</td>
+</tr>
+<tr>
+<td>GPU0–GPU3</td>
+<td>跨 NUMA（SYS，经 UPI）</td>
+<td style="text-align: right;">14.56 GB/s</td>
+<td style="text-align: right;">23.83 GB/s</td>
+</tr>
+</tbody>
+</table>
+<p>差 1.8% 和 1.4%。跨 NUMA 几乎没有代价，原因是两段都还在 PCIe 上、UPI 的带宽高于实测速率；NCCL 日志显示通道走的是 <code>via SHM/direct/direct</code>，即 GPU 之间的直接 P2P 映射，没有落到主机内存中转。</p>
+<p><strong>这个结论只对 PCIe 成立。</strong> 有 NVLink 的平台上，近/远会变成 NVLink 与 PCIe 的差别，量级完全不同；跨机时决定成本的是网卡与 RDMA 路径，不是 UPI。1.3 已经从驱动层测过这台机器的 PCIe 单向能力（x16 22.67 GB/s），这里的 24.18 GB/s 是集合通信视角下的同一量级。</p>
+<h3 id="6">6. 通信与计算的重叠</h3>
+<p>GEMM 取 8192³ bf16（1099.5 GFLOP），通信取 64 MiB all_reduce，2×L40S：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align: right;">时间</th>
+<th>折算</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>通信单独</td>
+<td style="text-align: right;">4.655 ms</td>
+<td>14.42 GB/s</td>
+</tr>
+<tr>
+<td>计算单独</td>
+<td style="text-align: right;">4.645 ms</td>
+<td>236.7 TFLOP/s</td>
+</tr>
+<tr>
+<td>串行（计算等通信）</td>
+<td style="text-align: right;">9.751 ms</td>
+<td>4.655 + 4.645 = 9.300 ms，吻合</td>
+</tr>
+<tr>
+<td>独立重叠（正确依赖）</td>
+<td style="text-align: right;">5.259 ms</td>
+<td>比串行快 46.1%</td>
+</tr>
+<tr>
+<td>理论上限</td>
+<td style="text-align: right;">4.645 ms</td>
+<td>达成 97%</td>
+</tr>
+</tbody>
+</table>
+<p>重叠的代价是资源竞争：重叠期间 GEMM 只有 209.1 TFLOP/s（单独时的 88.4%），通信有效速率 12.76 GB/s（单独时的 88.5%）。<strong>两个方向各掉约 11.6%</strong>，但总时间仍然接近理论上限——这就是重叠的价值：牺牲 12% 的单项效率，换回 46% 的端到端时间。</p>
+<p>还有一条必须单独说的：把「等待通信流」这一步漏掉，时间看起来一样快，但结果是错的。同一个重叠写法，正确版本 20 次读到的 buffer 值全部是 2.0；漏掉 <code>wait_stream</code> 的版本读到 <code>{1.0, 2.0}</code> 两种值——32 MiB 的 all_reduce 还没写完，D2H 就把半成品拷走了。<strong>重叠的收益与正确性是两件事，必须分开验。</strong></p>
+<h3 id="7-transport">7. 跨机 transport：一条千兆链路把成本模型压成纯字节</h3>
+<p>前六节的边界是「单机、PCIe」。同一套采集脚本可以放到两台互通的机器上（crater 与 crater2，各一张 RTX 5090，走 <code>net1</code> 的 1 GbE，<code>NCCL_SOCKET_IFNAME=net1</code>、<code>NCCL_IB_DISABLE=1</code>），此时 NCCL 的通道路径从 <code>SHM/direct/direct</code> 换成 <code>NET/Socket</code>。<strong>换的不只是带宽数字，还有三件事：可用的字节区间、算法与协议的切换点、以及「什么时候能计时」。</strong></p>
+<p>先看链路本身。两台机器的 <code>net1</code> 协商速率都是 1000 Mb/s（<code>/sys/class/net/net1/speed</code>）。用裸 TCP 单向流（不经 NCCL、不经 GPU）反复发 16 MiB 并等对端回执，<strong>中位 142.683 ms，即 0.1176 GB/s</strong>——1 GbE 线速 0.125 GB/s 的 94.1%。</p>
+<p>再看 NCCL 在同一对链路上的选择与耗时（隔离计时，见下）：</p>
+<table>
+<thead>
+<tr>
+<th>消息</th>
+<th>算法/协议/通道</th>
+<th style="text-align: right;">all_reduce t</th>
+<th style="text-align: right;">all_reduce busbw</th>
+<th style="text-align: right;">all_gather busbw</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4 KiB</td>
+<td>RING / LL / 1</td>
+<td style="text-align: right;">0.166 ms</td>
+<td style="text-align: right;">0.025 GB/s</td>
+<td style="text-align: right;">0.015 GB/s</td>
+</tr>
+<tr>
+<td>64 KiB</td>
+<td>RING / SIMPLE / 2</td>
+<td style="text-align: right;">0.670 ms</td>
+<td style="text-align: right;">0.098 GB/s</td>
+<td style="text-align: right;">0.049 GB/s</td>
+</tr>
+<tr>
+<td>1 MiB</td>
+<td>RING / SIMPLE / 2</td>
+<td style="text-align: right;">9.052 ms</td>
+<td style="text-align: right;">0.116 GB/s</td>
+<td style="text-align: right;">0.058 GB/s</td>
+</tr>
+<tr>
+<td>4 MiB</td>
+<td>RING / SIMPLE / 2</td>
+<td style="text-align: right;">35.879 ms</td>
+<td style="text-align: right;">0.117 GB/s</td>
+<td style="text-align: right;">0.058 GB/s</td>
+</tr>
+<tr>
+<td>16 MiB</td>
+<td>RING / SIMPLE / 2</td>
+<td style="text-align: right;">143.256 ms</td>
+<td style="text-align: right;">0.117 GB/s</td>
+<td style="text-align: right;">0.059 GB/s</td>
+</tr>
+<tr>
+<td>64 MiB</td>
+<td>RING / SIMPLE / 2</td>
+<td style="text-align: right;">571.853 ms</td>
+<td style="text-align: right;">0.117 GB/s</td>
+<td style="text-align: right;">0.059 GB/s</td>
+</tr>
+<tr>
+<td>256 MiB</td>
+<td>RING / SIMPLE / 2</td>
+<td style="text-align: right;">2286.445 ms</td>
+<td style="text-align: right;">0.117 GB/s</td>
+<td style="text-align: right;">0.059 GB/s</td>
+</tr>
+</tbody>
+</table>
+<p>16 MiB 这一格值得单独看：<strong>裸 TCP 0.1176 GB/s、NCCL all_reduce 0.1171 GB/s、NCCL broadcast 0.1175 GB/s，三个数字在 0.4% 以内。</strong> 集合通信没有给链路增加可观的开销，它只是把这条链路跑满了；千兆链路上各 collective 的差别被链路吞掉，只有 4 KiB 那一档还能看出 op 之间的差异（0.015–0.066 GB/s，全被启动开销支配）。</p>
+<p>与单机 PCIe 档对照（同为 64 MiB）：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">单机 2×L40S（PCIe）</th>
+<th style="text-align: right;">跨机 2×5090（1 GbE）</th>
+<th style="text-align: right;">比值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>broadcast 单向 β</td>
+<td style="text-align: right;">24.154 GB/s</td>
+<td style="text-align: right;">0.118 GB/s</td>
+<td style="text-align: right;">205×</td>
+</tr>
+<tr>
+<td>all_reduce busbw</td>
+<td style="text-align: right;">14.847 GB/s</td>
+<td style="text-align: right;">0.117 GB/s</td>
+<td style="text-align: right;">126×</td>
+</tr>
+<tr>
+<td>all_gather busbw</td>
+<td style="text-align: right;">6.364 GB/s</td>
+<td style="text-align: right;">0.059 GB/s</td>
+<td style="text-align: right;">108×</td>
+</tr>
+<tr>
+<td>起始段（4 KiB broadcast）</td>
+<td style="text-align: right;">0.100 GB/s</td>
+<td style="text-align: right;">0.066 GB/s</td>
+<td style="text-align: right;">1.5×</td>
+</tr>
+</tbody>
+</table>
+<p><strong>小消息的差距只有 1.5 倍，大消息是 100–200 倍</strong>，这正是「启动开销」与「字节速率」的分离：4 KiB 的耗时由每跳的固定成本支配，两台机器之间多一次 TCP 往返并不比 PCIe 上的 launch 与同步贵多少；一旦进入字节主导区间，1 GbE 与 PCIe Gen4×16 的差距就完整暴露出来。单机档第 2 节那张「单一 α/β 模型覆盖不了 5 个数量级」的表在跨机档里依然成立，但原因换了：跨机档的斜率由网卡决定，而且从 1 MiB 起就完全平坦。</p>
+<p>换一条网卡也一样。同一个 <code>/24</code> 上另有容器 overlay <code>eth0</code>（<code>/sys/class/net/eth0/speed</code> 报 10000，MTU 1450），跨机扫描给出 all_reduce 0.113 GB/s、broadcast 0.114 GB/s，与 <code>net1</code> 相差 3.5%。<strong>「网卡自报 10 GbE」与「两个容器之间实际能跑多少」是两件事</strong>，这里只有把裸 TCP 参照一起测出来才能判定瓶颈在哪一段。</p>
+<p><strong>跨机计时必须换口径。</strong> 本节所有跨机数字都用 <code>dist.barrier()</code> 逐轮隔离后再记 device event。原因是 NCCL 跨机时真正搬数据的是 CPU 侧的 proxy 线程：device event 只包住 GPU 上的 kernel，kernel 返回并不等于字节已经上链路。不隔离时，64 MiB broadcast 是 570.371 ms（隔离 570.564 ms）看不出问题，但<strong>4 KiB broadcast 只有 0.017 ms（隔离后 0.062 ms）、64 KiB 只有 0.022 ms（隔离后 0.595 ms）</strong>——前一轮的网络传输还没结束，下一轮就已经「计时完成」了。跨机小消息用 device event 直接读会得到小一个数量级的结果。</p>
+<p><strong>这一档没有覆盖的东西。</strong> 两台机器都无 RDMA（无 <code>/dev/infiniband</code>、无 IB 设备），走的是 <code>NET/Socket</code>；跨机侧的强制算法对照、通信与计算重叠、超过 2 个 rank 的拓扑，以及 NVLS/GIN 都没有做。生产集群跨节点走 RDMA/RoCE 时链路速率与协议栈都与这里的 1 GbE + 内核 TCP 不同，<strong>本节任何数字都不能代入</strong>。</p>
+<hr />
+<h2 id="_4">工程实现 · 源码解析</h2>
+<h3 id="_5">代码入口</h3>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/graph/tuning.cc:269-271</code></td>
+<td>每类 collective 的步数定义——成本公式的来源</td>
+</tr>
+<tr>
+<td><code>src/graph/tuning.cc:272-275</code></td>
+<td>算法合法性表：Broadcast/Reduce 只允许 Ring；AllGather/ReduceScatter 不允许 Tree</td>
+</tr>
+<tr>
+<td><code>src/graph/tuning.cc:286-289</code></td>
+<td>NVLS/NVLSTree 至少需要 2 个通道，否则被排除</td>
+</tr>
+<tr>
+<td><code>src/graph/tuning.cc:310-320</code></td>
+<td>总线带宽模型 <code>busBw</code> 的口径</td>
+</tr>
+<tr>
+<td><code>src/graph/tuning.cc:44-46</code></td>
+<td><code>NCCL_ALGO</code> 的写法：可按 collective 分别覆盖</td>
+</tr>
+<tr>
+<td><code>src/init.cc:1468-1478</code></td>
+<td>GIN（设备发起网络）支持的判定入口</td>
+</tr>
+<tr>
+<td><code>torch/distributed/distributed_c10d.py</code></td>
+<td>前端如何把 <code>NCCL_ALGO</code>/<code>NCCL_PROTO</code> 透传给 NCCL</td>
+</tr>
+</tbody>
+</table>
+<p>完整行号对照与摘录见 <a href="../raw/results/worldvln/6.1/20260914-costs/source/excerpts.txt">source/excerpts.txt</a>；来源版本与文件位置见 <a href="../raw/results/worldvln/6.1/20260914-costs/source/manifest.json">source/manifest.json</a>。</p>
+<h3 id="_6">设计取舍</h3>
+<p><strong>为什么把算法选择放在调优表里而不是运行时试跑。</strong> 每次 collective 都试跑不可行，NCCL 的做法是用一张「拓扑 → 每算法每协议的带宽/延迟」表在初始化时算一次代价，之后按消息大小查表。代价是表的质量取决于拓扑探测的准确度——本章第 4 节测到的「Tree 比 auto 快的 18.5%」就是模型失准的结果。NCCL 提供 <code>libnccl-tuner.so</code> 插件接口让用户替换这张表，本机没有该插件。</p>
+<p><strong>为什么小消息和大消息用不同协议。</strong> LL 用 8 字节粒度、开销小但只适合小消息；SIMPLE 用大块流水，带宽高但启动成本大；LL128 折中。三者不是「新旧替代」关系，而是按消息大小分工，切换点由调优表决定。</p>
+<p><strong>为什么广播只允许 Ring。</strong> 树形广播在单机内没有优势（树的每一跳都要经过同一批 PCIe 链路，而 ring 的流量分布更均匀），而实现树形广播会引入额外的记账与同步。这条限制写在 <code>tuning.cc</code> 里，强制违反会直接报错。</p>
+<p><strong>为什么 CPU 与 GPU 的路径不同。</strong> 本机没有可用的 RDMA 设备，NCCL 的 IB 插件找不到设备（<code>NET/IB : No device found.</code>），退到 Socket transport；而单机内 GPU 之间走 <code>SHM/direct/direct</code>，完全不经过网络栈。跨机时这两条路径的差别会成为主导项。</p>
+<hr />
+<h2 id="_7">工程实现 · 自己写一遍</h2>
+<p><code>labs/L6/collective_costs.py</code> 的核心是两件事：把测量包在可控的环境里，以及把 NCCL 自己的决策捞出来。</p>
+<p><strong>测量必须带工作集与迭代口径。</strong> 每个尺寸先预热 3 次，再用 device event 计时，小消息 20 次、大消息 8 次，取每 rank 中位数，最后报告 max-rank 完成时间：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">200</span>     <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">201</span>         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="n">op</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">202</span> 
+<span class="linenos" aria-hidden="true">203</span>     <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">204</span>         <span class="n">fn</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">205</span>     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">206</span>     <span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">207</span>     <span class="n">iters</span> <span class="o">=</span> <span class="mi">20</span> <span class="k">if</span> <span class="n">nbytes</span> <span class="o">&lt;=</span> <span class="p">(</span><span class="mi">4</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span> <span class="k">else</span> <span class="mi">8</span>
+<span class="linenos" aria-hidden="true">208</span>     <span class="n">starts</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">iters</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">209</span>     <span class="n">ends</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">enable_timing</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">iters</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">210</span>     <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">iters</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">211</span>         <span class="k">if</span> <span class="n">isolate</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">212</span>             <span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">213</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">214</span>         <span class="n">starts</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">215</span>         <span class="n">fn</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/collective_costs.py 第 200–215 行</code><a href="../code/labs/L6/collective_costs.py.html#labs-L6-collective_costs-py-L-200">在完整文件中打开 &rarr;</a></div></div>
+<p><strong>算法/协议的选择只能从 NCCL 日志里读。</strong> 驱动进程用 <code>NCCL_DEBUG_SUBSYS=TUNING</code> 启动子进程，再把 <code>-&gt; Algo ... proto ... chunk{Lo..Hi}</code> 解析出来，与测得的尺寸一一对应：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">280</span>     <span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">281</span> 
+<span class="linenos" aria-hidden="true">282</span> 
+<span class="linenos" aria-hidden="true">283</span> <span class="n">ALGO_RE</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">284</span>     <span class="sa">r</span><span class="s2">"NCCL INFO (\w+): (\d+) Bytes -&gt; Algo (\w+) proto (\w+) channel\{Lo\.\.Hi\}=\{(\d+)\.\.(\d+)\}"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">285</span> 
+<span class="linenos" aria-hidden="true">286</span> 
+<span class="linenos" aria-hidden="true">287</span> <span class="k">def</span><span class="w"> </span><span class="nf">parse_algo_log</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">op_map</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">288</span> <span class="w">    </span><span class="sd">"""把 NCCL 自己打印的算法选择行解析成 {op: [(bytes, algo, proto, channels)]}。"""</span>
+<span class="linenos" aria-hidden="true">289</span>     <span class="n">out</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true">290</span>     <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">path</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">291</span>         <span class="k">return</span> <span class="n">out</span>
+<span class="linenos" aria-hidden="true">292</span>     <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">encoding</span><span class="o">=</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="n">errors</span><span class="o">=</span><span class="s2">"replace"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">293</span>         <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">f</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">294</span>             <span class="n">m</span> <span class="o">=</span> <span class="n">ALGO_RE</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">line</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">295</span>             <span class="k">if</span> <span class="ow">not</span> <span class="n">m</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">296</span>                 <span class="k">continue</span>
+<span class="linenos" aria-hidden="true">297</span>             <span class="n">name</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">algo</span><span class="p">,</span> <span class="n">proto</span><span class="p">,</span> <span class="n">lo</span><span class="p">,</span> <span class="n">hi</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">groups</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">298</span>             <span class="n">op</span> <span class="o">=</span> <span class="n">op_map</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="o">.</span><span class="n">lower</span><span class="p">())</span>
+<span class="linenos" aria-hidden="true">299</span>             <span class="k">if</span> <span class="ow">not</span> <span class="n">op</span><span class="p">:</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/collective_costs.py 第 280–299 行</code><a href="../code/labs/L6/collective_costs.py.html#labs-L6-collective_costs-py-L-280">在完整文件中打开 &rarr;</a></div></div>
+<p><strong>归并结果不能在测量进程里做。</strong> 用 <code>all_gather_object</code> 收集各 rank 结果时，它内部会走一次 <code>ncclAllGather(int8)</code>——在强制 <code>NCCL_ALGO=Tree</code> 的配置下这次 AllGather 直接失败，把测量本身带崩。所以每个 rank 各自落盘，由主机侧合并：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">240</span>                                <span class="s2">"error"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">"</span><span class="p">})</span>
+<span class="linenos" aria-hidden="true">241</span>                 <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">242</span>                     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">op</span><span class="si">:</span><span class="s2">&lt;15</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">human</span><span class="p">(</span><span class="n">nb</span><span class="p">)</span><span class="si">:</span><span class="s2">&gt;8</span><span class="si">}</span><span class="s2"> ERROR </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">243</span>         <span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/collective_costs.py 第 240–243 行</code><a href="../code/labs/L6/collective_costs.py.html#labs-L6-collective_costs-py-L-240">在完整文件中打开 &rarr;</a></div></div>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="_8">命令</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 能力矩阵：NVLS / 网络 transport / P2P 路径</span>
+python<span class="w"> </span>labs/L6/collective_costs.py<span class="w"> </span>D<span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.1/run/D<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--gpus<span class="w"> </span><span class="m">0</span>,1
+
+<span class="c1"># 容量扫描：4 KiB→256 MiB 按 4 倍</span>
+python<span class="w"> </span>labs/L6/collective_costs.py<span class="w"> </span>B<span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.1/run/B_near<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--gpus<span class="w"> </span><span class="m">0</span>,1<span class="w"> </span>--tag<span class="w"> </span>near
+python<span class="w"> </span>labs/L6/collective_costs.py<span class="w"> </span>B<span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.1/run/B_far<span class="w">  </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--gpus<span class="w"> </span><span class="m">0</span>,3<span class="w"> </span>--tag<span class="w"> </span>far
+python<span class="w"> </span>labs/L6/collective_costs.py<span class="w"> </span>B<span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.1/run/B_4gpu<span class="w"> </span>--world-size<span class="w"> </span><span class="m">4</span><span class="w"> </span>--gpus<span class="w"> </span><span class="m">0</span>,1,2,3<span class="w"> </span>--tag<span class="w"> </span>4gpu
+
+<span class="c1"># 强制算法/协议</span>
+python<span class="w"> </span>labs/L6/collective_costs.py<span class="w"> </span>B<span class="w"> </span>--out<span class="w"> </span>.../alg_tree_simple<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--nccl-algo<span class="w"> </span>Tree<span class="w"> </span>--nccl-proto<span class="w"> </span>Simple
+
+<span class="c1"># 合法组合矩阵</span>
+python<span class="w"> </span>labs/L6/collective_costs.py<span class="w"> </span>legality<span class="w"> </span>--out<span class="w"> </span>.../legality<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--size<span class="w"> </span><span class="m">1048576</span>
+
+<span class="c1"># 通信与计算重叠</span>
+python<span class="w"> </span>labs/L6/collective_costs.py<span class="w"> </span>C<span class="w"> </span>--out<span class="w"> </span>.../C<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--gemm-n<span class="w"> </span><span class="m">8192</span><span class="w"> </span>--mb<span class="w"> </span><span class="m">64</span>
+
+<span class="c1"># 成本模型拟合</span>
+python<span class="w"> </span>labs/L6/collective_costs.py<span class="w"> </span>A<span class="w"> </span>--sweep<span class="w"> </span>.../A/sweep_input.json<span class="w"> </span>--out<span class="w"> </span>.../A
+
+<span class="c1"># 跨机档（本地 macOS 编排：推源码 → 两端各起一个 rank → 回收工件 → 归并）</span>
+python<span class="w"> </span>labs/L6/run_crosshost.py<span class="w"> </span>sweep<span class="w"> </span>--run-id<span class="w"> </span>&lt;id&gt;<span class="w"> </span>--isolate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sizes<span class="w"> </span><span class="m">4096</span>,65536,1048576,4194304,16777216,67108864,268435456<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--ops<span class="w"> </span>all_reduce,all_gather,reduce_scatter,broadcast,sendrecv
+python<span class="w"> </span>labs/L6/run_crosshost.py<span class="w"> </span>socket<span class="w"> </span>--run-id<span class="w"> </span>&lt;id&gt;<span class="w"> </span>--bytes<span class="w"> </span><span class="m">16777216</span><span class="w"> </span>--trials<span class="w"> </span><span class="m">20</span>
+</code></pre></div>
+
+<p>跨机档由 <code>labs/L6/run_crosshost.py</code> 编排，<code>labs/L6/crosshost_comm.py</code> 是各机器上真正执行的 worker；两端各写一份 JSON，归并放在本地做（跨机时 rank 之间看不到对方的目录）。<code>--isolate</code> 逐轮插 barrier，是跨机小消息唯一正确的计时方式；<code>--ifname</code> 可以强制换网卡，<code>net1</code> 与 <code>eth0</code> 的对照就是这么来的。</p>
+<h3 id="_9">实测数字</h3>
+<ul>
+<li><strong>单向链路上限</strong>：broadcast β = 24.18 GB/s（PCIe Gen4×16，编码后理论 31.5 GB/s 的 76.8%）。</li>
+<li><strong>双向 collective</strong>：all_reduce 14.82、sendrecv 14.66、reduce_scatter 12.81、all_gather 12.74 GB/s（每方向）。</li>
+<li><strong>N=4 缩放</strong>：all_reduce 的每方向速率 14.82 → 6.53 GB/s，busbw 9.79 GB/s。</li>
+<li><strong>近/远拓扑</strong>：14.82 vs 14.56 GB/s，差 1.8%。</li>
+<li><strong>重叠</strong>：46.1% 端到端收益，达成理论上限的 97%，两个方向各掉约 11.6% 效率。</li>
+<li><strong>rank 间离散</strong>：256 MiB 各 collective 的 max/min rank 差值都在 0.4% 以内（表内 <code>t_s_spread</code>）。</li>
+<li><strong>跨机链路</strong>：裸 TCP 单向 0.1176 GB/s（1 GbE 线速的 94.1%）；NCCL 16 MiB 上 all_reduce 0.1171、broadcast 0.1175 GB/s，与裸 TCP 差 0.4% 以内。</li>
+<li><strong>跨机 vs 单机</strong>：64 MiB 上 broadcast 差 205×、all_reduce 126×、all_gather 108×；4 KiB broadcast 只差 1.5×。</li>
+<li><strong>跨机第二条网卡</strong>：<code>eth0</code>（自报 10 GbE）0.113–0.114 GB/s，比 <code>net1</code> 低 3.5%。</li>
+</ul>
+<h3 id="_10">消融建议</h3>
+<ol>
+<li>把 <code>--gpus 0,1,2,3</code> 换成 <code>0,1,3,4</code>（两两跨 NUMA 的对称配置），看 Tree 与 Ring 的排序是否反转——这是检验「默认 tuner 失准」是否与拓扑非对称有关的最快方式。</li>
+<li>把 LL128 强制配置的扫描扩到 64 KiB 以下，找到 LL128 相对 Simple 的交叉点。</li>
+<li>把重叠用例里的 GEMM 换成半长（<code>--gemm-n 4096</code>），此时计算短于通信，观察收益是否从「接近通信时间」变成「接近计算时间」，以及竞争比例如何变化。</li>
+<li>把 <code>overlap_missing_wait</code> 的小 GEMM 换回大 GEMM，看错误值是否消失——用来确认「竞态是否可见取决于计算与通信的相对长度」，而不是写法本身。</li>
+</ol>
+<hr />
+<h2 id="_11">原始现场</h2>
+<p><strong>NCCL 自己打印的候选成本表</strong>（<code>results/worldvln/6.1/20260914-costs/D/nccl_capability.log</code>）</p>
+<div class="highlight"><pre><span></span><code>  Algorithm   |      Tree       |      Ring       |  CollNetDirect  | ... |    NVLS    |
+  Protocol    | LL | LL128|Simple| LL | LL128|Simple| LL | LL128|Simple| ... |Simple     |
+ Broadcast    | 0.0/  0.0 | ... | 7.6/ 10.0 | 16.5/  0.0 | 14.1/ 20.0 | ... | 0.0/  0.0
+ AllGather    | 0.0/  0.0 | ... | 7.6/ 20.0 | 16.5/  0.0 | 14.1/ 40.0 | ... | 0.0/  0.0
+ ReduceScatter| 0.0/  0.0 | ... | 7.6/ 20.0 | 16.5/  0.0 | 14.1/ 40.0 | ... | 0.0/  0.0
+ AllReduce    | 8.8/  2.4 | 17.8/ 0.0 | 16.4/ 9.2 | 8.6/ 10.0 | 19.0/ 0.0 | 19.8/ 20.0 | ... | 0.0/  0.0
+</code></pre></div>
+
+<p>Tree 列在 Broadcast/AllGather/ReduceScatter 上全是 0，NVLS 与 CollNet 整列全 0——与后文的合法性报错一一对应。</p>
+<p><strong>每次调用的实际选择</strong></p>
+<div class="highlight"><pre><span></span><code>NCCL INFO AllReduce: 4096 Bytes -&gt; Algo RING proto LL channel{Lo..Hi}={0..0}
+NCCL INFO AllReduce: 1048576 Bytes -&gt; Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+</code></pre></div>
+
+<p><strong>拓扑与传输路径</strong></p>
+<div class="highlight"><pre><span></span><code>NCCL INFO NET/IB : No device found.
+NCCL INFO NET/Socket : Using [0]eth0:192.168.26.29&lt;0&gt;
+NCCL INFO GIN/Plugin: Could not find: libnccl-gin.so
+NCCL INFO NET/Socket : GPU Direct RDMA Disabled for HCA 0 'eth0'
+NCCL INFO NVLS multicast support is not available on dev 0 (NVLS_NCHANNELS 0)
+NCCL INFO Pattern 4, crossNic 0, nChannels 1, bw 20.000000/20.000000, type PHB/PIX, sameChannels 1
+NCCL INFO Channel 00 : 0[0] -&gt; 1[1] via SHM/direct/direct
+NCCL INFO Symmetric VA size=48GB
+</code></pre></div>
+
+<p><strong>强制非法组合的报错</strong></p>
+<div class="highlight"><pre><span></span><code>Error : no algorithm/protocol available for function Broadcast with datatype ncclInt8.
+NCCL_ALGO was set to Tree. NCCL_PROTO was set to Simple.
+</code></pre></div>
+
+<p><strong>跨机档的链路与传输路径</strong>（<code>results/crater/6.1/20260922-crosshost-iso-net1/nccl_debug_*.log</code>）</p>
+<div class="highlight"><pre><span></span><code>NCCL INFO NET/IB : No device found.
+NCCL INFO NET/Socket : Using [0]net1:192.168.105.100&lt;0&gt;
+NCCL INFO NET/Socket : GPU Direct RDMA Disabled for HCA 0 'net1'
+NCCL INFO Channel 00/0 : 0[0] -&gt; 1[0] [send] via NET/Socket/0
+NCCL INFO Channel 01/1 : 1[0] -&gt; 0[0] [receive] via NET/Socket/0/Shared
+NCCL INFO AllReduce: 268435456 Bytes -&gt; Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+</code></pre></div>
+
+<p>对照单机档同一组行的 <code>Channel 00 : 0[0] -&gt; 1[1] via SHM/direct/direct</code>：跨机这份日志两处都写明了「无 IB 设备、GPU Direct RDMA 关闭、经 NET/Socket」，而 <code>channel{Lo..Hi}</code> 与单机档在同一区间取到同一算法与协议——调优表的输入维度没变，换掉的只是实际可达速率。</p>
+<p><strong>跨机档的裸 TCP 参照</strong>（<code>results/crater/6.1/20260922-socket-net1/crosshost_socket.json</code>）</p>
+<div class="highlight"><pre><span></span><code>rank0 rank0→rank1  16 MiB × 20  t=142.683 ms  0.1176 GB/s
+rank1 rank1←rank0  16 MiB × 20  t=142.674 ms  0.1176 GB/s
+</code></pre></div>
+
+<p>两端各自测得的耗时相差 0.006%，说明瓶颈在链路上而不是某一侧的主机。</p>
+<p><strong>本轮工件的完整入口</strong></p>
+<ul>
+<li>能力矩阵：<a href="../raw/results/worldvln/6.1/20260914-costs/D/capability.json">capability.json</a> 与 <a href="../raw/results/worldvln/6.1/20260914-costs/D/nccl_capability.log">nccl_capability.log</a></li>
+<li>容量扫描：<a href="../raw/results/worldvln/6.1/20260914-costs/B_near/sweep.json">近拓扑</a>、<a href="../raw/results/worldvln/6.1/20260914-costs/B_far/sweep.json">远拓扑</a>、<a href="../raw/results/worldvln/6.1/20260914-costs/B_4gpu/sweep.json">4 卡</a></li>
+<li>算法对照：<a href="../raw/results/worldvln/6.1/20260914-costs/alg_ring_simple/sweep.json">强制 Ring/Simple</a>、<a href="../raw/results/worldvln/6.1/20260914-costs/alg_ring_ll128/sweep.json">强制 Ring/LL128</a>、<a href="../raw/results/worldvln/6.1/20260914-costs/alg_tree_simple/sweep.json">强制 Tree/Simple（2 卡）</a>、<a href="../raw/results/worldvln/6.1/20260914-costs/alg_tree_4gpu/sweep.json">强制 Tree/Simple（4 卡）</a></li>
+<li>合法性矩阵：<a href="../raw/results/worldvln/6.1/20260914-costs/legality/legality.json">legality.json</a></li>
+<li>重叠：<a href="../raw/results/worldvln/6.1/20260914-costs/C/overlap.json">overlap.json</a></li>
+<li>成本模型：<a href="../raw/results/worldvln/6.1/20260914-costs/A/cost_model.json">cost_model.json</a> 与拟合输入 <a href="../raw/results/worldvln/6.1/20260914-costs/A/sweep_input.json">sweep_input.json</a></li>
+<li>NCCL 源码摘录与来源：<a href="../raw/results/worldvln/6.1/20260914-costs/source/excerpts.txt">excerpts.txt</a>、<a href="../raw/results/worldvln/6.1/20260914-costs/source/manifest.json">source/manifest.json</a></li>
+<li>跨机档：<a href="../raw/results/crater/6.1/20260922-crosshost-iso-net1/crosshost_sweep.json">net1 隔离扫描</a>（<a href="../raw/results/crater2/6.1/20260922-crosshost-iso-net1/sweep.rank1.json">crater2 侧原始点</a>）、<a href="../raw/results/crater/6.1/20260922-socket-net1/crosshost_socket.json">裸 TCP 参照</a>、<a href="../raw/results/crater/6.1/20260922-eth0-full/crosshost_sweep.json">eth0 对照</a>、<a href="../raw/results/crater/6.1/20260921-crosshost-net1/crosshost_sweep.json">非隔离扫描（用于对照计时口径）</a>、<a href="../raw/results/crater/6.1/20260921-crosshost-eth0/run_config.json">eth0 失败一档</a></li>
+</ul>
+<hr />
+<h2 id="_12">前沿</h2>
+<p><strong>对称内存与 NVLS。</strong> NCCL 2.29 在这台机器上注册了 48 GB 的对称虚拟地址空间（<code>Symmetric VA size=48GB</code>），但 <code>NVLS multicast support is not available on dev 0 (NVLS_NCHANNELS 0)</code>——NVLS 需要 NVSwitch 或支持组播的 NVLink 域，PCIe 平台没有。对称内存本身是可用的（窗口注册不需要 NVLink），它改变的是「谁可以直接读写谁的缓冲区」，不改变本章的步数与口径。这条路线在本项目里保持 <code>UNVERIFIED</code>。</p>
+<p><strong>设备发起的通信。</strong> 本机 <code>libnccl-gin.so</code> 缺失、IB 设备不可用，GIN 路径不具备运行条件。GIN 与 IBGDA 把提交动作下沉到 kernel 里，能去掉每步的 CPU 参与，从而压低 α；本章测到的 α（13–86 µs）里有多少是 CPU 提交造成的，需要在实际支持 GIN 的平台上重测才能回答。跨机档测到的是「链路已经饱和」的形态，GIN 在这种链路上不会带来收益；它的价值出现在有 RDMA 的集群里。</p>
+<p><strong>调优器插件。</strong> <code>libnccl-tuner.so</code> 缺失意味着用的是拓扑模型推算的默认表。自定义 tuner 可以用实测数据覆盖这张表——本章第 4 节测到的 18.5% 差距就是这类插件的目标场景。NCCL 也支持用 <code>NCCL_ALGO</code> 按 collective 分别覆盖（<code>tuning.cc:44-46</code> 给了写法示例），适合在固定拓扑上做一次性调优。</p>
+<p><strong>跨机 transport 的现实形态。</strong> 本章跨机档量到的是<strong>没有 RDMA 时的下界形态</strong>：1 GbE 内核 TCP，94.1% 线速，NCCL 与裸 socket 无差别，代价是比单机 PCIe 慢两个数量级。生产集群跨节点走的是 RDMA/RoCE 与 GPU Direct RDMA（本机日志里的 <code>GPU Direct RDMA Disabled for HCA 0</code> 就是缺这一段），链路速率高一个数量级、协议栈也从内核里搬到了网卡上；本章给出的「NCCL 不额外增加开销」这条结论可以迁移，具体速率不能。</p>
+<hr />
+<h2 id="_13">陷阱</h2>
+<p><strong>1. 混用三种带宽口径。</strong> 同一个 256 MiB all_gather，algbw 是 12.7 GB/s、busbw 是 6.36 GB/s，差一倍；换个 collective 又变成 24 GB/s。写数字时必须同时给出 M 的定义、N 和折算因子。</p>
+<p><strong>2. 用 rank 数变化前后的数字直接比。</strong> all_reduce 的 busbw 从 N=2 的 14.80 GB/s 到 N=4 的 9.79 GB/s，这个下降里既有链路竞争也有折算因子的变化。要分离两者只能看 β（每方向链路速率），它从 14.82 掉到 6.53。</p>
+<p><strong>3. 用小消息段的 α 去预测大消息。</strong> 全区间拟合的最大相对误差 22%–56%，分段后降到 2%–18%。4 KiB 的 44 µs 里几乎全是启动开销。</p>
+<p><strong>4. 由「带宽接近 24 GB/s」推断用了 ring。</strong> 算法选择要从 NCCL 的 <code>-&gt; Algo ... proto ...</code> 行读，不能反推。本章就是靠这条日志确认 auto 在 1 MiB 以上选了 RING/SIMPLE，而不是因为测出来像 ring。</p>
+<p><strong>5. 认为强制算法一定合法。</strong> <code>NCCL_ALGO=Tree</code> 在 AllGather/ReduceScatter/Broadcast 上直接报错，因为 <code>tuning.cc</code> 的合法性表不允许这些组合。设置环境变量前先查表。</p>
+<p><strong>6. 假定默认调优就是最优。</strong> 4 卡上强制 Tree 比 auto 的 Ring 快 18.5%。默认表来自拓扑模型，不是实测。</p>
+<p><strong>7. 把重叠的收益当成「免费」。</strong> 重叠期间计算掉到 88.4%、通信掉到 88.5% 的单项效率；总时间变好是因为两者本来串行。而且漏掉一个 <code>wait_stream</code> 就能让时间一样漂亮、结果全错。</p>
+<p><strong>8. 把单机 PCIe 的结论外推到 NVLink 或跨机。</strong> 单机档的前置条件是「单机、PCIe、无 NVLink、无 RDMA」。近/远拓扑差 1.8% 这个结论尤其不能外推——那是因为两段都在 PCIe 上。跨机档的 0.1176 GB/s 是 1 GbE 内核 TCP 的上限，不是「跨机 collective 的普遍速率」。</p>
+<p><strong>9. 跨机小消息照搬 device event 计时。</strong> 跨机搬数据的是 CPU 侧 proxy 线程，device event 只包住 GPU kernel。不逐轮隔离时 4 KiB broadcast 会报 0.017 ms，隔离后是 0.062 ms——差了 3.6 倍，而且方向是「看起来更快」。任何跨机计时都必须说明是否逐轮隔离，并与裸 TCP 或 CPU 墙钟对照一次。</p>
+<p><strong>10. 拿网卡自报的速率当可达带宽。</strong> <code>eth0</code> 自报 10000 Mb/s、<code>net1</code> 自报 1000 Mb/s，实测两条都是 0.113–0.118 GB/s。判定链路能力要用「两台机器之间的裸流吞吐」，不是 <code>/sys/class/net/*/speed</code>。</p>
+<hr />
+<h2 id="_14">自测题</h2>
+<details class="fold">
+<summary>1. M 是每 rank 输入 256 MiB，N=4，测得 all_reduce 耗时 41.138 ms。algbw 和 busbw 各是多少？</summary>
+<p>algbw = M/t = 268.435456 MB / 0.041138 s = 6.53 GB/s。busbw = 2(N−1)/N × M/t = 1.5 × 6.53 = 9.79 GB/s。两者相差 1.5 倍，这个倍数完全来自 N：N=2 时 2(N−1)/N = 1，algbw 与 busbw 相等。所以跨 N 比较只能看 β，不能直接比 algbw。</p>
+</details>
+<details class="fold">
+<summary>2. 为什么 broadcast 的 β 是 all_gather 的 1.9 倍？</summary>
+<p>broadcast 是纯单向流，每个 rank 只发不收（除 root 外只收不发），可以吃满链路的单向有效载荷 24.18 GB/s。all_gather 每个 rank 同时收发，PCIe 是双向链路，聚合带宽有限，每方向只能拿到约一半（12.74 GB/s），两边加起来约 25.5 GB/s，与单向上限同量级。</p>
+</details>
+<details class="fold">
+<summary>3. 强制 `NCCL_ALGO=Tree` 后 all_gather 报错，为什么不是回退到 Ring？</summary>
+<p>NCCL 的合法性表明确排除了 (AllGather, Tree) 这个组合（<code>src/graph/tuning.cc:273-275</code>）。强制指定后候选集为空，NCCL 直接报 <code>no algorithm/protocol available for function AllGather</code>。回退会让用户以为设置生效了，而实际跑的是另一个算法。</p>
+</details>
+<details class="fold">
+<summary>4. 全区间拟合的 α 是 28 µs，≥1 MiB 拟合的 α 是 16 µs，哪个更可信？</summary>
+<p>取决于要预测什么。预测 256 MiB 用后者（误差 6.9%），预测 4 KiB 两个都不可信——小消息段的时间由启动与同步支配，与二分段的线性模型不是同一个机制。报告 α 时必须同时说明拟合区间。</p>
+</details>
+<details class="fold">
+<summary>5. 重叠把串行 9.751 ms 降到 5.259 ms，理论上限是 4.645 ms。剩下的 0.614 ms 去哪了？</summary>
+<p>来自资源竞争：重叠期间 GEMM 从 236.7 掉到 209.1 TFLOP/s，通信从 14.42 掉到 12.76 GB/s，两者各损失约 11.6% 的效率。这部分不可能靠更好的重叠写法消除，只能靠减少通信量或换更宽的链路。</p>
+</details>
+<details class="fold">
+<summary>6. 为什么收集各 rank 的测量结果不能用 `all_gather_object`？</summary>
+<p>它内部会发起一次 <code>ncclAllGather(int8)</code>。在 <code>NCCL_ALGO=Tree</code> 的配置下这次 AllGather 不在合法组合里，直接报错，把测量进程带崩——本该只影响结果汇总的一步，污染了整个实验。测量代码里任何额外的集合通信都要先确认它在被测配置下合法。</p>
+</details>
+<details class="fold">
+<summary>7. 近拓扑与远拓扑只差 1.8%，能否推断「NUMA 位置对多卡通信不重要」？</summary>
+<p>不能。这只说明在这台机器上、这两条路径都由 PCIe 承载，UPI 带宽高于实测速率，所以瓶颈不在这里。换成 NVLink + PCIe 的混合拓扑，或跨机走网卡，位置的影响会变成数量级差异。</p>
+</details>
+<details class="fold">
+<summary>8. 跨机档里 4 KiB 只比单机慢 1.5 倍，而 64 MiB 慢 126 倍，这两个数字矛盾吗？</summary>
+<p>不矛盾，它们分别落在成本模型的两端。4 KiB 的耗时由每跳的固定成本支配（单机 41 µs、跨机 166 µs 的往返与同步），字节项可以忽略；64 MiB 的时间几乎全部是字节传输，PCIe 与 1 GbE 的速率差 126 倍就完整暴露。判据是：只要把消息改成 16 MiB，跨机档立刻落到 0.117 GB/s 的平坦段，与裸 TCP 的 0.1176 GB/s 一致。</p>
+</details>
+<details class="fold">
+<summary>9. 跨机 all_reduce 与裸 TCP 在 16 MiB 上都是 0.117 GB/s，能说「NCCL 已经优化到极限」吗？</summary>
+<p>只能说「这条链路已经跑满」，不能说 NCCL 已经优化到极限。两者一致（差 0.4%）证明 NCCL 没有在小消息之外引入额外开销，但瓶颈是 1 GbE 而不是 NCCL 的实现；换到 100 GbE RDMA 上，NCCL 的协议、通道数与 GPU Direct 路径才会重新成为变量。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L6/6.0b-distributed-tensor-layout.html">&#8592; 6.0b 分布式张量：DeviceMesh、DTensor 与布局变换</a><a class="nav-next" href="../L6/6.2-inference-parallelism.html">6.2 推理并行：TP / PP / EP / CP &#8594;</a></nav>
+</main>
+</body>
+</html>

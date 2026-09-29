@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.0 并发与通信语义：rank、进程组、张量归属与次序</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">6.0</div>
+  <div class="sidebar-title">并发与通信语义：rank、进程组、张量归属与次序</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：局部持有、全局重建、三步完成</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-rank">1. rank 是组内编号，不是设备编号</a></li>
+<li><a href="#2-op">2. 匹配靠的是序号、字节数和通信子，不是 op 名字</a></li>
+<li><a href="#3">3. 三步完成语义</a></li>
+<li><a href="#4-p2p-rank">4. P2P 的配对：一对 rank 一个通信子，按序号配对</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
+<li><a href="#_5">设计取舍</a></li>
+<li><a href="#_6">本章引用的源码入口</a></li>
+</ul>
+</li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_8">命令</a></li>
+<li><a href="#_9">实测数字</a></li>
+<li><a href="#_10">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：局部持有、全局重建、三步完成</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-rank">1. rank 是组内编号，不是设备编号</a></li>
+<li><a href="#2-op">2. 匹配靠的是序号、字节数和通信子，不是 op 名字</a></li>
+<li><a href="#3">3. 三步完成语义</a></li>
+<li><a href="#4-p2p-rank">4. P2P 的配对：一对 rank 一个通信子，按序号配对</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
+<li><a href="#_5">设计取舍</a></li>
+<li><a href="#_6">本章引用的源码入口</a></li>
+</ul>
+</li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_8">命令</a></li>
+<li><a href="#_9">实测数字</a></li>
+<li><a href="#_10">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L6 · 分布式：通信、并行、分离</div>
+  <div class="mod-id">6.0</div>
+  <h1>并发与通信语义：rank、进程组、张量归属与次序</h1>
+  <p class="lede">在讨论任何并行策略之前，先讲清 rank / world size / 进程组 / rendezvous、每个 rank 此刻持有哪片张量、集合通信的调用次序为什么必须一致、异步完成与 buffer 生命周期。含一个真实的死锁定位练习。</p>
+  <div class="chips"><span class="chip">实测机器 本地（macOS，CPU，torch 2.14.0）· worldvln（2×/4× L40S，sm_89，torch 2.13.0+cu130）</span><span class="chip">前置 1.3（PCIe 与 NUMA）· 2.0c（流、事件与内存复用）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>一张卡跑得动的模型，搬到多卡上第一步不是改模型，而是先回答三个问题：数据在谁手里、谁和谁配对、什么时候算真的交换完了。这三个问题的答案与设备数量无关，与后端实现强相关。答错的代价不是慢一点，而是<strong>某个 rank 拿到一个看起来像结果的错值</strong>，或者整个作业在没有任何人报错的情况下挂到超时。</p>
+<ol>
+<li>rank 怎样持有数据？全局张量和局部片段是什么关系？</li>
+<li>集合通信靠什么匹配？op 名字相同就一定会配上吗？</li>
+<li>API 返回、stream 完成、buffer 可以复用，这三件事有什么区别？</li>
+</ol>
+<p>后面的 6.0b 到 6.5 都建立在这一层的语义之上：并行策略只是在决定「哪个 rank 持有什么」，通信库只是在执行「谁和谁换哪块内存」。这一章把这两个动作的口径固定下来。</p>
+<div class="admonition warning">
+<p class="admonition-title">实验范围</p>
+<p>集合通信的数值对拍是精确的（整数、容差 0），失败注入是可复现的。但<strong>设备完成时间</strong>只在 worldvln 的两张 L40S 上测过，跨机链路、NVLink 和 RDMA 的语义不在本章范围内。凡是没有对应硬件或权限的结论，正文都标 <code>UNVERIFIED</code>。</p>
+</div>
+<hr />
+<h2 id="_2">心智模型：局部持有、全局重建、三步完成</h2>
+<p>多卡程序里同时存在两张视图。<strong>局部视图</strong>是每个 rank 手里那个张量的 shape、stride 和值；<strong>全局视图</strong>是所有 rank 拼接起来、语义上「应该」是什么。集合通信就是在这两张视图之间做转换的工具。</p>
+<figure>
+
+
+<svg viewBox="0 0 820 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="rank 的局部持有与集合通信的全局重建">
+  <defs>
+    <marker id="a60" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">局部持有 → 集合通信 → 全局重建（world_size = 4，每个 rank 持有 4 个元素）</text>
+
+    <!-- 局部视图 -->
+    <text x="12" y="48" font-size="11.5" font-weight="600">局部视图：每个 rank 手里那 4 个整数</text>
+    <g font-size="10">
+      <rect x="12" y="58" width="150" height="52" rx="4" fill="none" stroke="currentColor"/>
+      <text x="20" y="76" font-weight="600">rank 0</text>
+      <text x="20" y="94" font-family="monospace">[7, 1, 7, 0]</text>
+
+      <rect x="174" y="58" width="150" height="52" rx="4" fill="none" stroke="currentColor"/>
+      <text x="182" y="76" font-weight="600">rank 1</text>
+      <text x="182" y="94" font-family="monospace">[0, 7, 9, 3]</text>
+
+      <rect x="336" y="58" width="150" height="52" rx="4" fill="none" stroke="currentColor"/>
+      <text x="344" y="76" font-weight="600">rank 2</text>
+      <text x="344" y="94" font-family="monospace">[0, 3, 9, 8]</text>
+
+      <rect x="498" y="58" width="150" height="52" rx="4" fill="none" stroke="currentColor"/>
+      <text x="506" y="76" font-weight="600">rank 3</text>
+      <text x="506" y="94" font-family="monospace">[6, 0, 7, 1]</text>
+    </g>
+
+    <text x="668" y="80" font-size="10" opacity="0.75">同一个 op 名，</text>
+    <text x="668" y="94" font-size="10" opacity="0.75">不同进程组 →</text>
+    <text x="668" y="108" font-size="10" opacity="0.75">不同配对</text>
+
+    <!-- 箭头 -->
+    <line x1="330" y1="126" x2="330" y2="152" stroke="currentColor" marker-end="url(#a60)"/>
+    <text x="340" y="145" font-size="10">all_reduce(SUM)</text>
+
+    <!-- 全局视图 -->
+    <text x="12" y="176" font-size="11.5" font-weight="600">全局视图：四个 rank 都持有同一个结果</text>
+    <g font-size="10">
+      <rect x="12" y="186" width="636" height="34" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <text x="24" y="207" font-family="monospace">[16, 20, 17, 14]  = 逐元素求和</text>
+      <text x="662" y="207" font-size="10" opacity="0.75">rank 0..3 完全相同</text>
+    </g>
+
+    <!-- 匹配三要素 -->
+    <text x="12" y="256" font-size="11.5" font-weight="600">匹配三要素（缺一个就配不上）</text>
+    <g font-size="10">
+      <rect x="12" y="266" width="196" height="88" rx="4" fill="none" stroke="currentColor"/>
+      <text x="22" y="286" font-weight="600">1. 调用次序（序号）</text>
+      <text x="22" y="304">第 k 次调用只和第 k 次配</text>
+      <text x="22" y="320" opacity="0.8">Gloo: tag</text>
+      <text x="22" y="336" opacity="0.8">NCCL: seqNum</text>
+
+      <rect x="220" y="266" width="196" height="88" rx="4" fill="none" stroke="currentColor"/>
+      <text x="230" y="286" font-weight="600">2. 数据量 numel/字节</text>
+      <text x="230" y="304">Gloo 检查并当场报错</text>
+      <text x="230" y="320" opacity="0.8">NCCL 不检查</text>
+      <text x="230" y="336" opacity="0.8">→ 静默取错数据</text>
+
+      <rect x="428" y="266" width="220" height="88" rx="4" fill="none" stroke="currentColor"/>
+      <text x="438" y="286" font-weight="600">3. 进程组（通信子）</text>
+      <text x="438" y="304">不同组 = 不同通信子</text>
+      <text x="438" y="320" opacity="0.8">同组内再按 rank 配对</text>
+      <text x="438" y="336" opacity="0.8">组必须所有 rank 同序创建</text>
+    </g>
+  </g>
+</svg>
+
+
+</figure>
+
+<p>「完成」也是三件事，而不是一件。下面这张时间线是本章最重要的一张图。</p>
+<figure>
+
+
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="API 返回、stream 完成与 buffer 可复用的三步时间线">
+  <defs>
+    <marker id="b60" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">三步完成：CPU 返回 ≠ 数据可用 ≠ 内存可复用</text>
+
+    <!-- 时间轴 -->
+    <line x1="40" y1="180" x2="790" y2="180" stroke="currentColor" stroke-width="1.4"/>
+    <text x="40" y="200" font-size="10" opacity="0.8">CPU 时钟</text>
+
+    <!-- 三个里程碑 -->
+    <circle cx="120" cy="180" r="4" fill="currentColor"/>
+    <line x1="120" y1="180" x2="120" y2="120" stroke="currentColor" stroke-dasharray="3 2"/>
+    <text x="60" y="110" font-size="10.5" font-weight="600">① API 返回</text>
+    <text x="46" y="126" font-size="9.5" opacity="0.85">异步调用已入队</text>
+
+    <circle cx="420" cy="180" r="4" fill="currentColor"/>
+    <line x1="420" y1="180" x2="420" y2="120" stroke="currentColor" stroke-dasharray="3 2"/>
+    <text x="360" y="110" font-size="10.5" font-weight="600">② stream 可见结果</text>
+    <text x="346" y="126" font-size="9.5" opacity="0.85">wait()/event 建立依赖之后</text>
+
+    <circle cx="720" cy="180" r="4" fill="currentColor"/>
+    <line x1="720" y1="180" x2="720" y2="120" stroke="currentColor" stroke-dasharray="3 2"/>
+    <text x="648" y="110" font-size="10.5" font-weight="600">③ buffer 可复用</text>
+    <text x="640" y="126" font-size="9.5" opacity="0.85">通信侧真的不再读这块内存</text>
+
+    <!-- 实测数字 -->
+    <rect x="12" y="216" width="796" height="70" rx="4" fill="none" stroke="currentColor"/>
+    <text x="24" y="238" font-size="10.5" font-weight="600">worldvln 2×L40S 实测（64 MiB all_reduce，每种 20 次 × 2 rank）</text>
+    <text x="24" y="258" font-size="10">① 中位 0.052–0.065 ms（CPU 打点）　　② 中位 4.72–4.74 ms（torch.cuda.synchronize 返回）</text>
+    <text x="24" y="276" font-size="10">两步之间差约 90×。把 ① 当完成，读到的是对端还没写进来的旧值。</text>
+  </g>
+</svg>
+
+
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1-rank">1. rank 是组内编号，不是设备编号</h3>
+<p><code>init_process_group(rank, world_size)</code> 建立的是 <strong>world</strong> 这个进程组。rank 是这个组里的位置编号，与它用哪张卡、哪个 host 完全解耦。<code>labs/L6/distributed_basics.py</code> 里写作 <code>cuda:{rank}</code> 只是一种省事的约定；把 rank 1 放到 <code>cuda:3</code> 上，集合通信一样成立。</p>
+<p>从 world 里再切出子组，得到的是另一层编号：</p>
+<div class="highlight"><pre><span></span><code><span class="n">pair_handles</span> <span class="o">=</span> <span class="p">[</span><span class="n">dist</span><span class="o">.</span><span class="n">new_group</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">])]</span>
+<span class="n">even</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">new_group</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">])</span>
+</code></pre></div>
+
+<p><code>new_group</code> 本身是一次集合操作：<strong>所有 rank 必须以完全相同的顺序调用它</strong>。上面这段代码的列表推导在四个 rank 上执行时，两次 <code>new_group</code> 的次序和参数都一致，所以安全。把 <code>new_group</code> 放进 <code>if rank == 0:</code> 里，就是在给自己埋一次初始化阶段的死锁。</p>
+<p>组建好之后，两次编号要分清：<code>dist.get_process_group_ranks(group)</code> 给的是<strong>全局 rank 列表</strong>（<code>[0, 2]</code>），<code>dist.get_rank(group)</code> 给的是<strong>组内序号</strong>（even 组里 rank 2 的组内序号是 1）。本章的记录器保存的是前者，因为重建全局视图时只有全局 rank 才能和缓冲区位置对上。</p>
+<p>同一个 <code>all_reduce</code> 在不同进程组上是三次完全独立的配对。world=4、子组为 <code>pairs = {0,1}/{2,3}</code> 与 <code>even = {0,2}</code> 时，三个调用给出三个不同的结果：</p>
+<table>
+<thead>
+<tr>
+<th>进程组</th>
+<th>组内 rank</th>
+<th>输出（四个 rank 各自看到的值）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>world <code>[0,1,2,3]</code></td>
+<td>0–3</td>
+<td><code>[16, 20, 17, 14]</code></td>
+</tr>
+<tr>
+<td>pairs <code>[0,1]</code></td>
+<td>0–1</td>
+<td><code>[10, 11, 6, 10]</code></td>
+</tr>
+<tr>
+<td>even <code>[0,2]</code></td>
+<td>0–1</td>
+<td><code>[9, 12, 7, 6]</code></td>
+</tr>
+</tbody>
+</table>
+<p>全局视图里，同一次调用的四个局部片段必须靠 <code>(step, op, group, group_members)</code> 四元组才能对齐。只靠 <code>op</code> 名对齐，会把上面三个 <code>all_reduce</code> 混成一条记录——这正是第三节要讲的错配来源。</p>
+<h3 id="2-op">2. 匹配靠的是序号、字节数和通信子，不是 op 名字</h3>
+<p>集合通信没有消息头，亦无显式对端寻址字段。两端配对完全由底层实现约定：</p>
+<ul>
+<li><strong>Gloo</strong> 用 tag（等同于调用序号）匹配，并在传输层校验字节数。</li>
+<li><strong>NCCL</strong> 用通信子内的 <code>seqNum</code> 匹配，<strong>不校验 numel</strong>。</li>
+</ul>
+<p>op 名字只出现在 API 和 profiler 里，不参与匹配。下面两张表是同一组注入在两种后端上的实测结局。</p>
+<p><strong>Gloo（本地 macOS，2 进程，torch 2.14.0）</strong></p>
+<table>
+<thead>
+<tr>
+<th>注入</th>
+<th style="text-align: right;">wall</th>
+<th>退出码</th>
+<th>现场</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>op 次序错配</td>
+<td style="text-align: right;">21.0 s</td>
+<td><code>[1, 1]</code></td>
+<td><code>gloo/transport/uv/unbound_buffer.cc:65</code>：recv 等 20000 ms 超时</td>
+</tr>
+<tr>
+<td>shape 错配</td>
+<td style="text-align: right;">0.8 s</td>
+<td><code>[-6, -6]</code></td>
+<td><code>gloo/transport/uv/pair.cc:253</code>：<code>op.nread == op.preamble.nbytes</code> 断言失败，进程 SIGABRT</td>
+</tr>
+<tr>
+<td>单 rank 提前退出</td>
+<td style="text-align: right;">21.0 s</td>
+<td><code>[7, 1]</code></td>
+<td>rank0 主动退出；rank1 <code>unbound_buffer.cc:101</code>：send 等 20000 ms 超时</td>
+</tr>
+<tr>
+<td>组错配</td>
+<td style="text-align: right;">21.0 s</td>
+<td><code>[0, 1]</code></td>
+<td>rank0 在自己的 size=1 子组里成功返回；rank1 在 world 上等到超时</td>
+</tr>
+<tr>
+<td>P2P 两端都先发后收</td>
+<td style="text-align: right;">0.8 s</td>
+<td><code>[0, 0]</code></td>
+<td><strong>完成</strong>，Gloo 按 tag 匹配，容忍这个次序</td>
+</tr>
+</tbody>
+</table>
+<p><strong>NCCL（worldvln 2×L40S，torch 2.13.0+cu130）</strong></p>
+<table>
+<thead>
+<tr>
+<th>注入</th>
+<th style="text-align: right;">wall</th>
+<th>退出码</th>
+<th>现场</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>op 次序错配</td>
+<td style="text-align: right;">90.0 s</td>
+<td><code>[-9, -9]</code></td>
+<td>watchdog 在 20 s 报 <code>SeqNum=1, OpType=ALLREDUCE</code>（rank0）/ <code>BROADCAST</code>（rank1）；进程没有自行退出，由父进程超时强杀</td>
+</tr>
+<tr>
+<td>shape 错配</td>
+<td style="text-align: right;">84.0 s</td>
+<td><code>[0, -6]</code></td>
+<td><strong>rank0 正常返回</strong>，rank1 SIGABRT</td>
+</tr>
+<tr>
+<td>单 rank 提前退出</td>
+<td style="text-align: right;">83.5 s</td>
+<td><code>[7, -6]</code></td>
+<td>rank0 退出码 7；rank1 在 <code>AllReduce</code> 上被 watchdog 判定超时后中止</td>
+</tr>
+<tr>
+<td>组错配</td>
+<td style="text-align: right;">3.0 s</td>
+<td><code>[0, 1]</code></td>
+<td>rank1 在建立 NCCL 通信子阶段就失败：从 TCPStore 取 <code>ncclUniqueId</code> 超时</td>
+</tr>
+<tr>
+<td>P2P 两端都先发后收</td>
+<td style="text-align: right;">83.5 s</td>
+<td><code>[-6, -6]</code></td>
+<td>两端 <code>SeqNum=2, OpType=RECV</code> 同时超时</td>
+</tr>
+</tbody>
+</table>
+<p>shape 错配这一行值得单独看。NCCL 这侧 <strong>rank0 的调用成功返回了</strong>，它拿到的输出是：</p>
+<div class="highlight"><pre><span></span><code>rank0 输入 x = [1, 2, 3, 4]        （numel=4）
+rank1 输入 x = [1, 2, 3, 4, 5, 6, 7, 8]  （numel=8）
+rank0 得到的输出 = [2, 4, 8, 10]
+</code></pre></div>
+
+<p><code>[2, 4, 8, 10] − [1, 2, 3, 4] = [1, 2, 5, 6]</code>——对端贡献的是它的第 1、2、5、6 个元素。这不是任何一次合法 <code>all_reduce</code> 的结果，但它看起来完全像一个归约结果：量级正常、每个位置都有值、没有任何异常。Shape 错配在 NCCL 上不会当场失败，只会给出一份错数据，然后在对端超时崩溃。<strong>这是多卡调试里最贵的一类 bug。</strong></p>
+<p>同一类注入在 Gloo 上的表现完全相反：0.8 秒、断言、SIGABRT、非零退出码，错误现场直接指到字节数校验那一行。结论不是「Gloo 更好」，而是<strong>两个后端对同一份非法程序给出的失败形态不同，而可观测性决定了排查成本</strong>。</p>
+<h3 id="3">3. 三步完成语义</h3>
+<p><code>dist.all_reduce(t, async_op=True)</code> 返回一个 <code>Work</code>。从获得 <code>Work</code> 对象到「结果真正写入显存目标张量并对后续计算全局可见」之间有三道语义门槛。</p>
+<p><strong>第一道：CPU 侧返回。</strong> 这只说明调用已经入队。实测里它花 0.052–0.065 ms。</p>
+<p><strong>第二道：stream 可见结果。</strong> 对 NCCL，<code>WorkNCCL::wait()</code> 把<strong>当前 CUDA 流</strong>阻塞在 NCCL 的结束事件上，但默认不阻塞 CPU：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:820-825（v2.13.0）</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">ProcessGroupNCCL::WorkNCCL::synchronizeStream</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">auto</span><span class="w"> </span><span class="n">currentStream</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">at</span><span class="o">::</span><span class="n">cuda</span><span class="o">::</span><span class="n">getCurrentCUDAStream</span><span class="p">(</span><span class="n">device_</span><span class="p">.</span><span class="n">index</span><span class="p">());</span>
+<span class="w">  </span><span class="c1">// Block the current stream on the NCCL stream</span>
+<span class="w">  </span><span class="n">ncclEndEvent_</span><span class="o">-&gt;</span><span class="n">block</span><span class="p">(</span><span class="n">currentStream</span><span class="p">);</span>
+<span class="w">  </span><span class="p">...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:850-851（v2.13.0）</span>
+<span class="w">  </span><span class="c1">// In case of blockingWait or a timeout value is specified by the user, we</span>
+<span class="w">  </span><span class="c1">// block the CPU thread until the work is completed or timed out.</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">blockingWait_</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">timeout</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">kNoTimeout</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+</code></pre></div>
+
+<p><code>blockingWait_</code> 的默认值取自环境变量 <code>TORCH_NCCL_BLOCKING_WAIT</code>，默认 <code>false</code>（同文件 <code>:951</code>）。所以「<code>work.wait()</code> 返回了」在 NCCL 上的准确含义是：<strong>调用流上后续的 kernel 会排在通信之后</strong>，而不是「CPU 现在能安全读这块内存」。</p>
+<p>对 Gloo，语义相反：<code>Work::wait</code> 直接卡在条件变量上，CPU 返回即代表完成。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// torch/csrc/distributed/c10d/Work.cpp:121-126（v2.14.0）</span>
+<span class="kt">bool</span><span class="w"> </span><span class="nf">Work::wait</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">chrono</span><span class="o">::</span><span class="n">milliseconds</span><span class="w"> </span><span class="n">timeout</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">unique_lock</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span><span class="w"> </span><span class="n">lock</span><span class="p">(</span><span class="n">mutex_</span><span class="p">);</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">timeout</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">kNoTimeout</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// This waits without a timeout.</span>
+<span class="w">    </span><span class="n">cv_</span><span class="p">.</span><span class="n">wait</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="o">&amp;</span><span class="p">]</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">completed_</span><span class="p">;</span><span class="w"> </span><span class="p">});</span>
+</code></pre></div>
+
+<p><strong>第三道：buffer 可复用。</strong> 这一道最容易被前两道掩盖。通信还没读完输入缓冲区时改写它，结果是错的；通信还在写输出缓冲区时把它还给分配器，结果是读到脏数据（2.0c 从分配器一侧讲过同一件事）。</p>
+<p>把这三道拆开，就得到五种写法。worldvln 2×L40S、64 MiB <code>all_reduce</code>、期望值 3.0，每种变体 20 次 × 2 rank：</p>
+<table>
+<thead>
+<tr>
+<th>变体</th>
+<th style="text-align: right;">读时正确</th>
+<th style="text-align: right;">全同步后正确</th>
+<th>读到的值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cpu_return_only</code>：只等 CPU 返回就在默认流上读</td>
+<td style="text-align: right;">1/40</td>
+<td style="text-align: right;">40/40</td>
+<td><code>1.0 / 2.0 / 3.0</code></td>
+<td>默认流与通信流无依赖，读到的是本 rank 的旧值</td>
+</tr>
+<tr>
+<td><code>event_without_wait</code>：在入队点记事件，计算流等这个事件</td>
+<td style="text-align: right;">0/40</td>
+<td style="text-align: right;">40/40</td>
+<td><code>1.0 / 2.0</code></td>
+<td>事件只代表「调用已入队」，不代表通信完成</td>
+</tr>
+<tr>
+<td><code>premature_overwrite</code>：不等完成，在第三条流上改写 buffer</td>
+<td style="text-align: right;">0/40</td>
+<td style="text-align: right;"><strong>0/40</strong></td>
+<td><code>0.0 / 1.0 / 2.0</code></td>
+<td>输入被覆盖，通信结果本身就是错的，事后同步也救不回来</td>
+</tr>
+<tr>
+<td><code>event_after_wait</code>：先 <code>wait()</code> 让通信流挂上结束事件，再记事件</td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">40/40</td>
+<td><code>3.0</code></td>
+<td>正确做法之一</td>
+</tr>
+<tr>
+<td><code>wait_correct</code>：同一流上 <code>wait()</code> 之后直接读</td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">40/40</td>
+<td><code>3.0</code></td>
+<td>正确做法之二</td>
+</tr>
+</tbody>
+</table>
+<p><code>event_without_wait</code> 是这张表里最有信息量的一行：它的写法看起来非常标准（记事件、跨流等待），但它只是把「入队点」传播到计算流。事件必须在 <code>work.wait()</code> <strong>之后</strong>记录，才携带完成信息。这一点无法从「记一个 event」这个动作本身看出来，只能从实现里读出来。</p>
+<p><strong>同一套写法换到跨机 transport 上，分类结论完全一样。</strong> 把同一份代码放到 crater ↔ crater2（各 1×RTX 5090，<code>NET/Socket</code>，链路条件见 6.1 第 7 节），同样 64 MiB、期望值 3.0、每变体 20 次 × 2 rank：</p>
+<table>
+<thead>
+<tr>
+<th>变体</th>
+<th style="text-align: right;">读时正确</th>
+<th style="text-align: right;">全同步后正确</th>
+<th style="text-align: right;">CPU 返回中位</th>
+<th style="text-align: right;">设备完成中位</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cpu_return_only</code></td>
+<td style="text-align: right;">0/40</td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">0.0747 ms</td>
+<td style="text-align: right;">593.59 ms</td>
+</tr>
+<tr>
+<td><code>event_without_wait</code></td>
+<td style="text-align: right;">0/40</td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">0.0722 ms</td>
+<td style="text-align: right;">593.59 ms</td>
+</tr>
+<tr>
+<td><code>premature_overwrite</code></td>
+<td style="text-align: right;">0/40</td>
+<td style="text-align: right;"><strong>0/40</strong></td>
+<td style="text-align: right;">0.0707 ms</td>
+<td style="text-align: right;">594.60 ms</td>
+</tr>
+<tr>
+<td><code>event_after_wait</code></td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">0.0706 ms</td>
+<td style="text-align: right;">594.35 ms</td>
+</tr>
+<tr>
+<td><code>wait_correct</code></td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">0.0697 ms</td>
+<td style="text-align: right;">593.71 ms</td>
+</tr>
+</tbody>
+</table>
+<p>逐行的判定与单机档一致，三种错误写法的错误形态也一致（<code>premature_overwrite</code> 同样救不回来，读到的都是 <code>0.0</code>）。变的是量级：<strong>CPU 返回仍是 0.07 ms 量级，设备完成从单机档的 4.72 ms 涨到 593.6 ms，两者的比值从 90 倍变成 8000 倍。</strong> 错误写法的暴露窗口被拉长——跨机时 <code>cpu_return_only</code> 读到旧值的比例从 39/40 变成 40/40，「碰巧读对」这一支被链路延迟彻底挤掉。</p>
+<p>换到另一条网卡（容器 overlay <code>eth0</code>）复跑同一组，五个变体的读数分类与设备完成时间（593.6–594.6 ms）都与 <code>net1</code> 一致。<strong>这组结论只依赖「传输在 CPU 侧代理线程上完成」，不依赖具体网卡。</strong></p>
+<p>但跨机档的「设备完成」这一列本身要换工具：它由 CPU 侧墙钟（<code>torch.cuda.synchronize()</code> 包住整轮）测得，不是 device event。跨机搬数据的是代理线程，device event 只包住 GPU 上那一小段 kernel，直接读会得到小一个数量级的数字（6.1 第 7 节给了同一现象的定量对照：4 KiB broadcast 不隔离 0.017 ms、隔离后 0.062 ms）。<strong>完成语义的定义没变，测量它的工具必须跟着传输路径变。</strong></p>
+<h3 id="4-p2p-rank">4. P2P 的配对：一对 rank 一个通信子，按序号配对</h3>
+<p><code>send</code>/<code>recv</code> 与集合通信的匹配规则不同。NCCL 后端给未批量化的 P2P 单独建通信子，键按有序对归一化：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:151-157（v2.13.0）</span>
+<span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="nf">getKeySendRecv</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">myRank</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">peer</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">lowRank</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">myRank</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">peer</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">myRank</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">peer</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">highRank</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">myRank</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">peer</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">peer</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">myRank</span><span class="p">;</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">sendRecvPair</span><span class="w"> </span><span class="o">=</span>
+<span class="w">      </span><span class="n">std</span><span class="o">::</span><span class="n">to_string</span><span class="p">(</span><span class="n">lowRank</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">":"</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">to_string</span><span class="p">(</span><span class="n">highRank</span><span class="p">);</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">sendRecvPair</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>rank 0 发给 1 和 rank 0 收自 1，算出来的键都是 <code>"0:1"</code>：<strong>两个方向共用同一个 2-rank 通信子</strong>。同一通信子上再按 <code>seqNum</code> 配对，于是：</p>
+<ul>
+<li>rank0 <code>isend</code>(seq0) ↔ rank1 <code>irecv</code>(seq0)：正确配对</li>
+<li>rank0 <code>isend</code>(seq0) 与 rank1 <code>isend</code>(seq0)：两个 send 对上了</li>
+</ul>
+<p>实测就是这样：两端都「先 <code>isend</code> 再 <code>irecv</code>」时，两端的 <code>SeqNum=2, OpType=RECV</code> 同时超时。把两端的次序改成相反（一端先发后收、另一端先收后发），或者直接用 <code>dist.batch_isend_irecv</code> 成对提交，都能完成。本章的 <code>all_reduce</code>/<code>all_gather</code>/<code>reduce_scatter</code>/<code>send_recv</code> 对拍里，NCCL 一路走 <code>batch_isend_irecv</code>，Gloo 一路走未批量化的 <code>isend</code>/<code>irecv</code>，两者数值都与单进程参照逐元素相等。</p>
+<p>批量化路径在跨机 transport 上又暴露了一层差异。crater ↔ crater2 各一张 RTX 5090、8 MiB 载荷、30 轮、<code>NET/Socket</code>：</p>
+<table>
+<thead>
+<tr>
+<th>写法</th>
+<th>结果</th>
+<th style="text-align: right;">设备完成中位</th>
+<th style="text-align: right;">CPU 入队中位</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>async_isend_irecv</code>：两条都先入队、再逐个 <code>wait()</code></td>
+<td><strong>两端都失败</strong></td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td><code>batch_isend_irecv</code>：<code>P2POp</code> 列表一次提交</td>
+<td>两端各 30/30 正确</td>
+<td style="text-align: right;">71.57 ms</td>
+<td style="text-align: right;">0.068 ms</td>
+</tr>
+<tr>
+<td><code>coalescing_async</code>：<code>_coalescing_manager(async_ops=True)</code> + <code>cm.wait()</code></td>
+<td>两端各 30/30 正确</td>
+<td style="text-align: right;">71.61 ms</td>
+<td style="text-align: right;">0.140 ms</td>
+</tr>
+<tr>
+<td><code>coalescing_sync</code>：<code>_coalescing_manager(async_ops=False)</code></td>
+<td>两端各 30/30 正确</td>
+<td style="text-align: right;">71.61 ms</td>
+<td style="text-align: right;">0.126 ms</td>
+</tr>
+</tbody>
+</table>
+<p>三行成功的写法给出同一条链路时间（71.54–71.62 ms，离散 0.1%），起点也一致：8 MiB ÷ 0.1176 GB/s = 71.3 ms，与 6.1 量到的跨机链路速率吻合。<strong>区别只在 CPU 侧：批量化把每轮入队压到 0.068 ms，两条 coalescing 路径是 0.126–0.140 ms</strong>，而设备完成时间完全一样——批量化省的是提交开销，不是传输时间。</p>
+<p>失败那一行值得单独记：<code>async_isend_irecv</code> 在单机档是「逐条路径的正确形式」，跨机档却两端同时报</p>
+<div class="highlight"><pre><span></span><code>ncclSocketInit: connecting to address  with family 1 is neither AF_INET(2) nor AF_INET6(10)
+</code></pre></div>
+
+<p>——未批量化的 <code>isend</code>/<code>irecv</code> 在延迟建链时要给新通信子提供对端地址，而 Socket transport 上这次建链没有携带可用地址，于是直接失败（rank0 报 family 1、rank1 报 family 0，同一原因的两侧表现）。<strong>在单机上被证明正确的写法，换 transport 后必须重测</strong>，这条比任何性能数字都重要。</p>
+<p>最后一个变体 <code>sync_send_recv_ring</code>（两条阻塞 <code>send</code>/<code>recv</code> 顺序调用）在跨机档触发 <code>CUDA error: an illegal memory access was encountered</code>，rank 进程在写出结果文件前就被 watchdog 终止（工件留在 <code>results/crater/6.0/20260922-p2p-batching</code>）。因此正式那一档用 <code>--variants</code> 显式排除了它，并把这次失败按原样留在结果目录里——<strong>失败变体不能靠「反正会崩」跳过，它的崩溃形态本身就是结论的一部分。</strong></p>
+<p>Gloo 在同一场景下用 tag 匹配，不区分方向，所以同样的错误次序照样完成。<strong>「P2P 一定要求两端次序相反」不是通信的普遍规律，而是 NCCL 未批量化 P2P 的实现约束。</strong></p>
+<details class="fold">
+<summary>为什么 NCCL 要给每对 rank 单独建通信子</summary>
+<p>源码注释给出了两条理由（<code>ProcessGroupNCCL.cpp:4164-4170</code>）：一条通信子只对应一条流，如果多个未批量化 P2P 复用同一条通信子，会被序列化到同一条流上；而 NCCL 不允许同一条通信子上跨流发多个 P2P。把「每条流一个通信子」这条不变量守住，代价是每次 P2P 都要新参与一次通信子建立。</p>
+</details>
+<hr />
+<h2 id="_4">工程实现 · 源码解析</h2>
+<h3 id="_5">设计取舍</h3>
+<p><strong>为什么 NCCL 的 <code>wait()</code> 默认不阻塞 CPU。</strong> 多卡训练里，通信常常要和计算重叠：CPU 提交完通信后应该立刻去准备下一个 batch，而不是停在原地。把同步语义放在<strong>流</strong>上而不是 CPU 上，是让重叠自然发生的前提。代价是「<code>wait()</code> 返回」这件事不再蕴含「数据可用」，调用方必须自己维护流之间的依赖。</p>
+<p><strong>为什么 Gloo 与 NCCL 对非法程序的反应差这么多。</strong> Gloo 在传输层逐 op 校验字节数（<code>pair.cc:253</code>），把错误变成立即的断言；NCCL 的 kernel 按通信子里的 <code>seqNum</code> 和本地 numel 推进，对端的 numel 不参与判定，于是错配表现为「一端算完、一端超时」。可观测性上的取舍很明确：立即失败更容易定位，而宽松检查在合法程序里省掉了一次同步。</p>
+<p><strong>为什么通信子要按进程组划分。</strong> 不同子组是不同通信子，意味着组间没有共享状态，也意味着同一对 rank 在不同组里是两次独立的配对。这让「一个 rank 同时属于多个组」变得可行（张量并行组、数据并行组、流水线组），代价是每组都要独立建链，组数多的时候初始化时间和显存开销都需要算。</p>
+<p><strong>为什么 P2P 要批量化。</strong> <code>batch_isend_irecv</code> 把多个 P2P 操作放进同一个通信子、同一批提交，避免每个操作各建一次通信子，也让配对关系显式化。代价是调用方要一次性列出本 rank 所有的 P2P 操作，不能边算边发。</p>
+<h3 id="_6">本章引用的源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ProcessGroupNCCL.cpp:151-157</code></td>
+<td><code>getKeySendRecv</code>：P2P 通信子键按有序对归一化</td>
+</tr>
+<tr>
+<td><code>ProcessGroupNCCL.cpp:811-819</code></td>
+<td><code>WorkNCCL::synchronize</code></td>
+</tr>
+<tr>
+<td><code>ProcessGroupNCCL.cpp:820-828</code></td>
+<td><code>synchronizeStream</code>：只阻塞当前 CUDA 流</td>
+</tr>
+<tr>
+<td><code>ProcessGroupNCCL.cpp:829-866</code></td>
+<td><code>WorkNCCL::wait</code>：<code>blockingWait_</code> 为假时不等 CPU</td>
+</tr>
+<tr>
+<td><code>ProcessGroupNCCL.cpp:948-954</code></td>
+<td><code>blockingWait_</code> 默认取 <code>TORCH_NCCL_BLOCKING_WAIT</code></td>
+</tr>
+<tr>
+<td><code>ProcessGroupNCCL.cpp:4154-4191</code></td>
+<td>未批量化 P2P 为每对 rank 新建 2-rank 通信子</td>
+</tr>
+<tr>
+<td><code>Work.cpp:121-141</code></td>
+<td><code>Work::wait</code>：Gloo 侧 CPU 条件变量等待</td>
+</tr>
+<tr>
+<td><code>ProcessGroupGloo.cpp:196-215</code></td>
+<td><code>AsyncWork::execute</code>：后台线程执行 <code>run()</code></td>
+</tr>
+<tr>
+<td><code>ProcessGroupGloo.cpp:721-753</code></td>
+<td><code>runLoop</code>：Gloo 的工作线程</td>
+</tr>
+<tr>
+<td><code>ProcessGroupGloo.hpp:49-80</code></td>
+<td><code>AsyncWork</code> 的三阶段划分（准备 / 后台执行 / 前台同步）</td>
+</tr>
+</tbody>
+</table>
+<p>完整行号对照与摘录见 <a href="../raw/results/worldvln/6.0/20260914-contracts/source/excerpts.txt">source/excerpts.txt</a>；来源版本与文件位置见 <a href="../raw/results/worldvln/6.0/20260914-contracts/source/manifest.json">source/manifest.json</a>。</p>
+<hr />
+<h2 id="_7">工程实现 · 自己写一遍</h2>
+<p><code>labs/L6/comm_sequence.py</code> 记录的是「哪个 rank 在第几步、对哪个进程组、调用了哪个集合通信、调用前后的值是什么」。核心是三条约束。</p>
+<p><strong>输入必须是任何 rank 都能本地重建的确定性数据。</strong> 这样参照实现不需要额外通信：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">32</span> <span class="k">def</span><span class="w"> </span><span class="nf">op_input</span><span class="p">(</span><span class="n">op</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">gsize</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">33</span> <span class="w">    </span><span class="sd">"""确定性生成 rank 的输入。reduce_scatter 的输入长度等于组内 rank 数。"""</span>
+<span class="linenos" aria-hidden="true">34</span>     <span class="n">n</span> <span class="o">=</span> <span class="n">gsize</span> <span class="k">if</span> <span class="n">op</span> <span class="o">==</span> <span class="s2">"reduce_scatter"</span> <span class="k">else</span> <span class="mi">4</span>
+<span class="linenos" aria-hidden="true">35</span>     <span class="n">rng</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">Random</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">seed</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">op</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">36</span>     <span class="k">return</span> <span class="p">[</span><span class="n">rng</span><span class="o">.</span><span class="n">randrange</span><span class="p">(</span><span class="mi">10</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">37</span> 
+<span class="linenos" aria-hidden="true">38</span> 
+<span class="linenos" aria-hidden="true">39</span> <span class="k">def</span><span class="w"> </span><span class="nf">reference</span><span class="p">(</span><span class="n">op</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">members</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">gsize</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">40</span> <span class="w">    </span><span class="sd">"""纯 Python 单进程参照，整数运算无误差。返回 {rank: 期望输出列表}。"""</span>
+<span class="linenos" aria-hidden="true">41</span>     <span class="n">ins</span> <span class="o">=</span> <span class="p">{</span><span class="n">r</span><span class="p">:</span> <span class="n">op_input</span><span class="p">(</span><span class="n">op</span><span class="p">,</span> <span class="n">r</span><span class="p">,</span> <span class="n">gsize</span><span class="p">,</span> <span class="n">seed</span><span class="p">)</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">members</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">42</span>     <span class="k">if</span> <span class="n">op</span> <span class="o">==</span> <span class="s2">"all_reduce"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">43</span>         <span class="n">total</span> <span class="o">=</span> <span class="p">[</span><span class="nb">sum</span><span class="p">(</span><span class="n">ins</span><span class="p">[</span><span class="n">r</span><span class="p">][</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">members</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">ins</span><span class="p">[</span><span class="n">members</span><span class="p">[</span><span class="mi">0</span><span class="p">]]))]</span>
+<span class="linenos" aria-hidden="true">44</span>         <span class="k">return</span> <span class="p">{</span><span class="n">r</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">total</span><span class="p">)</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">members</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">45</span>     <span class="k">if</span> <span class="n">op</span> <span class="o">==</span> <span class="s2">"all_gather"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">46</span>         <span class="n">flat</span> <span class="o">=</span> <span class="p">[</span><span class="n">v</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">members</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">ins</span><span class="p">[</span><span class="n">r</span><span class="p">]]</span>
+<span class="linenos" aria-hidden="true">47</span>         <span class="k">return</span> <span class="p">{</span><span class="n">r</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">flat</span><span class="p">)</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">members</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">48</span>     <span class="k">if</span> <span class="n">op</span> <span class="o">==</span> <span class="s2">"reduce_scatter"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">49</span>         <span class="k">return</span> <span class="p">{</span><span class="n">members</span><span class="p">[</span><span class="n">i</span><span class="p">]:</span> <span class="p">[</span><span class="nb">sum</span><span class="p">(</span><span class="n">ins</span><span class="p">[</span><span class="n">r</span><span class="p">][</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">members</span><span class="p">)]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">members</span><span class="p">))}</span>
+<span class="linenos" aria-hidden="true">50</span>     <span class="k">if</span> <span class="n">op</span> <span class="o">==</span> <span class="s2">"send_recv"</span><span class="p">:</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/comm_sequence.py 第 32–50 行</code><a href="../code/labs/L6/comm_sequence.py.html#labs-L6-comm_sequence-py-L-32">在完整文件中打开 &rarr;</a></div></div>
+<p><strong>每记录一步就落盘并 flush。</strong> 集合通信卡住时进程会被强杀，内存里的记录会全部丢掉；而「最后进入的那个操作」恰恰是排查的关键。所以 <code>call()</code> 在执行前先写一条 <code>phase=begin</code> 的占位行：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">117</span>     <span class="k">def</span><span class="w"> </span><span class="nf">call</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">op</span><span class="p">,</span> <span class="n">group</span><span class="p">,</span> <span class="n">group_label</span><span class="p">,</span> <span class="n">tensors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">fn</span><span class="p">,</span> <span class="n">note</span><span class="o">=</span><span class="s2">""</span><span class="p">,</span> <span class="n">primary</span><span class="o">=</span><span class="s2">"x"</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">118</span> <span class="w">        </span><span class="sd">"""先给输入拍快照，执行 fn 修改张量，再给输出拍快照。</span>
+<span class="linenos" aria-hidden="true">119</span> 
+<span class="linenos" aria-hidden="true">120</span> <span class="sd">        调用前先往文件里写一条 phase=begin 的占位行：集合通信卡住或进程被杀时，</span>
+<span class="linenos" aria-hidden="true">121</span> <span class="sd">        这条占位行就是「最后进入的那个操作」，不会因为异常丢失现场。</span>
+<span class="linenos" aria-hidden="true">122</span> <span class="sd">        """</span>
+<span class="linenos" aria-hidden="true">123</span>         <span class="n">before</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">snapshot</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">tensors</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+<span class="linenos" aria-hidden="true">124</span>         <span class="bp">self</span><span class="o">.</span><span class="n">_flush</span><span class="p">({</span>
+<span class="linenos" aria-hidden="true">125</span>             <span class="s2">"rank"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span> <span class="s2">"step"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">step</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">"op"</span><span class="p">:</span> <span class="n">op</span><span class="p">,</span> <span class="s2">"group"</span><span class="p">:</span> <span class="n">group_label</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">126</span>             <span class="s2">"group_members"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">members</span><span class="p">(</span><span class="n">group</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">world_size</span><span class="p">),</span> <span class="s2">"backend"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">127</span>             <span class="s2">"device"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="s2">"input"</span><span class="p">:</span> <span class="n">before</span><span class="p">,</span> <span class="s2">"output"</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"primary"</span><span class="p">:</span> <span class="n">primary</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">128</span>             <span class="s2">"note"</span><span class="p">:</span> <span class="n">note</span><span class="p">,</span> <span class="s2">"phase"</span><span class="p">:</span> <span class="s2">"begin"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">129</span>         <span class="p">})</span>
+<span class="linenos" aria-hidden="true">130</span>         <span class="n">fn</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">131</span>         <span class="n">after</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">snapshot</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">tensors</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+<span class="linenos" aria-hidden="true">132</span>         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">op</span><span class="p">,</span> <span class="n">group</span><span class="p">,</span> <span class="n">group_label</span><span class="p">,</span> <span class="n">before</span><span class="p">,</span> <span class="n">after</span><span class="p">,</span> <span class="n">note</span><span class="p">,</span> <span class="n">primary</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">133</span> 
+<span class="linenos" aria-hidden="true">134</span>     <span class="k">def</span><span class="w"> </span><span class="nf">close</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/comm_sequence.py 第 117–134 行</code><a href="../code/labs/L6/comm_sequence.py.html#labs-L6-comm_sequence-py-L-117">在完整文件中打开 &rarr;</a></div></div>
+<p><strong>全局视图靠四元组对齐。</strong> 只按 <code>op</code> 名合并，会把不同进程组上的同名调用混成一条：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">184</span> <span class="c1"># --------------------------------------------------------------------------</span>
+<span class="linenos" aria-hidden="true">185</span> <span class="c1"># 全局视图</span>
+<span class="linenos" aria-hidden="true">186</span> <span class="c1"># --------------------------------------------------------------------------</span>
+<span class="linenos" aria-hidden="true">187</span> 
+<span class="linenos" aria-hidden="true">188</span> <span class="k">def</span><span class="w"> </span><span class="nf">global_view</span><span class="p">(</span><span class="n">ledgers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">189</span> <span class="w">    </span><span class="sd">"""把各 rank 的事件按 (step, op, group) 对齐成一行的全局视图。</span>
+<span class="linenos" aria-hidden="true">190</span> 
+<span class="linenos" aria-hidden="true">191</span> <span class="sd">    每个 rank 的 step 编号只在自己进程内单调，子组调用会让各 rank 的 step 错开；</span>
+<span class="linenos" aria-hidden="true">192</span> <span class="sd">    因此先按 (op, group, group_members) 分组，再按 step 排序。</span>
+<span class="linenos" aria-hidden="true">193</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true">194</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true">195</span>     <span class="k">for</span> <span class="n">lg</span> <span class="ow">in</span> <span class="n">ledgers</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">196</span>         <span class="k">for</span> <span class="n">ev</span> <span class="ow">in</span> <span class="n">lg</span><span class="p">[</span><span class="s2">"events"</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">197</span>             <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">ev</span><span class="p">[</span><span class="s2">"step"</span><span class="p">],</span> <span class="n">ev</span><span class="p">[</span><span class="s2">"op"</span><span class="p">],</span> <span class="n">ev</span><span class="p">[</span><span class="s2">"group"</span><span class="p">],</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">ev</span><span class="p">[</span><span class="s2">"group_members"</span><span class="p">]))</span>
+<span class="linenos" aria-hidden="true">198</span>             <span class="n">rows</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">{})[</span><span class="n">ev</span><span class="p">[</span><span class="s2">"rank"</span><span class="p">]]</span> <span class="o">=</span> <span class="n">ev</span>
+<span class="linenos" aria-hidden="true">199</span>     <span class="n">out</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">200</span>     <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">rows</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">201</span>         <span class="n">step</span><span class="p">,</span> <span class="n">op</span><span class="p">,</span> <span class="n">glabel</span><span class="p">,</span> <span class="n">mem</span> <span class="o">=</span> <span class="n">key</span>
+<span class="linenos" aria-hidden="true">202</span>         <span class="n">per_rank</span> <span class="o">=</span> <span class="n">rows</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">203</span>         <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+<span class="linenos" aria-hidden="true">204</span>             <span class="s2">"step"</span><span class="p">:</span> <span class="n">step</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">205</span>             <span class="s2">"op"</span><span class="p">:</span> <span class="n">op</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">206</span>             <span class="s2">"group"</span><span class="p">:</span> <span class="n">glabel</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">207</span>             <span class="s2">"group_members"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">mem</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">208</span>             <span class="s2">"present"</span><span class="p">:</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">per_rank</span><span class="p">),</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/comm_sequence.py 第 184–209 行</code><a href="../code/labs/L6/comm_sequence.py.html#labs-L6-comm_sequence-py-L-184">在完整文件中打开 &rarr;</a></div></div>
+<p>把这三条拼起来，一次 world=4 的对拍会留下 22 条检查项：每个 rank 的每一步都有一条「期望值 / 实得值」，另加每个进程组的成员列表。四个 rank 的耗时为 0.011–0.025 s。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="_8">命令</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 任务 A：world / 子组上的四类集合通信，与单进程参照逐元素对拍</span>
+python<span class="w"> </span>labs/L6/collective_contracts.py<span class="w"> </span>A<span class="w"> </span>--backend<span class="w"> </span>gloo<span class="w"> </span>--world-size<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--out<span class="w"> </span>results/local/6.0/run/A4
+
+<span class="c1"># 任务 B：五种失败注入，每种在独立子进程里跑，父进程超时兜底</span>
+python<span class="w"> </span>labs/L6/collective_contracts.py<span class="w"> </span>B<span class="w"> </span>--backend<span class="w"> </span>gloo<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--out<span class="w"> </span>results/local/6.0/run/B<span class="w"> </span>--parent-timeout<span class="w"> </span><span class="m">75</span>
+
+<span class="c1"># 任务 C：通信流写、计算流读的完成语义（需要 CUDA）</span>
+python<span class="w"> </span>labs/L6/collective_contracts.py<span class="w"> </span>C<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--out<span class="w"> </span>results/worldvln/6.0/run/C<span class="w"> </span>--bytes<span class="w"> </span><span class="m">67108864</span><span class="w"> </span>--trials<span class="w"> </span><span class="m">20</span>
+
+<span class="c1"># 跨机复测（本地 macOS 编排两台机器；任务 C and P2P 各一档）</span>
+python<span class="w"> </span>labs/L6/run_crosshost.py<span class="w"> </span>completion<span class="w"> </span>--run-id<span class="w"> </span>&lt;id&gt;<span class="w"> </span>--bytes<span class="w"> </span><span class="m">67108864</span><span class="w"> </span>--trials<span class="w"> </span><span class="m">20</span>
+python<span class="w"> </span>labs/L6/run_crosshost.py<span class="w"> </span>p2p<span class="w"> </span>--run-id<span class="w"> </span>&lt;id&gt;<span class="w"> </span>--bytes<span class="w"> </span><span class="m">8388608</span><span class="w"> </span>--trials<span class="w"> </span><span class="m">30</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--variants<span class="w"> </span>async_isend_irecv,batch_isend_irecv,coalescing_async,coalescing_sync
+</code></pre></div>
+
+<p>跨机档复用同一份 <code>collective_contracts.task_C</code>（只有设备与 <code>MASTER_ADDR</code> 由启动器注入），所以单机与跨机的五种写法是同一份代码；<code>p2p</code> 档由 <code>labs/L6/crosshost_comm.py</code> 的 <code>P2P_VARIANTS</code> 定义，<code>--variants</code> 用来排除会让进程在写盘前中止的 <code>sync_send_recv_ring</code>。</p>
+<p>任务 B 的父进程会把 <code>RANK</code>/<code>WORLD_SIZE</code> 写进子进程环境，并给每个子进程单独开一个进程组；超时后对整组发 <code>SIGKILL</code>。这一点在 NCCL 上是必需的：watchdog 在 20 s 就报出了超时，但进程要到 80 s 之后才真正退出，中间的 teardown 没有任何输出。</p>
+<h3 id="_9">实测数字</h3>
+<ul>
+<li><strong>Gloo，world = 2 / 3 / 4</strong>：8 / 12 / 22 项对拍，不一致 0。</li>
+<li><strong>NCCL，world = 2 / 4（worldvln，L40S）</strong>：8 / 22 项对拍，不一致 0。</li>
+<li><strong>完成语义（2×L40S，64 MiB）</strong>：CPU 返回中位 0.052–0.065 ms，设备完成中位 4.72–4.74 ms，相差约 90×。五种写法里只有 <code>event_after_wait</code> 与 <code>wait_correct</code> 在读时就拿到正确值。</li>
+<li><strong>完成语义（跨机 2×5090，64 MiB）</strong>：CPU 返回中位 0.070–0.075 ms，设备完成中位 593.6–594.6 ms，相差约 8000×；五种写法的正确率分类与单机档逐行一致，<code>cpu_return_only</code> 的读时正确率从 1/40 降到 0/40。</li>
+<li><strong>P2P 批量化（跨机 2×5090，8 MiB，30 轮）</strong>：<code>batch_isend_irecv</code> 71.57 ms / 入队 0.068 ms、两条 coalescing 71.61 ms / 入队 0.126–0.140 ms（均为两端 30/30 正确）；<code>async_isend_irecv</code> 两端同时失败（<code>ncclSocketInit</code> 地址族错误），<code>sync_send_recv_ring</code> 触发 <code>CUDA illegal memory access</code> 并被 watchdog 终止。</li>
+<li><strong>失败注入</strong>：见上一节两张表。Gloo 的五种注入全部在 21 s 内结束，最长的是内建超时的 20 s；NCCL 的次序错配与 P2P 错配都撞到 90 s 的父进程超时，因为 watchdog 报错后进程并不退出。</li>
+</ul>
+<h3 id="_10">消融建议</h3>
+<ol>
+<li>把 <code>all_reduce</code> 换到 <code>even = {0, 2}</code> 子组上再跑一次，确认期望值随 <code>group_members</code> 变化——这是检验「按 op 名匹配」这个直觉是否成立的最快方式。</li>
+<li>把任务 C 的 <code>--bytes</code> 从 64 MiB 降到 1 MiB。通信变快之后 <code>cpu_return_only</code> 的正确率会上升，说明竞态的可见性依赖通信时长，不依赖写法本身。</li>
+<li>把 <code>event_after_wait</code> 里的 <code>work.wait()</code> 挪到 <code>ev_done.record()</code> 之后，观察正确率从 40/40 掉到接近 0/40。</li>
+<li>在任务 B 的 <code>order_mismatch</code> 里把 <code>dist.init_process_group</code> 的 <code>timeout</code> 从 20 s 改成 120 s，观察 wall 时间随超时线性变化——确认失败是有界的、且边界由调用方设定。</li>
+</ol>
+<hr />
+<h2 id="_11">原始现场</h2>
+<p><strong>Gloo：shape 错配的断言原文</strong>（<code>results/local/6.0/20260914-contracts/B/shape_mismatch/rank0.log</code>）</p>
+<div class="highlight"><pre><span></span><code>libc++abi: terminating due to uncaught exception of type gloo::EnforceNotMet:
+[enforce fail at /Users/runner/work/pytorch/pytorch/third_party/gloo/gloo/transport/uv/pair.cc:253]
+op.nread == op.preamble.nbytes.
+</code></pre></div>
+
+<p><strong>Gloo：次序错配的超时原文</strong>（<code>results/local/6.0/20260914-contracts/B/order_mismatch/rank0.log</code>）</p>
+<div class="highlight"><pre><span></span><code>RuntimeError: [.../gloo/transport/uv/unbound_buffer.cc:65]
+Timed out waiting 20000ms for recv operation to complete
+</code></pre></div>
+
+<p><strong>NCCL：watchdog 报出的超时现场</strong>（<code>results/worldvln/6.0/20260914-contracts/B/order_mismatch/rank0.log</code>）</p>
+<div class="highlight"><pre><span></span><code>[rank0]:[E... ProcessGroupNCCL.cpp:730] [Rank 0] Watchdog caught collective operation timeout:
+WorkNCCL(SeqNum=1, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=20000)
+ran for 20040 milliseconds before timing out.
+[rank0]:[E... ProcessGroupNCCL.cpp:2372] [PG ID 0 PG GUID 0(default_pg) Rank 0]
+failure detected by watchdog at work sequence id: 1 PG status: last enqueued work: 1,
+last started work: -1 (), last completed work: -1
+</code></pre></div>
+
+<p><strong>NCCL：shape 错配下 rank0 的完整记录</strong>（<code>results/worldvln/6.0/20260914-contracts/B/shape_mismatch/rank0.jsonl</code>，两行分别是 <code>begin</code> 与 <code>end</code>）</p>
+<div class="highlight"><pre><span></span><code>{"rank": 0, "step": 1, "op": "all_reduce", "group": "world", "group_members": [0, 1],
+ "device": "cuda:0", "input": {"x": {"shape": [4], "values": [1, 2, 3, 4]}},
+ "output": null, "phase": "begin"}
+{"rank": 0, "step": 1, "op": "all_reduce", "group": "world", "group_members": [0, 1],
+ "device": "cuda:0", "input": {"x": {"shape": [4], "values": [1, 2, 3, 4]}},
+ "output": {"x": {"shape": [4], "values": [2, 4, 8, 10]}}, "phase": "end"}
+</code></pre></div>
+
+<p><strong>NCCL：P2P 两端同序的现场</strong>（<code>results/worldvln/6.0/20260914-contracts/B/p2p_send_first/rank0.log</code>）</p>
+<div class="highlight"><pre><span></span><code>[rank0]:[E... ProcessGroupNCCL.cpp:730] [Rank 0] Watchdog caught collective operation timeout:
+WorkNCCL(SeqNum=2, OpType=RECV, NumelIn=4, NumelOut=4, Timeout(ms)=20000)
+ran for 20057 milliseconds before timing out.
+</code></pre></div>
+
+<p><strong>完成语义的逐次原始记录</strong>（<code>results/worldvln/6.0/20260914-contracts/C/stream_semantics.json</code>）保留了五种变体各 40 条记录，字段含 <code>observed</code>、<code>final</code>、<code>cpu_return_ms</code>、<code>sync_done_ms</code>、<code>correct_observed</code>、<code>correct_final</code>。</p>
+<p><strong>跨机档：未批量化 P2P 的失败原文</strong>（<code>results/crater/6.0/20260922-p2p-iso4/crosshost_p2p.json</code>）</p>
+<div class="highlight"><pre><span></span><code>rank0: ncclSocketInit: connecting to address  with family 1 is neither AF_INET(2) nor AF_INET6(10)
+rank1: ncclSocketInit: connecting to address  with family 0 is neither AF_INET(2) nor AF_INET6(10)
+</code></pre></div>
+
+<p>两端报的是同一个建链失败的两个侧面（地址族编号不同），说明失败发生在通信子建立、而不是数据传输阶段；同一份代码在单机档能正常完成。</p>
+<p><strong>本轮工件的完整入口</strong></p>
+<ul>
+<li>Gloo 对拍（world=2/3/4）：<a href="../raw/results/local/6.0/20260914-contracts/A2/verify.json">A2 检查表</a>、<a href="../raw/results/local/6.0/20260914-contracts/A3/verify.json">A3</a>、<a href="../raw/results/local/6.0/20260914-contracts/A4/verify.json">A4 检查表</a> 与 <a href="../raw/results/local/6.0/20260914-contracts/A4/global_view.json">A4 全局视图</a></li>
+<li>Gloo 五种失败注入：<a href="../raw/results/local/6.0/20260914-contracts/B/order_mismatch/failure.json">次序错配</a>、<a href="../raw/results/local/6.0/20260914-contracts/B/shape_mismatch/failure.json">shape 错配</a>、<a href="../raw/results/local/6.0/20260914-contracts/B/early_exit/failure.json">单 rank 提前退出</a>、<a href="../raw/results/local/6.0/20260914-contracts/B/group_mismatch/failure.json">组错配</a>、<a href="../raw/results/local/6.0/20260914-contracts/B/p2p_send_first/failure.json">P2P 同序</a></li>
+<li>NCCL 对拍：<a href="../raw/results/worldvln/6.0/20260914-contracts/A2/verify.json">A2 检查表</a>、<a href="../raw/results/worldvln/6.0/20260914-contracts/A4/verify.json">A4 检查表</a> 与 <a href="../raw/results/worldvln/6.0/20260914-contracts/A4/global_view.json">A4 全局视图</a></li>
+<li>NCCL 五种失败注入：<a href="../raw/results/worldvln/6.0/20260914-contracts/B/order_mismatch/failure.json">次序错配</a>、<a href="../raw/results/worldvln/6.0/20260914-contracts/B/shape_mismatch/failure.json">shape 错配</a>、<a href="../raw/results/worldvln/6.0/20260914-contracts/B/early_exit/failure.json">单 rank 提前退出</a>、<a href="../raw/results/worldvln/6.0/20260914-contracts/B/group_mismatch/failure.json">组错配</a>、<a href="../raw/results/worldvln/6.0/20260914-contracts/B/p2p_send_first/failure.json">P2P 同序</a></li>
+<li>完成语义逐次记录：<a href="../raw/results/worldvln/6.0/20260914-contracts/C/stream_semantics.json">stream_semantics.json</a>；运行清单：<a href="../raw/results/worldvln/6.0/20260914-contracts/C/manifest.json">C/manifest.json</a></li>
+<li>PyTorch 源码摘录与来源：<a href="../raw/results/worldvln/6.0/20260914-contracts/source/excerpts.txt">excerpts.txt</a>、<a href="../raw/results/worldvln/6.0/20260914-contracts/source/manifest.json">source/manifest.json</a></li>
+<li>跨机档：<a href="../raw/results/crater/6.1/20260921-completion/crosshost_completion.json">完成语义归并结果</a>（<a href="../raw/results/crater/6.1/20260922-completion-eth0/crosshost_completion.json">eth0 对照</a>）、<a href="../raw/results/crater/6.0/20260922-p2p-iso4/crosshost_p2p.json">P2P 批量化归并结果</a>、<a href="../raw/results/crater/6.0/20260922-p2p-batching/launch.rank0.log"><code>sync_send_recv_ring</code> 的中止现场</a></li>
+</ul>
+<p>每个目录另有 <code>manifest.json</code>（环境版本、输入规格、计时边界、容差）与 <code>cases.json</code>（本轮的输入清单）。完整目录树保存在仓库的 <code>results/local/6.0/20260914-contracts/</code> 与 <code>results/worldvln/6.0/20260914-contracts/</code> 下，站内只打包上面这些文件。</p>
+<hr />
+<h2 id="_12">前沿</h2>
+<p><strong>对称内存（symmetric memory）。</strong> NCCL 的对称内存把各 rank 的缓冲区注册成彼此可寻址的窗口，NVLS 让归约在交换机一侧完成，SHARP 把聚合下沉到网卡。它们改变的是「归约在哪里发生」，不改变本章的三步完成语义——<code>wait()</code> 之后的依赖关系仍然要靠流和事件维护。worldvln 无 NVLink、无 RDMA 设备，这条路线在本项目里保持 <code>UNVERIFIED</code>，6.1 会给出硬件/驱动/权限矩阵。</p>
+<p><strong>超时取证。</strong> PyTorch 的 FlightRecorder 与 <code>TORCH_NCCL_DUMP_ON_TIMEOUT</code> 会在 watchdog 判定超时后 dump 出每个 rank 最后入队与最后完成的操作序号。本章的 NCCL 现场就来自这条路径（<code>ProcessGroupNCCL.cpp:730/1964/2372</code>）。它解决的是「挂住了但不知道挂在哪一步」，不解决「为什么配不上」。</p>
+<p><strong>设备发起的通信。</strong> IBGDA 与 NVSHMEM 让 GPU 侧直接发起通信，CPU 不再逐次提交。这会改变第一步（API 返回）的形态——提交动作本身下沉到 kernel 里——但第二步和第三步的语义仍然成立。6.3 会按抽象层次比较 NCCL、NVSHMEM、DeepEP 与 UCCL。</p>
+<p><strong>弹性与成员变更。</strong> 本节所有结论都假设进程组在一次作业内不变。弹性训练（TorchFT 等）要在 rank 集合变化后重建通信子，重建期间旧的 <code>Work</code> 句柄与缓冲区归属需要显式作废。本章没有覆盖这条路径。</p>
+<hr />
+<h2 id="_13">陷阱</h2>
+<p><strong>1. 把 CPU 返回当完成。</strong> <code>all_reduce(..., async_op=True)</code> 之后不建立任何流依赖就去读结果，实测 40 次里只有 1 次侥幸正确。默认流与通信流之间没有任何顺序关系，通过率不构成正确性证据。</p>
+<p><strong>2. 用 op 名字判断配对。</strong> <code>all_reduce</code> 这个名字在不同进程组、不同 step 上是互不相干的配对。重建全局视图必须带 <code>(step, op, group, group_members)</code>，少了任何一项都会把两批数据混在一起。</p>
+<p><strong>3. 把 <code>ev.record(stream)</code> 当完成标记。</strong> 事件标记的是它在流上的<strong>位置</strong>。在 <code>work.wait()</code> 之前记录，事件只代表「调用已入队」；实测 40 次全错。正确顺序是 <code>wait()</code> → <code>record()</code> → 跨流 <code>wait_event()</code>。</p>
+<p><strong>4. 在子组里假定 shape 一致。</strong> 子组的 rank 数决定了 <code>reduce_scatter</code> 的输入长度和 <code>all_gather</code> 的输出长度。world=4 与 pair 组（size=2）上同一个 op 的 shape 不同，写死 shape 会在切换并行度时立刻出错。</p>
+<p><strong>5. 假定错配一定会报错。</strong> NCCL 上 shape 错配的 rank0 正常返回了一个 <code>[2, 4, 8, 10]</code> 的错值；它不崩溃、不警告，直到对端超时。跨 rank 校验 shape（或在测试里加一次 <code>all_gather_object</code> 的元数据对拍）是唯一可靠的防线。</p>
+<p><strong>6. 假定 P2P 通信两端可任意独立定序。</strong> NCCL 未批量化 P2P 在同一对 rank 上共用一个 2-rank 通信子，按序号配对；两端同序会配错。用 <code>batch_isend_irecv</code> 成对提交，或者显式约定两端的操作次序。</p>
+<p><strong>7. 把 Gloo 的结论外推到 NCCL。</strong> 两者的匹配规则、超时行为、失败形态都不同：同一个「先发后收」的次序，Gloo 完成、NCCL 死锁。跨后端复用代码时，P2P 次序和 shape 校验要单独检查。</p>
+<p><strong>8. 把单机上验证过的写法直接搬到跨机。</strong> 未批量化的 <code>isend</code>/<code>irecv</code>（先入队再逐个 <code>wait()</code>）在单机上是正确形式，跨机 <code>NET/Socket</code> 上两端同时报 <code>ncclSocketInit</code> 地址族错误。传输层变了，通信子的建立路径也变了，正确性要重测。</p>
+<hr />
+<h2 id="_14">自测题</h2>
+<details class="fold">
+<summary>1. world_size=4，每个 rank 的输入是 `[rank, rank, rank, rank]`。`all_reduce(SUM)` 之后，rank 2 的张量是什么？</summary>
+<p><code>[6, 6, 6, 6]</code>（0+1+2+3 = 6）。所有 rank 的输出相同，这也是 <code>all_reduce</code> 与 <code>reduce</code> 的区别：后者只有目标 rank 拿到结果。</p>
+</details>
+<details class="fold">
+<summary>2. 两个 rank 各自调用 `all_reduce`，一个用 world 组，一个用 size=1 的子组。会发生什么？</summary>
+<p>Gloo 上 size=1 子组的那一侧立即返回（自己和自己归约），另一侧等 20 s 超时（实测 <code>group_mismatch</code>，退出码 <code>[0, 1]</code>）。NCCL 上更早失败：等待方在建立通信子阶段就取不到 <code>ncclUniqueId</code>（实测 3.0 s，退出码 <code>[0, 1]</code>）。</p>
+</details>
+<details class="fold">
+<summary>3. `work.wait()` 返回之后，CPU 能立刻安全地读这块 CUDA 张量吗？</summary>
+<p>不能。NCCL 的 <code>wait()</code> 默认只把<strong>当前流</strong>阻塞在 NCCL 结束事件上，<code>blockingWait_</code> 默认 <code>false</code>。要 CPU 侧安全读，需要 <code>torch.cuda.synchronize()</code>，或把读操作放进那个已经被阻塞的流里（实测 <code>wait_correct</code> 就是后者，40/40 正确）。</p>
+</details>
+<details class="fold">
+<summary>4. 为什么 `ev.record(s_comm)` 写在 `all_reduce(async_op=True)` 之后、`work.wait()` 之前，跨流等待这个事件仍然会读到旧值？</summary>
+<p>事件记录的是流上的位置。此时 <code>s_comm</code> 还没有和 NCCL 的结束事件建立依赖，事件覆盖的范围只到「调用已入队」。<code>work.wait()</code> 的作用正是把 <code>ncclEndEvent_</code> 阻塞到当前流上（<code>ProcessGroupNCCL.cpp:820-825</code>），之后记录的事件才代表通信完成。</p>
+</details>
+<details class="fold">
+<summary>5. 一段两 rank 的 P2P 代码在 Gloo 上跑通，切到 NCCL 后卡死。最可能的原因是什么？</summary>
+<p>两端对 <code>isend</code>/<code>irecv</code> 的调用次序相同。NCCL 为这对 rank 建一个共用的 2-rank 通信子并按序号配对，两端的 seq0 都是 send，谁也没在 seq0 上 recv，于是两端的 <code>RECV</code> 同时超时。改成 <code>batch_isend_irecv</code> 成对提交，或让两端次序相反。</p>
+</details>
+<details class="fold">
+<summary>6. 为什么本章的对拍用整数而不是浮点？</summary>
+<p>集合通信的语义是「把数据搬到该在的位置」，与数值精度无关。整数让容差为 0，任何位置错位、元素数错配都会立刻暴露；用浮点则需要先确定一个与后端无关的容差，反而把「搬错了位置」和「累加顺序不同」两类问题混在一起。</p>
+</details>
+<details class="fold">
+<summary>7. 同一份完成语义代码，单机档设备完成中位 4.72 ms、跨机档 593.6 ms，而 CPU 返回都是 0.07 ms 量级。这说明了什么？</summary>
+<p>说明三个「完成」门槛里，只有第一道与传输路径无关：CPU 返回始终是入队时间（微秒级），第二、三道的时间由链路上的字节决定（相差 126 倍，与 6.1 的链路速率一致），但它们的<strong>语义</strong>没变——跨机档里 <code>cpu_return_only</code> 读旧值、<code>premature_overwrite</code> 事后也救不回来，分类与单机档逐行相同。所以换传输路径要重测的是「暴露概率」和「计时工具」，不是判据本身。</p>
+</details>
+<details class="fold">
+<summary>8. 跨机档为什么不能直接用 device event 报「设备完成」？</summary>
+<p>跨机时数据由 CPU 侧的代理线程经 TCP 送出，device event 只包住 GPU 上的那一小段 kernel，kernel 返回不代表字节已经上链路。实测同一配置下 4 KiB broadcast 不隔离时 0.017 ms、逐轮隔离后 0.062 ms，差 3.6 倍。跨机档统一用 <code>torch.cuda.synchronize()</code> 的 CPU 墙钟，并与裸 TCP（16 MiB 上 0.1176 GB/s）对照过一次。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L5/5.13-hybrid-architecture-state.html">&#8592; 5.13 混合架构的状态管理</a><a class="nav-next" href="../L6/6.0b-distributed-tensor-layout.html">6.0b 分布式张量：DeviceMesh、DTensor 与布局变换 &#8594;</a></nav>
+</main>
+</body>
+</html>

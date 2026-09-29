@@ -1,0 +1,124 @@
+torch 2.14.0  device=cpu  seed=0
+
+================================================================================================
+[B1] 三种归属：注册表里有什么，state_dict 里就有什么
+================================================================================================
+self._parameters : ['p']
+self._buffers    : ['run', 'tmp']
+self._modules    : ['lin']
+
+named_parameters(): ['p', 'lin.weight', 'lin.bias']
+named_buffers()   : ['run', 'tmp']
+state_dict() 键   : ['lin.bias', 'lin.weight', 'p', 'run']
+
+普通属性 plain 与 non-persistent buffer tmp 的位置：
+  'plain' in _parameters/_buffers/_modules : False/False/False
+  'plain' in state_dict()                  : False
+  'plain' in named_parameters()            : False
+  'tmp'   in state_dict()                  : False
+  'tmp'   in named_buffers()               : True
+
+普通 tensor 属性可以参与前向，但不进注册表；
+non-persistent buffer 进 named_buffers、会被迁移，但不进 state_dict。
+
+--- 模块直接持有 tensor 时发生什么 -----------------------------------------------------------------
+  m.plain2 = torch.ones(3)  -> _parameters=['p'] _buffers=['run', 'tmp']
+  m.tensor_param = Parameter(...) -> _parameters 增加 'tensor_param': True
+
+================================================================================================
+[B2] 共享参数：去重、state_dict 的两个键、optimizer 的双倍更新
+================================================================================================
+参数对象判断：
+  m.head.weight is m.emb.weight : True
+  data_ptr 相同                : True
+  named_parameters()                -> ['emb.weight']
+  named_parameters(remove_duplicate=False) -> ['emb.weight', 'head.weight']
+
+--- state_dict 里出现两次，是两个对象、同一块存储 --------------------------------------------------------
+  keys          : ['emb.weight', 'head.weight']
+  is 同一对象    : False
+  data_ptr 相同 : True
+
+--- 两次 state_dict 之间是否共享 ----------------------------------------------------------------
+  sd['emb.weight'].data_ptr 与 sd2['emb.weight'].data_ptr 相同: True
+
+--- optimizer 收到重复参数时更新两次 ---------------------------------------------------------------
+  梯度绝对值和 |g|1 = 66.787872，lr = 0.1
+  去重后一步的参数变化  = 6.678787   （= lr × |g|1 = 6.678787）
+  不去重一步的参数变化  = 13.357574   （= 2 × lr × |g|1）
+  比值 d2 / d1          = 2.0000
+  param_groups[0]['params'] 长度 = 2
+  警告原文： optimizer contains a parameter group with duplicate parameters; in future, this will cause an error; see github.com/pytorch/pytorch/issues/40967 for more information
+
+--- load_state_dict 用两个键写同一块存储 ----------------------------------------------------------
+  sd 里 emb.weight 全 1、head.weight 全 2，加载后 emb.weight 全 2: True
+  共享关系仍然成立: True
+
+================================================================================================
+[B3] to() 的遍历范围：谁被迁移，谁被漏掉
+================================================================================================
+to(torch.float64) 之后：
+  lin.weight dtype : torch.float64   （对象 id 保持: True）
+  p (Parameter)    : torch.float64
+  run (buffer)     : torch.float64    （对象 id 保持: False）
+  tmp (non-persist): torch.float64
+  plain (普通属性)  : torch.float32    <- 没被迁移
+  dtype 对照：之前 lin.weight=torch.float32 plain=torch.float32 p=torch.float32
+
+--- 把同一个模型搬到 meta，普通属性留在原设备 -------------------------------------------------------------
+  lin.weight.device : meta
+  p.device          : meta
+  run.device        : meta
+  tmp.device        : meta
+  plain.device      : cpu  dtype=torch.float32  <- 既没换设备也没换 dtype
+  meta 模型的 state_dict 仍可枚举：['lin.bias', 'lin.weight', 'p', 'run']
+
+--- 漏迁的普通属性会在前向里怎样暴露 --------------------------------------------------------------------
+  float64 输入 + float32 plain -> torch.float64  （类型提升静默生效，不报错，但每一步都额外付转换成本）
+  RuntimeError: Tensor on device cpu is not on the expected device meta!
+
+================================================================================================
+[B4] state_dict 的严格性，以及 eval 与 autograd 无关
+================================================================================================
+
+--- 缺一个键 --------------------------------------------------------------------------------
+  Error(s) in loading state_dict for SharedParam:
+  	Missing key(s) in state_dict: "head.weight". 
+  strict=False 返回 missing=['head.weight'] unexpected=[]
+
+--- 多一个键 --------------------------------------------------------------------------------
+  Error(s) in loading state_dict for SharedParam:
+  	Unexpected key(s) in state_dict: "not_a_param". 
+  strict=False 返回 missing=[] unexpected=['not_a_param']
+
+--- state_dict 默认 detach：外面拿到的不是参数本身 ----------------------------------------------------
+  sd['emb.weight'].requires_grad = False
+  keep_vars=True 时 is 参数对象: True
+
+--- eval() 只改 training 标志，不关 autograd ---------------------------------------------------
+  m.training = False
+  输出 requires_grad = True  grad_fn = EmbeddingBackward0
+  no_grad 下 requires_grad = False  grad_fn = None
+
+================================================================================================
+[B5] mini_module 与 nn.Module 对拍
+================================================================================================
+比较项                              一致    mini / torch
+------------------------------------------------------------------------------------------------
+named_parameters 名字集合            是     ['lin.bias', 'lin.weight', 'p']
+named_buffers 名字集合               是     ['run', 'tmp']
+state_dict 键集合                   是     ['lin.bias', 'lin.weight', 'p', 'run']
+共享参数去重后的名字                       是     ['emb.weight']
+不去重时的名字                          是     ['emb.weight', 'head.weight']
+共享参数 state_dict 双键               是     ['emb.weight', 'head.weight']
+
+to(float64) 后的 dtype             一致    mini / torch
+------------------------------------------------------------------------------------------------
+lin.weight 被迁移                   是     torch.float64 / torch.float64
+run 被迁移                          是     torch.float64 / torch.float64
+tmp 被迁移                          是     torch.float64 / torch.float64
+plain 不被迁移                       是     torch.float32 / torch.float32
+
+--- mini 的 strict 缺键报错与 torch 对应 --------------------------------------------------------
+  mini : Error(s) in loading state_dict: missing=['run'] unexpected=[]
+  torch: Error(s) in loading state_dict for ThreeKinds: 	Missing key(s) in state_dict: "run".

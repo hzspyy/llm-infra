@@ -14,6 +14,7 @@
 //   # 想看寄存器用量加：-Xptxas -v
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <vector>
 #include <algorithm>
@@ -120,6 +121,29 @@ __global__ void tail_kernel(float* out, int iters) {
     float x = threadIdx.x * 0.001f;
     for (int i = 0; i < iters; ++i) x = fmaf(x, 1.0001f, 0.5f);
     if (x == 1234.5f) *out = x;
+}
+
+// ---------------------------------------------------------------------------
+// F. 线程 / block / SM 映射与边界尺寸
+//
+// 三个问题：
+//   F1 一个 block 的线程落在哪些 SM 上？32 个线程的 warp 边界在哪？
+//   F2 元素数跨过 32/128/256 的整数倍时，结果还对不对（尾元素有没有漏）？
+//   F3 元素数只多一个，为什么时间跳一个 block 的量级？
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ unsigned smid() {
+    unsigned r; asm("mov.u32 %0, %%smid;" : "=r"(r)); return r;
+}
+
+__global__ void map_kernel(int* smid_out, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n) smid_out[tid] = (int)smid();
+}
+
+// 逐元素 kernel：块内线程数故意不整除，用来看尾 block
+__global__ void scale_kernel(const float* __restrict__ in, float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = in[i] * 2.0f + 1.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +309,95 @@ int main() {
         printf("    ⇒ 耗时是**阶梯**而不是斜线：只要多出 1 个 block，就要多跑一整波。\n");
         printf("      所以 grid 要按「SM 数 × 每 SM 可驻留 block 数」对齐；\n");
         printf("      persistent kernel（固定开一波、内部循环取任务）就是为了消灭这个台阶。\n\n");
+    }
+
+    // ---------------- F. 映射与边界尺寸 ----------------
+    printf("[F] 线程/block/SM 映射与边界尺寸\n");
+    {
+        // F1：一个 block 的线程落在哪些 SM 上
+        const int NB = 3, BT = 48;          // 48 = 1.5 个 warp
+        int nmap = NB * BT;
+        int* d_smid; CK(cudaMalloc(&d_smid, nmap * sizeof(int)));
+        int* h_smid = (int*)malloc(nmap * sizeof(int));
+        map_kernel<<<NB, BT>>>(d_smid, nmap);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(h_smid, d_smid, nmap * sizeof(int), cudaMemcpyDeviceToHost));
+        printf("    %d 个 block × %d 线程（= 1.5 个 warp/block）\n", NB, BT);
+        for (int b = 0; b < NB; ++b) {
+            int sm = h_smid[b * BT], same = 1;
+            for (int t = 0; t < BT; ++t)
+                if (h_smid[b * BT + t] != sm) same = 0;
+            printf("      block %d：%d 个线程全在 SM %d（同 SM: %s）"
+                   "  尾 warp 活跃线程 = %d\n",
+                   b, BT, sm, same ? "是" : "否", BT % 32 == 0 ? 32 : BT % 32);
+        }
+        printf("    ⇒ 一个 block 不会被拆到两个 SM；block 内按 32 线程切 warp，\n");
+        printf("      %d 线程的 block = %d 个满 warp + 1 个 %d 线程的尾 warp。\n",
+               BT, BT / 32, BT % 32);
+        cudaFree(d_smid); free(h_smid);
+
+        // F2：元素数跨过 warp / block 整数倍，结果必须逐元素对齐
+        printf("\n    边界元素数正确性（block=128，逐元素与 CPU 参照比较）\n");
+        const int B = 128;
+        const int sizes[] = {1, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+                             255, 256, 257, 1023, 1024, 1025};
+        float* h_in = (float*)malloc(1u << 21);
+        float* h_out = (float*)malloc(1u << 21);
+        float* h_ref = (float*)malloc(1u << 21);
+        float *d_in, *d_out2;
+        CK(cudaMalloc(&d_in, 1u << 21));
+        CK(cudaMalloc(&d_out2, 1u << 21));
+        printf("      %-8s %-8s %-10s %s\n", "n", "grid", "逐元素一致", "不一致个数");
+        for (int n2 : sizes) {
+            for (int i = 0; i < n2; ++i) {
+                h_in[i] = i * 0.5f;
+                h_ref[i] = h_in[i] * 2.0f + 1.0f;
+            }
+            int grid = (n2 + B - 1) / B;
+            CK(cudaMemcpy(d_in, h_in, n2 * sizeof(float), cudaMemcpyHostToDevice));
+            scale_kernel<<<grid, B>>>(d_in, d_out2, n2);
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(h_out, d_out2, n2 * sizeof(float), cudaMemcpyDeviceToHost));
+            int bad = 0;
+            for (int i = 0; i < n2; ++i) if (h_out[i] != h_ref[i]) ++bad;
+            printf("      %-8d %-8d %-10s %d\n", n2, grid, bad == 0 ? "是" : "否", bad);
+        }
+        printf("    ⇒ `if (i < n)` 覆盖尾 warp 与尾 block 的全部元素；去掉它就会越界写，\n");
+        printf("      这类错误由 5.2 的失败小例与 compute-sanitizer 负责暴露。\n");
+
+        // F3：元素数跨过一波的边界，耗时跳一台阶
+        printf("\n    元素数跨过一波边界（block=256，grid=ceil(n/256)，每个 block 固定工作量）\n");
+        int bps = 0;
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, tail_kernel, 256, 0));
+        int onewave_blocks = SMS * bps;
+        int full = onewave_blocks * 256;
+        printf("      一波 = %d 个 block = %d 个元素；下面只改 n，grid 跟着变\n",
+               onewave_blocks, full);
+        printf("      %-10s %-12s %-8s %-12s %s\n",
+               "n", "grid", "波数", "耗时 ms", "相对一波");
+        float base = 0, prev = 0;
+        for (int delta : {-1, 0, 1, 256, 257}) {
+            int n2 = full + delta;
+            int grid = (n2 + 255) / 256;
+            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+            tail_kernel<<<grid, 256>>>(d_out2, 200000);
+            CK(cudaDeviceSynchronize());
+            cudaEventRecord(a);
+            for (int i = 0; i < 10; ++i) tail_kernel<<<grid, 256>>>(d_out2, 200000);
+            cudaEventRecord(b); CK(cudaEventSynchronize(b));
+            float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= 10;
+            if (delta == 0) base = ms;
+            const char* mark = (prev > 0 && ms > prev * 1.15) ? "   <- 多一波" : "";
+            printf("      %-10d %-12d %-8.2f %-12.3f %.2fx%s\n",
+                   n2, grid, (double)((grid + onewave_blocks - 1) / onewave_blocks), ms,
+                   base > 0 ? ms / base : 1.0, mark);
+            prev = ms;
+            cudaEventDestroy(a); cudaEventDestroy(b);
+        }
+        printf("    -> 元素数只多 1，grid 多 1 个 block 就跨进第二波；\n");
+        printf("       第二波里只有那 1 个 block 在跑，其余 169 个 SM 空等（对应 [E] 的台阶）。\n\n");
+        cudaFree(d_in); cudaFree(d_out2);
+        free(h_in); free(h_out); free(h_ref);
     }
 
     CK(cudaFree(d_out));

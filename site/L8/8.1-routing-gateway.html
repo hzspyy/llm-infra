@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.1 路由与网关</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">8.1</div>
+  <div class="sidebar-title">路由与网关</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：亲和与负载是一对反向力</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 亲和与排队的盈亏平衡</a></li>
+<li><a href="#2">2. 缓存命中需要容量、时间与身份三者同时成立</a></li>
+<li><a href="#3">3. 目录为什么会过期</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析与设计取舍</a><ul>
+<li><a href="#sglang-vs">SGLang 网关：两套策略，各自处理"亲和 vs 负载"</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#kv">起两个真实副本并打开 KV 事件</a></li>
+<li><a href="#81-ab">8.1-A/B 策略对比</a></li>
+<li><a href="#81-c">8.1-C 事件目录与丢失注入</a></li>
+<li><a href="#81-d-gsm8k">8.1-D GSM8K 级联路由</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：亲和与负载是一对反向力</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 亲和与排队的盈亏平衡</a></li>
+<li><a href="#2">2. 缓存命中需要容量、时间与身份三者同时成立</a></li>
+<li><a href="#3">3. 目录为什么会过期</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析与设计取舍</a><ul>
+<li><a href="#sglang-vs">SGLang 网关：两套策略，各自处理"亲和 vs 负载"</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#kv">起两个真实副本并打开 KV 事件</a></li>
+<li><a href="#81-ab">8.1-A/B 策略对比</a></li>
+<li><a href="#81-c">8.1-C 事件目录与丢失注入</a></li>
+<li><a href="#81-d-gsm8k">8.1-D GSM8K 级联路由</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L8 · 集群、生产与前沿</div>
+  <div class="mod-id">8.1</div>
+  <h1>路由与网关</h1>
+  <p class="lede">prefix-aware / KV-aware routing、负载均衡、autoscaling、LoRA 多路复用、多租户隔离。</p>
+  <div class="chips"><span class="chip">实测机器 worldvln（2× L40S，PCIe，无 NVLink）· Qwen3-1.7B ×2 副本 · vLLM 0.29.0</span><span class="chip">前置 5.2（连续批处理与抢占）· 5.3（Prefix Caching 与 Radix Tree）· 5.10（LoRA 多路复用）· 5.11（服务端事件与流水）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><strong>缓存亲和与排队均衡什么时候冲突？</strong> 把请求都送给"已经缓存了这段前缀"的副本，会让它的队列比别的副本长；实测里亲和策略在 2048 token 前缀上的尾时延比最短队列差 18 倍。</li>
+<li><strong>全局缓存目录怎样保持有效？</strong> 网关靠 worker 发布的 KV 事件维护"哪台机器有哪个块"。订阅起点、驱逐事件和链式哈希重建决定了这个目录是精确的还是过期的。</li>
+<li><strong>难度路由怎样约束质量？</strong> 小模型预检 + 大模型兜底在真实 GSM8K 上省不省钱，取决于"重跑子集的批处理效率"和"升级判据的召回"，而不是直觉。</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的立场</p>
+<p>命中率是过程指标。网关的判据只能是<strong>在任务质量约束下的端到端时延与成本</strong>。本章先用两个真实副本测出"多命中是否真的更快"，再检查事件目录在什么条件下会骗人，最后用真实评测回答级联路由值不值。</p>
+</div>
+<hr />
+<h2 id="_2">心智模型：亲和与负载是一对反向力</h2>
+<figure>
+
+
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="缓存亲和与排队均衡的冲突">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="20" font-size="13" font-weight="600">同一份热前缀：粘住一个副本换命中，摊开换队列</text>
+
+    <rect x="12" y="36" width="356" height="268" rx="6" fill="none" stroke="#e06c75" stroke-width="1.2"/>
+    <text x="24" y="56" font-size="12" font-weight="600" fill="#e06c75">纯亲和：命中最大，队列集中</text>
+    <rect x="30" y="70" width="120" height="30" rx="3" fill="currentColor" opacity="0.12"/>
+    <text x="90" y="90" text-anchor="middle" font-size="11">网关（只看命中）</text>
+    <path d="M 150 85 L 200 85" stroke="#e06c75" stroke-width="1.8" marker-end="url(#ar1)"/>
+    <rect x="205" y="66" width="150" height="40" rx="4" fill="#e06c75" opacity="0.16" stroke="#e06c75"/>
+    <text x="215" y="82" font-size="11" font-weight="600">worker-0（热）</text>
+    <text x="215" y="98" font-size="10">命中高，队列长</text>
+    <rect x="205" y="130" width="150" height="34" rx="4" fill="currentColor" opacity="0.07"/>
+    <text x="215" y="152" font-size="10.5">worker-1（冷，闲置）</text>
+    <text x="30" y="196" font-size="10.5">实测（ratio 75%、前缀 2048）</text>
+    <text x="30" y="214" font-size="10.5">命中 <tspan font-weight="600">215 344</tspan> token；TTFT p99 <tspan font-weight="600" fill="#e06c75">0.483 s</tspan></text>
+    <text x="30" y="232" font-size="10.5">worker-1 的命中恒为 0（它没收到共享前缀请求）</text>
+    <text x="30" y="262" font-size="10.5" opacity="0.85">省下的 prefill 被同一条队列里的等待吃掉</text>
+    <text x="30" y="286" font-size="10.5" font-weight="600" fill="#e06c75">p99 比最短队列差 18×（0.483 / 0.027）</text>
+
+    <rect x="392" y="36" width="356" height="268" rx="6" fill="none" stroke="#61afef" stroke-width="1.2"/>
+    <text x="404" y="56" font-size="12" font-weight="600" fill="#61afef">最短队列 + 缓存收益：两台都热</text>
+    <rect x="410" y="70" width="120" height="30" rx="3" fill="currentColor" opacity="0.12"/>
+    <text x="470" y="90" text-anchor="middle" font-size="11">网关（比在途数）</text>
+    <path d="M 530 78 L 580 78" stroke="#61afef" stroke-width="1.8" marker-end="url(#ar1)"/>
+    <path d="M 530 96 L 580 140" stroke="#61afef" stroke-width="1.8" marker-end="url(#ar1)"/>
+    <rect x="585" y="62" width="150" height="34" rx="4" fill="#61afef" opacity="0.16" stroke="#61afef"/>
+    <text x="595" y="84" font-size="10.5">worker-0（热）</text>
+    <rect x="585" y="126" width="150" height="34" rx="4" fill="#61afef" opacity="0.16" stroke="#61afef"/>
+    <text x="595" y="148" font-size="10.5">worker-1（也热）</text>
+    <text x="410" y="196" font-size="10.5">实测（同配置）</text>
+    <text x="410" y="214" font-size="10.5">命中 <tspan font-weight="600">309 600</tspan> token（312 000 中）</text>
+    <text x="410" y="232" font-size="10.5">TTFT p50 <tspan font-weight="600">0.024 s</tspan>，p99 <tspan font-weight="600" fill="#61afef">0.027 s</tspan></text>
+    <text x="410" y="262" font-size="10.5" opacity="0.85">KV 足够大时，热前缀会在两台机器上各存一份</text>
+    <text x="410" y="286" font-size="10.5" font-weight="600" fill="#61afef">亲和不是免费的，也可能不是必需的</text>
+
+    <defs>
+      <marker id="ar1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 z" fill="currentColor"/>
+      </marker>
+    </defs>
+  </g>
+</svg>
+
+
+<figcaption>当缓存容量足以容纳所有热前缀时，最短队列会自动把热前缀复制到每个副本上；只有当容量不够、驱逐频繁时，亲和才成为必需。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1">1. 亲和与排队的盈亏平衡</h3>
+<p>把一次请求路由到 worker <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>w</mi></mrow></math></span> 的预期首字时延写成两项之和：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mtext>TTFT</mtext><mi>w</mi></msub><mo>&#x0003D;</mo><munder><munder><mrow><msub><mi>q</mi><mi>w</mi></msub><mo>&#x000B7;</mo><msub><mover><mrow><mi>S</mi></mrow><mo stretchy="true">&#x000AF;</mo></mover><mi>w</mi></msub></mrow><mo>&#x23DF;</mo></munder><mrow><mtext>排队</mtext></mrow></munder><mo>&#x0002B;</mo><munder><munder><mrow><msub><mi>T</mi><mrow><mtext>base</mtext></mrow></msub><mo>&#x0002B;</mo><mo stretchy="false">&#x00028;</mo><mi>P</mi><mo>&#x02212;</mo><msub><mi>L</mi><mi>w</mi></msub><mo stretchy="false">&#x00029;</mo><mi>&#x003B1;</mi></mrow><mo>&#x23DF;</mo></munder><mrow><mtext>prefill</mtext></mrow></munder></mrow></math></div></p>
+<p>其中 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>q</mi><mi>w</mi></msub></mrow></math></span> 是在途请求数、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mover><mrow><mi>S</mi></mrow><mo stretchy="true">&#x000AF;</mo></mover><mi>w</mi></msub></mrow></math></span> 是它们剩余的平均服务时间、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>L</mi><mi>w</mi></msub></mrow></math></span> 是该副本已缓存的前缀长度、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B1;</mi></mrow></math></span> 是每 token 的 prefill 时间。热副本与冷副本的临界条件是</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>q</mi><mrow><mtext>hot</mtext></mrow></msub><mo>&#x000B7;</mo><mover><mrow><mi>S</mi></mrow><mo stretchy="true">&#x000AF;</mo></mover><mo>&#x0003C;</mo><mi>L</mi><mo>&#x000B7;</mo><mi>&#x003B1;</mi></mrow></math></div></p>
+<p>对 Qwen3-1.7B 在 L40S 上，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>&#x0003D;</mo><mn>2048</mn></mrow></math></span> 的前缀大约值 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mi>&#x003B1;</mi><mo>&#x02248;</mo><mn>40</mn><mtext>–</mtext><mn>80</mn></mrow></math></span> ms（本次 0.3× 档的 TTFT p50 是 61 ms，可以当作同量级参照）。而一个正在解码的请求占住副本的时间是它的<strong>剩余输出时间</strong>：输出 32 token、TPOT ~10 ms 时约 0.3 s。于是</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>q</mi><mrow><mtext>threshold</mtext></mrow></msub><mo>&#x02248;</mo><mfrac><mrow><mi>L</mi><mi>&#x003B1;</mi></mrow><mrow><mover><mrow><mi>S</mi></mrow><mo stretchy="true">&#x000AF;</mo></mover></mrow></mfrac><mo>&#x02248;</mo><mfrac><mrow><mn>0.05</mn></mrow><mrow><mn>0.3</mn></mrow></mfrac><mo>&#x0003C;</mo><mn>1</mn></mrow></math></div></p>
+<p><strong>热副本队列里只要还有一条请求在解码，亲和带来的收益就已经被吃掉了。</strong> 这个估计不需要精确：它说明临界队列阈值是个位数——本次实验的 8 QPS 负载下两台副本的队列深度都不到 2，所以三种策略的 p50 几乎一样（0.019–0.067 s），差别只在命中和尾部。要看到亲和显著获胜，需要把负载推到队列开始堆积，这正是 8.4 混合负载要做的事。</p>
+<h3 id="2">2. 缓存命中需要容量、时间与身份三者同时成立</h3>
+<p>一次前缀命中要求：</p>
+<ol>
+<li><strong>容量</strong>：这段前缀的 KV 还在显存里（没被驱逐）；</li>
+<li><strong>时间</strong>：它是在这次请求之前被写入的（同一副本上）；</li>
+<li><strong>身份</strong>：模型权重、量化格式、adapter revision、KV layout、位置编码都一致。</li>
+</ol>
+<p>第 3 条是网关最容易出错的地方。同一个 prompt 文本在不同 adapter 或不同量化版本下产生的 KV 完全不同；网关的前缀键必须包含完整身份元组，而 vLLM 的 KV 事件里 <code>BlockStored.lora_name</code>、<code>extra_keys</code> 和 <code>group_idx</code> 正是为此存在的字段。本次实验只用单模型单 adapter，所以身份维度没有进入实验，但它是生产环境里的真实失败面。</p>
+<h3 id="3">3. 目录为什么会过期</h3>
+<p>网关的目录有三个必然后果：</p>
+<ul>
+<li><strong>订阅起点晚于缓存建立</strong>：网关启动时，worker 的显存里已经有块了。这些块永远不会再发一次 <code>BlockStored</code>，除非网关触发一次全量重建。本次每个 case 都新建网关，所以目录从空开始——这直接反映在预测值上（见第 4 节）。</li>
+<li><strong>驱逐事件多于写入事件</strong>：实测 <code>BlockStored ≈ BlockRemoved</code>（例如 ratio25/RR 一次运行里 16194 存 / 16193 删），说明 KV 在持续换出。目录必须真的消费 <code>BlockRemoved</code>，否则会持续高估命中。</li>
+<li><strong>链式哈希的上下文</strong>：vLLM 的块身份是链式的（第 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi></mrow></math></span> 块的哈希含父块哈希），所以网关重建自己的键时需要知道父链。当 <code>BlockStored</code> 的 <code>parent_block_hash</code> 指向一个网关没见过的哈希时，重建会断链——本次运行里 <code>unknown_remove</code> 有 5 163–10 837 条，正是这个现象的计数。</li>
+</ul>
+<hr />
+<h2 id="_4">工程实现：源码解析与设计取舍</h2>
+<h3 id="sglang-vs">SGLang 网关：两套策略，各自处理"亲和 vs 负载"</h3>
+<p>固定 commit <code>5c2de3f</code> 的 <code>sgl-model-gateway/src/policies/</code> 下同时存在两条路线：</p>
+<p><strong><code>cache_aware.rs</code>（完整基数树路线）</strong>。<code>CacheAwarePolicy</code> 为每个 (pool, model) 维护一棵近似基数树，配置项包括 <code>cache_threshold</code>、<code>balance_abs_threshold</code>、<code>balance_rel_threshold</code>、<code>eviction_interval_secs</code>。路由主循环先判负载是否失衡（<code>:412-413</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">is_imbalanced</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">max_load</span><span class="p">.</span><span class="n">saturating_sub</span><span class="p">(</span><span class="n">min_load</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">config</span><span class="p">.</span><span class="n">balance_abs_threshold</span>
+<span class="w">    </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="p">(</span><span class="n">max_load</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">f32</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="p">(</span><span class="n">min_load</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">f32</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">config</span><span class="p">.</span><span class="n">balance_rel_threshold</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="n">is_imbalanced</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">select_worker_min_load</span><span class="p">(</span><span class="o">..</span><span class="p">.);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>负载均衡时才算缓存匹配率 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mtext>matched\_char\_count</mtext><mo>&#x0002F;</mo><mtext>input\_char\_count</mtext></mrow></math></span>，<code>match_rate &gt; cache_threshold</code> 才走"缓存命中路径"（按树里记录的 URL 选中该 worker），否则退回"最小负载"（<code>:444</code> 与 <code>:493</code>）。<strong>它是字符级而不是 token 级</strong>：网关在转发前不做 BPE，用很小的边界误差换掉整轮 tokenize 的开销。近似树还带周期性 LRU 驱逐（<code>evict_cache</code>，<code>:301</code>），避免目录无界增长。</p>
+<p><strong><code>prefix_hash.rs</code>（一致性哈希路线）</strong>。文件开头写明它是"A lightweight alternative to the full radix tree cache_aware policy"。它取前 <code>prefix_token_count</code> 个 token 做 xxh3 哈希（<code>:104-110</code>），用带界负载的一致性哈希环选副本，分支枚举是 <code>RingHit / LoadBalanceWalk / FallbackLeastLoad</code>（<code>:64-88</code>）。这条路线的代价是<strong>粒度固定</strong>：前缀只有前 N 个 token 参与哈希，第 N 个 token 之后的差异不影响归属；收益是不维护树、不消费驱逐事件、无内存增长。</p>
+<p>两条路线的接口一致（<code>impl LoadBalancingPolicy for ...</code>，<code>cache_aware.rs:386</code>、<code>prefix_hash.rs:225</code>），所以能在同一网关里按负载特征切换。这个设计说明了一件本章实验也印证的事：<strong>亲和目录的精度与它的维护成本是一对取舍，不是越精确越好。</strong></p>
+<h3 id="_5">设计取舍</h3>
+<table>
+<thead>
+<tr>
+<th>选择</th>
+<th>代价</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>网关用字符/字节前缀而不是 token id</td>
+<td>边界误差、<code>match_rate</code> 与引擎的块命中不完全一致</td>
+<td>转发路径不能承担每请求 tokenize；<code>cache_aware.rs</code> 明确用 <code>matched_char_count</code></td>
+</tr>
+<tr>
+<td>近似树 + 周期驱逐，而不是精确镜像</td>
+<td>会短时高估命中</td>
+<td>精确镜像要消费全部驱逐事件，且订阅起点问题无法自愈</td>
+</tr>
+<tr>
+<td>负载失衡时直接放弃亲和</td>
+<td>短期命中下降</td>
+<td><code>is_imbalanced</code> 用绝对差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x000D7;</mo></mrow></math></span> 相对比双阈值，避免低负载下的抖动</td>
+</tr>
+<tr>
+<td>一致性哈希（<code>prefix_hash</code>）</td>
+<td>前缀只有前 N token 参与</td>
+<td>无状态、无驱逐、无内存增长，适合超大规模副本数</td>
+</tr>
+<tr>
+<td>本章的 mini 实现用 token 级链式哈希</td>
+<td>与 SGLang 的字符级不同，命中数不可直接对比</td>
+<td>本项目要能和 vLLM 的真实块哈希对齐（见 mini 实现）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="mini">工程实现：mini 实现</h2>
+<p><code>labs/L8/request_router.py</code> 实现三种策略、两类目录和可重放决策日志：</p>
+<details class="fold">
+<summary>labs/L8/request_router.py 链式块键与精确目录</summary>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">block_key</span><span class="p">(</span><span class="n">parent</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""块键 = H(父块键, 本块 token 序列)。与 vLLM 的链式块哈希同语义:</span>
+<span class="sd">    同样的 token 片段出现在不同位置不会被误判为同一块。"""</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">sha1</span><span class="p">()</span>
+    <span class="n">h</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">parent</span><span class="p">)</span>
+    <span class="n">h</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">"&lt;I"</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">)))</span>
+    <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">tokens</span><span class="p">:</span>
+        <span class="n">h</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">"&lt;I"</span><span class="p">,</span> <span class="n">t</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">digest</span><span class="p">()</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">EventDirectory</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""精确目录: 由真实 KV 事件驱动, 消费 BlockStored / BlockRemoved / AllBlocksCleared。"""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">on_block_stored</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">worker</span><span class="p">,</span> <span class="n">block_hashes</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">,</span> <span class="n">block_size</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                        <span class="n">parent_block_hash</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="o">...</span>
+        <span class="n">parent</span> <span class="o">=</span> <span class="n">hmap</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">parent_block_hash</span><span class="p">,</span> <span class="n">ROOT_KEY</span><span class="p">)</span> <span class="k">if</span> <span class="n">parent_block_hash</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">ROOT_KEY</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">block_hashes</span><span class="p">)):</span>
+            <span class="n">key</span> <span class="o">=</span> <span class="n">block_key</span><span class="p">(</span><span class="n">parent</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">[</span><span class="n">i</span><span class="o">*</span><span class="n">bs</span><span class="p">:(</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="p">)</span><span class="o">*</span><span class="n">bs</span><span class="p">])</span>
+            <span class="n">cached</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">key</span><span class="p">);</span> <span class="n">hmap</span><span class="p">[</span><span class="n">block_hashes</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span> <span class="o">=</span> <span class="n">key</span><span class="p">;</span> <span class="n">parent</span> <span class="o">=</span> <span class="n">key</span>
+</code></pre></div>
+
+</details>
+<p><code>gateway.py</code> 是一个真实的 aiohttp 网关：对上层暴露 OpenAI 兼容流式接口，对下层按策略选 worker，并把每个决策（候选、队列、预测命中、最终选择）通过响应头 <code>x-lb-worker</code> / <code>x-lb-predicted-hit</code> 回给客户端；后台用 ZMQ SUB 订阅每个 worker 的 KV 事件流（<code>(topic, seq, msgpack(EventBatch))</code>），支持注入丢事件、延迟与重复。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="kv">起两个真实副本并打开 KV 事件</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># worldvln GPU2 / GPU3，各一个 Qwen3-1.7B，前缀缓存默认开启</span>
+vllm<span class="w"> </span>serve<span class="w"> </span>Qwen/Qwen3-1.7B<span class="w"> </span>--port<span class="w"> </span><span class="m">18000</span><span class="w"> </span>--gpu-memory-utilization<span class="w"> </span><span class="m">0</span>.30<span class="w"> </span>--max-model-len<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--kv-events-config<span class="w"> </span><span class="s1">'{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:15557","topic":"kv"}'</span>
+vllm<span class="w"> </span>serve<span class="w"> </span>Qwen/Qwen3-1.7B<span class="w"> </span>--port<span class="w"> </span><span class="m">18001</span><span class="w"> </span>--gpu-memory-utilization<span class="w"> </span><span class="m">0</span>.30<span class="w"> </span>--max-model-len<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--kv-events-config<span class="w"> </span><span class="s1">'{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:15558","topic":"kv"}'</span>
+
+bash<span class="w"> </span>labs/L8/run_8_1.sh<span class="w"> </span>out/8.1/&lt;run_id&gt;<span class="w"> </span>both
+</code></pre></div>
+
+<h3 id="81-ab">8.1-A/B 策略对比</h3>
+<p>150 条请求、8 QPS、输出 32 token；共享前缀比例 0 / 25% / 75%，前缀长度 2048（单轴扫描），再在 75% 上补 4096 与 128 两点。命中 token 来自两个 worker <code>/metrics</code> 的 <code>vllm:prefix_cache_hits_total</code> 前后差值（真实累计量），请求数来自 <code>/metrics</code> 的 <code>prefix_cache_queries_total</code>。</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>策略</th>
+<th style="text-align: right;">真实命中 token</th>
+<th style="text-align: right;">查询 token</th>
+<th style="text-align: right;">网关预测命中</th>
+<th style="text-align: right;">TTFT p50</th>
+<th style="text-align: right;">TTFT p99</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0% / 2048</td>
+<td>round_robin</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.067</td>
+<td style="text-align: right;">7.498</td>
+</tr>
+<tr>
+<td>0% / 2048</td>
+<td>shortest_queue</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.056</td>
+<td style="text-align: right;">0.060</td>
+</tr>
+<tr>
+<td>0% / 2048</td>
+<td>prefix_aware</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.062</td>
+<td style="text-align: right;">0.067</td>
+</tr>
+<tr>
+<td>25% / 2048</td>
+<td>round_robin</td>
+<td style="text-align: right;">55 296</td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.057</td>
+<td style="text-align: right;">0.064</td>
+</tr>
+<tr>
+<td>25% / 2048</td>
+<td>shortest_queue</td>
+<td style="text-align: right;">61 440</td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.057</td>
+<td style="text-align: right;">0.061</td>
+</tr>
+<tr>
+<td>25% / 2048</td>
+<td>prefix_aware</td>
+<td style="text-align: right;">65 536</td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">14 336</td>
+<td style="text-align: right;">0.060</td>
+<td style="text-align: right;">0.066</td>
+</tr>
+<tr>
+<td>75% / 2048</td>
+<td>round_robin</td>
+<td style="text-align: right;">186 368</td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.025</td>
+<td style="text-align: right;">0.061</td>
+</tr>
+<tr>
+<td>75% / 2048</td>
+<td>shortest_queue</td>
+<td style="text-align: right;"><strong>309 600</strong></td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.024</td>
+<td style="text-align: right;"><strong>0.027</strong></td>
+</tr>
+<tr>
+<td>75% / 2048</td>
+<td>prefix_aware</td>
+<td style="text-align: right;">215 344</td>
+<td style="text-align: right;">312 000</td>
+<td style="text-align: right;">16 384</td>
+<td style="text-align: right;">0.028</td>
+<td style="text-align: right;">0.483</td>
+</tr>
+<tr>
+<td>75% / 4096</td>
+<td>round_robin</td>
+<td style="text-align: right;">366 592</td>
+<td style="text-align: right;">619 200</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.032</td>
+<td style="text-align: right;">0.111</td>
+</tr>
+<tr>
+<td>75% / 4096</td>
+<td>shortest_queue</td>
+<td style="text-align: right;">382 464</td>
+<td style="text-align: right;">619 200</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.032</td>
+<td style="text-align: right;">0.112</td>
+</tr>
+<tr>
+<td>75% / 4096</td>
+<td>prefix_aware</td>
+<td style="text-align: right;"><strong>411 536</strong></td>
+<td style="text-align: right;">619 200</td>
+<td style="text-align: right;">83 856</td>
+<td style="text-align: right;">0.034</td>
+<td style="text-align: right;">0.118</td>
+</tr>
+<tr>
+<td>75% / 128</td>
+<td>round_robin</td>
+<td style="text-align: right;">10 880</td>
+<td style="text-align: right;">24 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.019</td>
+<td style="text-align: right;">0.022</td>
+</tr>
+<tr>
+<td>75% / 128</td>
+<td>shortest_queue</td>
+<td style="text-align: right;"><strong>21 600</strong></td>
+<td style="text-align: right;">24 000</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.018</td>
+<td style="text-align: right;">0.021</td>
+</tr>
+<tr>
+<td>75% / 128</td>
+<td>prefix_aware</td>
+<td style="text-align: right;">17 840</td>
+<td style="text-align: right;">24 000</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">0.022</td>
+<td style="text-align: right;">0.026</td>
+</tr>
+</tbody>
+</table>
+<p>读法（每条都是实测，不是模型推算）：</p>
+<ol>
+<li><strong>没有共享前缀时，缓存亲和无从发挥</strong>：三种策略的命中都是 0，查询 312 000 全部落空。0% 档 round_robin 的 p99 = 7.498 s 是本次唯一的异常尾，出现在运行最开始（首请求触发编译），不能当成策略差异。</li>
+<li><strong>亲和策略不是恒优</strong>：75%/2048 上最短队列命中 309 600 token（占全部 prompt token 的 99.2%），而 prefix_aware 只有 215 344，且 p99 差 18 倍。原因是 KV 容量足够容纳全部 16 个热前缀，最短队列把热前缀在<strong>两台</strong>上各养了一份，而亲和策略把全部流量压在一台上，另一台的命中恒为 0。</li>
+<li><strong>前缀越长，亲和的相对收益越大</strong>：4096 上 prefix_aware 反超（411 536 vs 382 464），因为单个前缀的 KV 占用翻倍、跨副本复制两份的代价上升。</li>
+<li><strong>网关预测值系统性低于真实命中</strong>：prefix_aware 预测 256–83 856，真实 17 840–411 536。这是目录冷启动造成的——每个 case 新建网关，而 worker 的缓存从上个 case 继承，所以"预测不到"的块其实在显存里。这个偏差不是算法错误，而是<strong>订阅起点</strong>问题。</li>
+</ol>
+<h3 id="81-c">8.1-C 事件目录与丢失注入</h3>
+<p>固定 75% / 4096 配置，只跑 prefix_aware，分别用"事件目录"和"近似目录"（只记网关自己发过的请求，不知道驱逐），并注入 0 / 20% / 50% 的事件丢弃：</p>
+<table>
+<thead>
+<tr>
+<th>目录</th>
+<th style="text-align: right;">丢事件</th>
+<th style="text-align: right;">真实命中 token</th>
+<th style="text-align: right;">查询 token</th>
+<th style="text-align: right;">网关预测命中</th>
+<th style="text-align: right;">TTFT p50</th>
+<th style="text-align: right;">p99</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>近似</td>
+<td style="text-align: right;">0%</td>
+<td style="text-align: right;">419 728</td>
+<td style="text-align: right;">619 200</td>
+<td style="text-align: right;">405 504</td>
+<td style="text-align: right;">0.032</td>
+<td style="text-align: right;">0.117</td>
+</tr>
+<tr>
+<td>近似</td>
+<td style="text-align: right;">20%</td>
+<td style="text-align: right;">419 728</td>
+<td style="text-align: right;">619 200</td>
+<td style="text-align: right;">405 504</td>
+<td style="text-align: right;">0.033</td>
+<td style="text-align: right;">0.118</td>
+</tr>
+<tr>
+<td>近似</td>
+<td style="text-align: right;">50%</td>
+<td style="text-align: right;">419 728</td>
+<td style="text-align: right;">619 200</td>
+<td style="text-align: right;">405 504</td>
+<td style="text-align: right;">0.035</td>
+<td style="text-align: right;">0.118</td>
+</tr>
+<tr>
+<td>精确事件</td>
+<td style="text-align: right;">0%</td>
+<td style="text-align: right;">395 200</td>
+<td style="text-align: right;">615 072</td>
+<td style="text-align: right;">100 288</td>
+<td style="text-align: right;">2.197</td>
+<td style="text-align: right;">7.986</td>
+</tr>
+<tr>
+<td>精确事件</td>
+<td style="text-align: right;">20%</td>
+<td style="text-align: right;">419 728</td>
+<td style="text-align: right;">619 200</td>
+<td style="text-align: right;">12 288</td>
+<td style="text-align: right;">0.034</td>
+<td style="text-align: right;">0.116</td>
+</tr>
+<tr>
+<td>精确事件</td>
+<td style="text-align: right;">50%</td>
+<td style="text-align: right;">419 728</td>
+<td style="text-align: right;">619 200</td>
+<td style="text-align: right;">51 088</td>
+<td style="text-align: right;">0.033</td>
+<td style="text-align: right;">0.116</td>
+</tr>
+</tbody>
+</table>
+<p><strong>这里的结论是一个负结果，必须原样保留</strong>：在这个负载下，注入 20%/50% 的事件丢失<strong>没有改变真实命中</strong>（三行都是 419 728）。原因是亲和在 warmup 之后已经收敛到单一副本，路由决策对目录的细节不敏感——丢事件只影响"预测值"，不影响"选谁"。</p>
+<p>关于目录有效性，实测到的三条事实：</p>
+<ol>
+<li><strong>事件确实在流动</strong>。一次 ratio25/RR 运行里，<code>w0</code> 收到 215 个批次、应用 8 630 条事件，<code>w1</code> 收到 209 批、应用 7 986 条，<strong>序列号缺口为 0</strong>。这两个数字也说明订阅端没有丢包。</li>
+<li><strong>驱逐是常态</strong>。<code>BlockStored</code> 与 <code>BlockRemoved</code> 数量几乎相等（16 194 / 16 193），目录必须真的消费删除事件。</li>
+<li><strong>断链与迟到订阅有明确计数</strong>。<code>unknown_remove</code> 达到 5 163–10 837 条，来自两类情况：网关订阅前已经存在于显存里的块被删除；以及 <code>BlockStored</code> 的 <code>parent_block_hash</code> 指向网关没重建过的父块。<strong>这解释了预测值为何系统性偏低</strong>，也说明"订阅即精确"是个错误的假设。</li>
+</ol>
+<p><strong>没有做成的部分</strong>：vLLM 0.29 的 OpenAI 兼容 <code>/v1/completions</code> 不返回逐请求的 <code>cached_tokens</code>（<code>--enable-prompt-tokens-details</code> 只在另一套 generate 接口里），所以"预测命中但实际未命中"的假阳性只能按窗口聚合核对，无法逐请求判定。计划里"注入延迟与 worker 重启、比较精确事件与近似前缀索引"的完整矩阵因此只完成了丢事件一维；延迟、重复与真实重启保留为未完成。</p>
+<h3 id="81-d-gsm8k">8.1-D GSM8K 级联路由</h3>
+<p>固定题集（<code>openai/gsm8k</code> test 前 400 题，固定顺序），前 150 题做标定、后 250 题做评测；小模型 <code>Qwen3-1.7B</code>、大模型 <code>Qwen3-4B</code>，贪心解码、<code>max_tokens=768</code>、关前缀缓存，置信度取生成答案的均摊 token logprob。阈值在标定集上按"升级率 ≤ 35% 时准确率最高"选取，冻结后不再改动。</p>
+<table>
+<thead>
+<tr>
+<th>运行方式</th>
+<th style="text-align: right;">评测集准确率</th>
+<th style="text-align: right;">升级率</th>
+<th style="text-align: right;">评测集 GPU-秒</th>
+<th style="text-align: right;">输出 token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全部小模型</td>
+<td style="text-align: right;">0.804</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">5.06</td>
+<td style="text-align: right;">73 347</td>
+</tr>
+<tr>
+<td>全部大模型</td>
+<td style="text-align: right;"><strong>0.904</strong></td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;"><strong>10.08</strong></td>
+<td style="text-align: right;">64 705</td>
+</tr>
+<tr>
+<td>级联路由</td>
+<td style="text-align: right;">0.848</td>
+<td style="text-align: right;">0.24</td>
+<td style="text-align: right;"><strong>11.05</strong></td>
+<td style="text-align: right;">90 667</td>
+</tr>
+</tbody>
+</table>
+<p>冻结阈值 <code>-0.0746</code>，标定集上升级率 0.34、准确率 0.88。</p>
+<p><strong>这个结果是负的：级联既没有更准，也没有更便宜。</strong> 它比全量大模型多花 9.6% 的 GPU 秒，却低了 5.6 个百分点。两个原因都是真实机制：</p>
+<ol>
+<li><strong>重跑子集丢掉批处理效率</strong>。大模型在全量 400 题上跑 16.08 s（0.040 s/题），在 60 题升级子集上跑 5.99 s（<strong>0.0998 s/题</strong>）——子集小、并发低，单位成本涨了 2.5 倍。级联的账必须把这段低效算进去。</li>
+<li><strong>平均 logprob 作为置信度的召回不够</strong>。250 题里有 28 题"小模型答错但没被升级"，10 题"升级了但大模型也答错"；升级的 60 题只挽回了部分错误。标定集上"升级率 34% 换 +8.7 个点"，到评测集变成"升级率 24% 换 +4.4 个点"。</li>
+</ol>
+<p>计划要求"路由拒绝、升级模型和错误答案均计入；不以牺牲质量获得的低成本宣称更优"。按实测，这次级联既没牺牲质量也没拿到成本优势——它是一个应当在正文里明确写出的负面结论，而不是需要调参掩盖的结果。</p>
+<hr />
+<h2 id="_6">原始现场</h2>
+<p>路由策略与目录的逐 case 汇总：</p>
+<details class="fold">
+<summary>results/worldvln/8.1/20260914-gateway/summary_ratio75-len2048-prefix_aware-s0.json 亲和策略的目录与事件统计</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"policy"</span><span class="p">:</span><span class="w"> </span><span class="s2">"prefix_aware"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"worker_assignment"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"w0"</span><span class="p">:</span><span class="w"> </span><span class="mi">150</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"directory_stats"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"stored"</span><span class="p">:</span><span class="w"> </span><span class="mi">6191</span><span class="p">,</span><span class="w"> </span><span class="nt">"removed"</span><span class="p">:</span><span class="w"> </span><span class="mi">6191</span><span class="p">,</span><span class="w"> </span><span class="nt">"cleared"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"duplicate"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"unknown_remove"</span><span class="p">:</span><span class="w"> </span><span class="mi">4523</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"subscribers"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"w0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"received"</span><span class="p">:</span><span class="w"> </span><span class="mi">475</span><span class="p">,</span><span class="w"> </span><span class="nt">"applied"</span><span class="p">:</span><span class="w"> </span><span class="mi">6536</span><span class="p">,</span><span class="w"> </span><span class="nt">"dropped"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"seq_gaps"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"last_seq"</span><span class="p">:</span><span class="w"> </span><span class="mi">2785</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"w1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"received"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"applied"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"dropped"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"seq_gaps"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"last_seq"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">}</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"metrics_delta"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"w0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mf">215344.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_cache_queries_total"</span><span class="p">:</span><span class="w"> </span><span class="mf">312000.0</span><span class="p">},</span>
+<span class="w">                    </span><span class="nt">"w1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_cache_queries_total"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">}}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>近似目录的预测抬到与真实命中同量级；注意它<strong>同时也订阅事件</strong>（<code>directory_stats</code> 非空），差别只在路由用哪个索引：</p>
+<details class="fold">
+<summary>results/worldvln/8.1/20260914-gateway/summary_srcapprox-drop0-prefix_aware-s0.json 近似目录（75% / 4096）</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"case"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"tag"</span><span class="p">:</span><span class="w"> </span><span class="s2">"srcapprox-drop0"</span><span class="p">,</span><span class="w"> </span><span class="nt">"shared_ratio"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.75</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="w">           </span><span class="nt">"policy"</span><span class="p">:</span><span class="w"> </span><span class="s2">"prefix_aware"</span><span class="p">,</span><span class="w"> </span><span class="nt">"prediction_source"</span><span class="p">:</span><span class="w"> </span><span class="s2">"approx"</span><span class="p">,</span><span class="w"> </span><span class="nt">"drop_rate"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"worker_assignment"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"w0"</span><span class="p">:</span><span class="w"> </span><span class="mi">150</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"directory_stats"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"stored"</span><span class="p">:</span><span class="w"> </span><span class="mi">12617</span><span class="p">,</span><span class="w"> </span><span class="nt">"removed"</span><span class="p">:</span><span class="w"> </span><span class="mi">12617</span><span class="p">,</span><span class="w"> </span><span class="nt">"unknown_remove"</span><span class="p">:</span><span class="w"> </span><span class="mi">4649</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"subscribers"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"w0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"received"</span><span class="p">:</span><span class="w"> </span><span class="mi">491</span><span class="p">,</span><span class="w"> </span><span class="nt">"applied"</span><span class="p">:</span><span class="w"> </span><span class="mi">13012</span><span class="p">,</span><span class="w"> </span><span class="nt">"seq_gaps"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">                  </span><span class="nt">"w1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"received"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"applied"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"seq_gaps"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"metrics_delta"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"w0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mf">419728.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_cache_queries_total"</span><span class="p">:</span><span class="w"> </span><span class="mf">619200.0</span><span class="p">},</span>
+<span class="w">                    </span><span class="nt">"w1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_cache_queries_total"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"requests_with_actual"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>SGLang 的两套策略源码按固定 commit <code>5c2de3f</code> 存在 <code>results/worldvln/8.1/20260914-refs/</code>：<code>sglang_cache_aware.rs</code>（63 405 B，基数树 + 周期驱逐 + 双阈值失衡判定）、<code>sglang_prefix_hash.rs</code>（14 007 B，xxh3 一致性哈希 + 有界负载），另有 <code>dynamo_common.rs</code>（Dynamo 的 <code>RouterMode</code> 入口）、llm-d 的 prefix-cache-aware routing 文档页与 Gateway API Inference Extension 文档页，<code>manifest.txt</code> 记录每个仓库的 commit 与字节数。</p>
+<hr />
+<h2 id="_7">前沿</h2>
+<ol>
+<li><strong>精确块哈希路由。</strong> llm-d 把请求调度做成 Gateway API 的 Endpoint Picker（EPP），用 <code>prefix-cache-scorer</code> 给每个 pod 打分，并区分"估算"与"精确"两种 scorer：估算版只看请求前缀，精确版消费引擎上报的块级事件。这正好对应本章的两类目录。参考：llm-d 的 <a href="https://llm-d.ai/docs/architecture/advanced/kv-management/prefix-cache-aware-routing">Prefix-Cache Aware Routing</a> 与 <a href="https://gateway-api-inference-extension.sigs.k8s.io/">Gateway API Inference Extension</a>。</li>
+<li><strong>无树的一致性哈希路线。</strong> SGLang 网关在 <code>prefix_hash.rs</code> 里给出"前 N token 的 xxh3 一致性哈希 + 有界负载"作为完整基数树（<code>cache_aware.rs</code>）的轻量替代；两者共用 <code>LoadBalancingPolicy</code> 接口，可按副本规模切换。</li>
+<li><strong>级联与路由的理论边界。</strong> RouteLLM（<a href="https://arxiv.org/abs/2406.18665">arXiv:2406.18665</a>）用偏好数据学路由器，把"用便宜模型保住多少前沿质量"写成可优化目标；Cascadia（<a href="https://arxiv.org/abs/2506.04203">arXiv:2506.04203</a>）进一步把级联的<strong>部署</strong>与<strong>路由</strong>联合优化，明确指出子集重跑的批处理效率是级联收益的关键变量——本章 8.1-D 测到的"子集单位成本涨 2.5 倍"正是这个变量。</li>
+<li><strong>服务状态的跨请求复用。</strong> Pensieve（<a href="https://arxiv.org/abs/2312.05516">arXiv:2312.05516</a>）把 KV 状态在请求间显式建模复用；<a href="https://arxiv.org/abs/2407.12391">LLM Inference Serving 综述</a> 与 <a href="https://doi.org/10.1145/3638757">GPU 数据中心调度综述</a> 覆盖了本章没有展开的集群调度与隔离部分。</li>
+</ol>
+<hr />
+<h2 id="_8">陷阱</h2>
+<ol>
+<li><strong>把命中率当目标。</strong> 本次 75%/2048 上亲和策略命中 215 344 token，比最短队列少 30%，尾部还差 18 倍。命中是手段。</li>
+<li><strong>假设网关启动时目录是空的、worker 缓存也是空的。</strong> 二者不同步：本次每个 case 新建网关但 worker 缓存继承，预测值只有真实命中的 4%–20%。</li>
+<li><strong>忘记 <code>BlockRemoved</code>。</strong> 实测写入与删除数量几乎相等；只消费 <code>BlockStored</code> 的目录会持续高估。</li>
+<li><strong>同名模型不等于同一份缓存。</strong> 量化格式、adapter、KV layout 不同，块就不同；身份元组不能省。</li>
+<li><strong>级联路由不能只报"节省百分比"。</strong> 本次级联既不省也不准；子集重跑的批处理效率必须计入，否则结论会偏向级联。</li>
+<li><strong>用不同 case 之间的命中数做绝对比较。</strong> 同一个 worker 进程在多个 case 间持续运行，后面的 case 继承了前面的缓存；跨 case 只能比同一起跑线的量，或者每次重启副本。</li>
+</ol>
+<hr />
+<h2 id="_9">自测题</h2>
+<details class="fold">
+<summary>1. 为什么在 75% 共享前缀、2048 token 的配置下，最短队列反而比缓存亲和命中更多？</summary>
+<p><strong>答案：</strong>
+因为 KV 容量足够装下全部 16 个热前缀。最短队列把请求摊到两台副本上，两台都会把热前缀缓存下来，之后每一条共享请求都能命中；缓存亲和把全部流量压到一台，另一台的命中恒为 0，而请求本身也没有更多命中可拿。亲和的优势只有在容量不足、需要靠"专机专前缀"避免互相驱逐时才出现——本次 4096 token 前缀就更接近这个条件。</p>
+</details>
+<details class="fold">
+<summary>2. 网关的预测命中为什么系统性地低于引擎的真实命中？</summary>
+<p><strong>答案：</strong>
+因为目录的订阅起点晚于缓存的建立。网关是每个 case 新建的，而 worker 进程与它的 KV 缓存跨 case 连续存在；订阅前已经写入显存的块不会再补发 <code>BlockStored</code>，网关自然预测不到。实测里 <code>unknown_remove</code>（删除一个网关没见过的块）有几千条，正是同一现象的另一面。生产网关需要用"新 worker 加入即从空目录开始、并接受一段低估期"或"触发一次全量重建"来处理，而不是假设订阅即精确。</p>
+</details>
+<details class="fold">
+<summary>3. 本次注入 20%/50% 的事件丢失，为什么真实命中没有变化？</summary>
+<p><strong>答案：</strong>
+因为路由决策已经收敛到单一副本，丢事件只改变了"预测值"，没有改变"选谁"。这说明一个负结果：当工作负载的亲和性足够强、目录的预测误差不影响排序时，目录精度不是瓶颈。要验证丢事件的危害，需要构造"两台副本命中接近、必须逐请求比较"的负载，或者让驱逐频繁到预测与真实持续背离。</p>
+</details>
+<details class="fold">
+<summary>4. 级联路由为什么可能比&quot;全部用大模型&quot;更贵？</summary>
+<p><strong>答案：</strong>
+因为两段成本相加，而第二段的单位成本更高。本次全量大模型在 400 题上 0.040 s/题，而升级子集只有 60 题、并发低，单位成本 0.0998 s/题。级联付了"小模型全量跑一遍"的固定成本，再用更高的单价重跑一部分题目；只有升级判据足够准（把真正难的题挑出来）且子集规模足够大（保住批处理效率）时，总成本才会低于直接上大模型。</p>
+</details>
+<details class="fold">
+<summary>5. 网关用字符前缀做匹配，而引擎按 token 块缓存。这会产生什么错误？</summary>
+<p><strong>答案：</strong>
+两边的切分边界不同。字符匹配率是个连续值，块命中是离散的（整块命中或不命中），所以 <code>match_rate &gt; cache_threshold</code> 可能选中一个只匹配了半个块边界的副本，实际命中会低于预测。反过来，前缀里含多字节字符时字符数与 token 数不成比例，同一个阈值在不同语言上的严格程度不同。SGLang 选择接受这个误差，是因为网关在转发路径上做完整 tokenize 的代价更高。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L7/7.11-training-job-orchestration.html">&#8592; 7.11 训练作业调度、性能诊断与规模决策</a><a class="nav-next" href="../L8/8.2-orchestration.html">8.2 编排：K8s / Ray / Slurm &#8594;</a></nav>
+</main>
+</body>
+</html>

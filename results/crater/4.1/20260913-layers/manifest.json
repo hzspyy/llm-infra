@@ -1,0 +1,152 @@
+{
+  "chapter": "4.1",
+  "date": "2026-09-13",
+  "machine": "crater",
+  "gpu": "NVIDIA GeForce RTX 5090 D (sm_120, 580.95.05)",
+  "run_id": "20260913-layers",
+  "tasks": "A（单元级对齐与首差定位：RMSNorm/QK-Norm/RoPE/GQA/SwiGLU/residual/lm_head 十三个阶段对照 HF 子模块，shape/stride 全表，六个错误变体的首差阶段）；B（自建 KV cache：full prefill vs 增量解码、与 HF cache 对拍、左/右 padding 与内容隔离、多长度批、cache_position 偏移、B=1/4 × S=1/17/128/2048 扫描）；C（SmolLM3 NoPE 层接入：真实 config 的 no_rope 模式、四种模式的逐层对拍、真实权重下的 NoPE/RoPE 层对照）",
+  "commands": [
+    "python labs/L4/transformer_layers.py --outdir out/4.1/20260913-layers A B",
+    "python labs/L4/transformer_layers.py --outdir out/4.1/20260913-layers C"
+  ],
+  "exit_codes": {
+    "A_B": 0,
+    "C": 0
+  },
+  "environment": {
+    "python": "3.12.14",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.17.0",
+    "env_sh": "/scratch/learn/env.sh",
+    "HF_HOME": "/scratch/learn/models/hf"
+  },
+  "pins": {
+    "Qwen/Qwen3-1.7B": {
+      "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+      "config_sha256_16": "1ddb5b89ebc90dcb",
+      "dtype": "bfloat16"
+    },
+    "HuggingFaceTB/SmolLM3-3B-Base": {
+      "revision": "d78a42f79198603e614095753484a04c10c2b940",
+      "config_sha256_16": "e8336e843aecb733",
+      "weights_bytes": 5800000000,
+      "dtype": "bfloat16"
+    }
+  },
+  "protocol": {
+    "A": "Qwen3-1.7B bf16，固定 10 token 输入；手写实现按 HF 的算子顺序逐步对照 HF 的对应子模块（nn.Linear/RMSNorm/SDPA/rotary）；判定阈值为 1 ulp（2^-8 × 该阶段最大绝对值）",
+    "B": "同一份手写实现加 KV cache；左 padding + attention mask；对照方式为「S-1 个 token prefill + 1 步解码」与「S 个 token 一次前向」，以及 HF 自己的 DynamicCache 同路径对拍",
+    "C": "SmolLM3 的真实 config.json 在线获取并记录 sha256；小模型用真实 no_rope 模式（interval=4/2/1 与显式全 RoPE）随机初始化后逐层对拍；真实 3B 权重下抽查 embedding、NoPE 层与 RoPE 层的隐藏状态",
+    "repeats": "数值对照为单次确定性前向；计时为单次测量，仅用于量级对照",
+    "tolerance": "A/C 要求逐位相等（fp32 小模型与 bf16 真实权重都达到 0.0）；B 报告 bf16 下的绝对差，不设通过阈值",
+    "seed": 0
+  },
+  "derived": {
+    "A_stages": "13 个阶段（embed、input_layernorm、q/k_proj、q view+transpose+q_norm、RoPE(q)、attention(SDPA)、o_proj+residual、post_attention_layernorm、gate/up_proj、silu(gate)*up、down_proj+residual）在 bf16 下全部 max|diff| = 0.0",
+    "A_model": "第 0 层整层输出 max|diff| 0.0；29 个 hidden_states 逐位完全相同 29 个；最终 logits max|diff| 0.000000，argmax 相同；首个相对误差 > 5% 的层为 None",
+    "A_strides": "q 的 stride (20480, 128, 2048, 1) 非连续（transpose 的结果），attention 输出经 transpose+reshape 后必须 contiguous；这些在表里逐项记录",
+    "A_counterexamples": [
+      {"variant": "漏掉 QK-Norm", "first_stage": "q view+transpose+q_norm", "diff": 20.61},
+      {"variant": "权重不转置", "first_stage": "q_proj", "diff": 4.851},
+      {"variant": "RoPE 改成交错配对", "first_stage": "RoPE(q)", "diff": 12.72},
+      {"variant": "q/k 的 norm 互换", "first_stage": "q view+transpose+q_norm", "diff": 445.98},
+      {"variant": "RMSNorm 内部用 bf16 累加", "first_stage": "q view+transpose+q_norm", "diff": 0.125},
+      {"variant": "eps 写成 0", "first_stage": "input_layernorm", "diff": 0.0078}
+    ],
+    "B_prefill_decode": {
+      "text_tokens": 46,
+      "prefill_s_minus_1_vs_full_same_position": 0.0625,
+      "one_step_decode_vs_full_last": 0.25,
+      "hf_cache_prefill_diff": 0.0625,
+      "hf_cache_decode_diff": 0.0,
+      "kv_cache_bytes": 5275648,
+      "hf_cache_shape": [[1, 8, 46, 128], [1, 8, 46, 128]],
+      "multi_step_decode_max_diff": 0.3652,
+      "cache_len_after_8_steps": 54
+    },
+    "B_padding": {
+      "left_pad_vs_unpadded": {"1": 0.3125, "7": 0.3125, "31": 0.28125},
+      "other_random_embedding_vs_normal": {"1": 0.0, "7": 0.0, "31": 0.0},
+      "nan_pad_run_finite": false,
+      "right_tail_pad_8_diff": 0.1875,
+      "no_mask_negative_control": 5.3359
+    },
+    "B_multi_length": {"lengths": [1, 5, 5, 18],
+                       "batch_vs_solo_diffs": [0.0664, 0.1875, 0.1875, 0.3125]},
+    "B_position_offset": {"prefix_1": 0.25, "prefix_5": 0.28125,
+                          "prefix_23": 0.3125, "prefix_45": 0.1875,
+                          "negative_control_position_zero": 3.875},
+    "B_scan": [
+      {"B": 1, "S": 1, "prefill_s": 0.00643, "decode_step_s": 0.0000022, "kv_mib": 0.11, "decode_vs_full": 0.0, "cache_len": 1},
+      {"B": 1, "S": 17, "prefill_s": 0.00676, "decode_step_s": 0.01314, "kv_mib": 1.86, "decode_vs_full": 0.4219, "cache_len": 17},
+      {"B": 1, "S": 128, "prefill_s": 0.00735, "decode_step_s": 0.01336, "kv_mib": 14.0, "decode_vs_full": 0.25, "cache_len": 128},
+      {"B": 1, "S": 2048, "prefill_s": 0.0142, "decode_step_s": 0.07824, "kv_mib": 224.0, "decode_vs_full": 0.25, "cache_len": 2048},
+      {"B": 4, "S": 1, "prefill_s": 0.00654, "decode_step_s": 0.0000032, "kv_mib": 0.44, "decode_vs_full": 0.0, "cache_len": 1},
+      {"B": 4, "S": 17, "prefill_s": 0.0067, "decode_step_s": 0.01346, "kv_mib": 7.44, "decode_vs_full": 0.7188, "cache_len": 17},
+      {"B": 4, "S": 128, "prefill_s": 0.00761, "decode_step_s": 0.02288, "kv_mib": 56.0, "decode_vs_full": 0.0, "cache_len": 128},
+      {"B": 4, "S": 2048, "prefill_s": 0.0525, "decode_step_s": 0.27347, "kv_mib": 896.0, "decode_vs_full": 0.25, "cache_len": 2048}
+    ],
+    "C_config": {
+      "layers": 36,
+      "no_rope_layer_interval": 4,
+      "no_rope_indices": [3, 7, 11, 15, 19, 23, 27, 31, 35],
+      "no_rope_count": 9,
+      "rope_theta": 5000000.0,
+      "hidden_size": 2048,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 4,
+      "tie_word_embeddings": true,
+      "formula": "no_rope_layers[i] = int((i+1) % interval != 0)，1 表示该层有 RoPE"
+    },
+    "C_tiny_alignment": [
+      {"tag": "interval_4", "no_rope": [3, 7], "worst_rel": 0.0},
+      {"tag": "explicit_all_rope", "no_rope": [], "worst_rel": 0.0},
+      {"tag": "interval_2", "no_rope": [1, 3, 5, 7], "worst_rel": 0.0},
+      {"tag": "interval_1_all_nope", "no_rope": [0, 1, 2, 3, 4, 5, 6, 7], "worst_rel": 0.0}
+    ],
+    "C_real_weights": [
+      {"hidden_state": 0, "layer_type": "embedding", "max_abs_diff": 0.0, "scale": 1.9},
+      {"hidden_state": 1, "layer_type": "RoPE", "max_abs_diff": 0.0, "scale": 3.6},
+      {"hidden_state": 3, "layer_type": "RoPE", "max_abs_diff": 0.0, "scale": 394.0},
+      {"hidden_state": 4, "layer_type": "NoPE(第 3 层)", "max_abs_diff": 0.0, "scale": 396.0},
+      {"hidden_state": 7, "layer_type": "RoPE", "max_abs_diff": 0.0, "scale": 396.0},
+      {"hidden_state": 11, "layer_type": "RoPE", "max_abs_diff": 0.0, "scale": 396.0}
+    ]
+  },
+  "source_refs": {
+    "transformers.models.qwen3.modeling_qwen3": {
+      "86/126": "Qwen3RotaryEmbedding 与其 forward",
+      "140": "rotate_half",
+      "148": "apply_rotary_pos_emb",
+      "211": "Qwen3Attention",
+      "237-238": "q_norm/k_norm 建在 head_dim 上",
+      "252-253": "q/k 投影后先 norm 再 transpose",
+      "357/410": "rotary_emb 挂在模型上，模型算出 position_embeddings 再传给每层"
+    },
+    "transformers.models.smollm3.configuration_smollm3": {
+      "89-91": "no_rope_layers / no_rope_layer_interval / layer_types 字段",
+      "101-103": "no_rope_layers[i] = int((i+1) % interval != 0)",
+      "106-113": "layer_types 由 use_sliding_window 与 has_rope 共同决定"
+    },
+    "transformers.models.smollm3.modeling_smollm3": {
+      "174": "SmolLM3Attention",
+      "200": "self.use_rope = config.no_rope_layers[layer_idx]",
+      "218-224": "q/k/v 投影后按 use_rope 决定是否 apply_rotary_pos_emb",
+      "271/287/295-296": "MLP 与 DecoderLayer 的 norm 位置",
+      "427": "最终 self.norm",
+      "436": "tie_word_embeddings 的权重映射"
+    }
+  },
+  "artifacts": [
+    "run-AB.log",
+    "run-C.log",
+    "transformer_layers.json"
+  ],
+  "caveats": [
+    "A/C 的逐位相同是在同一台机器、同一 torch/transformers 版本、同一 dtype 与同一算子调用顺序下的结果；换后端（例如 eager attention 或 compile）不再保证",
+    "B 中除「与 HF cache 解码一步 0.0」以外，其余差异都是 bf16 下形状相关的 kernel 选择造成的（与 4.2 的 batch 不变性同源），不是实现错误",
+    "padding 内容隔离用「换成另一组随机 embedding」验证（逐位 0.0）；NaN 会穿透加性 -inf mask 污染整行（实测输出全为 NaN），这一点作为反例记录，未做进一步工程加固",
+    "B 的耗时是未优化的 Python 参考实现（每层逐个算子），只用于量级与缓存占用对照，不作为引擎性能结论",
+    "C 的真实权重对照抽取 embedding 与第 0/1/3/4/7/11 层的隐藏状态；未覆盖全部 36 层与生成任务质量"
+  ]
+}

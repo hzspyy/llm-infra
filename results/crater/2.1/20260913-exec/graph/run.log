@@ -1,0 +1,75 @@
+=== 编译 ===
+
+=== 正常路径 ===
+=== NVIDIA GeForce RTX 5090 D  sm_120  SM=170 ===
+
+[C1] 捕获 -> 实例化 -> 首次 -> 热 replay
+    捕获 0.104 ms   实例化 0.069 ms   节点数 1
+    首次 launch 0.0204 ms   热 replay 0.0021 ms（100 次平均）
+    图中每步处理 n=100000，grid=782
+    显存 free 变化 -2.0 MB
+
+[C2] 改输入的值（同一块 d_x）—— 合法
+    与新输入的不一致元素 = 0（图只固定地址，不固定内容）
+
+[C3] 换输入指针（改用 d_x2 / d_y2）—— 不合法
+    写到 d_y（旧地址）的结果：与旧输入一致 0/100000，与新输入一致 0/100000
+    d_y2[0] = 0.0（新地址没有任何一个字节被写）
+    => 执行用的是捕获时的地址；host 侧换个变量不会有任何效果。
+
+[C4] 改元素数（shape）—— 不合法
+    replay 后 [0,100000) 内不匹配 = 0
+    [100000, 200000) 仍为 0：是（grid 还是捕获时的 782 个 block）
+    合法修法一：按新 n 重新捕获 -> 不匹配 = 0
+    合法修法二：cudaGraphExecKernelNodeSetParams 改节点参数 -> 成功，不匹配 = 0
+
+[C5] 释放并重新分配 —— 不合法
+    捕获时地址 d_x=0x7579bf000000 d_y=0x7579bf400000；后来分配 d_x3=0x7579c4600000 d_y3=0x7579c4661c00
+    图仍指旧地址：驱动没回收时看起来能跑，回收后是非法访问。
+    用 `./graph_capture c5` 跑这条路径，配合 compute-sanitizer 观察。
+
+[C6] 把 n 放进设备内存 —— 同一张图跑不同 n（动态尺寸的正解）
+    实际 n   不匹配  说明
+    1000       0          grid 固定 8192 个 block，逻辑尺寸由设备端决定
+    100000     0          grid 固定 8192 个 block，逻辑尺寸由设备端决定
+    200000     0          grid 固定 8192 个 block，逻辑尺寸由设备端决定
+    1048576    0          grid 固定 8192 个 block，逻辑尺寸由设备端决定
+
+[C7] 10 个 kernel 的链：逐个 launch vs 一次 replay
+    CPU 侧提交：逐个 launch 0.018 ms   一次 replay 0.005 ms   (3.51 x)
+    GPU 侧执行：逐个 launch 0.021 ms   一次 replay 0.010 ms   (2.02 x)
+    => replay 省的是 CPU 提交；GPU 上该跑的 kernel 一个不少。
+
+=== compute-sanitizer --tool memcheck ./graph_capture c5 ===
+[CUDA] cudaStreamSynchronize(s) @269: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @271: unspecified launch failure
+[CUDA] cudaStreamSynchronize(s) @273: unspecified launch failure
+[CUDA] cudaEventSynchronize(eb) @281: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaGraphLaunch(e4, s) @285: unspecified launch failure
+[CUDA] cudaEventSynchronize(eb) @286: unspecified launch failure
+    CPU 侧提交：逐个 launch 0.312 ms   一次 replay 0.031 ms   (10.04 x)
+    GPU 侧执行：逐个 launch 0.000 ms   一次 replay 0.000 ms   (-nan x)
+    => replay 省的是 CPU 提交；GPU 上该跑的 kernel 一个不少。
+========= ERROR SUMMARY: 44804 errors
+========= ERROR SUMMARY: 44704 errors were not printed. Use --print-limit option to adjust the number of printed errors
+
+原始输出：/scratch/learn/work/out/2.1/20260913-exec2/graph/

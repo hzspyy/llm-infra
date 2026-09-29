@@ -1,0 +1,1100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.6 VLM（二）：视觉编码器与 connector</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">4.6</div>
+  <div class="sidebar-title">VLM（二）：视觉编码器与 connector</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#merger-deepstack">心智模型：塔内的两条出口——主 merger 与 DeepStack</a></li>
+<li><a href="#_2">机制拆解</a><ul>
+<li><a href="#_3">视觉塔的配置与阶段</a></li>
+<li><a href="#connector-linear">connector 不是"一个 linear"</a></li>
+<li><a href="#24">分段成本：贵的是 24 层编码，不是压缩</a></li>
+<li><a href="#deepstack">DeepStack：三个注入点的载荷</a></li>
+</ul>
+</li>
+<li><a href="#merger">工程实现 · 源码解析：merger 与注入点</a></li>
+<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_5">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#merger-deepstack">心智模型：塔内的两条出口——主 merger 与 DeepStack</a></li>
+<li><a href="#_2">机制拆解</a><ul>
+<li><a href="#_3">视觉塔的配置与阶段</a></li>
+<li><a href="#connector-linear">connector 不是"一个 linear"</a></li>
+<li><a href="#24">分段成本：贵的是 24 层编码，不是压缩</a></li>
+<li><a href="#deepstack">DeepStack：三个注入点的载荷</a></li>
+</ul>
+</li>
+<li><a href="#merger">工程实现 · 源码解析：merger 与注入点</a></li>
+<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_5">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L4 · 模型架构与数值</div>
+  <div class="mod-id">4.6</div>
+  <h1>VLM（二）：视觉编码器与 connector</h1>
+  <p class="lede">ViT 的前向、patch embedding 的实际张量、connector（MLP / resampler / cross-attn）把视觉特征投到语言维度的全过程；以及哪些模块被冻结、哪些参与训练。 从视觉编码器基础训练到 VLM connector/视觉塔微调。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · torch 2.13.0+cu130 · transformers 5.17.0 · Qwen3-VL-4B-Instruct</span><span class="chip">前置 4.5（patch 与 grid）· 4.1（层实现）· 3.1（attention 的账）· 0.2（roofline）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答的三个问题</h2>
+<p>4.5 把像素变成了 <code>pixel_values</code> 与 <code>grid_thw</code>。这一章接着问：这些 patch 经过哪些层、在哪里被压缩成视觉 token、又以什么形式进入语言模型。</p>
+<ol>
+<li><strong>视觉塔里有哪些阶段？</strong> patch embedding、24 个 block、merger、DeepStack 注入点各自的形状、维度与 norm 位置。</li>
+<li><strong>connector 是什么？</strong> 为什么不能概括成"一个 linear"？它的输入输出长度与维度怎么算？</li>
+<li><strong>分段成本与缓存载荷是什么？</strong> processor / ViT / merger / LLM prefill 各占多少，batch 与分辨率怎么影响它们？要被缓存的特征有多少字节？</li>
+</ol>
+<hr />
+<h2 id="merger-deepstack">心智模型：塔内的两条出口——主 merger 与 DeepStack</h2>
+<figure>
+
+
+<svg viewBox="0 0 820 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Qwen3-VL 视觉塔的阶段、出口与分段成本">
+  <rect width="820" height="470" fill="#0A0D12"/>
+  <text x="410" y="28" fill="#E9A568" font-size="17" font-weight="bold" text-anchor="middle">Qwen3-VL 视觉塔：24 层、两条出口、三个注入点</text>
+
+  <text x="30" y="60" fill="#38BDF8" font-size="13" font-weight="bold">塔内阶段（640×480 → 1200 patch）</text>
+  <rect x="30" y="72" width="360" height="128" fill="#1E2636" stroke="#38BDF8" stroke-width="1.4"/>
+  <text x="44" y="94" fill="#E8EEF7" font-size="11">patch_embed → [1200, 1024]，L2 14.04</text>
+  <text x="44" y="114" fill="#E8EEF7" font-size="11">block 0 → 23（hidden 1024、intermediate 4096、16 头）</text>
+  <text x="44" y="134" fill="#E8EEF7" font-size="11">block 23 的 L2 涨到 924.5（残差累积）</text>
+  <text x="44" y="154" fill="#E8EEF7" font-size="11">主 merger：norm→fc1→GELU→fc2 → [300, 2560]</text>
+  <text x="44" y="174" fill="#9FB3C8" font-size="11">1200 patch ÷ merge²(4) = 300 视觉 token</text>
+  <text x="44" y="192" fill="#9FB3C8" font-size="11">tower 返回 last_hidden_state[1200,1024] + pooler + deepstack</text>
+
+  <text x="410" y="60" fill="#6EE7B7" font-size="13" font-weight="bold">两条出口</text>
+  <rect x="410" y="72" width="380" height="128" fill="#1E2636" stroke="#6EE7B7" stroke-width="1.4"/>
+  <text x="424" y="94" fill="#E8EEF7" font-size="11">主出口：merger 输出 [300, 2560] → LLM 输入嵌入</text>
+  <text x="424" y="114" fill="#E8EEF7" font-size="11">DeepStack：第 5/11/17 层各出一个 [300, 2560]</text>
+  <text x="424" y="134" fill="#E8EEF7" font-size="11">→ LLM 前 3 层逐层相加（_deepstack_process）</text>
+  <text x="424" y="154" fill="#9FB3C8" font-size="11">两类 merger 的 norm 维度不同：主 1024 / DeepStack 4096</text>
+  <text x="424" y="174" fill="#9FB3C8" font-size="11">顺序写错会在形状上直接报错（RuntimeError）</text>
+  <text x="424" y="192" fill="#9FB3C8" font-size="11">单 linear 反例：与官方输出的相对差 1.021</text>
+
+  <text x="30" y="232" fill="#E9A568" font-size="13" font-weight="bold">分段成本（640×480，B=1 → B=8）</text>
+  <rect x="30" y="244" width="760" height="104" fill="#1E2636" stroke="#E9A568" stroke-width="1.4"/>
+  <text x="44" y="266" fill="#E8EEF7" font-size="11">processor 1.46 → 10.45 ms（CPU）；ViT 9.90 → 58.97 ms；merger 0.12 → 0.68 ms</text>
+  <text x="44" y="288" fill="#E8EEF7" font-size="11">LLM prefill 22.79 → 115.57 ms；完整请求 32.69 → 174.54 ms</text>
+  <text x="44" y="310" fill="#E8EEF7" font-size="11">峰值 8657 → 9724 MiB（B=8 时视觉 token 2400）</text>
+  <text x="44" y="332" fill="#9FB3C8" font-size="11">merger 只占 ViT 的 1.2%：压缩本身几乎不花时间，贵的是 24 层编码</text>
+
+  <text x="410" y="372" fill="#9FB3C8" font-size="12" text-anchor="middle">视觉 token 数由 merge 决定：1200 patch → 300 token（少了 4×），但特征维度升到 2560</text>
+  <text x="410" y="400" fill="#9FB3C8" font-size="12" text-anchor="middle">DeepStack 让"第 5/11/17 层"的信息也进入 LLM，而不只是最后一层</text>
+  <text x="410" y="428" fill="#9FB3C8" font-size="12" text-anchor="middle">要缓存的不只是主出口：4 个张量共 6.74 MiB（640×480 / bf16）</text>
+</svg>
+
+
+<figcaption>Qwen3-VL 视觉塔的阶段、两条出口与分段成本；DeepStack 让多个中间层进入 LLM。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_2">机制拆解</h2>
+<h3 id="_3">视觉塔的配置与阶段</h3>
+<p><code>Qwen3-VL-4B-Instruct</code> 的 <code>vision_config</code>：</p>
+<div class="highlight"><pre><span></span><code>depth                  24          hidden_size        1024
+intermediate_size      4096        num_heads          16
+out_hidden_size        2560        spatial_merge_size 2
+patch_size             16          temporal_patch_size 2
+num_position_embeddings 2304       deepstack_visual_indexes [5, 11, 17]
+</code></pre></div>
+
+<ul>
+<li><strong><code>out_hidden_size = 2560</code></strong> 就是 LLM 的 hidden：视觉塔的输出维度必须与语言模型的嵌入维度对齐，这个映射由 merger 完成。</li>
+<li><strong><code>spatial_merge_size = 2</code></strong>：2×2 个 patch（每个 1024 维）拼成 1 个视觉 token（2560 维）。所以 token 数是 patch 数的 1/4。</li>
+<li><strong><code>deepstack_visual_indexes = [5, 11, 17]</code></strong>：除最后一层外，另有三个中间层被送进 LLM。</li>
+</ul>
+<p>对一张 640×480 的图（4.5 的规则给出 grid [1,30,40] = 1200 patch），逐层挂 hook 的记录：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>形状</th>
+<th>dtype</th>
+<th style="text-align: right;">L2 均值</th>
+<th style="text-align: right;">字节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>patch_embed</code></td>
+<td>(1200, 1024)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">14.04</td>
+<td style="text-align: right;">2.344 MiB</td>
+</tr>
+<tr>
+<td><code>block_0</code></td>
+<td>(1200, 1024)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">21.99</td>
+<td style="text-align: right;">2.344 MiB</td>
+</tr>
+<tr>
+<td><code>block_5</code></td>
+<td>(1200, 1024)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">13.70</td>
+<td style="text-align: right;">2.344 MiB</td>
+</tr>
+<tr>
+<td><code>deepstack_merger_0</code></td>
+<td>(300, 2560)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">9.20</td>
+<td style="text-align: right;">1.465 MiB</td>
+</tr>
+<tr>
+<td><code>block_11</code></td>
+<td>(1200, 1024)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">17.19</td>
+<td style="text-align: right;">2.344 MiB</td>
+</tr>
+<tr>
+<td><code>deepstack_merger_1</code></td>
+<td>(300, 2560)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">14.81</td>
+<td style="text-align: right;">1.465 MiB</td>
+</tr>
+<tr>
+<td><code>block_17</code></td>
+<td>(1200, 1024)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">37.36</td>
+<td style="text-align: right;">2.344 MiB</td>
+</tr>
+<tr>
+<td><code>deepstack_merger_2</code></td>
+<td>(300, 2560)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">16.11</td>
+<td style="text-align: right;">1.465 MiB</td>
+</tr>
+<tr>
+<td><code>block_23</code></td>
+<td>(1200, 1024)</td>
+<td>bfloat16</td>
+<td style="text-align: right;"><strong>924.51</strong></td>
+<td style="text-align: right;">2.344 MiB</td>
+</tr>
+<tr>
+<td><code>merger</code></td>
+<td>(300, 2560)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">18.47</td>
+<td style="text-align: right;">1.465 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>三件可以直接读出来的事：</p>
+<ul>
+<li><strong><code>block_23</code> 的 L2 是 patch_embed 的 66 倍</strong>（924.5 vs 14.0）。塔内是残差结构，激活幅度逐层累积；这也是为什么后面必须有 norm/merger 把它压回可用范围。</li>
+<li><strong>merger 是"降长度、升维度"</strong>：1200×1024 → 300×2560。总元素数从 1.23M 降到 0.77M（-37%），但序列长度少了 4×，这对后面 LLM 的 attention（<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mi>S</mi><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math></span>）是决定性的。</li>
+<li><strong>tower 返回三个字段</strong>：<code>last_hidden_state</code>（1200×1024，merger 之前的序列）、<code>pooler_output</code>（merger 之后的 300×2560）、<code>deepstack_features</code>（3 个 300×2560）。</li>
+</ul>
+<h3 id="connector-linear">connector 不是"一个 linear"</h3>
+<p><code>Qwen3VLVisionPatchMerger</code>（<code>modeling_qwen3_vl.py:174-187</code>）的结构：</p>
+<div class="highlight"><pre><span></span><code>merger.norm        LayerNorm(1024)       ← use_postshuffle_norm=False 时作用在拼接前
+merger.linear_fc1  Linear(4096, 4096)
+merger.act_fn      GELU
+merger.linear_fc2  Linear(2560, 4096)
+</code></pre></div>
+
+<p>手写实现（同权重、同调用顺序）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">z</span> <span class="o">=</span> <span class="n">merger</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>                       <span class="c1"># x: [1200, 1024]</span>
+<span class="n">z</span> <span class="o">=</span> <span class="n">z</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span>              <span class="c1"># 2×2 拼接 → [300, 4096]</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">merger</span><span class="o">.</span><span class="n">linear_fc2</span><span class="p">(</span><span class="n">merger</span><span class="o">.</span><span class="n">act_fn</span><span class="p">(</span><span class="n">merger</span><span class="o">.</span><span class="n">linear_fc1</span><span class="p">(</span><span class="n">z</span><span class="p">)))</span>     <span class="c1"># [300, 2560]</span>
+</code></pre></div>
+
+<p>对拍结果：<strong>max|diff| = 0.000e+00</strong>。</p>
+<p>DeepStack 的 merger 用的是<strong>另一种 norm 位置</strong>（<code>use_postshuffle_norm=True</code>）：先拼成 4096 维再 LayerNorm。手写同样得到 <strong>0.000e+00</strong>。</p>
+<p>把顺序写错会怎样？两类 merger 的 <code>norm</code> 维度不同（1024 vs 4096），把主 merger 当成 post-shuffle 直接在形状上报错：</p>
+<div class="highlight"><pre><span></span><code>RuntimeError: Given normalized_shape=[1024], expected input with shape [*, 1024], but got ...
+</code></pre></div>
+
+<p><strong>"connector 是一个 linear"这个说法错得有多远？</strong> 用一个 4096→2560 的单层 linear 代替整条 merger（把 4 个 patch 直接拼起来过 linear），与官方输出的相对差是 <strong>1.021</strong>——量级等于 1，说明两者完全不相关。connector 里有 LayerNorm、两层线性与 GELU，省掉任何一步都不是"近似"，而是另一个函数。</p>
+<h3 id="24">分段成本：贵的是 24 层编码，不是压缩</h3>
+<p>固定一张 640×480 的底图，扫分辨率与 batch（先做一次预热以排除首次调用的冷启动）：</p>
+<table>
+<thead>
+<tr>
+<th>分辨率</th>
+<th style="text-align: right;">batch</th>
+<th style="text-align: right;">视觉 token</th>
+<th style="text-align: right;">processor</th>
+<th style="text-align: right;">ViT（含 merger）</th>
+<th style="text-align: right;">其中 merger</th>
+<th style="text-align: right;">LLM prefill</th>
+<th style="text-align: right;">完整请求</th>
+<th style="text-align: right;">峰值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>320×240</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">1.03 ms</td>
+<td style="text-align: right;">13.11 ms</td>
+<td style="text-align: right;">0.09 ms</td>
+<td style="text-align: right;">10.28 ms</td>
+<td style="text-align: right;">23.39 ms</td>
+<td style="text-align: right;">8548 MiB</td>
+</tr>
+<tr>
+<td>320×240</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">640</td>
+<td style="text-align: right;">3.71</td>
+<td style="text-align: right;">18.04</td>
+<td style="text-align: right;">0.20</td>
+<td style="text-align: right;">42.30</td>
+<td style="text-align: right;">60.34</td>
+<td style="text-align: right;">8868</td>
+</tr>
+<tr>
+<td>640×480</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">300</td>
+<td style="text-align: right;">1.46</td>
+<td style="text-align: right;">9.90</td>
+<td style="text-align: right;">0.12</td>
+<td style="text-align: right;">22.79</td>
+<td style="text-align: right;">32.69</td>
+<td style="text-align: right;">8657</td>
+</tr>
+<tr>
+<td>640×480</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">2400</td>
+<td style="text-align: right;">10.45</td>
+<td style="text-align: right;">58.97</td>
+<td style="text-align: right;">0.68</td>
+<td style="text-align: right;">115.57</td>
+<td style="text-align: right;">174.54</td>
+<td style="text-align: right;">9724</td>
+</tr>
+<tr>
+<td>1280×720</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">880</td>
+<td style="text-align: right;">4.57</td>
+<td style="text-align: right;">25.68</td>
+<td style="text-align: right;">0.27</td>
+<td style="text-align: right;">48.67</td>
+<td style="text-align: right;">74.35</td>
+<td style="text-align: right;">8963</td>
+</tr>
+<tr>
+<td>1280×720</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">7040</td>
+<td style="text-align: right;">34.84</td>
+<td style="text-align: right;">207.95</td>
+<td style="text-align: right;">1.78</td>
+<td style="text-align: right;">349.48</td>
+<td style="text-align: right;">557.42</td>
+<td style="text-align: right;">11999</td>
+</tr>
+</tbody>
+</table>
+<p>四条结论：</p>
+<ul>
+<li><strong>merger 只占 ViT 的 1.2%</strong>（0.12 / 9.90 ms）。把 1200 个 patch 压成 300 个 token 几乎不花时间——成本在 24 层 Transformer 里。<strong>优化 connector 的收益远小于优化塔本身</strong>（层数、分辨率、或干脆少送 patch）。</li>
+<li><strong>各阶段对 batch 的扩展性不同</strong>：B=1→8 时 processor 7.2×、ViT 6.0×、LLM 5.1×、完整 5.3×。processor 是 CPU 且逐图独立（接近线性），ViT 与 LLM 在 batch 增大后受算力与显存带宽限制。</li>
+<li><strong>分辨率的影响比 batch 更陡</strong>：1280×720 的视觉 token 是 320×240 的 11 倍（880 vs 80），完整请求从 23 ms 涨到 74 ms（B=1）。视觉 token 直接进入 LLM 的 prefill 长度。</li>
+<li><strong>峰值显存随 batch 增长</strong>：9724 MiB（640×480, B=8）→ 11999 MiB（1280×720, B=8）。权重约 8.4 GiB 是底，其余是激活。</li>
+</ul>
+<h3 id="deepstack">DeepStack：三个注入点的载荷</h3>
+<p>DeepStack 让第 5/11/17 层的特征也进入 LLM（<code>modeling_qwen3_vl.py:847-851</code> 的 <code>_deepstack_process</code> 按 <code>layer_idx</code> 逐层相加）。单张 640×480 图的<strong>完整视觉载荷</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>载荷</th>
+<th>形状</th>
+<th>dtype</th>
+<th style="text-align: right;">字节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>deepstack_0_layer5</code></td>
+<td>(300, 2560)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">1.465 MiB</td>
+</tr>
+<tr>
+<td><code>deepstack_1_layer11</code></td>
+<td>(300, 2560)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">1.465 MiB</td>
+</tr>
+<tr>
+<td><code>deepstack_2_layer17</code></td>
+<td>(300, 2560)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">1.465 MiB</td>
+</tr>
+<tr>
+<td><code>main_merger</code></td>
+<td>(1200, 1024)</td>
+<td>bfloat16</td>
+<td style="text-align: right;">2.344 MiB</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td></td>
+<td></td>
+<td style="text-align: right;"><strong>6.738 MiB</strong></td>
+</tr>
+</tbody>
+</table>
+<p>注意最后一行：<strong>主出口 2.344 MiB 是 merger 之前的序列</strong>（1200×1024），而三个 DeepStack 载荷是 merger 之后的（300×2560）。缓存设计（4.8）必须把这四个张量当成一个整体，键里要包含模型、processor 配置、图像内容与分辨率——少一个张量就不是同一份特征。</p>
+<p><strong>分析性消融。</strong> 把三个 DeepStack merger 的输出置零（其余保持官方配置），在 <strong>24 张</strong>合成图（OCR 与计数各 12 张，贪心生成 12 token）上比对：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th style="text-align: right;">严格命中（答案子串）</th>
+<th style="text-align: right;">归一化命中（去连字符/大小写）</th>
+<th style="text-align: right;">平均生成耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原模型</td>
+<td style="text-align: right;"><strong>24/24</strong></td>
+<td style="text-align: right;">24/24</td>
+<td style="text-align: right;">93 ms</td>
+</tr>
+<tr>
+<td>去掉 DeepStack 注入</td>
+<td style="text-align: right;">22/24</td>
+<td style="text-align: right;"><strong>24/24</strong></td>
+<td style="text-align: right;">80 ms</td>
+</tr>
+</tbody>
+</table>
+<p>两点必须说清楚：</p>
+<ul>
+<li><strong>严格判据下的 2 个"失败"都是格式差异</strong>：模型答 <code>TOKEN-04AB7</code>、<code>TOKEN-0?AB7</code>（少一个连字符），去掉非字母数字后两条件<strong>都是 24/24</strong>。<strong>判据本身会制造假失败</strong>——报告质量差异时必须同时给出严格与归一化两套数字，否则会把格式差异当成能力退化。</li>
+<li><strong>耗时降 14%（93 → 80 ms）</strong>，与"注入的计算量很小"一致；但<strong>"去掉注入仍能作答"不等于"DeepStack 没有作用"</strong>：这个任务集（合成 OCR/计数、12 个样本对）太窄，测不出精细的视觉理解差异。</li>
+</ul>
+<p>结论：<strong>在这个任务集上，置零注入带来的质量差异为 0（归一化后都是 24/24），只有 14% 的耗时下降</strong>。因此能说的只有"这类合成 OCR/计数任务不需要 DeepStack"；要判断它的收益需要更细的任务（需要多层视觉细节的组合推理）与更大的样本量——<strong>不能反过来声称"DeepStack 没有作用"</strong>。修改后的模型不能称为官方配置。</p>
+<hr />
+<h2 id="merger">工程实现 · 源码解析：merger 与注入点</h2>
+<p><code>transformers/models/qwen3_vl/modeling_qwen3_vl.py</code>：</p>
+<div class="highlight"><pre><span></span><code>:174-187  class Qwen3VLVisionPatchMerger
+            hidden_size = config.hidden_size * spatial_merge_size²   # 1024*4 = 4096
+            norm = LayerNorm(hidden_size if use_postshuffle_norm else hidden_size/4)
+            linear_fc1: Linear(4096,4096) / act_fn: GELU / linear_fc2: Linear(2560,4096)
+          forward: norm(x.view(-1, hidden_size) if postshuffle else x).view(-1, hidden_size)
+                   → fc2(act(fc1(x)))
+:674-681  self.deepstack_visual_indexes = config.deepstack_visual_indexes
+          self.deepstack_merger_list = ModuleList([Qwen3VLVisionPatchMerger(config,
+              use_postshuffle_norm=True) for _ in range(len(indexes))])
+:723-736  逐层循环中：if layer_num in self.deepstack_visual_indexes:
+              deepstack_feature_lists.append(deepstack_merger_list[j](hidden_states))
+:743      return BaseModelOutputWithDeepstackFeatures(..., deepstack_features=...)
+:847-851  LLM 侧：if deepstack_visual_embeds is not None and layer_idx in range(len(...)):
+              hidden_states = self._deepstack_process(hidden_states, visual_pos_masks,
+                                                      deepstack_visual_embeds[layer_idx])
+:861      _deepstack_process：只在视觉位置掩码处相加
+</code></pre></div>
+
+<p>两个实现细节值得记：</p>
+<ul>
+<li><strong>两类 merger 的 <code>use_postshuffle_norm</code> 不同</strong>：主体是 <code>False</code>（norm 作用在 1024 维的 patch 上，拼接后<strong>不再</strong> norm），DeepStack 是 <code>True</code>（先拼成 4096 维再 norm）。写反了会在形状上直接报错，属于"友好的错误"。</li>
+<li><strong>注入是"加在视觉位置上"</strong>，不是替换或拼接：<code>_deepstack_process</code> 用 <code>visual_pos_masks</code> 选出视觉 token 的位置做加法，文本位置的 hidden 不受影响。这意味着 4.8 的缓存可以只存视觉位置的张量。</li>
+</ul>
+<hr />
+<h2 id="_4">工程实现 · 自己写一遍</h2>
+<p><code>labs/L4/vision_connector.py</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 逐层特征清单：给关键模块挂 hook</span>
+<span class="n">handles</span> <span class="o">=</span> <span class="p">[</span><span class="n">vis</span><span class="o">.</span><span class="n">patch_embed</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">hook</span><span class="p">(</span><span class="s2">"patch_embed"</span><span class="p">))]</span>
+<span class="n">handles</span> <span class="o">+=</span> <span class="p">[</span><span class="n">vis</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">hook</span><span class="p">(</span><span class="sa">f</span><span class="s2">"block_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">))</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="mi">5</span><span class="p">,</span><span class="mi">11</span><span class="p">,</span><span class="mi">17</span><span class="p">,</span><span class="mi">23</span><span class="p">)]</span>
+<span class="n">handles</span> <span class="o">+=</span> <span class="p">[</span><span class="n">vis</span><span class="o">.</span><span class="n">merger</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">hook</span><span class="p">(</span><span class="s2">"merger"</span><span class="p">))]</span>
+<span class="n">handles</span> <span class="o">+=</span> <span class="p">[</span><span class="n">m</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">hook</span><span class="p">(</span><span class="sa">f</span><span class="s2">"deepstack_merger_</span><span class="si">{</span><span class="n">j</span><span class="si">}</span><span class="s2">"</span><span class="p">))</span>
+            <span class="k">for</span> <span class="n">j</span><span class="p">,</span> <span class="n">m</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">)]</span>
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+    <span class="n">vout</span> <span class="o">=</span> <span class="n">vis</span><span class="p">(</span><span class="n">pixel_values</span><span class="p">,</span> <span class="n">grid_thw</span><span class="o">=</span><span class="n">image_grid_thw</span><span class="p">)</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># 手写 merger（两种 norm 位置）</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">my_merger_plain</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">):</span>          <span class="c1"># use_postshuffle_norm=False</span>
+    <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">linear_fc2</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">act_fn</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">linear_fc1</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]))))</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">my_merger_post</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">m</span><span class="p">):</span>           <span class="c1"># use_postshuffle_norm=True</span>
+    <span class="n">z</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">linear_fc2</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">act_fn</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">linear_fc1</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">z</span><span class="p">))))</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># 分析性消融：把 DeepStack 注入置零（其余保持官方）</span>
+<span class="n">originals</span> <span class="o">=</span> <span class="p">{</span><span class="nb">id</span><span class="p">(</span><span class="n">m</span><span class="p">):</span> <span class="n">m</span><span class="o">.</span><span class="n">forward</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">}</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">zero_forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">originals</span><span class="p">[</span><span class="nb">id</span><span class="p">(</span><span class="bp">self</span><span class="p">)](</span><span class="n">x</span><span class="p">))</span>
+</code></pre></div>
+
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># A：逐层特征清单、merger 对拍与单 linear 反例</span>
+python<span class="w"> </span>labs/L4/vision_connector.py<span class="w"> </span>--outdir<span class="w"> </span>out/4.6/run<span class="w"> </span>A
+<span class="c1"># B/C：分段成本扫描、DeepStack 载荷与消融</span>
+python<span class="w"> </span>labs/L4/vision_connector.py<span class="w"> </span>--outdir<span class="w"> </span>out/4.6/run<span class="w"> </span>B<span class="w"> </span>C
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/4.6/20260913-connector/</code>（<code>run-A.log</code>、<code>run-BC.log</code>、<code>vision_connector.json</code>）。</p>
+<details class="fold srcfold"><summary>labs/L4/vision_connector.py 全文（386 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""L4.6 —— 视觉编码器与 connector。</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">[A] 逐层特征清单：patch embedding、每个 block、merger、DeepStack 注入点；</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">    手写 patch merger（LayerNorm+MLP，不是"一个 linear"）与官方逐元素对拍</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="sd">[B] 固定图片扫分辨率 × batch=1/2/4/8：processor / ViT / merger / LLM prefill</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="sd">    分段计时与峰值显存，检查每阶段资源闭合</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">[C] DeepStack：记录 [5,11,17] 三个注入点的载荷（形状/dtype/字节），</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="sd">    做"去掉 DeepStack"的分析性消融（对照原模型的任务命中与成本），</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="sd">    并给出 4.8 特征缓存所需的完整载荷清单</span>
+<span class="linenos" aria-hidden="true"> 11</span> 
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">用法：</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="sd">    python labs/L4/vision_connector.py --outdir out/4.6/run A B</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="sd">    python labs/L4/vision_connector.py --outdir out/4.6/run C</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 16</span> 
+<span class="linenos" aria-hidden="true"> 17</span> <span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="kn">import</span><span class="w"> </span><span class="nn">glob</span>
+<span class="linenos" aria-hidden="true"> 19</span> <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="linenos" aria-hidden="true"> 24</span> 
+<span class="linenos" aria-hidden="true"> 25</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos" aria-hidden="true"> 26</span> 
+<span class="linenos" aria-hidden="true"> 27</span> <span class="n">HUB</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"HF_HOME"</span><span class="p">,</span> <span class="s2">"/scratch/learn/models/hf"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/hub"</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="n">REPO</span> <span class="o">=</span> <span class="s2">"Qwen/Qwen3-VL-4B-Instruct"</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="n">SUMMARY</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true"> 30</span> 
+<span class="linenos" aria-hidden="true"> 31</span> 
+<span class="linenos" aria-hidden="true"> 32</span> <span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 33</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 34</span> 
+<span class="linenos" aria-hidden="true"> 35</span> 
+<span class="linenos" aria-hidden="true"> 36</span> <span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 37</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">70</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)),</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 38</span> 
+<span class="linenos" aria-hidden="true"> 39</span> 
+<span class="linenos" aria-hidden="true"> 40</span> <span class="k">def</span><span class="w"> </span><span class="nf">snap</span><span class="p">(</span><span class="n">repo</span><span class="o">=</span><span class="n">REPO</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 41</span>     <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">HUB</span><span class="si">}</span><span class="s2">/models--</span><span class="si">{</span><span class="n">repo</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'/'</span><span class="p">,</span><span class="w"> </span><span class="s1">'--'</span><span class="p">)</span><span class="si">}</span><span class="s2">/snapshots/*"</span><span class="p">))[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 42</span> 
+<span class="linenos" aria-hidden="true"> 43</span> 
+<span class="linenos" aria-hidden="true"> 44</span> <span class="k">def</span><span class="w"> </span><span class="nf">load</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 45</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForImageTextToText</span><span class="p">,</span> <span class="n">AutoProcessor</span>
+<span class="linenos" aria-hidden="true"> 46</span>     <span class="n">d</span> <span class="o">=</span> <span class="n">snap</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 47</span>     <span class="n">proc</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">d</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 48</span>     <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForImageTextToText</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true"> 49</span>         <span class="n">d</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device_map</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 50</span>     <span class="k">return</span> <span class="n">d</span><span class="p">,</span> <span class="n">proc</span><span class="p">,</span> <span class="n">model</span>
+<span class="linenos" aria-hidden="true"> 51</span> 
+<span class="linenos" aria-hidden="true"> 52</span> 
+<span class="linenos" aria-hidden="true"> 53</span> <span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos" aria-hidden="true"> 54</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">(</span><span class="n">args</span><span class="p">,</span> <span class="n">ctx</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 55</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 视觉编码器与 connector：逐层特征清单"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 56</span>     <span class="n">d</span><span class="p">,</span> <span class="n">proc</span><span class="p">,</span> <span class="n">model</span> <span class="o">=</span> <span class="n">ctx</span> <span class="ow">or</span> <span class="n">load</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 57</span>     <span class="n">vis</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">visual</span>
+<span class="linenos" aria-hidden="true"> 58</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">REPO</span><span class="si">}</span><span class="s2"> 的 vision tower：depth </span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">depth</span><span class="si">}</span><span class="s2">、hidden "</span>
+<span class="linenos" aria-hidden="true"> 59</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="si">}</span><span class="s2">、intermediate </span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span><span class="si">}</span><span class="s2">、"</span>
+<span class="linenos" aria-hidden="true"> 60</span>           <span class="sa">f</span><span class="s2">"heads </span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_heads</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 61</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  输出维度 </span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">out_hidden_size</span><span class="si">}</span><span class="s2">（送入 LLM 的 hidden）、"</span>
+<span class="linenos" aria-hidden="true"> 62</span>           <span class="sa">f</span><span class="s2">"spatial_merge </span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">spatial_merge_size</span><span class="si">}</span><span class="s2">、"</span>
+<span class="linenos" aria-hidden="true"> 63</span>           <span class="sa">f</span><span class="s2">"DeepStack 注入层 </span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">deepstack_visual_indexes</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 64</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  patch_embed: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">patch_embed</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos" aria-hidden="true"> 65</span>           <span class="sa">f</span><span class="s2">"merger: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">merger</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">（use_postshuffle_norm="</span>
+<span class="linenos" aria-hidden="true"> 66</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">merger</span><span class="o">.</span><span class="n">use_postshuffle_norm</span><span class="si">}</span><span class="s2">），"</span>
+<span class="linenos" aria-hidden="true"> 67</span>           <span class="sa">f</span><span class="s2">"deepstack_merger_list </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个"</span>
+<span class="linenos" aria-hidden="true"> 68</span>           <span class="sa">f</span><span class="s2">"（use_postshuffle_norm=</span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">use_postshuffle_norm</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 69</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  merger 的模块树（证明它不是单个 linear）："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 70</span>     <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">vis</span><span class="o">.</span><span class="n">merger</span><span class="o">.</span><span class="n">named_children</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 71</span>         <span class="n">extra</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="s2">"weight"</span><span class="p">)</span> <span class="k">else</span> <span class="s2">""</span>
+<span class="linenos" aria-hidden="true"> 72</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    merger.</span><span class="si">{</span><span class="n">n</span><span class="si">:</span><span class="s2">&lt;12</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">m</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}{</span><span class="n">extra</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 73</span> 
+<span class="linenos" aria-hidden="true"> 74</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span>
+<span class="linenos" aria-hidden="true"> 75</span>     <span class="n">img</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">new</span><span class="p">(</span><span class="s2">"RGB"</span><span class="p">,</span> <span class="p">(</span><span class="mi">640</span><span class="p">,</span> <span class="mi">480</span><span class="p">),</span> <span class="p">(</span><span class="mi">20</span><span class="p">,</span> <span class="mi">24</span><span class="p">,</span> <span class="mi">36</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 76</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">ImageDraw</span>
+<span class="linenos" aria-hidden="true"> 77</span>     <span class="n">ImageDraw</span><span class="o">.</span><span class="n">Draw</span><span class="p">(</span><span class="n">img</span><span class="p">)</span><span class="o">.</span><span class="n">text</span><span class="p">((</span><span class="mi">40</span><span class="p">,</span> <span class="mi">200</span><span class="p">),</span> <span class="s2">"CONNECTOR"</span><span class="p">,</span> <span class="n">fill</span><span class="o">=</span><span class="p">(</span><span class="mi">255</span><span class="p">,</span> <span class="mi">255</span><span class="p">,</span> <span class="mi">255</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 78</span>     <span class="n">inputs</span> <span class="o">=</span> <span class="n">proc</span><span class="p">(</span><span class="n">images</span><span class="o">=</span><span class="p">[</span><span class="n">img</span><span class="p">],</span> <span class="n">text</span><span class="o">=</span><span class="p">[</span><span class="s2">"describe"</span><span class="p">],</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 79</span>     <span class="n">pv</span><span class="p">,</span> <span class="n">thw</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"pixel_values"</span><span class="p">],</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"image_grid_thw"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 80</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  输入：pixel_values </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">pv</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">，image_grid_thw "</span>
+<span class="linenos" aria-hidden="true"> 81</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">thw</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span><span class="si">}</span><span class="s2"> → </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">thw</span><span class="o">.</span><span class="n">prod</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="o">/</span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个视觉 token"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 82</span> 
+<span class="linenos" aria-hidden="true"> 83</span>     <span class="n">caps</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true"> 84</span>     <span class="n">handles</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true"> 85</span> 
+<span class="linenos" aria-hidden="true"> 86</span>     <span class="k">def</span><span class="w"> </span><span class="nf">hook</span><span class="p">(</span><span class="n">name</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 87</span>         <span class="k">def</span><span class="w"> </span><span class="nf">fn</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">inp</span><span class="p">,</span> <span class="n">out</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 88</span>             <span class="n">t</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">)</span> <span class="k">else</span> <span class="n">out</span>
+<span class="linenos" aria-hidden="true"> 89</span>             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 90</span>                 <span class="n">caps</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 91</span>         <span class="k">return</span> <span class="n">fn</span>
+<span class="linenos" aria-hidden="true"> 92</span> 
+<span class="linenos" aria-hidden="true"> 93</span>     <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">patch_embed</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">hook</span><span class="p">(</span><span class="s2">"patch_embed"</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true"> 94</span>     <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">11</span><span class="p">,</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">23</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 95</span>         <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">hook</span><span class="p">(</span><span class="sa">f</span><span class="s2">"block_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true"> 96</span>     <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">merger</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">hook</span><span class="p">(</span><span class="s2">"merger"</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true"> 97</span>     <span class="k">for</span> <span class="n">j</span><span class="p">,</span> <span class="n">m</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 98</span>         <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">hook</span><span class="p">(</span><span class="sa">f</span><span class="s2">"deepstack_merger_</span><span class="si">{</span><span class="n">j</span><span class="si">}</span><span class="s2">"</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true"> 99</span>     <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">100</span>         <span class="n">vis_out</span> <span class="o">=</span> <span class="n">vis</span><span class="p">(</span><span class="n">pv</span><span class="p">,</span> <span class="n">grid_thw</span><span class="o">=</span><span class="n">thw</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">101</span>     <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">handles</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">102</span>         <span class="n">h</span><span class="o">.</span><span class="n">remove</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">103</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'阶段'</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'形状'</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'dtype'</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'L2 均值'</span><span class="si">:</span><span class="s2">&gt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'元素字节'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">104</span>     <span class="n">inv</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">105</span>     <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">caps</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">106</span>         <span class="n">row</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"stage"</span><span class="p">:</span> <span class="n">k</span><span class="p">,</span> <span class="s2">"shape"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">107</span>                <span class="s2">"dtype"</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"torch."</span><span class="p">,</span> <span class="s2">""</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">108</span>                <span class="s2">"l2_mean"</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true">109</span>                <span class="s2">"bytes"</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">v</span><span class="o">.</span><span class="n">element_size</span><span class="p">())}</span>
+<span class="linenos" aria-hidden="true">110</span>         <span class="n">inv</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">row</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">111</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">k</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">shape</span><span class="p">))</span><span class="si">:</span><span class="s2">&lt;24</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">'dtype'</span><span class="p">]</span><span class="si">:</span><span class="s2">&lt;10</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">112</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">'l2_mean'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">'bytes'</span><span class="p">]</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">20</span><span class="si">:</span><span class="s2">&gt;10.3f</span><span class="si">}</span><span class="s2"> MiB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">113</span>     <span class="n">ds</span> <span class="o">=</span> <span class="p">[</span><span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">vis_out</span><span class="o">.</span><span class="n">deepstack_features</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">114</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  tower 直接返回：last_hidden_state </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">vis_out</span><span class="o">.</span><span class="n">last_hidden_state</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos" aria-hidden="true">115</span>           <span class="sa">f</span><span class="s2">"deepstack_features </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">ds</span><span class="p">)</span><span class="si">}</span><span class="s2"> × </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">ds</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">116</span> 
+<span class="linenos" aria-hidden="true">117</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"A2 手写 patch merger 与官方对拍"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">118</span>     <span class="n">mg</span> <span class="o">=</span> <span class="n">vis</span><span class="o">.</span><span class="n">merger</span>
+<span class="linenos" aria-hidden="true">119</span>     <span class="n">hs</span> <span class="o">=</span> <span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">spatial_merge_size</span> <span class="o">**</span> <span class="mi">2</span>
+<span class="linenos" aria-hidden="true">120</span>     <span class="n">x</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1200</span><span class="p">,</span> <span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span> <span class="o">*</span> <span class="mf">0.5</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">121</span>     <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">122</span>         <span class="n">y_off</span> <span class="o">=</span> <span class="n">mg</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">123</span> 
+<span class="linenos" aria-hidden="true">124</span>     <span class="k">def</span><span class="w"> </span><span class="nf">my_merger_plain</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">m</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">125</span> <span class="w">        </span><span class="sd">"""use_postshuffle_norm=False：先在 1024 维上 LayerNorm，再拼 2×2。"""</span>
+<span class="linenos" aria-hidden="true">126</span>         <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">linear_fc2</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">act_fn</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">linear_fc1</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">t</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]))))</span>
+<span class="linenos" aria-hidden="true">127</span> 
+<span class="linenos" aria-hidden="true">128</span>     <span class="k">def</span><span class="w"> </span><span class="nf">my_merger_post</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">m</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">129</span> <span class="w">        </span><span class="sd">"""use_postshuffle_norm=True：先拼 2×2，再在 4096 维上 LayerNorm。"""</span>
+<span class="linenos" aria-hidden="true">130</span>         <span class="n">z</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span> <span class="o">*</span> <span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">131</span>         <span class="k">return</span> <span class="n">m</span><span class="o">.</span><span class="n">linear_fc2</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">act_fn</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">linear_fc1</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">z</span><span class="p">))))</span>
+<span class="linenos" aria-hidden="true">132</span> 
+<span class="linenos" aria-hidden="true">133</span>     <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">134</span>         <span class="n">y_my</span> <span class="o">=</span> <span class="n">my_merger_plain</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">mg</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">135</span>     <span class="n">d_my</span> <span class="o">=</span> <span class="p">(</span><span class="n">y_off</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">-</span> <span class="n">y_my</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">136</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  主 merger（use_postshuffle_norm=False）：输入 [1200,1024] → 输出 "</span>
+<span class="linenos" aria-hidden="true">137</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">y_off</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">138</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    手写 norm→reshape→fc1→GELU→fc2：max|diff| </span><span class="si">{</span><span class="n">d_my</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">139</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">140</span>         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">141</span>             <span class="n">my_merger_post</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">mg</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">142</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"    用错误顺序（先拼再 norm）未报错"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">143</span>     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">144</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    用错误顺序（先拼再 norm）：</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">)[:</span><span class="mi">80</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">145</span>         <span class="nb">print</span><span class="p">(</span><span class="s2">"    → 两类 merger 的 norm 维度不同（1024 vs 4096），顺序写错会在形状上直接报错"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">146</span>     <span class="n">dm</span> <span class="o">=</span> <span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">147</span>     <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">148</span>         <span class="n">z_off</span> <span class="o">=</span> <span class="n">dm</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">149</span>         <span class="n">z_my</span> <span class="o">=</span> <span class="n">my_merger_post</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dm</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">150</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  DeepStack merger（use_postshuffle_norm=True）："</span>
+<span class="linenos" aria-hidden="true">151</span>           <span class="sa">f</span><span class="s2">"手写 max|diff| </span><span class="si">{</span><span class="p">(</span><span class="n">z_off</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">-</span><span class="n">z_my</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">152</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  若把 connector 简化成单个 linear（</span><span class="si">{</span><span class="n">hs</span><span class="si">}</span><span class="s2">→</span><span class="si">{</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">out_hidden_size</span><span class="si">}</span><span class="s2">）："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">153</span>     <span class="n">lin</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">hs</span><span class="p">,</span> <span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">out_hidden_size</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">154</span>     <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">155</span>         <span class="n">y_lin</span> <span class="o">=</span> <span class="n">lin</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">hs</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">156</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    与官方输出的相对差 "</span>
+<span class="linenos" aria-hidden="true">157</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">((</span><span class="n">y_off</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">-</span><span class="n">y_lin</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span><span class="o">/</span><span class="n">y_off</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">norm</span><span class="p">())</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">158</span>           <span class="sa">f</span><span class="s2">"（量级 = 1 说明完全不相关）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">159</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  tower 的返回字段：</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">vis_out</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> → "</span>
+<span class="linenos" aria-hidden="true">160</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">[</span><span class="n">k</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">vis_out</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">vis_out</span><span class="p">[</span><span class="n">k</span><span class="p">]</span><span class="w"> </span><span class="ow">is</span><span class="w"> </span><span class="ow">not</span><span class="w"> </span><span class="kc">None</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">161</span>     <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"A"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"inventory"</span><span class="p">:</span> <span class="n">inv</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">162</span>                     <span class="s2">"merger_plain_max_abs_diff"</span><span class="p">:</span> <span class="n">d_my</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">163</span>                     <span class="s2">"deepstack_merger_max_abs_diff"</span><span class="p">:</span> <span class="p">(</span><span class="n">z_off</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">-</span><span class="n">z_my</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true">164</span>                     <span class="s2">"tower_output_fields"</span><span class="p">:</span> <span class="p">[</span><span class="n">k</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">vis_out</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="k">if</span> <span class="n">vis_out</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">165</span>                     <span class="s2">"config"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"depth"</span><span class="p">:</span> <span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">depth</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">166</span>                                <span class="s2">"hidden"</span><span class="p">:</span> <span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">167</span>                                <span class="s2">"out_hidden"</span><span class="p">:</span> <span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">out_hidden_size</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">168</span>                                <span class="s2">"merge"</span><span class="p">:</span> <span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">spatial_merge_size</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">169</span>                                <span class="s2">"deepstack_indexes"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">deepstack_visual_indexes</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true">170</span>                     <span class="s2">"mini_merger_max_abs_diff"</span><span class="p">:</span> <span class="p">(</span><span class="n">y_off</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">-</span><span class="n">y_my</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true">171</span>                     <span class="s2">"single_linear_rel"</span><span class="p">:</span> <span class="p">((</span><span class="n">y_off</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">-</span><span class="n">y_lin</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span><span class="o">/</span><span class="n">y_off</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">norm</span><span class="p">())</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true">172</span>                     <span class="s2">"visual_tokens"</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">thw</span><span class="o">.</span><span class="n">prod</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span><span class="o">/</span><span class="mi">4</span><span class="p">)}</span>
+<span class="linenos" aria-hidden="true">173</span>     <span class="k">return</span> <span class="n">ctx</span> <span class="k">if</span> <span class="n">ctx</span> <span class="k">else</span> <span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="n">proc</span><span class="p">,</span> <span class="n">model</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">174</span> 
+<span class="linenos" aria-hidden="true">175</span> 
+<span class="linenos" aria-hidden="true">176</span> <span class="c1"># ---------------------------------------------------------------- B</span>
+<span class="linenos" aria-hidden="true">177</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">(</span><span class="n">args</span><span class="p">,</span> <span class="n">ctx</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">178</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span><span class="p">,</span> <span class="n">ImageDraw</span>
+<span class="linenos" aria-hidden="true">179</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[B] processor / ViT / merger / LLM prefill 的分段成本"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">180</span>     <span class="n">d</span><span class="p">,</span> <span class="n">proc</span><span class="p">,</span> <span class="n">model</span> <span class="o">=</span> <span class="n">ctx</span> <span class="ow">or</span> <span class="n">load</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">181</span>     <span class="n">vis</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">visual</span>
+<span class="linenos" aria-hidden="true">182</span>     <span class="n">base</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">new</span><span class="p">(</span><span class="s2">"RGB"</span><span class="p">,</span> <span class="p">(</span><span class="mi">1280</span><span class="p">,</span> <span class="mi">720</span><span class="p">),</span> <span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">20</span><span class="p">,</span> <span class="mi">30</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">183</span>     <span class="n">ImageDraw</span><span class="o">.</span><span class="n">Draw</span><span class="p">(</span><span class="n">base</span><span class="p">)</span><span class="o">.</span><span class="n">text</span><span class="p">((</span><span class="mi">60</span><span class="p">,</span> <span class="mi">320</span><span class="p">),</span> <span class="s2">"STAGE TIMING"</span><span class="p">,</span> <span class="n">fill</span><span class="o">=</span><span class="p">(</span><span class="mi">255</span><span class="p">,</span> <span class="mi">255</span><span class="p">,</span> <span class="mi">255</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">184</span>     <span class="n">resolutions</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"small_320x240"</span><span class="p">:</span> <span class="p">(</span><span class="mi">320</span><span class="p">,</span> <span class="mi">240</span><span class="p">),</span> <span class="s2">"mid_640x480"</span><span class="p">:</span> <span class="p">(</span><span class="mi">640</span><span class="p">,</span> <span class="mi">480</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">185</span>                    <span class="s2">"large_1280x720"</span><span class="p">:</span> <span class="p">(</span><span class="mi">1280</span><span class="p">,</span> <span class="mi">720</span><span class="p">)}</span>
+<span class="linenos" aria-hidden="true">186</span>     <span class="c1"># 预热一次，避免把首次调用的 JIT/缓存冷启动算进第一格</span>
+<span class="linenos" aria-hidden="true">187</span>     <span class="n">warm</span> <span class="o">=</span> <span class="n">base</span><span class="o">.</span><span class="n">resize</span><span class="p">((</span><span class="mi">640</span><span class="p">,</span> <span class="mi">480</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">188</span>     <span class="n">wi</span> <span class="o">=</span> <span class="n">proc</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">189</span>         <span class="p">[[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"image"</span><span class="p">,</span> <span class="s2">"image"</span><span class="p">:</span> <span class="n">warm</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">190</span>                                        <span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"text"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"warmup"</span><span class="p">}]}]],</span>
+<span class="linenos" aria-hidden="true">191</span>         <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">192</span>         <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">193</span>     <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">194</span>         <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">wi</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">195</span>     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">196</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">197</span>     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="n">h</span><span class="p">)</span> <span class="ow">in</span> <span class="n">resolutions</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">198</span>         <span class="n">img</span> <span class="o">=</span> <span class="n">base</span><span class="o">.</span><span class="n">resize</span><span class="p">((</span><span class="n">w</span><span class="p">,</span> <span class="n">h</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">199</span>         <span class="k">for</span> <span class="n">B</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">200</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">reset_peak_memory_stats</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">201</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">202</span>             <span class="n">iput</span> <span class="o">=</span> <span class="n">proc</span><span class="o">.</span><span class="n">image_processor</span><span class="p">(</span><span class="n">images</span><span class="o">=</span><span class="p">[</span><span class="n">img</span><span class="p">]</span> <span class="o">*</span> <span class="n">B</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">203</span>             <span class="n">t_proc</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true">204</span>             <span class="n">convs</span> <span class="o">=</span> <span class="p">[[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="p">[</span>
+<span class="linenos" aria-hidden="true">205</span>                 <span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"image"</span><span class="p">,</span> <span class="s2">"image"</span><span class="p">:</span> <span class="n">img</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">206</span>                 <span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"text"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"describe"</span><span class="p">}]}]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">B</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">207</span>             <span class="n">inputs</span> <span class="o">=</span> <span class="n">proc</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">208</span>                 <span class="n">convs</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">209</span>                 <span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">,</span> <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">210</span>             <span class="n">pv</span><span class="p">,</span> <span class="n">thw</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"pixel_values"</span><span class="p">],</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"image_grid_thw"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">211</span>             <span class="k">assert</span> <span class="n">iput</span><span class="p">[</span><span class="s2">"pixel_values"</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">pv</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="s2">"图像块数不一致"</span>
+<span class="linenos" aria-hidden="true">212</span>             <span class="c1"># ViT（含 merger）</span>
+<span class="linenos" aria-hidden="true">213</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">214</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">215</span>             <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">216</span>                 <span class="n">vout</span> <span class="o">=</span> <span class="n">vis</span><span class="p">(</span><span class="n">pv</span><span class="p">,</span> <span class="n">grid_thw</span><span class="o">=</span><span class="n">thw</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">217</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">218</span>             <span class="n">t_vit</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true">219</span>             <span class="c1"># 单独计时 merger</span>
+<span class="linenos" aria-hidden="true">220</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">221</span>             <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">222</span>                 <span class="n">merged</span> <span class="o">=</span> <span class="n">vis</span><span class="o">.</span><span class="n">merger</span><span class="p">(</span><span class="n">vout</span><span class="o">.</span><span class="n">last_hidden_state</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">223</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">224</span>             <span class="n">t_merger</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true">225</span>             <span class="c1"># 完整请求</span>
+<span class="linenos" aria-hidden="true">226</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">227</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">228</span>             <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">229</span>                 <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">inputs</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">230</span>             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">231</span>             <span class="n">t_full</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true">232</span>             <span class="n">peak</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">max_memory_allocated</span><span class="p">()</span> <span class="o">/</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>
+<span class="linenos" aria-hidden="true">233</span>             <span class="n">vtokens</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">thw</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">/</span> <span class="mi">4</span><span class="p">)</span>   <span class="c1"># 逐图求和</span>
+<span class="linenos" aria-hidden="true">234</span>             <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"res"</span><span class="p">:</span> <span class="n">name</span><span class="p">,</span> <span class="s2">"wh"</span><span class="p">:</span> <span class="p">[</span><span class="n">w</span><span class="p">,</span> <span class="n">h</span><span class="p">],</span> <span class="s2">"batch"</span><span class="p">:</span> <span class="n">B</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">235</span>                          <span class="s2">"visual_tokens_total"</span><span class="p">:</span> <span class="n">vtokens</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">236</span>                          <span class="s2">"proc_s"</span><span class="p">:</span> <span class="n">t_proc</span><span class="p">,</span> <span class="s2">"vit_s"</span><span class="p">:</span> <span class="n">t_vit</span><span class="p">,</span> <span class="s2">"merger_s"</span><span class="p">:</span> <span class="n">t_merger</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">237</span>                          <span class="s2">"full_s"</span><span class="p">:</span> <span class="n">t_full</span><span class="p">,</span> <span class="s2">"llm_s"</span><span class="p">:</span> <span class="n">t_full</span> <span class="o">-</span> <span class="n">t_vit</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">238</span>                          <span class="s2">"peak_mib"</span><span class="p">:</span> <span class="n">peak</span><span class="p">})</span>
+<span class="linenos" aria-hidden="true">239</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;15</span><span class="si">}</span><span class="s2"> B=</span><span class="si">{</span><span class="n">B</span><span class="si">:</span><span class="s2">&lt;2</span><span class="si">}</span><span class="s2"> token </span><span class="si">{</span><span class="n">vtokens</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">240</span>                   <span class="sa">f</span><span class="s2">"processor </span><span class="si">{</span><span class="n">t_proc</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">7.2f</span><span class="si">}</span><span class="s2"> ms  ViT </span><span class="si">{</span><span class="n">t_vit</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">7.2f</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos" aria-hidden="true">241</span>                   <span class="sa">f</span><span class="s2">"merger </span><span class="si">{</span><span class="n">t_merger</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">6.2f</span><span class="si">}</span><span class="s2">  LLM </span><span class="si">{</span><span class="nb">max</span><span class="p">(</span><span class="n">t_full</span><span class="o">-</span><span class="n">t_vit</span><span class="p">,</span><span class="mi">0</span><span class="p">)</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">8.2f</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos" aria-hidden="true">242</span>                   <span class="sa">f</span><span class="s2">"完整 </span><span class="si">{</span><span class="n">t_full</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">8.2f</span><span class="si">}</span><span class="s2"> ms  峰值 </span><span class="si">{</span><span class="n">peak</span><span class="si">:</span><span class="s2">7.0f</span><span class="si">}</span><span class="s2"> MiB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">243</span>     <span class="c1"># 每阶段最优 batch</span>
+<span class="linenos" aria-hidden="true">244</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  各阶段随 batch 的变化（同一分辨率 640×480）："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">245</span>     <span class="k">for</span> <span class="n">stage</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"proc_s"</span><span class="p">,</span> <span class="s2">"vit_s"</span><span class="p">,</span> <span class="s2">"merger_s"</span><span class="p">,</span> <span class="s2">"full_s"</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">246</span>         <span class="n">sel</span> <span class="o">=</span> <span class="p">{</span><span class="n">r</span><span class="p">[</span><span class="s2">"batch"</span><span class="p">]:</span> <span class="n">r</span><span class="p">[</span><span class="n">stage</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">rows</span> <span class="k">if</span> <span class="n">r</span><span class="p">[</span><span class="s2">"res"</span><span class="p">]</span> <span class="o">==</span> <span class="s2">"mid_640x480"</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">247</span>         <span class="n">base1</span> <span class="o">=</span> <span class="n">sel</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">248</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">stage</span><span class="si">:</span><span class="s2">&lt;9</span><span class="si">}</span><span class="s2"> B=1 </span><span class="si">{</span><span class="n">base1</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">7.2f</span><span class="si">}</span><span class="s2"> ms → B=8 </span><span class="si">{</span><span class="n">sel</span><span class="p">[</span><span class="mi">8</span><span class="p">]</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">7.2f</span><span class="si">}</span><span class="s2"> ms "</span>
+<span class="linenos" aria-hidden="true">249</span>               <span class="sa">f</span><span class="s2">"（</span><span class="si">{</span><span class="n">base1</span><span class="o">/</span><span class="n">sel</span><span class="p">[</span><span class="mi">8</span><span class="p">]</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">× 加速，理论上限 8×）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">250</span>     <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"B"</span><span class="p">]</span> <span class="o">=</span> <span class="n">rows</span>
+<span class="linenos" aria-hidden="true">251</span>     <span class="k">return</span> <span class="n">ctx</span> <span class="k">if</span> <span class="n">ctx</span> <span class="k">else</span> <span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="n">proc</span><span class="p">,</span> <span class="n">model</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">252</span> 
+<span class="linenos" aria-hidden="true">253</span> 
+<span class="linenos" aria-hidden="true">254</span> <span class="c1"># ---------------------------------------------------------------- C</span>
+<span class="linenos" aria-hidden="true">255</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">(</span><span class="n">args</span><span class="p">,</span> <span class="n">ctx</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">256</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span><span class="p">,</span> <span class="n">ImageDraw</span>
+<span class="linenos" aria-hidden="true">257</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[C] DeepStack 注入点与消融"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">258</span>     <span class="n">d</span><span class="p">,</span> <span class="n">proc</span><span class="p">,</span> <span class="n">model</span> <span class="o">=</span> <span class="n">ctx</span> <span class="ow">or</span> <span class="n">load</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">259</span>     <span class="n">vis</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">visual</span>
+<span class="linenos" aria-hidden="true">260</span>     <span class="n">idxs</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">vis</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">deepstack_visual_indexes</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">261</span>     <span class="n">layers</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">language_model</span><span class="o">.</span><span class="n">layers</span>
+<span class="linenos" aria-hidden="true">262</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  DeepStack 注入层（vision 侧）</span><span class="si">{</span><span class="n">idxs</span><span class="si">}</span><span class="s2"> → LLM 侧前 "</span>
+<span class="linenos" aria-hidden="true">263</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">idxs</span><span class="p">)</span><span class="si">}</span><span class="s2"> 层（_deepstack_process 按 index 取用）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">264</span> 
+<span class="linenos" aria-hidden="true">265</span>     <span class="n">img</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">new</span><span class="p">(</span><span class="s2">"RGB"</span><span class="p">,</span> <span class="p">(</span><span class="mi">640</span><span class="p">,</span> <span class="mi">480</span><span class="p">),</span> <span class="p">(</span><span class="mi">18</span><span class="p">,</span> <span class="mi">22</span><span class="p">,</span> <span class="mi">34</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">266</span>     <span class="n">ImageDraw</span><span class="o">.</span><span class="n">Draw</span><span class="p">(</span><span class="n">img</span><span class="p">)</span><span class="o">.</span><span class="n">text</span><span class="p">((</span><span class="mi">40</span><span class="p">,</span> <span class="mi">200</span><span class="p">),</span> <span class="s2">"DEEPSTACK-42"</span><span class="p">,</span> <span class="n">fill</span><span class="o">=</span><span class="p">(</span><span class="mi">255</span><span class="p">,</span> <span class="mi">255</span><span class="p">,</span> <span class="mi">255</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">267</span>     <span class="n">inputs</span> <span class="o">=</span> <span class="n">proc</span><span class="p">(</span><span class="n">images</span><span class="o">=</span><span class="p">[</span><span class="n">img</span><span class="p">],</span> <span class="n">text</span><span class="o">=</span><span class="p">[</span><span class="s2">"图中写了什么？"</span><span class="p">],</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">268</span>     <span class="n">pv</span><span class="p">,</span> <span class="n">thw</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"pixel_values"</span><span class="p">],</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"image_grid_thw"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">269</span>     <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">270</span>         <span class="n">vout</span> <span class="o">=</span> <span class="n">vis</span><span class="p">(</span><span class="n">pv</span><span class="p">,</span> <span class="n">grid_thw</span><span class="o">=</span><span class="n">thw</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">271</span>     <span class="n">payload</span> <span class="o">=</span> <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"deepstack_</span><span class="si">{</span><span class="n">j</span><span class="si">}</span><span class="s2">_layer</span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="s2">"shape"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">272</span>                 <span class="s2">"dtype"</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"torch."</span><span class="p">,</span> <span class="s2">""</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">273</span>                 <span class="s2">"bytes"</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">t</span><span class="o">.</span><span class="n">element_size</span><span class="p">())}</span>
+<span class="linenos" aria-hidden="true">274</span>                <span class="k">for</span> <span class="n">j</span><span class="p">,</span> <span class="p">(</span><span class="n">idx</span><span class="p">,</span> <span class="n">t</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">idxs</span><span class="p">,</span> <span class="n">vout</span><span class="o">.</span><span class="n">deepstack_features</span><span class="p">))]</span>
+<span class="linenos" aria-hidden="true">275</span>     <span class="n">payload</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"main_merger"</span><span class="p">,</span> <span class="s2">"shape"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">vout</span><span class="o">.</span><span class="n">last_hidden_state</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">276</span>                     <span class="s2">"dtype"</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">vout</span><span class="o">.</span><span class="n">last_hidden_state</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"torch."</span><span class="p">,</span> <span class="s2">""</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">277</span>                     <span class="s2">"bytes"</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">vout</span><span class="o">.</span><span class="n">last_hidden_state</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span>
+<span class="linenos" aria-hidden="true">278</span>                                  <span class="n">vout</span><span class="o">.</span><span class="n">last_hidden_state</span><span class="o">.</span><span class="n">element_size</span><span class="p">())})</span>
+<span class="linenos" aria-hidden="true">279</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'载荷'</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'形状'</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'dtype'</span><span class="si">:</span><span class="s2">&lt;9</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="s1">'字节'</span><span class="si">:</span><span class="s2">&gt;10</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">280</span>     <span class="n">total</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true">281</span>     <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">payload</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">282</span>         <span class="n">total</span> <span class="o">+=</span> <span class="n">p</span><span class="p">[</span><span class="s2">"bytes"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">283</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">p</span><span class="p">[</span><span class="s1">'name'</span><span class="p">]</span><span class="si">:</span><span class="s2">&lt;26</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">p</span><span class="p">[</span><span class="s1">'shape'</span><span class="p">]))</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p</span><span class="p">[</span><span class="s1">'dtype'</span><span class="p">]</span><span class="si">:</span><span class="s2">&lt;9</span><span class="si">}</span><span class="s2"> "</span>
+<span class="linenos" aria-hidden="true">284</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">p</span><span class="p">[</span><span class="s1">'bytes'</span><span class="p">]</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">20</span><span class="si">:</span><span class="s2">&gt;9.3f</span><span class="si">}</span><span class="s2"> MiB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">285</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  单张 640×480 图的视觉特征总载荷 </span><span class="si">{</span><span class="n">total</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">20</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> MiB"</span>
+<span class="linenos" aria-hidden="true">286</span>           <span class="sa">f</span><span class="s2">"（4.8 的 feature cache 需要按这份清单做键）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">287</span> 
+<span class="linenos" aria-hidden="true">288</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"C2 分析性消融：去掉 DeepStack 注入"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">289</span>     <span class="n">originals</span> <span class="o">=</span> <span class="p">{</span><span class="nb">id</span><span class="p">(</span><span class="n">m</span><span class="p">):</span> <span class="n">m</span><span class="o">.</span><span class="n">forward</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">290</span> 
+<span class="linenos" aria-hidden="true">291</span>     <span class="k">def</span><span class="w"> </span><span class="nf">zero_forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">292</span>         <span class="n">y</span> <span class="o">=</span> <span class="n">originals</span><span class="p">[</span><span class="nb">id</span><span class="p">(</span><span class="bp">self</span><span class="p">)](</span><span class="n">x</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">293</span>         <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">y</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">294</span> 
+<span class="linenos" aria-hidden="true">295</span>     <span class="n">TASKS</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">"read"</span><span class="p">,</span> <span class="s2">"图中的编号字符串是什么？只回答字符串。"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">296</span>              <span class="p">(</span><span class="s2">"count"</span><span class="p">,</span> <span class="s2">"图中有几个红色圆点？只回答数字。"</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">297</span>     <span class="n">test_imgs</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">298</span>     <span class="n">n_ablate</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">args</span><span class="p">,</span> <span class="s2">"n_ablate"</span><span class="p">,</span> <span class="mi">6</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">299</span>     <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_ablate</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">300</span>         <span class="n">im</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">new</span><span class="p">(</span><span class="s2">"RGB"</span><span class="p">,</span> <span class="p">(</span><span class="mi">640</span><span class="p">,</span> <span class="mi">480</span><span class="p">),</span> <span class="p">(</span><span class="mi">18</span><span class="p">,</span> <span class="mi">22</span><span class="p">,</span> <span class="mi">34</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">301</span>         <span class="n">dr</span> <span class="o">=</span> <span class="n">ImageDraw</span><span class="o">.</span><span class="n">Draw</span><span class="p">(</span><span class="n">im</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">302</span>         <span class="k">if</span> <span class="n">i</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">303</span>             <span class="n">s</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"TOKEN-</span><span class="si">{</span><span class="n">i</span><span class="si">:</span><span class="s2">02d</span><span class="si">}</span><span class="s2">-AB7"</span>
+<span class="linenos" aria-hidden="true">304</span>             <span class="n">dr</span><span class="o">.</span><span class="n">text</span><span class="p">((</span><span class="mi">60</span><span class="p">,</span> <span class="mi">220</span><span class="p">),</span> <span class="n">s</span><span class="p">,</span> <span class="n">fill</span><span class="o">=</span><span class="p">(</span><span class="mi">255</span><span class="p">,</span> <span class="mi">255</span><span class="p">,</span> <span class="mi">255</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">305</span>             <span class="n">test_imgs</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">im</span><span class="p">,</span> <span class="s2">"read"</span><span class="p">,</span> <span class="n">s</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">306</span>         <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">307</span>             <span class="n">n</span> <span class="o">=</span> <span class="mi">3</span> <span class="o">+</span> <span class="n">i</span> <span class="o">%</span> <span class="mi">4</span>
+<span class="linenos" aria-hidden="true">308</span>             <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">309</span>                 <span class="n">cx</span><span class="p">,</span> <span class="n">cy</span> <span class="o">=</span> <span class="mi">90</span> <span class="o">+</span> <span class="mi">70</span> <span class="o">*</span> <span class="n">k</span><span class="p">,</span> <span class="mi">240</span>
+<span class="linenos" aria-hidden="true">310</span>                 <span class="n">dr</span><span class="o">.</span><span class="n">ellipse</span><span class="p">([</span><span class="n">cx</span> <span class="o">-</span> <span class="mi">22</span><span class="p">,</span> <span class="n">cy</span> <span class="o">-</span> <span class="mi">22</span><span class="p">,</span> <span class="n">cx</span> <span class="o">+</span> <span class="mi">22</span><span class="p">,</span> <span class="n">cy</span> <span class="o">+</span> <span class="mi">22</span><span class="p">],</span> <span class="n">fill</span><span class="o">=</span><span class="p">(</span><span class="mi">220</span><span class="p">,</span> <span class="mi">90</span><span class="p">,</span> <span class="mi">60</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">311</span>             <span class="n">test_imgs</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">im</span><span class="p">,</span> <span class="s2">"count"</span><span class="p">,</span> <span class="n">n</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">312</span> 
+<span class="linenos" aria-hidden="true">313</span>     <span class="k">def</span><span class="w"> </span><span class="nf">run_all</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">314</span>         <span class="n">out</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">315</span>         <span class="k">for</span> <span class="n">im</span><span class="p">,</span> <span class="n">kind</span><span class="p">,</span> <span class="n">ans</span> <span class="ow">in</span> <span class="n">test_imgs</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">316</span>             <span class="n">prompt</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">TASKS</span><span class="p">)[</span><span class="n">kind</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">317</span>             <span class="n">msgs</span> <span class="o">=</span> <span class="p">[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="p">[</span>
+<span class="linenos" aria-hidden="true">318</span>                 <span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"image"</span><span class="p">,</span> <span class="s2">"image"</span><span class="p">:</span> <span class="n">im</span><span class="p">},</span> <span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"text"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="n">prompt</span><span class="p">}]}]</span>
+<span class="linenos" aria-hidden="true">319</span>             <span class="n">ins</span> <span class="o">=</span> <span class="n">proc</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">msgs</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">320</span>                                            <span class="n">tokenize</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">321</span>                                            <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">322</span>             <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">323</span>             <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">324</span>                 <span class="n">gen</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="o">**</span><span class="n">ins</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="o">=</span><span class="mi">12</span><span class="p">,</span> <span class="n">do_sample</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">325</span>             <span class="n">dt</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true">326</span>             <span class="n">txt</span> <span class="o">=</span> <span class="n">proc</span><span class="o">.</span><span class="n">batch_decode</span><span class="p">(</span><span class="n">gen</span><span class="p">[:,</span> <span class="n">ins</span><span class="p">[</span><span class="s2">"input_ids"</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]:],</span>
+<span class="linenos" aria-hidden="true">327</span>                                     <span class="n">skip_special_tokens</span><span class="o">=</span><span class="kc">True</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">328</span>             <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"kind"</span><span class="p">:</span> <span class="n">kind</span><span class="p">,</span> <span class="s2">"answer"</span><span class="p">:</span> <span class="n">ans</span><span class="p">,</span> <span class="s2">"output"</span><span class="p">:</span> <span class="n">txt</span><span class="p">[:</span><span class="mi">30</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">329</span>                         <span class="s2">"hit"</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">ans</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="n">txt</span><span class="o">.</span><span class="n">lower</span><span class="p">(),</span> <span class="s2">"s"</span><span class="p">:</span> <span class="n">dt</span><span class="p">})</span>
+<span class="linenos" aria-hidden="true">330</span>         <span class="k">return</span> <span class="n">out</span>
+<span class="linenos" aria-hidden="true">331</span> 
+<span class="linenos" aria-hidden="true">332</span>     <span class="n">base</span> <span class="o">=</span> <span class="n">run_all</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">333</span>     <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">334</span>         <span class="n">m</span><span class="o">.</span><span class="n">forward</span> <span class="o">=</span> <span class="n">zero_forward</span><span class="o">.</span><span class="fm">__get__</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="n">m</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">335</span>     <span class="k">try</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">336</span>         <span class="n">ablated</span> <span class="o">=</span> <span class="n">run_all</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">337</span>     <span class="k">finally</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">338</span>         <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">vis</span><span class="o">.</span><span class="n">deepstack_merger_list</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">339</span>             <span class="n">m</span><span class="o">.</span><span class="n">forward</span> <span class="o">=</span> <span class="n">originals</span><span class="p">[</span><span class="nb">id</span><span class="p">(</span><span class="n">m</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">340</span>     <span class="n">hb</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="s2">"hit"</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">base</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">341</span>     <span class="n">ha</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="s2">"hit"</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">ablated</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">342</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  原模型 </span><span class="si">{</span><span class="n">hb</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">base</span><span class="p">)</span><span class="si">}</span><span class="s2"> 命中，平均 </span><span class="si">{</span><span class="nb">sum</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="s1">'s'</span><span class="p">]</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">base</span><span class="p">)</span><span class="o">/</span><span class="nb">len</span><span class="p">(</span><span class="n">base</span><span class="p">)</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">343</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  去掉 DeepStack 注入 </span><span class="si">{</span><span class="n">ha</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">ablated</span><span class="p">)</span><span class="si">}</span><span class="s2"> 命中，"</span>
+<span class="linenos" aria-hidden="true">344</span>           <span class="sa">f</span><span class="s2">"平均 </span><span class="si">{</span><span class="nb">sum</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="s1">'s'</span><span class="p">]</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">ablated</span><span class="p">)</span><span class="o">/</span><span class="nb">len</span><span class="p">(</span><span class="n">ablated</span><span class="p">)</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> ms"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">345</span>     <span class="k">for</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">base</span><span class="p">,</span> <span class="n">ablated</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">346</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">a</span><span class="p">[</span><span class="s1">'kind'</span><span class="p">]</span><span class="si">:</span><span class="s2">&lt;6</span><span class="si">}</span><span class="s2"> 答案 </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="s1">'answer'</span><span class="p">])</span><span class="si">:</span><span class="s2">&lt;12</span><span class="si">}</span><span class="s2"> 原 </span><span class="si">{</span><span class="n">a</span><span class="p">[</span><span class="s1">'output'</span><span class="p">][:</span><span class="mi">14</span><span class="p">]</span><span class="si">:</span><span class="s2">&lt;16</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">347</span>               <span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="s1">'✓'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">a</span><span class="p">[</span><span class="s1">'hit'</span><span class="p">]</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'✗'</span><span class="si">}</span><span class="s2"> | 消融 </span><span class="si">{</span><span class="n">b</span><span class="p">[</span><span class="s1">'output'</span><span class="p">][:</span><span class="mi">14</span><span class="p">]</span><span class="si">:</span><span class="s2">&lt;16</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">348</span>               <span class="sa">f</span><span class="s2">" </span><span class="si">{</span><span class="s1">'✓'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">b</span><span class="p">[</span><span class="s1">'hit'</span><span class="p">]</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'✗'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">349</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  这是分析性消融：把 deepstack merger 的输出置零，其余保持官方配置；"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">350</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  修改后的模型不能称为官方配置，结论只用于说明注入点的作用。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">351</span>     <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"C"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"payload"</span><span class="p">:</span> <span class="n">payload</span><span class="p">,</span> <span class="s2">"total_bytes"</span><span class="p">:</span> <span class="n">total</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">352</span>                     <span class="s2">"deepstack_indexes"</span><span class="p">:</span> <span class="n">idxs</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">353</span>                     <span class="s2">"baseline"</span><span class="p">:</span> <span class="n">base</span><span class="p">,</span> <span class="s2">"ablated"</span><span class="p">:</span> <span class="n">ablated</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">354</span>                     <span class="s2">"baseline_hits"</span><span class="p">:</span> <span class="n">hb</span><span class="p">,</span> <span class="s2">"ablated_hits"</span><span class="p">:</span> <span class="n">ha</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">355</span>                     <span class="s2">"n"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">base</span><span class="p">)}</span>
+<span class="linenos" aria-hidden="true">356</span>     <span class="k">return</span> <span class="n">ctx</span> <span class="k">if</span> <span class="n">ctx</span> <span class="k">else</span> <span class="p">(</span><span class="n">d</span><span class="p">,</span> <span class="n">proc</span><span class="p">,</span> <span class="n">model</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">357</span> 
+<span class="linenos" aria-hidden="true">358</span> 
+<span class="linenos" aria-hidden="true">359</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">360</span>     <span class="n">ap</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">361</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"sections"</span><span class="p">,</span> <span class="n">nargs</span><span class="o">=</span><span class="s2">"*"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="p">[</span><span class="s2">"A"</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">362</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--n-ablate"</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">6</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">363</span>                     <span class="n">help</span><span class="o">=</span><span class="s2">"DeepStack 消融的样本数（read/count 各一半）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">364</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--outdir"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">expanduser</span><span class="p">(</span><span class="s2">"~/l46_out"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">365</span>     <span class="n">args</span> <span class="o">=</span> <span class="n">ap</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">366</span>     <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">outdir</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">367</span>     <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">args</span><span class="o">.</span><span class="n">sections</span><span class="p">]</span> <span class="ow">or</span> <span class="p">[</span><span class="s2">"A"</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">368</span>     <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"env"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"torch"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">369</span>                       <span class="s2">"transformers"</span><span class="p">:</span> <span class="nb">__import__</span><span class="p">(</span><span class="s2">"transformers"</span><span class="p">)</span><span class="o">.</span><span class="n">__version__</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">370</span>                       <span class="s2">"gpu"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_name</span><span class="p">(</span><span class="mi">0</span><span class="p">)}</span>
+<span class="linenos" aria-hidden="true">371</span>     <span class="n">ctx</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">372</span>     <span class="k">if</span> <span class="s2">"A"</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">373</span>         <span class="n">ctx</span> <span class="o">=</span> <span class="n">section_A</span><span class="p">(</span><span class="n">args</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">374</span>     <span class="k">if</span> <span class="s2">"B"</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">375</span>         <span class="n">ctx</span> <span class="o">=</span> <span class="n">section_B</span><span class="p">(</span><span class="n">args</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">376</span>     <span class="k">if</span> <span class="s2">"C"</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">377</span>         <span class="n">ctx</span> <span class="o">=</span> <span class="n">section_C</span><span class="p">(</span><span class="n">args</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">378</span>     <span class="n">path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">outdir</span><span class="p">,</span> <span class="s2">"vision_connector.json"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">379</span>     <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"w"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">380</span>         <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">SUMMARY</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="nb">str</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">381</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">已写出 </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">382</span>     <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">383</span> 
+<span class="linenos" aria-hidden="true">384</span> 
+<span class="linenos" aria-hidden="true">385</span> <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">386</span>     <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L4/vision_connector.py 全文（386 行）</code><a href="../code/labs/L4/vision_connector.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h3 id="_5">消融建议</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>先预测，再验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 段把主 merger 的 norm 换成 post-shuffle</td>
+<td>报错还是静默出错？为什么</td>
+</tr>
+<tr>
+<td>A 段去掉 <code>act_fn</code>（GELU）</td>
+<td>与官方输出的相对差会到多少？</td>
+</tr>
+<tr>
+<td>B 段把 batch 从 8 改成 16</td>
+<td>VL 的显存峰值会先撞到哪一项（权重/激活/KV）？</td>
+</tr>
+<tr>
+<td>B 段用 <code>torch.compile</code> 重跑 ViT</td>
+<td>24 层编码的时间能降多少？merger 呢？</td>
+</tr>
+<tr>
+<td>C 段把三个 DeepStack merger 的<strong>权重</strong>置零（而不是输出）</td>
+<td>与输出置零等价吗？为什么</td>
+</tr>
+<tr>
+<td>C 段只保留 layer 17 的注入</td>
+<td>任务命中会变成多少？（样本量小，需先加样本）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_6">原始现场</h2>
+<details>
+<summary>① 逐层特征清单与 merger 模块树</summary>
+<div class="highlight"><pre><span></span><code>  Qwen/Qwen3-VL-4B-Instruct 的 vision tower：depth 24、hidden 1024、intermediate 4096、heads 16
+  输出维度 2560（送入 LLM 的 hidden）、spatial_merge 2、DeepStack 注入层 [5, 11, 17]
+  patch_embed: Qwen3VLVisionPatchEmbed，merger: Qwen3VLVisionPatchMerger（use_postshuffle_norm=False），
+  deepstack_merger_list 3 个（use_postshuffle_norm=True）
+    merger.norm         LayerNorm (1024,)
+    merger.linear_fc1   Linear (4096, 4096)
+    merger.act_fn       GELU
+    merger.linear_fc2   Linear (2560, 4096)
+  输入：pixel_values (1200, 1536)，image_grid_thw [1, 30, 40] → 300 个视觉 token
+  patch_embed    (1200, 1024)  bfloat16  L2 14.036
+  block_0        (1200, 1024)  bfloat16  L2 21.994
+  block_5        (1200, 1024)  bfloat16  L2 13.698
+  deepstack_merger_0 (300, 2560) bfloat16 L2 9.199
+  block_23       (1200, 1024)  bfloat16  L2 924.513
+  merger         (300, 2560)   bfloat16  L2 18.465
+  tower 直接返回：last_hidden_state (1200, 1024)，deepstack_features 3 × (300, 2560)
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：<code>block_23</code> 的 L2（924.5）与 <code>patch_embed</code>（14.0）的对比；<code>merger</code> 的输入输出形状变化（1200×1024 → 300×2560）。</p>
+<p><strong>下一步观察</strong>：把图像换成分辨率更低的 320×240，哪些阶段的形状变化？L2 的分布会变吗？</p>
+<p>采集命令：<code>python labs/L4/vision_connector.py A</code>
+完整输出：<code>results/crater/4.6/20260913-connector/run-A.log</code></p>
+</details>
+<details>
+<summary>② merger 对拍与单 linear 反例</summary>
+<div class="highlight"><pre><span></span><code>  主 merger（use_postshuffle_norm=False）：输入 [1200,1024] → 输出 (300, 2560)
+    手写 norm→reshape→fc1→GELU→fc2：max|diff| 0.000e+00
+    用错误顺序（先拼再 norm）：RuntimeError: Given normalized_shape=[1024], expected input with shape [*, 1024]
+  DeepStack merger（use_postshuffle_norm=True）：手写 max|diff| 0.000e+00
+  若把 connector 简化成单个 linear（4096→2560）：
+    与官方输出的相对差 1.021
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：相对差 1.021——单 linear 与官方 connector 的输出<strong>完全不相关</strong>，这不是"近似"。</p>
+<p><strong>下一步观察</strong>：只去掉 <code>act_fn</code>（保留两层 linear 与 norm），相对差是多少？</p>
+<p>采集命令：<code>python labs/L4/vision_connector.py A</code>
+完整输出：<code>results/crater/4.6/20260913-connector/run-A.log</code></p>
+</details>
+<details>
+<summary>③ 分段成本扫描（3 分辨率 × batch）</summary>
+<div class="highlight"><pre><span></span><code>  small_320x240   B=1  token 80     processor 1.03 ms  ViT 13.11  merger 0.09  LLM 10.28  完整 23.39 ms  峰值 8548 MiB
+  small_320x240   B=8  token 640    processor 3.71 ms  ViT 18.04  merger 0.20  LLM 42.30  完整 60.34 ms  峰值 8868 MiB
+  mid_640x480     B=1  token 300    processor 1.46 ms  ViT  9.90  merger 0.12  LLM 22.79  完整 32.69 ms  峰值 8657 MiB
+  mid_640x480     B=8  token 2400   processor 10.45 ms ViT 58.97  merger 0.68  LLM 115.57 完整 174.54 ms 峰值 9724 MiB
+  large_1280x720  B=1  token 880    processor 4.57 ms  ViT 25.68  merger 0.27  LLM 48.67  完整 74.35 ms  峰值 8963 MiB
+  large_1280x720  B=8  token 7040   processor 34.84 ms ViT 207.95 merger 1.78  LLM 349.48 完整 557.42 ms 峰值 11999 MiB
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：merger 一列始终是 ViT 的 1–2%；processor 的扩展性接近线性（CPU 逐图独立），ViT 与 LLM 在高 batch 下降。</p>
+<p><strong>下一步观察</strong>：把底图换成 1920×1080，视觉 token 与完整请求时间各是多少？会撞到 <code>max_pixels</code> 的上界吗？</p>
+<p>采集命令：<code>python labs/L4/vision_connector.py B</code>
+完整输出：<code>results/crater/4.6/20260913-connector/run-BC.log</code></p>
+</details>
+<details>
+<summary>④ DeepStack 载荷与消融</summary>
+<div class="highlight"><pre><span></span><code>  DeepStack 注入层（vision 侧）[5, 11, 17] → LLM 侧前 3 层（_deepstack_process 按 index 取用）
+  载荷                         形状             dtype      字节
+  deepstack_0_layer5         (300, 2560)      bfloat16   1.465 MiB
+  deepstack_1_layer11        (300, 2560)      bfloat16   1.465 MiB
+  deepstack_2_layer17        (300, 2560)      bfloat16   1.465 MiB
+  main_merger                (1200, 1024)     bfloat16   2.344 MiB
+  单张 640×480 图的视觉特征总载荷 6.738 MiB
+
+  原模型 6/6 命中，平均 82 ms
+  去掉 DeepStack 注入 5/6 命中，平均 78 ms
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：主出口 1200×1024（merger 前）与三个 DeepStack 出口 300×2560（merger 后）——<strong>载荷的序列长度不同</strong>，缓存时必须分开存。</p>
+<p><strong>下一步观察</strong>：把 4 个张量全部缓存下来，第二张相同图片的端点延迟能省多少？（需要 4.8 的缓存实验）</p>
+<p>采集命令：<code>python labs/L4/vision_connector.py C</code>
+完整输出：<code>results/crater/4.6/20260913-connector/run-BC.log</code></p>
+</details>
+<hr />
+<h2 id="_7">前沿</h2>
+<p><strong>视觉 token 的数量与长度正在成为服务的第一约束。</strong> 本章实测 1280×720 的图给出 880 个视觉 token（B=1），完整请求 74 ms；B=8 时 7040 token、557 ms、峰值 12.0 GiB。视觉 token 与文本 token 在 LLM 里是同一种序列，因此<strong>图像的分辨率选择直接与文本上下文竞争</strong>——这解释了 4.5 的预算曲线为什么在服务端是准入控制问题，而不只是预处理参数。</p>
+<p><strong>DeepStack 这类"多层特征注入"把缓存载荷从 1 个张量变成 4 个。</strong> 主出口是 merger 前的 1200×1024，三个注入点是 merger 后的 300×2560，合起来 6.74 MiB/图（bf16）。它们的序列长度、注入层、dtype 都不同，缓存键必须覆盖模型 revision、processor 配置、图像内容与分辨率（4.8 会给出实现）。<strong>"视觉特征是一个向量"这个直觉在这里失效了。</strong></p>
+<p><strong>压缩发生在最后一步，但代价在整个塔。</strong> merger 只占 ViT 时间的 1.2%，24 层编码占了 98.8%。想省视觉成本，三个杠杆的优先级是：减少送进塔的 patch（分辨率/裁剪）&gt; 用更小的塔或更少的层 &gt; 优化 connector。这个次序与"connector 是瓶颈"的直觉相反，值得在设计阶段先用分段计时确认。</p>
+<hr />
+<h2 id="_8">陷阱</h2>
+<ol>
+<li><strong>connector 不是"一个 linear"。</strong> 用 4096→2560 的单层 linear 代替官方 merger，输出相对差 <strong>1.021</strong>（完全不相关）。</li>
+<li><strong>两类 merger 的 norm 位置不同</strong>：主体 <code>use_postshuffle_norm=False</code>（先 norm 1024，再拼 4096）、DeepStack <code>True</code>（先拼 4096，再 norm）。写反了会报形状错。</li>
+<li><strong>merger 是"降长度、升维度"</strong>：1200×1024 → 300×2560。token 数少 4×，单 token 维度升到 2560。</li>
+<li><strong>merger 只占 ViT 的 1.2%</strong>（0.12/9.90 ms）。优化它几乎没有收益。</li>
+<li><strong>视觉塔的激活幅度会涨到很大</strong>（block_23 的 L2 = 924.5，是 patch_embed 的 66 倍）；不要用前几层的尺度去估计后面。</li>
+<li><strong>tower 的返回值里有三个字段</strong>（<code>last_hidden_state</code>、<code>pooler_output</code>、<code>deepstack_features</code>），主出口在 <code>pooler_output</code> 而不是 <code>last_hidden_state</code>。</li>
+<li><strong>DeepStack 的载荷序列长度与主出口不同</strong>（300 vs 1200），缓存不能用一个张量概括。</li>
+<li><strong>注入是"在视觉位置上相加"</strong>，不是替换；文本位置的 hidden 不受影响。</li>
+<li><strong>首次调用的冷启动会污染计时</strong>：本章第一次未预热时 ViT 显示 238 ms，预热后是 9.9 ms（24×）。分段计时必须先预热。</li>
+<li><strong>峰值显存随 batch 增长</strong>（9724 → 11999 MiB），权重（≈8.4 GiB）只是底。</li>
+<li><strong>batch 的扩展性各阶段不同</strong>（processor 7.2×、ViT 6.0×、LLM 5.1×，B=1→8），不能用"线性"估容量。</li>
+<li><strong>合成 6 张图上的 6/6 vs 5/6 不是质量结论</strong>；样本量、任务集与评测协议都不足以下结论。</li>
+</ol>
+<hr />
+<h2 id="_9">自测题</h2>
+<details>
+<summary>1. 一张 640×480 的图，视觉塔的输入序列多长、输出多长、维度怎么变？</summary>
+<p>4.5 的规则给出 grid [1, 30, 40] → patch 数 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>30</mn><mo>&#x000D7;</mo><mn>40</mn><mo>&#x0003D;</mo><mn>1200</mn></mrow></math></span>。</p>
+<ul>
+<li><strong>输入</strong>：1200 个 patch，每个 1024 维（<code>patch_size=16</code> 切块后有 256 个像素 × 3 通道 × temporal 2 = 1536，经 patch_embed 的卷积投到 1024 维，见 A 段 <code>pixel_values (1200,1536)</code>）。</li>
+<li><strong>塔内</strong>：24 层，宽度不变（1200×1024），L2 从 14.0 涨到 924.5。</li>
+<li><strong>输出</strong>：</li>
+<li><code>last_hidden_state</code> = (1200, 1024)：merger <strong>之前</strong>；</li>
+<li><code>pooler_output</code> = (300, 2560)：merger 之后，<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1200</mn><mo>&#x0002F;</mo><msup><mn>2</mn><mn>2</mn></msup><mo>&#x0003D;</mo><mn>300</mn></mrow></math></span>，维度投到 LLM 的 2560；</li>
+<li><code>deepstack_features</code> = 3 × (300, 2560)：第 5/11/17 层的 merger 输出。</li>
+</ul>
+<p>所以"视觉 token 数 = 300"说的是<strong>进入 LLM 的长度</strong>；塔内部的序列长度是 1200，两者差 4 倍。</p>
+</details>
+<details>
+<summary>2. 为什么说"connector 是一个 linear"是错的？用本章的数字说明。</summary>
+<p>本章的 merger（<code>modeling_qwen3_vl.py:174-187</code>）是 <code>LayerNorm → Linear(4096,4096) → GELU → Linear(4096,2560)</code>。用它和"把 4 个 patch 拼起来过一个 4096→2560 linear"对照，同一个随机输入上：</p>
+<ul>
+<li>官方 vs 手写完整 merger：<strong>max|diff| = 0.000e+00</strong>（同权重同顺序，逐位一致）；</li>
+<li>官方 vs 单个 linear：<strong>相对差 1.021</strong>（量级 1 = 完全不相关）。</li>
+</ul>
+<p>也就是说，单 linear 连"近似"都算不上。原因有三：LayerNorm 决定了每个 token 的尺度；两层线性加 GELU 提供了非线性与更大的容量；4096→4096→2560 的瓶颈结构与直接 4096→2560 是不同的映射。</p>
+<p>另外别忘了 norm 的位置：主体 merger 的 norm 作用在拼接<strong>前</strong>的 1024 维上，DeepStack 的 norm 作用在拼接<strong>后</strong>的 4096 维上。把它当成一个 linear，连"输入维度"这件事都说不清。</p>
+</details>
+<details>
+<summary>3. 视觉塔里最该优化的是哪一步？用分段计时回答。</summary>
+<p>按"占 ViT 时间比例"排序（640×480、B=1）：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th style="text-align: right;">时间</th>
+<th style="text-align: right;">占 ViT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>24 层编码</td>
+<td style="text-align: right;">≈9.78 ms</td>
+<td style="text-align: right;">98.8%</td>
+</tr>
+<tr>
+<td>merger</td>
+<td style="text-align: right;">0.12 ms</td>
+<td style="text-align: right;">1.2%</td>
+</tr>
+</tbody>
+</table>
+<p>所以优化的次序是：</p>
+<ol>
+<li><strong>少送 patch</strong>（降分辨率、裁剪、区域选择）——直接减少塔内的序列长度与 LLM 的 token 数，两个阶段同时受益；</li>
+<li><strong>换更小/更浅的塔</strong>——1.2% 之外的 98.8% 全在这里；</li>
+<li><strong>优化 connector</strong>——上限只有 1.2%。</li>
+</ol>
+<p>这与"connector 是瓶颈"的直觉相反。注意这个结论依赖分辨率与 batch：如果将来 connector 变复杂（例如多层融合），它的占比会变，必须先测再优化。</p>
+</details>
+<details>
+<summary>4. DeepStack 给缓存带来了什么额外要求？</summary>
+<p>它把"一份视觉特征"变成<strong>四个形状不同的张量</strong>：</p>
+<div class="highlight"><pre><span></span><code>deepstack_0_layer5   (300, 2560)   1.465 MiB   ← merger 之后
+deepstack_1_layer11  (300, 2560)   1.465 MiB
+deepstack_2_layer17  (300, 2560)   1.465 MiB
+main_merger          (1200, 1024)  2.344 MiB   ← merger 之前
+合计 6.738 MiB（640×480，bf16）
+</code></pre></div>
+
+<p>三个要求：</p>
+<ol>
+<li><strong>必须整组存取</strong>：只缓存主出口会让 LLM 前 3 层缺少注入，输出与官方配置不同。</li>
+<li><strong>键要包含模型与配置</strong>：<code>deepstack_visual_indexes</code>、<code>out_hidden_size</code>、merge 大小都在 config 里；换 revision 就是另一份载荷。</li>
+<li><strong>不能按"视觉 token 数 × 维度"估算字节</strong>：主出口的序列长度是 1200 而不是 300，按 300 估算会少算 5.4 MiB。</li>
+</ol>
+<p>这三点直接决定 4.8 的 feature cache 的键与容量预算。</p>
+</details>
+<details>
+<summary>5. 你测出第一次调用的 ViT 用了 238 ms，预热后是 9.9 ms。差在哪？</summary>
+<p>第一次调用包含了一次性成本，且这些成本不属于稳态：</p>
+<ul>
+<li><strong>CUDA kernel 的首次装载/JIT</strong>（Triton/FlashInfer 的 autotune、cuBLAS 的 kernel 选择）；</li>
+<li><strong>分配器首次扩张</strong>：显存池从零开始建立；</li>
+<li><strong>权重首次被读取</strong>（从 CPU/磁盘到 GPU 的拷贝若还没发生）；</li>
+<li><strong>Python/框架的首次路径</strong>（缓存、懒初始化）。</li>
+</ul>
+<p>本章的 B 段因此在计时前跑了一次完整的 <code>model(**inputs)</code> 预热，第一格从 238 ms 降到 13.1 ms（320×240 的 ViT）。</p>
+<p>工程含义：<strong>任何分段计时都必须先预热</strong>，并明确"预热几次"；服务容量规划关心的是稳态，冷启动是另一个单独的指标（8.7）。</p>
+</details>
+<details>
+<summary>6. 为什么"注入"用加法而不是拼接或替换？这对缓存意味着什么？</summary>
+<p><code>_deepstack_process</code>（<code>modeling_qwen3_vl.py:861</code>）在<strong>视觉位置</strong>上把 DeepStack 特征加到 hidden states 上，文本位置不动。用加法的好处是：</p>
+<ul>
+<li><strong>序列长度不变</strong>：拼接会让 LLM 的序列变长（300→600），attention 成本与 KV cache 都要跟着变；</li>
+<li><strong>与残差结构同构</strong>：LLM 本来就是"层层相加"的结构，把视觉中间层当成一路残差注入是最自然的做法；</li>
+<li><strong>掩码即可控制</strong>：用 <code>visual_pos_masks</code> 选出位置，实现上不需要重排序列。</li>
+</ul>
+<p>对缓存的要求：只要缓存<strong>视觉位置</strong>的张量（不用管文本位置），但四个张量的序列长度不同（主出口 1200、注入点 300），所以"按位置切片"这件事必须分别处理——这也是 4.8 缓存实现里最容易错的地方。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L4/4.5-vlm.html">&#8592; 4.5 VLM（一）：图像与视频预处理</a><a class="nav-next" href="../L4/4.7-vlm-sequence-position-mask.html">4.7 VLM（三）：多模态序列、位置编码与 mask &#8594;</a></nav>
+</main>
+</body>
+</html>

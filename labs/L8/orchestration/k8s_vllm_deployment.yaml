@@ -1,0 +1,70 @@
+# 8.2-C: 一个单副本 vLLM worker 的 Kubernetes 映射（未在真实集群上运行）。
+#
+# 每个字段都对应本机真实测到的一个阶段（见 results/crater2/8.2/summary_A_*.json）：
+#   Qwen3-1.7B 冷启动 46.1 s 就绪，其中进程存在但不可服务的窗口 36.8 s；
+#   热启动 27.1 s。因此 startupProbe 的容忍窗口必须覆盖冷启动，而不是只覆盖权重加载。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-qwen3-1p7b
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0        # 先起新的再停旧的：与 8.2-B 的"排空后重启"同语义
+      maxSurge: 1
+  selector:
+    matchLabels: {app: vllm-qwen3}
+  template:
+    metadata:
+      labels:
+        app: vllm-qwen3
+        # 只有 TP>1 时才需要 PodGroup；单副本不要带这个标签，否则会被 coscheduling 插件
+        # 当成"必须整组调度"而阻塞（见 kubernetes-sigs/scheduler-plugins/pkg/coscheduling）。
+        # scheduling.x-k8s.io/pod-group: vllm-tp2
+    spec:
+      # 排空时间要大于"最长在途请求 + 引擎自身退出时间"，否则 SIGKILL 会丢在途请求。
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.29.0
+          args:
+            - "--model=Qwen/Qwen3-1.7B"
+            - "--port=8000"
+            - "--max-model-len=8192"
+            - "--gpu-memory-utilization=0.85"
+          ports: [{containerPort: 8000}]
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          # startupProbe：在它就绪之前，readiness/liveness 都不生效。
+          # failureThreshold × periodSeconds 必须 > 冷启动到可服务的时间（实测 46.1 s），
+          # 否则容器会在编译/图捕获阶段被判死并反复重启。
+          startupProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 5
+            failureThreshold: 60      # 300 s 容忍窗口
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                # 摘流量与进程退出之间留出排空窗口；kubelet 在 preStop 返回后才发 SIGTERM。
+                command: ["/bin/sh", "-c", "sleep 20"]
+---
+# 网关侧的就绪边界：只有 readinessProbe 通过的 pod 才会进 Endpoints，
+# 这与 8.2-A 的三级探针是同一件事——"进程活着"和"能被路由"必须是两个判据。
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-qwen3
+spec:
+  selector: {app: vllm-qwen3}
+  ports: [{name: http, port: 80, targetPort: 8000}]

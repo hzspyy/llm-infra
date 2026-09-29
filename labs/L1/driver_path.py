@@ -202,6 +202,136 @@ def main() -> None:
                                "clock_ticks_per_second": HZ,
                                "interpretation": "CPU time accounting, not syscall tracing"}
 
+    # ---- G. 提交方式：逐次同步 / 批量提交 / CUDA Graph ----
+    # 三者提交的是**同一组微小 kernel**，差别只在「什么时候等 GPU」。
+    # 要分开的三笔成本：CPU 提交、GPU 执行、GPU 空闲（等 CPU 或等同步）。
+    print("\n[G] 提交方式对照（同一组微小 kernel，N=2000）")
+
+    def ctxt_switches() -> dict:
+        out = {}
+        for line in open(f"/proc/{os.getpid()}/status"):
+            if line.startswith(("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")):
+                k, _, v = line.partition(":")
+                out[k.strip()] = int(v)
+        return out
+
+    def per_kernel_device_us(n: int = 200) -> float:
+        """单次 kernel 的 GPU 侧耗时（event 测，不含 CPU 提交）。"""
+        torch.cuda.synchronize()
+        a, b = torch.cuda.Event(True), torch.cuda.Event(True)
+        a.record()
+        for _ in range(n):
+            small.add_(1.0)
+        b.record()
+        torch.cuda.synchronize()
+        return a.elapsed_time(b) * 1000 / n
+
+    def run_mode(mode: str, n: int = 2000) -> dict:
+        torch.cuda.synchronize()
+        gaps = []
+        c0 = ctxt_switches()
+        submit_s = None
+        capture_ms = None
+        grabj = None
+        if mode == "graph":
+            # 捕获本身成本很高，但它不属于「执行」——必须挡在计时之外。
+            t_cap = time.perf_counter()
+            grabj = torch.cuda.CUDAGraph()
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(n):
+                    small.add_(1.0)
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+            with torch.cuda.graph(grabj):
+                for _ in range(n):
+                    small.add_(1.0)
+            capture_ms = (time.perf_counter() - t_cap) * 1e3
+
+        torch.cuda.synchronize()
+        e_start, e_end = torch.cuda.Event(True), torch.cuda.Event(True)
+        wall0 = time.perf_counter()
+        e_start.record()
+        if mode == "per-submit":
+            for _ in range(n):
+                t = time.perf_counter()
+                small.add_(1.0)
+                torch.cuda.synchronize()          # 每次提交后立刻等
+                gaps.append((time.perf_counter() - t) * 1e6)
+        elif mode == "batch":
+            t_sub = time.perf_counter()
+            prev = None
+            for _ in range(n):
+                now = time.perf_counter()
+                if prev is not None:
+                    gaps.append((now - prev) * 1e6)
+                prev = now
+                small.add_(1.0)
+            submit_s = time.perf_counter() - t_sub
+        elif mode == "graph":
+            t_sub = time.perf_counter()
+            grabj.replay()
+            submit_s = time.perf_counter() - t_sub
+        e_end.record()
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - wall0
+        device_span = e_start.elapsed_time(e_end)
+        c1 = ctxt_switches()
+        dev_us = per_kernel_device_us()
+        busy_ms = dev_us * n / 1000
+        if mode == "graph":
+            del grabj
+        # 「GPU 忙」的口径随提交方式而变，必须说清楚：
+        #   batch / graph：提交后没有 CPU 插手，设备跨度就是执行时间；
+        #   per-submit：设备跨度里混着等 CPU 往返的空隙，纯执行时间只能用
+        #               单独测的单 kernel 设备时间 × N 估。
+        # 用 eager 的单 kernel 时间去估 graph 会得到「空闲为负」的荒谬值
+        # （graph 里每个 kernel 的设备时间本来就比 eager 低，见 [C] 段）。
+        busy_ms = device_span if mode in ("batch", "graph") else dev_us * n / 1000
+        return {
+            "mode": mode, "n": n, "wall_ms": round(wall * 1e3, 2),
+            "submit_ms": None if submit_s is None else round(submit_s * 1e3, 2),
+            "capture_ms": None if capture_ms is None else round(capture_ms, 2),
+            "device_busy_ms": round(busy_ms, 2),
+            "device_span_ms": round(device_span, 2),
+            "eager_busy_ms": round(dev_us * n / 1000, 2),
+            "per_kernel_effective_us": round(busy_ms * 1000 / n, 3),
+            "gpu_idle_ms": round(wall * 1e3 - busy_ms, 2),
+            "gpu_idle_frac": round((wall * 1e3 - busy_ms) / (wall * 1e3), 3),
+            "eager_per_kernel_us": round(dev_us, 3),
+            "ctxt_switches": {k: c1[k] - c0.get(k, 0) for k in c1},
+            "gap_us": {
+                "n": len(gaps),
+                "median": round(statistics.median(gaps), 2) if gaps else None,
+                "p99": round(sorted(gaps)[int(len(gaps) * 0.99)], 2) if gaps else None,
+                "max": round(max(gaps), 2) if gaps else None,
+                "gt_100us": sum(1 for g in gaps if g > 100),
+            },
+        }
+
+    print("    GPU忙：batch/graph 用设备跨度（提交后没有 CPU 插手）；"
+          "per-submit 用单独测的单 kernel 设备时间 × N。")
+    print(f"    {'方式':>12} {'墙钟ms':>9} {'提交ms':>9} {'GPU忙ms':>9} "
+          f"{'设备跨度':>9} {'GPU空闲':>9} {'空闲占比':>8} {'每kernelµs':>10} "
+          f"{'提交间隔中位µs':>14} {'>100µs':>7} {'换出':>5}")
+    g_rows = []
+    for mode in ("per-submit", "batch", "graph"):
+        r = run_mode(mode)
+        g_rows.append(r)
+        nv = r["ctxt_switches"].get("nonvoluntary_ctxt_switches", 0)
+        sub = "-" if r["submit_ms"] is None else f"{r['submit_ms']:.2f}"
+        print(f"    {mode:>12} {r['wall_ms']:>9.2f} {sub:>9} "
+              f"{r['device_busy_ms']:>9.2f} {r['device_span_ms']:>9.2f} "
+              f"{r['gpu_idle_ms']:>9.2f} "
+              f"{r['gpu_idle_frac']:>8.1%} {r['per_kernel_effective_us']:>10.3f} "
+              f"{str(r['gap_us']['median']):>14} "
+              f"{r['gap_us']['gt_100us']:>7} {nv:>5}")
+    res["G_submit_modes"] = g_rows
+    print("    读法：per-submit 的墙钟里大部分是同步往返；batch 把提交压到一次；")
+    print("          graph 的 replay 提交只要一次调用，但执行仍受设备侧约束。")
+    print("          捕获成本（graph）单独记在 capture_ms，不计入墙钟。")
+
     if args.out:
         Path(args.out).write_text(json.dumps(res, indent=2, ensure_ascii=False) + "\n",
                                   encoding="utf-8")

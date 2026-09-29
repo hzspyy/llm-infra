@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.7 实时闭环的延迟预算</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">1.7</div>
+  <div class="sidebar-title">实时闭环的延迟预算</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：年龄与延迟不是一回事</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#_4">定义先对齐：五个事件、两个时间量</a></li>
+<li><a href="#p50-p95">抖动：把 p50 挪一点，把 p95 挪很多</a></li>
+<li><a href="#_5">排队：容量换的是有效动作率</a></li>
+<li><a href="#deadline">deadline：一个悬崖，不是一条斜坡</a></li>
+<li><a href="#action-chunk">action chunk：用新鲜度换计算次数</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 源码解析</a><ul>
+<li><a href="#_7">事件与时钟：为什么必须校准</a></li>
+<li><a href="#deadline-join">控制循环：deadline 是 join 的超时</a></li>
+<li><a href="#_8">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_9">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_10">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：年龄与延迟不是一回事</a></li>
+<li><a href="#_3">机制拆解</a><ul>
+<li><a href="#_4">定义先对齐：五个事件、两个时间量</a></li>
+<li><a href="#p50-p95">抖动：把 p50 挪一点，把 p95 挪很多</a></li>
+<li><a href="#_5">排队：容量换的是有效动作率</a></li>
+<li><a href="#deadline">deadline：一个悬崖，不是一条斜坡</a></li>
+<li><a href="#action-chunk">action chunk：用新鲜度换计算次数</a></li>
+</ul>
+</li>
+<li><a href="#_6">工程实现 · 源码解析</a><ul>
+<li><a href="#_7">事件与时钟：为什么必须校准</a></li>
+<li><a href="#deadline-join">控制循环：deadline 是 join 的超时</a></li>
+<li><a href="#_8">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_9">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_10">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L1 · 硬件与操作系统</div>
+  <div class="mod-id">1.7</div>
+  <h1>实时闭环的延迟预算</h1>
+  <p class="lede">构建传感器、预处理、模型、通信、控制与执行的完整时间线，在 deadline 与动作质量约束下分析尾延迟、抖动、排队和过期动作。</p>
+  <div class="chips"><span class="chip">实测机器 jetson-64 (Jetson AGX Orin 64GB) + crater（时序逻辑对照）</span><span class="chip">前置 L1.4（计时与同步）· L1.6（端侧推理）· L5.1（prefill 与 decode）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li>输入年龄与处理时延有什么区别？</li>
+<li>排队和抖动如何造成 deadline miss？</li>
+<li>action chunk 怎样与控制频率协调？</li>
+</ol>
+<p>上一章测的是「推理要多久」。闭环系统关心的是<strong>决策时刻手上的输入有多旧</strong>，
+以及这个年龄的<strong>分布</strong>能不能落进控制周期里。本章把一条最小闭环
+（采样 → 入队 → 推理 → 动作取用/丢弃）拆成可观测事件，用 Jetson 上真实的
+<code>llama.cpp</code> 推理作为负载，测频率、队列容量、过期策略、抖动与 action chunk。</p>
+<hr />
+<h2 id="_2">心智模型：年龄与延迟不是一回事</h2>
+<figure>
+
+
+<svg viewBox="0 0 740 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="闭环时间线：输入年龄与处理时延">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="18" font-size="12.5" font-weight="600">一个控制周期里发生了什么</text>
+
+    <!-- sample -->
+    <line x1="40" y1="70" x2="700" y2="70" stroke="currentColor" stroke-width="1" opacity="0.4"/>
+    <circle cx="90" cy="70" r="4" fill="currentColor"/>
+    <text x="66" y="56" font-size="10.5">采样 t₀</text>
+    <circle cx="200" cy="70" r="4" fill="currentColor"/>
+    <text x="180" y="56" font-size="10.5">入队</text>
+    <circle cx="270" cy="70" r="4" fill="currentColor"/>
+    <text x="250" y="56" font-size="10.5">推理开始</text>
+    <circle cx="470" cy="70" r="4" fill="currentColor"/>
+    <text x="446" y="56" font-size="10.5">推理结束</text>
+    <circle cx="560" cy="70" r="4" fill="currentColor"/>
+    <text x="540" y="56" font-size="10.5">动作取用</text>
+
+    <!-- age bar -->
+    <rect x="90" y="78" width="470" height="16" fill="currentColor" opacity="0.55"/>
+    <text x="325" y="90" text-anchor="middle" font-size="10" fill="var(--bg)">输入年龄 age = t_use − t₀</text>
+    <!-- latency bar -->
+    <rect x="270" y="100" width="200" height="16" fill="currentColor" opacity="0.3"/>
+    <text x="370" y="112" text-anchor="middle" font-size="10">处理时延 latency = t_end − t_start</text>
+    <!-- queue wait -->
+    <rect x="200" y="122" width="70" height="16" fill="currentColor" opacity="0.18"/>
+    <text x="235" y="134" text-anchor="middle" font-size="9.5">排队</text>
+
+    <!-- deadline -->
+    <line x1="430" y1="52" x2="430" y2="150" stroke="currentColor" stroke-width="1.6" stroke-dasharray="5 4"/>
+    <text x="436" y="164" font-size="10.5" font-weight="600">deadline = 周期起点 + 预算</text>
+
+    <line x1="12" y1="182" x2="728" y2="182" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+    <text x="12" y="204" font-size="12" font-weight="600">三个结论（Orin 实测）</text>
+    <text x="12" y="226" font-size="11">① deadline 落在推理耗时两侧时，有效动作率在 <tspan font-weight="600">0.96 ↔ 0.00</tspan> 之间跳变——中间没有平滑过渡</text>
+    <text x="12" y="246" font-size="11">② 队列容量换的是<tspan font-weight="600">有效动作率</tspan>，代价是<tspan font-weight="600">输入年龄</tspan>（FIFO p50 143 ms vs latest 62 ms）</text>
+    <text x="12" y="266" font-size="11">③ action chunk 让计算变少，但动作变旧：chunk 1/4/8 的年龄 p50 是 <tspan font-weight="600">63 / 204 / 402 ms</tspan></text>
+    <text x="12" y="288" font-size="10.5" opacity="0.8">年龄包含排队与抖动；把各段均值相加永远得不到年龄的分位数。</text>
+  </g>
+</svg>
+
+
+<figcaption>输入年龄、处理时延、排队与 deadline 的关系；数字为本章实测。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解</h2>
+<h3 id="_4">定义先对齐：五个事件、两个时间量</h3>
+<p><code>labs/L1/closed_loop_budget.py</code> 把闭环拆成五个事件，全部打在同一时钟域
+（同一进程用 <code>time.monotonic()</code>，跨进程先做偏移校准）：</p>
+<table>
+<thead>
+<tr>
+<th>事件</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>enqueue</code></td>
+<td>采样值进入队列（记录采样时刻 <code>t_sampled</code> 与队列深度）</td>
+</tr>
+<tr>
+<td><code>infer_start</code></td>
+<td>某条输入被选中并开始推理（同时记录排队年龄）</td>
+</tr>
+<tr>
+<td><code>infer_end</code></td>
+<td>推理返回（记录服务端/客户端延迟）</td>
+</tr>
+<tr>
+<td><code>action_use</code></td>
+<td>动作在某个控制周期被取用（记录 <code>age_ms</code>）</td>
+</tr>
+<tr>
+<td><code>action_drop</code> / <code>action_none</code> / <code>deadline_miss</code></td>
+<td>丢弃、本周期无输入、动作没赶上 deadline</td>
+</tr>
+</tbody>
+</table>
+<p>两个时间量的区别是整个章节的支点：</p>
+<ul>
+<li><strong>处理时延</strong> <code>latency = infer_end − infer_start</code>：模型/引擎有多快。</li>
+<li><strong>输入年龄</strong> <code>age = action_use − t_sampled</code>：决策时手上的数据有多旧。
+  它包含<strong>采样抖动 + 排队 + 推理 + chunk 复用</strong>四段。</li>
+</ul>
+<p>只优化第一个量会把第二个量养大：推理更快 ⇒ 队列排空更快 ⇒ 但如果策略是
+FIFO，动作可能来自更早的样本。<strong>闭环的 SLO 必须写在年龄上，不是写在时延上。</strong></p>
+<h3 id="p50-p95">抖动：把 p50 挪一点，把 p95 挪很多</h3>
+<p>固定 <code>freq=10 Hz、queue=4、policy=latest</code>，只改采样抖动（均匀分布，±j 毫秒）：</p>
+<table>
+<thead>
+<tr>
+<th>抖动</th>
+<th>有效动作率</th>
+<th>输入年龄 p50</th>
+<th>输入年龄 p95</th>
+<th>丢弃（latest）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 ms</td>
+<td>1.000</td>
+<td>45.1 ms</td>
+<td>50.1 ms</td>
+<td>0</td>
+</tr>
+<tr>
+<td>5 ms</td>
+<td>0.993</td>
+<td>46.7 ms</td>
+<td>339.9 ms</td>
+<td>126</td>
+</tr>
+<tr>
+<td>20 ms</td>
+<td>0.993</td>
+<td>63.0 ms</td>
+<td>431.9 ms</td>
+<td>92</td>
+</tr>
+<tr>
+<td>50 ms</td>
+<td>0.993</td>
+<td>98.4 ms</td>
+<td><strong>330.5 ms</strong></td>
+<td>72</td>
+</tr>
+</tbody>
+</table>
+<p><strong>抖动只把 p50 挪了几十毫秒，却把 p95 从 50 ms 推到 340–430 ms。</strong>
+原因是 <code>latest</code> 策略在抖动下会偶尔选到「上一个周期剩下的那条」：
+采样提前到达时它被立刻取用（年龄小），采样迟到时只能等下一个周期（年龄大）。
+均值/中位数看不见这件事，<strong>只看 p50 的调参会把尾延迟留给现场</strong>。</p>
+<h3 id="_5">排队：容量换的是有效动作率</h3>
+<p>固定 <code>freq=10 Hz、jitter=20 ms</code>，扫描队列容量与策略：</p>
+<table>
+<thead>
+<tr>
+<th>队列</th>
+<th>策略</th>
+<th>有效动作率</th>
+<th>年龄 p50</th>
+<th>年龄 p95</th>
+<th>丢弃原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>任意</td>
+<td>0.760–0.767</td>
+<td>54.9–56.9 ms</td>
+<td>134.5–136.4 ms</td>
+<td><code>queue_full</code> 36–37</td>
+</tr>
+<tr>
+<td>4</td>
+<td>FIFO</td>
+<td>0.993</td>
+<td><strong>142.9 ms</strong></td>
+<td>166.0 ms</td>
+<td>—</td>
+</tr>
+<tr>
+<td>4</td>
+<td>latest</td>
+<td>0.993</td>
+<td><strong>62.2 ms</strong></td>
+<td>430.7 ms</td>
+<td><code>latest</code> 91</td>
+</tr>
+<tr>
+<td>4</td>
+<td>drop-stale</td>
+<td>0.993</td>
+<td>62.6 ms</td>
+<td>431.4 ms</td>
+<td><code>drop-stale</code> 92</td>
+</tr>
+<tr>
+<td>16</td>
+<td>FIFO</td>
+<td>0.993</td>
+<td>142.5 ms</td>
+<td>165.1 ms</td>
+<td>—</td>
+</tr>
+<tr>
+<td>16</td>
+<td>latest</td>
+<td>0.993</td>
+<td>62.6 ms</td>
+<td>431.7 ms</td>
+<td><code>latest</code> 92</td>
+</tr>
+</tbody>
+</table>
+<p>三条读法：</p>
+<ol>
+<li><strong>容量 1 会丢输入</strong>：推理占用期间到达的样本被直接丢弃，有效动作率掉到 0.76。
+   端侧设备上这是常见配置（省内存），代价是控制指令的更新率下降。</li>
+<li><strong>队列 4 与 16 没有区别</strong>：<code>latest</code> 会在每个周期把多余的丢掉，
+   所以容量超过「一个控制周期内可能到达的样本数」就不再有收益。
+   <strong>队列不是越大越好，它是策略的输入。</strong></li>
+<li><strong>FIFO 的年龄高而尾部长</strong>（p50 143 ms / p95 166 ms），<code>latest</code> 相反
+   （62 ms / 431 ms）。两者不是「谁更好」，而是<strong>面向不同的失败模式</strong>：
+   FIFO 保证顺序、延迟稳定；<code>latest</code> 保证新鲜度、但偶尔很旧。</li>
+</ol>
+<h3 id="deadline">deadline：一个悬崖，不是一条斜坡</h3>
+<p>真实推理负载（Jetson + llama.cpp Q4_K_M），固定 <code>jitter=20 ms、queue=4、latest</code>，
+只改 deadline：</p>
+<table>
+<thead>
+<tr>
+<th>负载</th>
+<th>推理耗时 p50</th>
+<th>deadline</th>
+<th>有效动作率</th>
+<th>deadline miss 率</th>
+<th>年龄 p50</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>32 token</td>
+<td>~450 ms</td>
+<td>200 ms</td>
+<td>0.016</td>
+<td><strong>0.976</strong></td>
+<td>190 ms</td>
+</tr>
+<tr>
+<td>32 token</td>
+<td>~450 ms</td>
+<td>400 ms</td>
+<td>0.000</td>
+<td><strong>0.984</strong></td>
+<td>—（无动作）</td>
+</tr>
+<tr>
+<td>32 token</td>
+<td>~450 ms</td>
+<td>800 ms</td>
+<td>0.984</td>
+<td>0.000</td>
+<td>491 ms</td>
+</tr>
+<tr>
+<td>128 token</td>
+<td>~2.1 s</td>
+<td>500 ms</td>
+<td>0.000</td>
+<td><strong>0.988</strong></td>
+<td>—</td>
+</tr>
+<tr>
+<td>128 token</td>
+<td>~2.1 s</td>
+<td>1500 ms</td>
+<td>0.000</td>
+<td><strong>0.964</strong></td>
+<td>—</td>
+</tr>
+<tr>
+<td>128 token</td>
+<td>~2.1 s</td>
+<td>3000 ms</td>
+<td>0.962</td>
+<td>0.000</td>
+<td>1849 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>有效动作率从 0.98 掉到 0，中间只隔了几百毫秒的 deadline 变化。</strong>
+这不是渐变，而是「deadline 是否跨过推理耗时」的二元结果：</p>
+<ul>
+<li>deadline &lt; 推理耗时 ⇒ 动作永远赶不上 ⇒ 有效动作率 ≈ 0，输入全部白采；</li>
+<li>deadline &gt; 推理耗时 ⇒ 动作来得及 ⇒ 有效动作率 ≈ 1，但<strong>年龄等于排队 + 推理</strong>。</li>
+</ul>
+<p>所以端侧闭环的参数选择只有两个自由度：<strong>要么把推理压到 deadline 以内，
+要么把 deadline 放大到推理之上并接受相应的输入年龄。</strong> 没有第三条路。</p>
+<div class="admonition warning">
+<p class="admonition-title">表里那些「—」是有信息量的</p>
+<p>当有效动作率为 0 时，<code>年龄 p50</code> 是空的——因为<strong>没有任何动作被取用</strong>，
+自然没有「取用时的年龄」。这时该报的是「本周期无动作」的比例与丢弃原因，
+而不是把空的年龄写成 0 或者用没取用的样本凑一个数。</p>
+</div>
+<h3 id="action-chunk">action chunk：用新鲜度换计算次数</h3>
+<p>策略一次算 k 步动作（action chunk），控制周期逐条取用。固定
+<code>freq=10 Hz、queue=4、latest、jitter=20 ms</code>：</p>
+<table>
+<thead>
+<tr>
+<th>chunk</th>
+<th>有效动作率</th>
+<th>年龄 p50</th>
+<th>年龄 p95</th>
+<th>丢弃</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>0.993</td>
+<td>62.6 ms</td>
+<td>339.9 ms</td>
+<td><code>latest</code> 83</td>
+</tr>
+<tr>
+<td>4</td>
+<td>0.993</td>
+<td><strong>204.2 ms</strong></td>
+<td>401.6 ms</td>
+<td><code>queue_full</code> 110 + <code>latest</code> 111</td>
+</tr>
+<tr>
+<td>8</td>
+<td>0.993</td>
+<td><strong>401.7 ms</strong></td>
+<td>723.4 ms</td>
+<td><code>queue_full</code> 129 + <code>latest</code> 54</td>
+</tr>
+</tbody>
+</table>
+<p><strong>计算次数变成 1/k，年龄中位数涨了 6.4 倍。</strong> 这就是「计算更快但消费旧动作」
+的反例：如果只看「每步推理调用次数」，chunk=8 是最省的选择；把年龄放进来看，
+它把动作的时效性打到了 400 ms 量级——对一个 10 Hz 的控制器来说，
+这已经超过了三个控制周期。</p>
+<p>真实推理上同样成立：<code>freq=2 Hz、128 token</code> 时，chunk=4 的年龄 p50 是 2118 ms、
+p95 是 3080 ms，而单步模式的 p50 是 1849 ms。<strong>chunk 的收益要按「最老动作」
+计价，而不是按调用次数计价。</strong></p>
+<hr />
+<h2 id="_6">工程实现 · 源码解析</h2>
+<h3 id="_7">事件与时钟：为什么必须校准</h3>
+<p>跨进程（更不用说跨设备）时，各进程的 <code>time.monotonic()</code> 起点不同：
+<code>T0</code> 是进程启动时刻，所以「A 的时间戳减 B 的时间戳」在默认情况下毫无意义。
+<code>AgentBackend</code> 用 NTP 式的四时间戳法估计偏移：</p>
+<div class="highlight"><pre><span></span><code>t1 = 本地发送前      t2 = agent 收到      t3 = agent 回复前      t4 = 本地收到后
+offset = ((t2 − t1) + (t3 − t4)) / 2      精度上界 ≈ RTT / 2
+</code></pre></div>
+
+<p>实现上重复 11 次并<strong>取 RTT 最小的一次</strong>（离群样本通常来自调度抖动，
+而不是时钟本身）。实测（同一台 Orin 上两个进程，注入 ±0/250 ms 偏移）：</p>
+<div class="highlight"><pre><span></span><code>agent offset 0   → 校准结果 2999.038 ms   RTT 0.880 ms（±0.44）
+agent offset 250 → 校准结果 3250.176 ms   RTT 0.885 ms（±0.44）
+Δoffset = 251.1 ms   ← 注入的 250 ms 被恢复出来
+</code></pre></div>
+
+<p>2999 ms 的那部分是两个进程 <code>T0</code> 的差值（epoch 差），<strong>它本身就是「不校准就错多少」的量级</strong>。
+把 agent 的时间戳换算到本地域后，每次推理的 start skew（本地估计起点 − agent 起点）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>样本数</th>
+<th>start skew p50</th>
+<th>min / max</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已校准</td>
+<td>97</td>
+<td><strong>+0.6 ms</strong></td>
+<td>0.5 / 0.9</td>
+</tr>
+<tr>
+<td>未校准</td>
+<td>49</td>
+<td><strong>+43 686.4 ms</strong></td>
+<td>43686.3 / 43688.9</td>
+</tr>
+</tbody>
+</table>
+<p><strong>43.7 秒的偏差不是推理慢，而是两个进程的时钟起点不同。</strong>
+如果不校准就把 agent 的时间戳当成「本地时间」，重建出的关键路径会整体错位——
+把推理时延算成 43 秒，任何预算分析都失去意义。</p>
+<h3 id="deadline-join">控制循环：deadline 是 join 的超时</h3>
+<p>核心循环只有四步（省略日志）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">while</span> <span class="n">now_ms</span><span class="p">()</span> <span class="o">&lt;</span> <span class="n">t_end</span><span class="p">:</span>
+    <span class="n">period_start</span> <span class="o">=</span> <span class="n">now_ms</span><span class="p">()</span>
+    <span class="n">deadline</span> <span class="o">=</span> <span class="n">period_start</span> <span class="o">+</span> <span class="n">args</span><span class="o">.</span><span class="n">deadline_ms</span>
+
+    <span class="k">with</span> <span class="n">lock</span><span class="p">:</span>                       <span class="c1"># 1) 按策略取输入（或复用 chunk）</span>
+        <span class="n">chosen</span><span class="p">,</span> <span class="n">dropped</span> <span class="o">=</span> <span class="n">pick</span><span class="p">(</span><span class="n">queue</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">policy</span><span class="p">,</span> <span class="n">period_start</span><span class="p">,</span> <span class="n">max_age</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">chosen</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>           <span class="c1"># 2) 起一个 worker 跑推理</span>
+        <span class="n">th</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Thread</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">worker</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">chosen</span><span class="p">,))</span>
+        <span class="n">th</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+        <span class="n">th</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="p">(</span><span class="n">deadline</span> <span class="o">-</span> <span class="n">now_ms</span><span class="p">())</span> <span class="o">/</span> <span class="mf">1000.0</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">th</span><span class="o">.</span><span class="n">is_alive</span><span class="p">():</span>            <span class="c1"># 3) 没赶上：记 miss，本周期的动作不用</span>
+            <span class="n">metrics</span><span class="o">.</span><span class="n">deadline_miss</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="n">chunk_left</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">chunk_input</span><span class="p">,</span> <span class="n">chunk_left</span> <span class="o">=</span> <span class="n">chosen</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">chunk</span>
+
+    <span class="k">if</span> <span class="n">chunk_left</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>               <span class="c1"># 4) 取用动作（记录年龄）</span>
+        <span class="n">age</span> <span class="o">=</span> <span class="n">now_ms</span><span class="p">()</span> <span class="o">-</span> <span class="n">chunk_input</span><span class="o">.</span><span class="n">t_sampled</span>
+        <span class="n">metrics</span><span class="o">.</span><span class="n">ages</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">age</span><span class="p">)</span>
+        <span class="n">chunk_left</span> <span class="o">-=</span> <span class="mi">1</span>
+    <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="p">(</span><span class="n">period_start</span> <span class="o">+</span> <span class="n">period</span> <span class="o">-</span> <span class="n">now_ms</span><span class="p">())</span> <span class="o">/</span> <span class="mf">1000.0</span><span class="p">))</span>
+</code></pre></div>
+
+<p>三处容易写错的细节：</p>
+<ol>
+<li><strong>miss 之后必须继续走周期对齐</strong>。早期实现用 <code>continue</code> 跳过末尾的 sleep，
+   结果 deadline 很紧时循环空转，控制频率被人为放大——测出来的是 harness 的
+   节奏，不是控制器的节奏。</li>
+<li><strong>worker 线程不能跨周期复用同一个输入对象</strong>：<code>chosen.t_infer_end</code> 会被下一个
+   周期覆盖，事件日志就对不上了。每次取输入都新起一个 worker。</li>
+<li><strong><code>age</code> 用采样时刻算，不用推理开始时刻算</strong>。排队时间必须计入年龄，
+   否则「队列越长年龄越大」这个最关键的结论会消失。</li>
+</ol>
+<h3 id="_8">设计取舍</h3>
+<table>
+<thead>
+<tr>
+<th>决策</th>
+<th>选择</th>
+<th>替代方案与代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>时钟</td>
+<td><code>time.monotonic()</code> + NTP 式偏移校准</td>
+<td>用墙钟（<code>time.time()</code>）：会被 NTP 跳变打断；用固定偏移：平台一换就错</td>
+</tr>
+<tr>
+<td>指标</td>
+<td>事件 JSONL + 分位数</td>
+<td>只存聚合值：能看出 p50，看不出「为什么慢」；JSONL 可以重算任何分位数</td>
+</tr>
+<tr>
+<td>推理后端</td>
+<td>可插拔（sleep / http / agent）</td>
+<td>只接真实后端：时序逻辑无法在无设备时回归；只接模型：结论无法与硬件解耦</td>
+</tr>
+<tr>
+<td>过期策略</td>
+<td>显式四种（fifo/latest/drop-stale/queue-full 丢弃）</td>
+<td>隐式「总是用最新的」：会把丢失与丢弃混在一起，无法定位</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">本轮的边界</p>
+<p>任务 C 要求「离线动作误差、系统时延和闭环任务结果分别验收」。本轮完成了
+<strong>系统时延与时间预算</strong>（含 chunk 反例），但<strong>没有接真实策略</strong>：
+动作头依赖 10.6 的 DROID 策略，本环境没有机器人与策略 checkpoint，
+因此「离线动作误差」与「闭环任务结果」保持 <code>UNVERIFIED</code>。
+sleep 后端的 chunk 实验验证的是时序逻辑；真实推理上的 chunk 只测到年龄，
+没有测动作质量。</p>
+</div>
+<hr />
+<h2 id="_9">工程实现 · 自己写一遍</h2>
+<p><code>labs/L1/closed_loop_budget.py</code> 的三种模式对应三种问题：</p>
+<ul>
+<li><code>--mode agent</code>：端侧进程，用自己的时钟给「收到 / 开始 / 结束」打点，
+  可注入时钟偏移；</li>
+<li><code>--mode calibrate</code>：只跑偏移估计，输出 offset 与精度上界；</li>
+<li><code>--mode run/matrix</code>：重放 + 周期消费，扫描抖动、频率、队列、策略与 chunk。</li>
+</ul>
+<p><code>--backend</code> 三选一让同一份时序逻辑可以对着不同负载跑：
+<code>sleep</code>（纯延迟模型，验证逻辑）、<code>http</code>（真实 llama-server，量系统）、
+<code>agent</code>（跨进程 + 时钟校准）。<strong>把「时序逻辑」与「推理实现」解耦，
+是无设备环境下仍能回归测试的前提。</strong></p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1) 纯时序逻辑（不需要模型）：抖动、队列、策略、chunk 三条轴</span>
+python<span class="w"> </span>labs/L1/closed_loop_budget.py<span class="w"> </span>--mode<span class="w"> </span>matrix<span class="w"> </span>--backend<span class="w"> </span>sleep<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--latency-ms<span class="w"> </span><span class="m">40</span><span class="w"> </span>--seconds<span class="w"> </span><span class="m">15</span><span class="w"> </span>--deadline-ms<span class="w"> </span><span class="m">80</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--events<span class="w"> </span>events_sleep.jsonl<span class="w"> </span>--out<span class="w"> </span>matrix_sleep.json
+
+<span class="c1"># 2) 时钟偏移与校准：agent 注入 250 ms 偏移</span>
+python<span class="w"> </span>labs/L1/closed_loop_budget.py<span class="w"> </span>--mode<span class="w"> </span>agent<span class="w"> </span>--port<span class="w"> </span><span class="m">19081</span><span class="w"> </span>--backend<span class="w"> </span>http<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--endpoint<span class="w"> </span>http://127.0.0.1:8080/completion<span class="w"> </span>--clock-offset-ms<span class="w"> </span><span class="m">250</span><span class="w"> </span><span class="p">&amp;</span>
+python<span class="w"> </span>labs/L1/closed_loop_budget.py<span class="w"> </span>--mode<span class="w"> </span>calibrate<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--agent-url<span class="w"> </span>http://127.0.0.1:19081<span class="w"> </span>--calibrate-rounds<span class="w"> </span><span class="m">11</span><span class="w"> </span>--out<span class="w"> </span>calibrate.json
+
+<span class="c1"># 3) 真实推理负载下的闭环（Jetson + llama.cpp）</span>
+llama-server<span class="w"> </span>-m<span class="w"> </span>Qwen3-1.7B-Q4_K_M.gguf<span class="w"> </span>-c<span class="w"> </span><span class="m">8192</span><span class="w"> </span>-ngl<span class="w"> </span><span class="m">99</span><span class="w"> </span>-np<span class="w"> </span><span class="m">4</span><span class="w"> </span>--port<span class="w"> </span><span class="m">8080</span><span class="w"> </span><span class="p">&amp;</span>
+python<span class="w"> </span>labs/L1/closed_loop_budget.py<span class="w"> </span>--mode<span class="w"> </span>run<span class="w"> </span>--backend<span class="w"> </span>http<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--endpoint<span class="w"> </span>http://127.0.0.1:8080/completion<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--freq<span class="w"> </span><span class="m">5</span><span class="w"> </span>--queue<span class="w"> </span><span class="m">4</span><span class="w"> </span>--policy<span class="w"> </span>latest<span class="w"> </span>--jitter-ms<span class="w"> </span><span class="m">20</span><span class="w"> </span>--n-predict<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--deadline-ms<span class="w"> </span><span class="m">800</span><span class="w"> </span>--seconds<span class="w"> </span><span class="m">40</span><span class="w"> </span>--out<span class="w"> </span>run_http32.json
+</code></pre></div>
+
+<h3 id="_10">消融建议</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>你应该看到什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--policy fifo</code>（同队列、同频率）</td>
+<td>年龄 p50 从 62 ms 涨到 143 ms，但 p95 从 431 ms 降到 166 ms</td>
+</tr>
+<tr>
+<td><code>--queue 1</code></td>
+<td><code>queue_full</code> 丢弃出现，有效动作率掉到 0.76</td>
+</tr>
+<tr>
+<td><code>--jitter-ms</code> 0 → 50</td>
+<td>p50 只涨几十毫秒，p95 从 50 ms 涨到 330 ms</td>
+</tr>
+<tr>
+<td><code>--deadline-ms</code> 跨过推理耗时</td>
+<td>有效动作率在 0.98 与 0 之间跳变，没有中间值</td>
+</tr>
+<tr>
+<td><code>--chunk 8</code></td>
+<td>调用次数降到 1/8，年龄 p50 涨到约 6.4 倍</td>
+</tr>
+<tr>
+<td>去掉 <code>--no-calibrate</code> 里的校准（即加该开关）</td>
+<td>agent 时间戳与本地相差数十秒，关键路径整体错位</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_11">原始现场</h2>
+<details>
+<summary>① 时钟校准：两次注入不同偏移的测量</summary>
+<div class="highlight"><pre><span></span><code>$ python closed_loop_budget.py --mode calibrate --agent-url http://127.0.0.1:19081 --calibrate-rounds 11
+offset=2999.038 ms  RTT=0.88 ms  （注入 +0.0 ms，精度上界 ±0.44 ms）
+$ # 重启 agent，注入 +250 ms
+offset=3250.176 ms  RTT=0.885 ms  （注入 +0.0 ms，精度上界 ±0.442 ms）
+Δoffset = 251.1 ms
+</code></pre></div>
+
+<p>（命令行里打印的「注入 +0.0 ms」是 harness 自己的参数默认值；注入值在 agent
+进程的 <code>--clock-offset-ms</code> 上，见运行脚本。）</p>
+<p>校准前后的 start skew（事件日志 <code>agent_span_local</code>）：</p>
+<div class="highlight"><pre><span></span><code>已校准  n=97  p50=+0.6 ms   min=0.5  max=0.9
+未校准  n=49  p50=+43686.4 ms  min=43686.3  max=43688.9
+</code></pre></div>
+
+<p>原始文件：<code>results/jetson/1.7/calibrate_off0.json</code>、<code>calibrate_off250.json</code>、
+<code>events_agent_calibrated.jsonl</code>、<code>events_agent_uncalibrated.jsonl</code>。</p>
+</details>
+<details>
+<summary>② 事件 JSONL 摘录（真实推理，freq=2 / 128 token）</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">17.4</span><span class="p">,</span><span class="w"> </span><span class="nt">"event"</span><span class="p">:</span><span class="w"> </span><span class="s2">"enqueue"</span><span class="p">,</span><span class="w"> </span><span class="nt">"sid"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"queue"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"jitter_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">-3.2</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">17.9</span><span class="p">,</span><span class="w"> </span><span class="nt">"event"</span><span class="p">:</span><span class="w"> </span><span class="s2">"infer_start"</span><span class="p">,</span><span class="w"> </span><span class="nt">"sid"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"queue_age_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">2129.6</span><span class="p">,</span><span class="w"> </span><span class="nt">"event"</span><span class="p">:</span><span class="w"> </span><span class="s2">"infer_end"</span><span class="p">,</span><span class="w"> </span><span class="nt">"sid"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2111.7</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">2129.7</span><span class="p">,</span><span class="w"> </span><span class="nt">"event"</span><span class="p">:</span><span class="w"> </span><span class="s2">"action_use"</span><span class="p">,</span><span class="w"> </span><span class="nt">"sid"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"age_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2112.3</span><span class="p">,</span><span class="w"> </span><span class="nt">"chunk_left"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">500.2</span><span class="p">,</span><span class="w"> </span><span class="nt">"event"</span><span class="p">:</span><span class="w"> </span><span class="s2">"action_none"</span><span class="p">,</span><span class="w"> </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">500.2</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">512.1</span><span class="p">,</span><span class="w"> </span><span class="nt">"event"</span><span class="p">:</span><span class="w"> </span><span class="s2">"enqueue"</span><span class="p">,</span><span class="w"> </span><span class="nt">"sid"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"queue"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"jitter_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">11.7</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">512.2</span><span class="p">,</span><span class="w"> </span><span class="nt">"event"</span><span class="p">:</span><span class="w"> </span><span class="s2">"deadline_miss"</span><span class="p">,</span><span class="w"> </span><span class="nt">"sid"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"t"</span><span class="p">:</span><span class="w"> </span><span class="mf">2500.0</span><span class="p">}</span>
+</code></pre></div>
+
+<p><code>infer_start</code> 的 <code>queue_age_ms</code> 只有 0.5 ms（入队即被选中），
+而 <code>action_use</code> 的 <code>age_ms</code> 是 2112 ms（推理占了绝大部分）——
+<strong>这正是「排队很短但年龄很大」的形态</strong>：瓶颈不在队列，在推理。</p>
+<p>原始文件：<code>results/jetson/1.7/events_dl3000_128.jsonl</code> 等。</p>
+</details>
+<details>
+<summary>③ 策略与队列矩阵（sleep 后端，40 ms 固定延迟，`--seconds 15`）</summary>
+<div class="highlight"><pre><span></span><code>tag                        有效   miss    年龄p50    年龄p95                           丢弃
+jitter00                1.000  0.000    45.13    50.14                           {}
+jitter50                0.993  0.000    98.41   330.49              {'latest': 72}
+f10_q01_latest          0.760  0.000    55.67   134.89           {'queue_full': 37}
+f10_q04_fifo            0.993  0.000   142.89   166.03                           {}
+f10_q04_latest          0.993  0.000    62.18   430.69               {'latest': 91}
+f10_q16_latest          0.993  0.000    62.64   431.68               {'latest': 92}
+f20_q01_latest          0.837  0.000    56.97    80.26           {'queue_full': 50}
+chunk1                  0.993  0.000    62.64   339.88               {'latest': 83}
+chunk4                  0.993  0.000   204.18   401.59 {'queue_full': 110, 'latest': 111}
+chunk8                  0.993  0.000   401.67    723.4 {'queue_full': 129, 'latest': 54}
+</code></pre></div>
+
+<p>原始文件：<code>results/crater/1.7/matrix_sleep_crater.json</code>、<code>matrix.log</code>。</p>
+</details>
+<hr />
+<h2 id="_12">前沿</h2>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>与本章的关系</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>实时调度理论</strong></td>
+<td>本章的「deadline 悬崖」是固定优先级调度的经典结论；端侧的区别是被调度的任务（推理）本身就超过了若干控制周期</td>
+</tr>
+<tr>
+<td><strong>端到端可观测性</strong></td>
+<td>统一事件模型（采样/入队/推理/取用）是把「模型快」翻译成「任务按时」的唯一桥梁；本章的 JSONL 就是最小实现</td>
+</tr>
+<tr>
+<td><strong>学习型控制器与 chunk</strong></td>
+<td>action chunk 是 diffusion policy 等工作的默认形态；本章给出它的时效性代价，10.6 会在真实动作头上验收</td>
+</tr>
+<tr>
+<td><strong>时钟与时间同步</strong></td>
+<td>PTP/硬件时间戳能把偏移压到微秒级；本轮用软件 NTP 式估计，精度受 RTT/2 限制（实测 ±0.44 ms）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>除本章实测外的内容来自各自文档，<strong>尚未复现</strong><span class="unverified">未实测</span>。</p>
+</blockquote>
+<hr />
+<h2 id="_13">陷阱</h2>
+<p><strong>1. 把处理时延当输入年龄。</strong> 前者从 <code>infer_start</code> 起算，后者从<strong>采样</strong>起算，
+中间还夹着排队、抖动与 chunk 复用。端侧实测里两者差 4–8 倍。</p>
+<p><strong>2. 跨设备直接用两个时间戳相减。</strong> 不同进程的单调时钟起点不同，实测偏差
+43.7 秒。<strong>先校准，再算关键路径。</strong></p>
+<p><strong>3. 只报均值或 p50。</strong> 抖动 5 ms 就能把年龄 p95 从 50 ms 推到 340 ms，
+而 p50 只动了 1.6 ms。</p>
+<p><strong>4. 把队列开大当解法。</strong> 队列 4 与 16 在 <code>latest</code> 策略下完全一样；
+队列开大只对 FIFO 有意义，而且会把年龄推高。</p>
+<p><strong>5. 用「调用次数少了」论证 chunk 更好。</strong> chunk=8 把调用降到 1/8，
+同时把年龄中位数推到 6.4 倍。<strong>按最老动作计价。</strong></p>
+<p><strong>6. 把各段均值相加当闭环分位数。</strong> 年龄的 p95 不是各段 p95 之和，
+它由同一批样本的联合分布决定；本章的做法是从事件日志重算，而不是拼装。</p>
+<p><strong>7. 有效动作率为 0 时把年龄填 0。</strong> 那是「没有动作」而不是「年龄为零」，
+两者在 SLO 里的含义完全相反。</p>
+<p><strong>8. 在紧 deadline 下用 <code>continue</code> 跳过周期对齐。</strong> 会让 harness 空转、
+控制频率失真，测出来的是测量代码的节奏。</p>
+<hr />
+<h2 id="_14">自测题</h2>
+<details>
+<summary>1. 若推理单次耗时 300 ms、控制周期 100 ms、deadline 为 900 ms，系统行为会如何？</summary>
+<p>按本章的实测形态：deadline（900 ms）跨过了推理耗时（300 ms），
+所以<strong>有效动作率会接近 1</strong>，但输入年龄的中位数大约等于
+「排队 + 推理」≈ 300–400 ms，也就是 3–4 个控制周期。</p>
+<p>这不是「系统坏了」，而是<strong>控制回路变成了 300 ms 的等效延迟</strong>。
+后果取决于被控对象：位置控制可能振荡，而慢过程（温度、流速）完全没问题。
+要做的是把年龄写进 SLO，而不是把 deadline 调小——后者会让有效动作率直接掉到 0。</p>
+</details>
+<details>
+<summary>2. 为什么 deadline 从 400 ms 调到 800 ms，有效动作率从 0 跳到 0.98，中间没有过渡？</summary>
+<p>因为推理耗时几乎是确定的（同一台设备、同一份模型、同一序列长度，
+p50 与 p95 相差不到 20 ms）。当 deadline &lt; 推理耗时时，<strong>每一次</strong>都赶不上；
+当 deadline &gt; 推理耗时时，<strong>几乎每一次</strong>都赶得上。
+中间那段之所以窄，是因为推理耗时的分布本身很窄。</p>
+<p>反过来，如果推理耗时的分布很宽（比如并发下排队严重、或热节流导致抖动），
+这条曲线就会被拉成斜坡。<strong>悬崖的陡峭程度是推理耗时稳定性的直接体现。</strong></p>
+</details>
+<details>
+<summary>3. action chunk=4 让推理调用减少到 1/4，为什么年龄反而涨了 3 倍？</summary>
+<p>因为动作被复用了 4 个周期。第 1 个周期用的是刚算出来的动作（年龄 ≈ 排队+推理），
+第 4 个周期用的还是同一批动作，年龄就多了 3 个周期。
+在 10 Hz 下这是 300 ms，实测 p50 从 62.6 ms 涨到 204.2 ms（约 +141 ms 的观测差，
+因为并非所有 chunk 都被完整用满）。</p>
+<p><strong>正确的计价方式</strong>：chunk 的收益是调用次数与能耗，代价是「最老动作」的年龄；
+两者都要进 SLO。10.6 会在真实动作头上把「动作误差随 age 的增长」也测出来。</p>
+</details>
+<details>
+<summary>4. 时钟校准为什么要取 RTT 最小的一次，而不是平均？</summary>
+<p>四时间戳法假设「去程与回程延迟对称」，偏移估计的误差上界是 RTT/2。
+RTT 越大，这个假设越不可靠（路径不对称的可能性越高），误差也越大。
+取最小 RTT 的样本，等于挑选<strong>最接近对称假设</strong>的那次测量。</p>
+<p>本章实测的 RTT 在 0.88–0.885 ms，估计误差上界 ±0.44 ms；
+而未校准的偏差是 43 686 ms —— 相差五个数量级。
+<strong>先校准，再讨论毫秒级的优化。</strong></p>
+</details>
+<details>
+<summary>5. 队列容量设成 1 省内存，为什么有效动作率只有 0.76？</summary>
+<p>因为容量 1 时，「推理占用中」到达的样本没有位置可放，只能丢弃
+（<code>queue_full</code>）。10 Hz 控制周期是 100 ms，而推理要 40 ms（本章的 sleep 模型）
+或 450 ms（真实端侧），后者意味着<strong>大部分周期都在丢样本</strong>。</p>
+<p>三个选择：把容量加到「一个推理时长 / 控制周期 + 1」、
+改用 latest 策略并接受年龄、或者换更小/更快的模型。
+<strong>容量应该由「推理耗时 ÷ 控制周期」决定，不是由内存预算决定</strong>——
+这也是 <a class="xref" href="../L1/1.6-edge-inference-stack.html" title="端侧推理栈">L1.6</a> 里 KV 与权重挤占统一内存的同一笔账。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L1/1.6-edge-inference-stack.html">&#8592; 1.6 端侧推理栈</a><a class="nav-next" href="../L2/2.0-tensor-and-framework.html">2.0 框架内部：storage、stride、view 与 dispatcher &#8594;</a></nav>
+</main>
+</body>
+</html>

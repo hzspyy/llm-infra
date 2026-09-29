@@ -1,0 +1,1450 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.2 工具协议与调用数据路径</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">9.2</div>
+  <div class="sidebar-title">工具协议与调用数据路径</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一次工具调用经过四层</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-tool-choice">1. tool choice 在哪里约束输出</a></li>
+<li><a href="#2">2. 约束解码作用在哪一段</a></li>
+<li><a href="#3-parser">3. 增量 parser：状态比语法难</a></li>
+<li><a href="#4">4. 重扫的代价是二次的</a></li>
+<li><a href="#5-schema">5. 提交闸门：闭合、允许表与 schema 三道</a></li>
+<li><a href="#6">6. 约束与投机：接受长度看内容，不看模板</a></li>
+<li><a href="#7">7. 协议边界：谁提供幂等，谁提供取消</a></li>
+</ul>
+</li>
+<li><a href="#vllm">工程实现：vLLM 的工具调用路径</a><ul>
+<li><a href="#_5">源码解析</a></li>
+<li><a href="#_6">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现——有状态增量解析器</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">工具调用三条路径：协议层比工具本身贵得多</a></li>
+<li><a href="#exactly-once">失败矩阵：协议不给 exactly-once</a></li>
+<li><a href="#tasks">Tasks 扩展：能力能协商，规范路径走不通</a></li>
+<li><a href="#_8">取消通知不保证副作用回滚，两种实现都要数账本</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一次工具调用经过四层</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-tool-choice">1. tool choice 在哪里约束输出</a></li>
+<li><a href="#2">2. 约束解码作用在哪一段</a></li>
+<li><a href="#3-parser">3. 增量 parser：状态比语法难</a></li>
+<li><a href="#4">4. 重扫的代价是二次的</a></li>
+<li><a href="#5-schema">5. 提交闸门：闭合、允许表与 schema 三道</a></li>
+<li><a href="#6">6. 约束与投机：接受长度看内容，不看模板</a></li>
+<li><a href="#7">7. 协议边界：谁提供幂等，谁提供取消</a></li>
+</ul>
+</li>
+<li><a href="#vllm">工程实现：vLLM 的工具调用路径</a><ul>
+<li><a href="#_5">源码解析</a></li>
+<li><a href="#_6">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现——有状态增量解析器</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">工具调用三条路径：协议层比工具本身贵得多</a></li>
+<li><a href="#exactly-once">失败矩阵：协议不给 exactly-once</a></li>
+<li><a href="#tasks">Tasks 扩展：能力能协商，规范路径走不通</a></li>
+<li><a href="#_8">取消通知不保证副作用回滚，两种实现都要数账本</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L9 · Agent 系统与运行时</div>
+  <div class="mod-id">9.2</div>
+  <h1>工具协议与调用数据路径</h1>
+  <p class="lede">从模型的 tool-call delta 到 MCP 客户端、传输与工具服务，分析能力协商、schema、序列化、连接池、流控、取消和结果回传；以完整调用成本和可执行语义验收。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen3-4B · vLLM 0.29.0 · DFlash 草稿</span><span class="chip">前置 5.6（结构化输出与语法）· 5.5（投机解码）· 9.1（Agent 负载形状）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>工具调用看起来只是一段 JSON，但它在系统里有三条不同的路径：<strong>模板</strong>决定模型看见什么工具，<strong>约束</strong>决定它能吐出哪些 token，<strong>解析</strong>决定这些 token 如何变回一次函数调用。三条路径各自有成本，而且它们的效果不能互相推断。</p>
+<ol>
+<li>tool choice 在哪里约束输出？</li>
+<li>增量 parser 怎样维护多调用状态？</li>
+<li>约束与投机如何共同影响成本？</li>
+</ol>
+<hr />
+<h2 id="_2">心智模型：一次工具调用经过四层</h2>
+<svg viewBox="0 0 820 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="工具调用的四层路径">
+  <defs>
+    <marker id="a92" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">工具调用：模板 → 约束 → 生成 → 解析</text>
+
+    <rect x="20" y="40" width="180" height="86" rx="4" fill="none" stroke="currentColor"/>
+    <text x="30" y="60" font-size="11" font-weight="600">① 模板</text>
+    <text x="30" y="78" font-size="9.5">工具 schema 进 prompt</text>
+    <text x="30" y="94" font-size="9.5">1/4/16/64 个工具</text>
+    <text x="30" y="110" font-size="9.5">实测 186→5 127 token</text>
+
+    <rect x="220" y="40" width="180" height="86" rx="4" fill="none" stroke="currentColor"/>
+    <text x="230" y="60" font-size="11" font-weight="600">② 约束</text>
+    <text x="230" y="78" font-size="9.5">tool_choice 控制能否调用</text>
+    <text x="230" y="94" font-size="9.5">guided_json 控制参数形状</text>
+    <text x="230" y="110" font-size="9.5">不是所有调用都靠 grammar</text>
+
+    <rect x="420" y="40" width="180" height="86" rx="4" fill="none" stroke="currentColor"/>
+    <text x="430" y="60" font-size="11" font-weight="600">③ 生成</text>
+    <text x="430" y="78" font-size="9.5">目标模型 / 草稿模型</text>
+    <text x="430" y="94" font-size="9.5">DFlash 接受长度按内容变</text>
+    <text x="430" y="110" font-size="9.5">固定结构 1.00 ↔ 自由 0.13</text>
+
+    <rect x="620" y="40" width="180" height="86" rx="4" fill="none" stroke="currentColor"/>
+    <text x="630" y="60" font-size="11" font-weight="600">④ 解析</text>
+    <text x="630" y="78" font-size="9.5">增量状态机还原调用</text>
+    <text x="630" y="94" font-size="9.5">每字符只扫一次</text>
+    <text x="630" y="110" font-size="9.5">重扫代价随长度二次增长</text>
+
+    <line x1="200" y1="83" x2="218" y2="83" stroke="currentColor" stroke-width="1.5" marker-end="url(#a92)"/>
+    <line x1="400" y1="83" x2="418" y2="83" stroke="currentColor" stroke-width="1.5" marker-end="url(#a92)"/>
+    <line x1="600" y1="83" x2="618" y2="83" stroke="currentColor" stroke-width="1.5" marker-end="url(#a92)"/>
+
+    <!-- 增量解析状态机 -->
+    <text x="12" y="168" font-size="12" font-weight="600">增量 parser 的状态与扣留窗口</text>
+    <rect x="20" y="184" width="120" height="36" rx="4" fill="none" stroke="currentColor"/>
+    <text x="34" y="206" font-size="10">SEEK（找 &lt;tool_call&gt;）</text>
+    <rect x="180" y="184" width="150" height="36" rx="4" fill="none" stroke="currentColor"/>
+    <text x="192" y="206" font-size="10">BODY（有界头部缓冲）</text>
+    <rect x="370" y="184" width="150" height="36" rx="4" fill="none" stroke="currentColor"/>
+    <text x="382" y="206" font-size="10">VALUE（字符串/括号深度）</text>
+    <rect x="560" y="184" width="150" height="36" rx="4" fill="none" stroke="currentColor"/>
+    <text x="572" y="206" font-size="10">AFTER（只找结束标记）</text>
+    <line x1="140" y1="202" x2="178" y2="202" stroke="currentColor" marker-end="url(#a92)"/>
+    <line x1="330" y1="202" x2="368" y2="202" stroke="currentColor" marker-end="url(#a92)"/>
+    <line x1="520" y1="202" x2="558" y2="202" stroke="currentColor" marker-end="url(#a92)"/>
+
+    <text x="20" y="246" font-size="10" opacity="0.85">尾部最多扣留 11 个字符（len("&lt;/tool_call&gt;")），确定不是结束标记才作为 delta 发出</text>
+    <text x="20" y="264" font-size="10" opacity="0.85">字符串内出现结束标记不算结束；值结束后外层对象的 } 不计入 arguments</text>
+
+    <!-- 成本面板 -->
+    <text x="12" y="302" font-size="12" font-weight="600">三条成本线（本机实测）</text>
+    <g font-size="10">
+      <text x="20" y="326">模板：每多一个工具约 +79 token（64 个工具 = 5 127 token，是 1 个工具的 27.6 倍）</text>
+      <text x="20" y="346">约束：结构固定内容接受率 1.00，参数自由降到 0.13–0.22；抄写类（长文本/长数字）0.59–0.92</text>
+      <text x="20" y="366">解析：单遍 O(n)；逐片段重扫在 64 KB payload 上扫 2.69 亿字符（单遍的 4 097 倍）、墙钟 2.83 倍</text>
+      <rect x="20" y="380" width="780" height="40" rx="3" fill="none" stroke="currentColor" opacity="0.5"/>
+      <text x="30" y="398" opacity="0.85">三条线不能互相推断：模板可预测 ⇒ 草稿接受率高；参数自由度高 ⇒ 接受率低，但与 JSON 是否合法无关</text>
+      <text x="30" y="414" opacity="0.85">JSON 能解析只是第 ④ 层的语法有效，工具选得对不对是第 ②③ 层的事</text>
+    </g>
+  </g>
+</svg>
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1-tool-choice">1. tool choice 在哪里约束输出</h3>
+<p><code>tool_choice</code> 不是一个开关，而是四种不同的施加点。用同一句 prompt（「请调用工具查询珠穆朗玛峰海拔，只调用一次」）在同一台服务上扫 4 种模式 × 4 种工具数（1/4/16/64），每格 2 次：</p>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th>1 个工具</th>
+<th>4 个工具</th>
+<th>16 个工具</th>
+<th>64 个工具</th>
+<th>实际选中的工具（≥4 工具时）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>none</code></td>
+<td>不调用</td>
+<td>不调用</td>
+<td>不调用</td>
+<td>不调用</td>
+<td>—（8/8 次都没有 tool_calls）</td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td><strong>不调用</strong>（0/2）</td>
+<td>调用</td>
+<td>调用</td>
+<td>调用</td>
+<td><code>search_corpus</code></td>
+</tr>
+<tr>
+<td><code>required</code></td>
+<td>调用 <code>calculate</code></td>
+<td>调用</td>
+<td>调用</td>
+<td>调用</td>
+<td><code>search_corpus</code></td>
+</tr>
+<tr>
+<td><code>named=calculate</code></td>
+<td>调用 <code>calculate</code></td>
+<td>调用 <code>calculate</code></td>
+<td>调用 <code>calculate</code></td>
+<td>调用 <code>calculate</code></td>
+<td>恒为 <code>calculate</code></td>
+</tr>
+</tbody>
+</table>
+<p>四列读出来的东西不一样：</p>
+<ol>
+<li><strong><code>none</code> 是硬约束</strong>：模型仍然会回答，但不会产生 tool_calls。它不改变模型"知不知道"工具，只是不允许它调用。</li>
+<li><strong><code>required</code> 与 <code>named</code> 是"必须调用"</strong>：两者都会产生调用，区别在 <code>named</code> 把函数名锁死。<code>required</code> + 只有 <code>calculate</code> 可用时，模型被迫调用一个与问题无关的工具。</li>
+<li><strong><code>auto</code> 是判断权交给模型</strong>：声明 1 个工具（<code>calculate</code>）时它拒绝调用，直接给出文字答案；声明 ≥4 个工具时它选了 <code>search_corpus</code>——语义上正确的那个。<strong>同一个 <code>auto</code>，工具集合不同，行为就不同</strong>；只测单工具的 auto 会得到"模型不爱调用"的错误结论。</li>
+<li><strong>四种模式的语法有效性都是 100%</strong>：8/8 格都返回合法 JSON，参数也都能解析。<strong>"语法有效"在这批请求上无法区分模式</strong>，区分它们的是"有没有调用"和"调用得对不对"。</li>
+</ol>
+<p>模板成本随工具数线性上升（每格 prompt token 是全批次里引擎自报的中位数）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">工具数</th>
+<th style="text-align: right;">prompt token</th>
+<th style="text-align: right;">相对 1 个工具</th>
+<th style="text-align: right;">每次调用 e2e 中位数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">186</td>
+<td style="text-align: right;">1.00×</td>
+<td style="text-align: right;">137–389 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">393</td>
+<td style="text-align: right;">2.11×</td>
+<td style="text-align: right;">189–223 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1 335</td>
+<td style="text-align: right;">7.18×</td>
+<td style="text-align: right;">203–259 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">5 127</td>
+<td style="text-align: right;">27.6×</td>
+<td style="text-align: right;">204–319 ms</td>
+</tr>
+</tbody>
+</table>
+<p>平均每多一个工具约 <strong>+79 token</strong>。这些 token 每一轮都要重新 prefill——在 9.1 的 <code>codefix</code> 会话里，12 轮就是 12 次；工具库越大，第 ① 层越贵。注意 e2e 中位数并没有随工具数明显上升（137→319 ms 里还混着首请求的编译与预热），<strong>模板 token 的增长主要落在 prefill 与缓存账上，不是每次调用的固定开销</strong>。</p>
+<h4 id="mask-tool_choice-prompt">约束与 mask 的施加点：<code>tool_choice</code> 不改 prompt，也不建语法</h4>
+<p>把四种模式在 vLLM 0.29.0 里逐条追到底，它们在服务端只影响<strong>两件事</strong>，而且都不在解码 mask 上：</p>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>代码</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>chat_completion/serving.py:989-993</code></td>
+<td><code>is_named_tool_choice = type(request.tool_choice) is ChatCompletionNamedToolChoiceParam</code>；<code>is_required_tool_choice = request.tool_choice == "required"</code></td>
+<td>把 <code>required</code> 与 <code>named</code> 识别出来</td>
+</tr>
+<tr>
+<td><code>:1006-1014</code></td>
+<td><code>elif is_named_tool_choice or is_required_tool_choice:</code> → 无条件从解析结果构造 <code>tool_calls</code></td>
+<td>这两种模式<strong>强制走工具解析</strong>，即使模型输出里没有工具段也会给出空调用</td>
+</tr>
+<tr>
+<td><code>:1017-1021</code></td>
+<td><code>elif not request.tool_choice or request.tool_choice == "none":</code> → 只取 <code>content</code></td>
+<td><code>none</code> 只关闭解析，不改变输入</td>
+</tr>
+<tr>
+<td><code>:1030+</code></td>
+<td><code>auto</code> 分支：解析出 <code>tool_calls</code> 就回填，否则退回纯文本</td>
+<td><code>auto</code> 是"解析成功与否"的分支</td>
+</tr>
+</tbody>
+</table>
+<p><strong><code>tool_choice</code> 没有参与语法或 mask 的构造。</strong> 在 <code>chat_completion/</code> 目录里搜索 <code>tool_choice</code> 与 <code>structured/guided/grammar/mask</code> 的交集为空——解码侧约束必须由 <code>structured_outputs</code>（或 <code>guided_*</code>）单独请求。这也解释了本轮实测：四种模式下参数都是合法 JSON，但那是模板与训练的结果，不是 grammar 在解码时施加 bitmask。</p>
+<p><strong><code>none</code> 能不能把工具从 prompt 里去掉，取决于一个本版本没暴露的开关。</strong> <code>entrypoints/launchers/cli_args.py:108</code> 定义了 <code>exclude_tools_when_tool_choice_none: bool = False</code>，它在 <code>responses/utils.py:388-390</code> 的 <code>construct_tool_dicts</code> 里生效：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">construct_tool_dicts</span><span class="p">(</span><span class="n">tools</span><span class="p">,</span> <span class="n">tool_choice</span><span class="p">,</span> <span class="n">exclude_tools_when_tool_choice_none</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">tools</span> <span class="ow">or</span> <span class="p">(</span><span class="n">tool_choice</span> <span class="o">==</span> <span class="s2">"none"</span> <span class="ow">and</span> <span class="n">exclude_tools_when_tool_choice_none</span><span class="p">):</span>
+        <span class="k">return</span> <span class="kc">None</span>
+</code></pre></div>
+
+<p>但 <code>chat_completion/serving.py:167</code> 只是把这个字段存下来、<strong>全文再没有读它</strong>，而该字段在本版本的 CLI 里也没有对应的命令行开关（全包搜索 <code>--exclude-tools</code> 无结果）。于是走 OpenAI chat completions 接口时，<code>tool_choice=none</code> 无法让工具从 prompt 里消失——这正是实测 <code>none</code> 的 prompt token（186/393/1 335/5 127）与 <code>auto</code>/<code>required</code> 完全相同的原因；而 SGLang 的 <code>none</code> 只有 33 token，是它自己的渲染路径默认就这么做。<strong>跨引擎对照前必须确认这类"字段存在但未接线"的差异</strong>，否则会把渲染差异当成模型行为差异。</p>
+<h4 id="_4">同一套模式在两个引擎上的渲染路径不同</h4>
+<p>把同一份 4 模式 × 4 工具数矩阵搬到 SGLang 0.5.19（<code>--tool-call-parser qwen25</code>，transformers 5.12.1）对照 vLLM 0.29.0：</p>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th>vLLM prompt token（1/4/16/64）</th>
+<th>SGLang prompt token（1/4/16/64）</th>
+<th>差异</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>none</code></td>
+<td>186 / 393 / 1 335 / 5 127</td>
+<td><strong>33 / 33 / 33 / 33</strong></td>
+<td>vLLM 仍把工具渲染进 prompt；SGLang 完全不渲染</td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td>186 / 393 / 1 335 / 5 127</td>
+<td>196 / 433 / 1 495 / 5 767</td>
+<td>同量级，SGLang 模板多 5%–13%</td>
+</tr>
+<tr>
+<td><code>required</code></td>
+<td>186 / 393 / 1 335 / 5 127</td>
+<td>196 / 433 / 1 495 / 5 767</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>named=calculate</code></td>
+<td>186 / 393 / 1 335 / 5 127</td>
+<td><strong>196 / 196 / 196 / 196</strong></td>
+<td>SGLang 只渲染被指定的那个工具</td>
+</tr>
+</tbody>
+</table>
+<p>两个可迁移的事实：</p>
+<ol>
+<li><strong><code>tool_choice</code> 的"约束"发生在两处不同的地方：</strong> 一处是 prompt 渲染（把哪些工具写进上下文），一处是输出侧解析（允不允许产生 tool_calls）。SGLang 在 <code>named</code> 下把渲染收敛到单个工具，<code>none</code> 下直接不渲染；vLLM 保持全量渲染，靠输出侧约束生效。<strong>"prompt 一样"不是跨引擎对照的前提</strong>，工具集 token 账必须分引擎记。</li>
+<li><strong>四种模式在两个引擎上都被支持，本批请求没有出现拒绝路径。</strong> 两边的语法有效性、调用判定与工具选择一致（<code>auto</code>+1 工具都是 0/2 次调用，<code>named</code> 都锁定 <code>calculate</code>，<code>required</code> 都产生调用），差异只在 prompt 的构造。</li>
+</ol>
+<h4 id="schema">工具 schema 的前缀是增量可复用的</h4>
+<p>同一请求连发两次，第二次的前缀必然命中：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">工具数</th>
+<th style="text-align: right;">prompt token</th>
+<th style="text-align: right;">第 1 次未命中 token</th>
+<th style="text-align: right;">第 1 次 TTFT</th>
+<th style="text-align: right;">第 2 次未命中 token</th>
+<th style="text-align: right;">第 2 次 TTFT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">186</td>
+<td style="text-align: right;">186</td>
+<td style="text-align: right;">158.3 ms</td>
+<td style="text-align: right;"><strong>10</strong></td>
+<td style="text-align: right;">14.2 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">393</td>
+<td style="text-align: right;">297（96 已命中）</td>
+<td style="text-align: right;">70.3 ms</td>
+<td style="text-align: right;"><strong>9</strong></td>
+<td style="text-align: right;">63.5 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1 335</td>
+<td style="text-align: right;">1 031（304 已命中）</td>
+<td style="text-align: right;">99.7 ms</td>
+<td style="text-align: right;"><strong>7</strong></td>
+<td style="text-align: right;">65.7 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">5 127</td>
+<td style="text-align: right;">3 879（1 248 已命中）</td>
+<td style="text-align: right;">247.1 ms</td>
+<td style="text-align: right;"><strong>7</strong></td>
+<td style="text-align: right;">77.2 ms</td>
+</tr>
+</tbody>
+</table>
+<p>两点要分开说：</p>
+<ul>
+<li><strong>工具集是包含关系，前缀可以跨请求复用。</strong> 4 个工具的第 1 次请求已经命中 96 token——那是 1 工具请求留下的 <code>calculate</code> 块；16/64 个工具同理（304/1 248）。把工具集从 1 扩到 64，增量是"新增工具的那几段"，不是整块重算。</li>
+<li><strong>缓存热了之后，5 127 token 的工具集只剩 7 个未命中 token 要算。</strong> 所以"工具越多越贵"的准确说法是：<strong>冷前缀的一次性成本随工具数增长（186→5 127），稳态成本几乎是常数（7–10 token）</strong>。容量压力落在缓存而不是每次 prefill 上——这与 9.3 的会话驻留是同一个池子。</li>
+</ul>
+<h4 id="vs">完整工具集 vs 按需发现</h4>
+<p>给模型 64 个工具，其中只有 <code>lookup_37</code> 能回答问题。两种做法各跑 2 次：</p>
+<table>
+<thead>
+<tr>
+<th>做法</th>
+<th style="text-align: right;">模型往返</th>
+<th>声明的工具数</th>
+<th style="text-align: right;">prompt token 合计</th>
+<th style="text-align: right;">TTFT 合计</th>
+<th style="text-align: right;">e2e 合计</th>
+<th>最终选中</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>完整工具集</td>
+<td style="text-align: right;">1</td>
+<td>64</td>
+<td style="text-align: right;">5 128（5 088 命中）</td>
+<td style="text-align: right;">89.1 ms</td>
+<td style="text-align: right;">206.8 ms</td>
+<td><code>lookup_37</code> ✓</td>
+</tr>
+<tr>
+<td>按需发现</td>
+<td style="text-align: right;">2</td>
+<td>1 → 2</td>
+<td style="text-align: right;"><strong>584</strong>（160 → 576 命中）</td>
+<td style="text-align: right;">147.9 ms</td>
+<td style="text-align: right;">330.4 ms</td>
+<td><code>lookup_37</code> ✓</td>
+</tr>
+</tbody>
+</table>
+<p>按需发现把 prompt token 压到 <strong>1/8.8</strong>（584 vs 5 128），代价是<strong>多一次模型往返、e2e 变成 1.6 倍</strong>（330 vs 207 ms），并且两次都没有漏选（最终工具选择正确）。<strong>这就是"按需发现同时报告漏选与额外往返"的具体形态</strong>：省下的是上下文，付出的是往返；在本实验里往返更贵，所以只有当工具集大到让冷前缀成本压过一次往返时，按需发现才划算。阈值可以直接从这两列算：完整集冷前缀 5 128 token ≈ 一次 89 ms 的 prefill，而一次额外往返 ≈ 330−207 = 123 ms，因此工具集需要再大一些（或前缀频繁被驱逐）才会翻转。</p>
+<h3 id="2">2. 约束解码作用在哪一段</h3>
+<p><code>tool_choice</code> 与"参数形状约束"是两件事。前者限制<strong>能不能调用、调用哪个</strong>，后者限制<strong>参数长什么样</strong>。在进程内 LLM 上对四种内容做 <code>structured_outputs(json=schema)</code> 对照（每格 3 次，贪心解码，thinking 关闭）：</p>
+<table>
+<thead>
+<tr>
+<th>内容类型</th>
+<th>约束</th>
+<th style="text-align: right;">JSON 合法</th>
+<th style="text-align: right;">参数正确</th>
+<th style="text-align: right;">输出 token</th>
+<th style="text-align: right;">ms/token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>结构固定（两字段可枚举）</td>
+<td>无</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">10.3</td>
+</tr>
+<tr>
+<td>结构固定</td>
+<td>guided_json</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">15.7</td>
+</tr>
+<tr>
+<td>参数自由（自拟 query）</td>
+<td>无</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">10.2</td>
+</tr>
+<tr>
+<td>参数自由</td>
+<td>guided_json</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">18.6</td>
+</tr>
+<tr>
+<td>长数字（39 位整数原样抄）</td>
+<td>无</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">46</td>
+<td style="text-align: right;">9.4</td>
+</tr>
+<tr>
+<td>长数字</td>
+<td>guided_json</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">46</td>
+<td style="text-align: right;">9.5</td>
+</tr>
+<tr>
+<td>长文本（76 token 原样抄）</td>
+<td>无</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">8.9</td>
+</tr>
+<tr>
+<td>长文本</td>
+<td>guided_json</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">3/3</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">10.3</td>
+</tr>
+</tbody>
+</table>
+<p>这四类内容在本模型上<strong>不加约束也能 100% 合法</strong>——因为任务简单、输出短、模板已经把格式交代清楚。这不是"约束无用"，而是说明：<strong>约束解码的收益只在模型本来会写错格式时才能看到</strong>。这里能看到的只有代价：</p>
+<ul>
+<li>结构固定与参数自由的 <code>ms/token</code> 从 10.2–10.3 涨到 15.7–18.6 ms（<strong>+53%~+82%</strong>），因为每一步都要与自动机求交、生成 bitmask 并施加到 logits 上（5.6 已给出这条路径的源码与掩码形状）。</li>
+<li>长数字与长文本两格几乎无差别（9.4→9.5、8.9→10.3 ms/token）：这两类内容本来就是"抄"，语法约束在这里没什么可排除的。</li>
+</ul>
+<h3 id="3-parser">3. 增量 parser：状态比语法难</h3>
+<p>工具调用的流式解析核心难点在于：客户端契约要求按数据块增量输出新解析的片段，而网络传输给到解析器的是任意切分的字节流。<code>labs/L9/incremental_tool_parser.py</code> 实现的状态机将其解耦为四段显式状态：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>做什么</th>
+<th>为什么需要</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SEEK</code></td>
+<td>固定窗口找 <code>&lt;tool_call&gt;</code></td>
+<td>标记可能跨片段，窗口只需 len(marker)</td>
+</tr>
+<tr>
+<td><code>BODY</code></td>
+<td>有界头部缓冲找 <code>"name"</code> 与 <code>"arguments"</code> 键</td>
+<td>头部长度有限，不必缓存整个调用体</td>
+</tr>
+<tr>
+<td><code>VALUE</code></td>
+<td>维护字符串/转义/<code>\uXXXX</code>/括号深度，判断值何时结束</td>
+<td>决定 arguments 的边界；外层对象的 <code>}</code> 不能混进来</td>
+</tr>
+<tr>
+<td><code>AFTER</code></td>
+<td>只找 <code>&lt;/tool_call&gt;</code></td>
+<td>值结束后的结构字符不属于参数</td>
+</tr>
+</tbody>
+</table>
+<p>再加一条：<strong>尾部扣留 len(<code>&lt;/tool_call&gt;</code>) = 11 个字符</strong>。扣留是必需的——若不扣留，<code>&lt;/tool_call&gt;</code> 的前缀会先作为参数 delta 发给客户端，等标记读完才发现该收回；扣留窗口让"发出"与"确认不是标记"同时完成。</p>
+<p>六个构造用例的对拍结果（CPU，无 GPU）：</p>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th style="text-align: right;">片段数</th>
+<th>结果</th>
+<th>与一次性解析对拍</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单调用短参数</td>
+<td style="text-align: right;">3</td>
+<td>1 个调用</td>
+<td>逐字段相同</td>
+</tr>
+<tr>
+<td>转义字符串（<code>\"</code>、<code>\\</code>、<code>\n</code>）</td>
+<td style="text-align: right;">5</td>
+<td>1 个调用</td>
+<td>逐字段相同</td>
+</tr>
+<tr>
+<td>Unicode 转义被逐字符切开（91 片段）</td>
+<td style="text-align: right;">91</td>
+<td>1 个调用</td>
+<td>逐字段相同</td>
+</tr>
+<tr>
+<td>并行两个调用</td>
+<td style="text-align: right;">5</td>
+<td>2 个调用</td>
+<td>逐字段相同</td>
+</tr>
+<tr>
+<td>不完整 JSON（流在 JSON 中途结束）</td>
+<td style="text-align: right;">4</td>
+<td>1 个调用，标 <code>incomplete_json</code></td>
+<td>两边都判错（错误信息可不同）</td>
+</tr>
+<tr>
+<td>流中途取消</td>
+<td style="text-align: right;">6</td>
+<td>0 个调用（丢弃在途）</td>
+<td>取消是客户端语义，参照实现看不到</td>
+</tr>
+</tbody>
+</table>
+<p>还验证了一条流式协议的核心不变量：<strong>每步发出的 delta 拼接起来必须等于最终 <code>arguments_raw</code></strong>（六个用例全部成立）。这条不变量一旦破坏，客户端就会拿到与最终解析结果不一致的参数。</p>
+<h3 id="4">4. 重扫的代价是二次的</h3>
+<p>一个"简单实现"是每收到一个片段就把累计文本整体重新解析一次。它的语义与增量实现相同，代价不同。用固定 8 字符片段喂入同一条调用，参数 payload 从 256 B 扫到 64 KiB：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">payload</th>
+<th style="text-align: right;">片段数</th>
+<th style="text-align: right;">单遍扫描字符</th>
+<th style="text-align: right;">逐片段重扫字符</th>
+<th style="text-align: right;">扫描倍数</th>
+<th style="text-align: right;">单遍墙钟</th>
+<th style="text-align: right;">重扫墙钟</th>
+<th style="text-align: right;">时间倍数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">256 B</td>
+<td style="text-align: right;">33</td>
+<td style="text-align: right;">262</td>
+<td style="text-align: right;">4 486</td>
+<td style="text-align: right;">17.1×</td>
+<td style="text-align: right;">0.15 ms</td>
+<td style="text-align: right;">0.09 ms</td>
+<td style="text-align: right;">0.62×</td>
+</tr>
+<tr>
+<td style="text-align: right;">1 KiB</td>
+<td style="text-align: right;">129</td>
+<td style="text-align: right;">1 030</td>
+<td style="text-align: right;">67 078</td>
+<td style="text-align: right;">65.1×</td>
+<td style="text-align: right;">0.60 ms</td>
+<td style="text-align: right;">0.37 ms</td>
+<td style="text-align: right;">0.62×</td>
+</tr>
+<tr>
+<td style="text-align: right;">4 KiB</td>
+<td style="text-align: right;">513</td>
+<td style="text-align: right;">4 102</td>
+<td style="text-align: right;">1 054 726</td>
+<td style="text-align: right;">257.1×</td>
+<td style="text-align: right;">2.37 ms</td>
+<td style="text-align: right;">2.17 ms</td>
+<td style="text-align: right;">0.92×</td>
+</tr>
+<tr>
+<td style="text-align: right;">16 KiB</td>
+<td style="text-align: right;">2 049</td>
+<td style="text-align: right;">16 390</td>
+<td style="text-align: right;">16 801 798</td>
+<td style="text-align: right;">1 025.1×</td>
+<td style="text-align: right;">9.08 ms</td>
+<td style="text-align: right;">18.58 ms</td>
+<td style="text-align: right;">2.05×</td>
+</tr>
+<tr>
+<td style="text-align: right;">64 KiB</td>
+<td style="text-align: right;">8 193</td>
+<td style="text-align: right;">65 542</td>
+<td style="text-align: right;">268 533 766</td>
+<td style="text-align: right;">4 097.1×</td>
+<td style="text-align: right;">73.5 ms</td>
+<td style="text-align: right;">204.0 ms</td>
+<td style="text-align: right;">2.77×</td>
+</tr>
+</tbody>
+</table>
+<p>两点必须一起说：</p>
+<ul>
+<li><strong>扫描量是确定的二次增长</strong>：片段数与长度成正比，逐片段重扫的总量 ≈ L·k/2，所以倍数随长度线性上升（每个 4 倍长度让倍数再乘 4）。</li>
+<li><strong>墙钟不是</strong>。前三行重扫反而更快，因为 Python 的字符串拼接与小 JSON 解析有固定成本，而增量实现每字符都要走状态机分支；到 16 KiB 才反超，64 KiB 是 2.77 倍。<strong>"二次复杂度"是复杂度事实，"慢多少"要在目标语言与目标长度上实测</strong>——本实验里 4 KiB 以下两种实现一样快。</li>
+</ul>
+<p><strong>多调用长参数不会让缓冲累加。</strong> 把 payload 拆到 1/2/4 个调用里（总量仍是 256 B/4 KiB/64 KiB），单遍状态机的峰值缓冲稳定在 <strong>62 字符</strong>：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">总 payload</th>
+<th style="text-align: right;">调用数</th>
+<th style="text-align: right;">片段数</th>
+<th style="text-align: right;">扫描倍数</th>
+<th style="text-align: right;">单遍峰值缓冲</th>
+<th style="text-align: right;">重扫峰值缓冲</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">256 B</td>
+<td style="text-align: right;">1 / 2 / 4</td>
+<td style="text-align: right;">33 / 34 / 44</td>
+<td style="text-align: right;">17.1 / 17.7 / 22.8</td>
+<td style="text-align: right;">62 / 62 / 62</td>
+<td style="text-align: right;">262 / 269 / 347</td>
+</tr>
+<tr>
+<td style="text-align: right;">4 KiB</td>
+<td style="text-align: right;">1 / 2 / 4</td>
+<td style="text-align: right;">513 / 514 / 516</td>
+<td style="text-align: right;">257.1 / 257.7 / 258.8</td>
+<td style="text-align: right;">62 / 62 / 62</td>
+<td style="text-align: right;">4 102 / 4 109 / 4 123</td>
+</tr>
+<tr>
+<td style="text-align: right;">64 KiB</td>
+<td style="text-align: right;">1 / 2 / 4</td>
+<td style="text-align: right;">8 193 / 8 194 / 8 196</td>
+<td style="text-align: right;">4 097.1 / 4 097.7 / 4 098.8</td>
+<td style="text-align: right;">62 / 62 / 62</td>
+<td style="text-align: right;">65 542 / 65 549 / 65 563</td>
+</tr>
+</tbody>
+</table>
+<p>原因是每个调用结束时它的 arguments 就被交出去，常驻的只有头部窗口与尾部扣留窗口；<strong>缓冲与"流里同时有多少调用"无关，只与单个调用的头部长度有关</strong>。逐片段重扫的峰值则随总字节数线性增长。</p>
+<p><strong>常驻缓冲是第三个、也是唯一随长度不变的量。</strong> 单遍状态机的缓冲只有三部分：找 <code>&lt;tool_call&gt;</code> 的滑窗（≤11 字符）、有界的头部缓冲（≤256 字符）、arguments 区的尾部扣留窗口（≤12 字符）。实测峰值稳定在 <strong>62 字符</strong>，与 payload 无关；逐片段重扫的峰值就是累计文本本身（64 KiB 档 65 542 字符，相差 1 057 倍）。三者一起看才完整：扫描量差 4 097 倍、墙钟差 2.68 倍、缓冲差 1 057 倍，<strong>决定能不能在长流上跑的是第三个</strong>。</p>
+<h3 id="5-schema">5. 提交闸门：闭合、允许表与 schema 三道</h3>
+<p>解析出参数不等于可以执行。把「一次调用可以派发」定义成三步全部通过，10 个用例逐项断言：</p>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th style="text-align: right;">解析出的调用</th>
+<th style="text-align: right;">派发</th>
+<th>拒绝原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单调用 / 转义串 / Unicode 转义跨片段 / 逐字符转义</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1</td>
+<td>—</td>
+</tr>
+<tr>
+<td>两个并行调用</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">2</td>
+<td>—</td>
+</tr>
+<tr>
+<td>交错三调用（末个截断）</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">2</td>
+<td><code>incomplete_json</code></td>
+</tr>
+<tr>
+<td>JSON 未闭合</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0</td>
+<td><code>incomplete_json</code></td>
+</tr>
+<tr>
+<td>闭合但 <code>expression</code> 传了整数</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0</td>
+<td><code>schema: 'expression' should be string, got int</code></td>
+</tr>
+<tr>
+<td>闭合但工具不在允许表</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0</td>
+<td><code>not_in_allowlist</code></td>
+</tr>
+<tr>
+<td>客户端中途取消</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td>（在途调用被丢弃）</td>
+</tr>
+</tbody>
+</table>
+<p>三点设计后果：</p>
+<ol>
+<li><strong>schema 校验必须在服务端做，且要在派发之前。</strong> 客户端解析器只保证 JSON 语法；类型错误在参数闭合后才暴露，此时派发已经太晚。</li>
+<li><strong>允许表是客户端的第一道闸，不是唯一一道。</strong> 客户端拦下未授权工具能省掉一次往返，但服务端仍需独立校验——两者都不能靠提示词或工具注解。</li>
+<li><strong>截断与取消都不会派发。</strong> 未闭合的调用在 <code>finish()</code> 里被标成 <code>incomplete_json</code> 并保持 <code>dispatched=False</code>；取消丢弃在途调用、保留已完成的调用。这条不变量是 9.5「不重复副作用」在客户端侧的前提。</li>
+</ol>
+<h3 id="6">6. 约束与投机：接受长度看内容，不看模板</h3>
+<p>DFlash 草稿（<code>z-lab/Qwen3-4B-DFlash-b16</code>，8 个投机 token）与普通解码在同一批 8 格上对拍：</p>
+<table>
+<thead>
+<tr>
+<th>内容类型</th>
+<th style="text-align: right;">接受率（无约束）</th>
+<th style="text-align: right;">接受率（约束）</th>
+<th style="text-align: right;">墙钟 无草稿</th>
+<th style="text-align: right;">墙钟 DFlash</th>
+<th style="text-align: right;">加速</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>结构固定</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">186–282 ms</td>
+<td style="text-align: right;">45–174 ms</td>
+<td style="text-align: right;">1.6–4.2×</td>
+</tr>
+<tr>
+<td>参数自由</td>
+<td style="text-align: right;">0.125</td>
+<td style="text-align: right;">0.222</td>
+<td style="text-align: right;">82–149 ms</td>
+<td style="text-align: right;">69–135 ms</td>
+<td style="text-align: right;">1.1–1.2×</td>
+</tr>
+<tr>
+<td>长数字（抄 prompt 里的 39 位整数）</td>
+<td style="text-align: right;">0.594</td>
+<td style="text-align: right;">0.844</td>
+<td style="text-align: right;">434 ms</td>
+<td style="text-align: right;">109–110 ms</td>
+<td style="text-align: right;">4.0×</td>
+</tr>
+<tr>
+<td>长文本（抄 prompt 里的 76 token）</td>
+<td style="text-align: right;">0.796</td>
+<td style="text-align: right;">0.921</td>
+<td style="text-align: right;">716–821 ms</td>
+<td style="text-align: right;">144–171 ms</td>
+<td style="text-align: right;">4.5–5.0×</td>
+</tr>
+</tbody>
+</table>
+<p>四个可迁移的结论：</p>
+<ol>
+<li><strong>结构固定时接受率 1.0</strong>，但绝对收益有限——这类输出本来就只有 18 个 token，草稿一次就猜完，省下的是每请求的固定开销。</li>
+<li><strong>参数自由时接受率掉到 0.13–0.22</strong>，加速只有 1.1–1.2×。参数内容由模型自己决定，草稿猜不中。</li>
+<li><strong>"抄 prompt"是草稿最喜欢的内容</strong>：长文本 0.80/0.92、长数字 0.59/0.84，墙钟降到 1/4 上下。</li>
+<li><strong>约束解码会抬高接受率</strong>（自由 0.125→0.222、长数字 0.594→0.844、长文本 0.796→0.921）：语法把候选压到更小的集合里，草稿与目标的分布更接近。<strong>但接受率是"草稿猜中多少"，与"输出是否正确"没有关系</strong>——8 格 × 3 次的参数正确率都是 100%，两种解码方式没有区别。</li>
+</ol>
+<p>这里有一个与直觉相反的结果要保留：<strong>"长数字没人猜得中"只对 prompt 里没有的数字成立。</strong> 本实验的 39 位整数就写在 prompt 里，草稿能看到 prompt，于是接受率 0.59–0.84。要检验"高熵数字"假设，必须用不在上下文里的数字。</p>
+<h3 id="7">7. 协议边界：谁提供幂等，谁提供取消</h3>
+<p>模型 token 走到真正执行要跨四道边界，每道边界的保证不同：</p>
+<table>
+<thead>
+<tr>
+<th>边界</th>
+<th>谁在管</th>
+<th>提供什么保证</th>
+<th>不提供什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>工具解析器</td>
+<td>引擎（Hermes parser）</td>
+<td>把 delta 还原成 <code>tool_calls</code>；参数闭合前不提交</td>
+<td>不校验业务语义，不保证参数已授权</td>
+</tr>
+<tr>
+<td>schema 校验</td>
+<td>服务端框架（pydantic 等）</td>
+<td>必填/类型/枚举检查，失败给出结构化错误</td>
+<td>不理解权限与租户；schema 变更会让缓存 schema 的调用方失败</td>
+</tr>
+<tr>
+<td>JSON-RPC / 传输</td>
+<td>MCP 客户端与服务端</td>
+<td>请求-响应配对、会话、取消通知、SSE/JSON 两种回包</td>
+<td><strong>不提供 exactly-once</strong>：重试就是重新执行，除非服务端按业务键去重</td>
+</tr>
+<tr>
+<td>业务执行</td>
+<td>工具实现</td>
+<td>副作用、幂等键、事务边界、允许表</td>
+<td>协议层无法替你回滚已验证的副作用</td>
+</tr>
+</tbody>
+</table>
+<p>这张表解释了失败矩阵里的每一行：不带幂等键重试产生 2 条副作用，是因为第三层只保证「一次尝试的结果可见」；「执行成功但响应丢失」窗口只能靠第四层的幂等键收口；<code>session_idle_timeout</code> 属于第三层的会话状态，它失效时客户端要做的是重建会话，而不是重试同一请求。</p>
+<p><strong>取消也在第三层。</strong> MCP 的取消通知是「尽力而为」：服务端可以忽略，副作用也不会因为收到取消而回滚。要真正做到可回收，需要在工具实现里传播取消（进程组、deadline），并让业务侧用幂等键区分「重试」与「新动作」——这部分留给 9.5 的持久执行与 9.8 的沙箱回收。</p>
+<hr />
+<h2 id="vllm">工程实现：vLLM 的工具调用路径</h2>
+<h3 id="_5">源码解析</h3>
+<p><strong>模板与工具注入。</strong> 服务端把 <code>tools</code> 交给 tokenizer 的 chat template 渲染成 prompt。实测的模板成本可以直接从 usage 读出：1/4/16/64 个工具对应 186/393/1 335/5 127 token。</p>
+<p><strong>工具解析器。</strong> <code>vllm/tool_parsers/hermes_tool_parser.py:70</code> <code>extract_tool_calls</code> 做一次性解析；<code>:204</code> <code>extract_tool_calls_streaming</code> 做增量解析，输入是"累计文本 + 本步增量"，输出是"本步该发给客户端的 delta"。本次实测里一次典型调用被切成 12–15 个参数片段。</p>
+<p><strong>约束解码。</strong> <code>structured_outputs</code> 在 0.29 里必须是 <code>StructuredOutputsParams</code> 对象（<code>vllm/sampling_params.py</code> 的 dataclass 字段为 <code>json/regex/choice/grammar/...</code>）；直接传 dict 会在 <code>input_processor.py</code> 的参数校验处报 <code>'dict' object has no attribute '_backend'</code>。这条错误在本轮实验中真实出现过，保留在 <code>content.log</code> 的失败版本里。</p>
+<p><strong>reasoning 与 tool 的分离。</strong> <code>--reasoning-parser qwen3</code> 把 <code>thinking</code> 段从输出中拆出来（<code>vllm/reasoning/qwen3_engine_reasoning_parser.py</code>）。这直接改变工具任务的行为：本实验里若开着 thinking，模型会先写 256 token 的思考再输出 JSON，甚至在 <code>max_tokens</code> 用尽时根本不给答案——本轮 9.2 的对照组因此显式 <code>enable_thinking=False</code>。</p>
+<h3 id="_6">设计取舍</h3>
+<ul>
+<li><strong>在模板里塞工具 vs 在系统提示里描述工具。</strong> 前者用引擎的 tool parser 自动还原调用、可以被约束解码加持；后者要靠正则自己解析、拿不到语法保证。代价是模板 token 随工具数线性增长，64 个工具就是 5 127 token/轮。</li>
+<li><strong><code>tool_choice=required</code> vs <code>named</code>。</strong> <code>required</code> 保留模型的选择自由（本实验里它选了语义正确的 <code>search_corpus</code>），<code>named</code> 把选择权拿走（恒为 <code>calculate</code>）。要求"必须产生一次调用"而工具集又很大时，两者对任务成功率的影响完全不同：本实验里 named + 只有一个 <code>calculate</code> 会得到一次语义无关的调用。</li>
+<li><strong>流式 delta vs 一次性返回。</strong> 流式让客户端早看到参数、能提前取消，代价是解析器要维护状态、尾部要扣留窗口。一次性返回实现简单，但客户端必须等整段生成完。</li>
+<li><strong>约束解码 vs 提示词约束。</strong> 约束是硬保证，但每一步都要与自动机求交（本实验里 <code>ms/token</code> 涨 53%–82%）；提示词约束没有运行时成本，但只是概率倾向。<strong>先问"模型本来会不会写错"</strong>，再决定要不要付这个代价。</li>
+</ul>
+<hr />
+<h2 id="mini">工程实现：mini 实现——有状态增量解析器</h2>
+<p>核心是"值何时结束"的判断。下面这段来自 <code>labs/L9/incremental_tool_parser.py</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_consume_args</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">text</span><span class="p">):</span>
+    <span class="n">flushed</span><span class="p">,</span> <span class="n">ended</span> <span class="o">=</span> <span class="p">[],</span> <span class="kc">False</span>
+    <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="n">text</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_value_done</span><span class="p">:</span>                     <span class="c1"># 值已完整，只等 &lt;/tool_call&gt;</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_staging</span> <span class="o">+</span> <span class="n">ch</span><span class="p">)[</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="n">CLOSE</span><span class="p">):]</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span> <span class="o">==</span> <span class="n">CLOSE</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span> <span class="o">=</span> <span class="s2">""</span>               <span class="c1"># 结束标记不属于 arguments</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_end_call</span><span class="p">();</span> <span class="n">ended</span> <span class="o">=</span> <span class="kc">True</span><span class="p">;</span> <span class="k">break</span>
+            <span class="k">continue</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_value_kind</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">ch</span><span class="o">.</span><span class="n">isspace</span><span class="p">():</span>
+            <span class="k">continue</span>                             <span class="c1"># 值前的空白不进 delta</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_value_kind</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_value_kind</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"object"</span> <span class="k">if</span> <span class="n">ch</span> <span class="o">==</span> <span class="s2">"{"</span> <span class="k">else</span> <span class="s2">"array"</span> <span class="k">if</span> <span class="n">ch</span> <span class="o">==</span> <span class="s2">"["</span>
+                                <span class="k">else</span> <span class="s2">"string"</span> <span class="k">if</span> <span class="n">ch</span> <span class="o">==</span> <span class="s1">'"'</span> <span class="k">else</span> <span class="s2">"literal"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span> <span class="o">+=</span> <span class="n">ch</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_track</span><span class="p">(</span><span class="n">ch</span><span class="p">)</span>                          <span class="c1"># 字符串/转义/\uXXXX/括号深度</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_value_complete</span><span class="p">():</span>               <span class="c1"># 对象深度归零、字符串闭合…</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_value_done</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_cur</span><span class="p">[</span><span class="s2">"arguments_raw"</span><span class="p">]</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span>
+            <span class="n">flushed</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_staging</span><span class="p">);</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span> <span class="o">=</span> <span class="s2">""</span>
+            <span class="k">continue</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_staging</span><span class="p">)</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">CLOSE</span><span class="p">):</span>      <span class="c1"># 扣留窗口之外的部分立刻发出</span>
+            <span class="n">ready</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span><span class="p">[:</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="n">CLOSE</span><span class="p">)]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staging</span><span class="p">[</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="n">CLOSE</span><span class="p">):]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_cur</span><span class="p">[</span><span class="s2">"arguments_raw"</span><span class="p">]</span> <span class="o">+=</span> <span class="n">ready</span>
+            <span class="n">flushed</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ready</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">ended</span><span class="p">,</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">flushed</span><span class="p">)</span>
+</code></pre></div>
+
+<p>三处容易写错的地方：</p>
+<ol>
+<li><strong>结束标记的扣留</strong>：不扣留就会把标记前缀当参数发出去；扣留窗口只需要 11 个字符。</li>
+<li><strong>值的边界不等于调用体的边界</strong>：<code>{"name": "...", "arguments": {...}}</code> 里外层对象的 <code>}</code> 紧跟在内层 <code>}</code> 之后，若"从 arguments 键之后一路收到底"，参数里就会多一个 <code>}</code>，<code>json.loads</code> 报 <code>Extra data</code>。</li>
+<li><strong>字符串内的标记不结束调用</strong>：<code>_track</code> 维护的 <code>_in_string</code> 必须与扣留窗口配合，否则 <code>{"q": "&lt;/tool_call&gt;"}</code> 会提前收尾。</li>
+</ol>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1) tool_choice × 工具数矩阵 + 内容类型（约束/草稿）对照，脚本自带服务启停</span>
+bash<span class="w"> </span>labs/L9/run_tool_pipeline.sh<span class="w"> </span>&lt;run_root&gt;
+
+<span class="c1"># 2) 增量解析器对拍与扫描代价（CPU 即可，退出码即自检结果）</span>
+python<span class="w"> </span>labs/L9/incremental_tool_parser.py<span class="w"> </span>--out<span class="w"> </span>&lt;out_dir&gt;
+
+<span class="c1"># 2b) 工具预算（schema 冷/热前缀、完整集 vs 按需发现）+ 两引擎 tool_choice 矩阵</span>
+bash<span class="w"> </span>labs/L9/run_tool_budget.sh<span class="w"> </span>&lt;run_root&gt;/budget
+
+<span class="c1"># 3) 同一工具的 direct / stdio MCP / Streamable HTTP MCP 三条路径</span>
+<span class="c1">#    （自带两个 HTTP 服务与一次引擎测量：下一轮 prefill）</span>
+bash<span class="w"> </span>labs/L9/run_mcp_tool_path.sh<span class="w"> </span>&lt;run_root&gt;/mcp-path
+
+<span class="c1"># 4) 失败路径与授权边界矩阵（断连、重复执行、晚到结果、schema 变更、会话失效、鉴权、allowlist）</span>
+python<span class="w"> </span>labs/L9/mcp_fault_cases.py<span class="w"> </span>run<span class="w"> </span>--out<span class="w"> </span>&lt;run_root&gt;/mcp-faults
+
+<span class="c1"># 5) Tasks 扩展：能力协商、tasks/get 轮询、tasks/result、tasks/cancel 与取消回滚</span>
+<span class="c1">#    （隔离环境：/Volumes/data/venvs/mcp，python-sdk 2.2.0）</span>
+/Volumes/data/venvs/mcp/bin/python<span class="w"> </span>labs/L9/mcp_tasks_probe.py<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>&lt;run_root&gt;/mcp-tasks/mcp_tasks.json<span class="w"> </span>--state-dir<span class="w"> </span>&lt;run_root&gt;/mcp-tasks/state
+</code></pre></div>
+
+<p>本次数字（crater，RTX 5090 D，Qwen3-4B，<code>--max-model-len 8192</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th style="text-align: right;">规模</th>
+<th>关键读数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tool_choice × 工具数</td>
+<td style="text-align: right;">4×4×2 = 32 请求</td>
+<td>四种模式全部被支持；<code>auto</code>+1 工具 0/2 调用；模板 186→5 127 token</td>
+</tr>
+<tr>
+<td>内容类型对照</td>
+<td style="text-align: right;">2 解码 × 4 内容 × 2 约束 × 3 次 = 48 次</td>
+<td>参数正确 48/48；接受率 0.125–1.000；<code>ms/token</code> 8.9–18.6</td>
+</tr>
+<tr>
+<td>增量解析对拍</td>
+<td style="text-align: right;">10 用例</td>
+<td>四种检查全过：增量与一次性解析逐字段相同、调用数、派发数（闭合→允许表→schema）、拒绝原因</td>
+</tr>
+<tr>
+<td>扫描代价</td>
+<td style="text-align: right;">5 个 payload 档 × 8 chars/片段</td>
+<td>64 KiB 时重扫 2.69 亿字符（4 097×）、墙钟 2.68×、峰值缓冲 62 字符对 65 542 字符（1 057×）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_7">工具调用三条路径：协议层比工具本身贵得多</h3>
+<p>同一个 <code>calculate</code> 工具（返回 66–69 字节的 JSON）、同一批参数，四条路径各 9 个采样点（并发 1/8/32 × 注入延迟 0/10/1000 ms，每格 64 次调用，全部校验返回值、0 错误 0 不匹配）：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th style="text-align: right;">连接建立</th>
+<th>单次总耗时 p50（延迟 0，并发 1/8/32）</th>
+<th>传输段 p50（并发 1/8/32）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>直接调用</td>
+<td style="text-align: right;">—</td>
+<td>0.0036 / 0.0035 / 0.0035 ms</td>
+<td>0.002 / 0.002 / 0.002 ms</td>
+</tr>
+<tr>
+<td>stdio MCP</td>
+<td style="text-align: right;"><strong>275.6 ms</strong>（拉子进程 + initialize）</td>
+<td>0.28 / 2.39 / <strong>8.41</strong> ms</td>
+<td>0.27 / 2.39 / <strong>8.41</strong> ms</td>
+</tr>
+<tr>
+<td>Streamable HTTP（JSON 回包）</td>
+<td style="text-align: right;">14.6 ms</td>
+<td>0.79 / 4.46 / <strong>17.28</strong> ms</td>
+<td>0.78 / 4.46 / 17.28 ms</td>
+</tr>
+<tr>
+<td>Streamable HTTP（SSE 回包）</td>
+<td style="text-align: right;">4.5 ms</td>
+<td>1.14 / 7.27 / <strong>27.85</strong> ms</td>
+<td>1.14 / 7.26 / 27.84 ms</td>
+</tr>
+</tbody>
+</table>
+<p>三点直接可用的结论：</p>
+<ol>
+<li><strong>协议开销在并发下超线性增长。</strong> 64 次调用的平均单次耗时从并发 1 的 0.28 ms 升到并发 32 的 8.41 ms（stdio）、0.79→17.28 ms（HTTP JSON）、1.14→27.85 ms（SSE）。工具本身只花 0.005 ms，增长全部来自帧编解码与单管道/单连接的串行化。<strong>把工具调用拆成 MCP 服务不能只看功能，要看这条曲线的斜率。</strong></li>
+<li><strong>SSE 与 JSON 的差价约 1.4–1.6 倍</strong>，且随并发放大；一次工具调用的结果只有 69 字节，差价不是带宽而是分帧与事件解析。</li>
+<li><strong>冷连接代价压倒热路径。</strong> 每次调用重建连接时（8 次调用），stdio 单次 330 ms、HTTP 4.9 ms；热连接下分别是 0.28 ms 与 0.79 ms——<strong>stdio 冷热差约 1 000 倍</strong>。池化连接的收益不在吞吐，在把这条 275 ms 的固定成本从关键路径上拿掉。</li>
+</ol>
+<p><code>next-turn</code> 那一档把工具结果按 96 B / 4 KiB / 24 KiB 回填给模型，测下一轮首 token：TTFT 11.4–20.2 ms，prompt token 95/126/286，<code>cached_tokens</code> 分别命中 80/112/272。<strong>注意填充物是空格</strong>，字节数增长远快于 token 数增长，所以这一档只能说明「回填体积对首 token 的影响小于协议自身的抖动」，不能用来估计真实大结果（如整份文件）的 prefill 代价。</p>
+<h3 id="exactly-once">失败矩阵：协议不给 exactly-once</h3>
+<p>10 个用例在独立进程里各跑一遍（避免一个会话的取消作用域污染下一个），副作用由服务端账本逐条数出：</p>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>观测结果</th>
+<th>说明了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>不带幂等键重试</td>
+<td>账本 <strong>2</strong> 条副作用</td>
+<td>协议层重试就是第二次执行</td>
+</tr>
+<tr>
+<td>带幂等键重试</td>
+<td>账本 <strong>1</strong> 条，第二次 <code>dedup_hit=true</code></td>
+<td>去重必须由服务端在同一提交边界完成</td>
+</tr>
+<tr>
+<td>客户端超时 + 晚到结果</td>
+<td>首次超时；执行于 3 s 后完成（账本 1 条）；同键重试 <code>dedup_hit=true</code></td>
+<td>断开不停止执行，晚到回包被丢弃</td>
+</tr>
+<tr>
+<td>副作用已提交后进程被杀</td>
+<td>客户端报错，账本 <strong>1</strong> 条，同键重试 <code>dedup_hit=true</code>、总数仍 1</td>
+<td>「执行成功但响应丢失」窗口的真实代价与唯一解法</td>
+</tr>
+<tr>
+<td>副作用提交前进程被杀</td>
+<td>客户端报错，账本 <strong>0</strong> 条</td>
+<td>另一种断连窗口：确实没执行</td>
+</tr>
+<tr>
+<td>schema 变更</td>
+<td>v2 必填 <code>[expression, mode]</code>；旧调用被 pydantic 校验拒绝（<code>Field required</code>）；重新 <code>tools/list</code> 后成功</td>
+<td>缓存 schema 的调用方在参数校验处失败，退路是重新列出工具</td>
+</tr>
+<tr>
+<td>会话失效</td>
+<td>配置的 <code>session_idle_timeout=2 s</code> 在等待 6 s 后仍未过期（负结果）；服务重启后新会话可继续</td>
+<td>超时未生效按事实记录；重建会话是恢复路径</td>
+</tr>
+<tr>
+<td>HTTP 鉴权</td>
+<td>无 token <strong>401</strong>、有 token 200；工具侧看到 <code>Authorization: Bearer l9-secr...</code></td>
+<td>传输层鉴权与工具授权是两层</td>
+</tr>
+<tr>
+<td>客户端 allowlist</td>
+<td>未授权工具在发出前被拒，账本 <strong>0</strong> 条</td>
+<td>允许表要在客户端先拦一道，服务端仍需独立校验</td>
+</tr>
+<tr>
+<td>Tasks 扩展</td>
+<td>见下一小节：能力可协商，但规范路径（任务增强 <code>tools/call</code>）被本机 SDK 服务端判为 invalid result</td>
+<td>依赖版本的实际支持范围，不能按规范文本假定</td>
+</tr>
+</tbody>
+</table>
+<p>协商结果本身也是一条要记的事实：钉住的规范版本是 MCP 2025-11-25，python-sdk 2.2.0 的握手版本上限相同（<code>negotiated_protocol_version = 2025-11-25</code>），但该 SDK 同时认识 2026-07-28 的「现代」版本；换 SDK 大版本必须重新记录协商值，否则协议行为不可比。</p>
+<h3 id="tasks">Tasks 扩展：能力能协商，规范路径走不通</h3>
+<p>上一轮只测到「服务端没声明 <code>capabilities.tasks</code>」。本轮显式声明了一个完整的 Tasks 能力块（<code>list</code> / <code>cancel</code> / <code>requests.tools.call</code>），并用 SDK 自己的 lowlevel 服务端实现 <code>tasks/get</code>、<code>tasks/cancel</code>、<code>tasks/result</code>，客户端则用同一份 SDK 的 <code>send_request</code> 发原始请求。结果分三层：</p>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>观测</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>能力协商</td>
+<td>客户端 <code>initialize</code> 收到 <code>tasks: {list, cancel, requests: {tools: {call}}}</code></td>
+<td>能力块可以声明并被解析，协商本身没问题</td>
+</tr>
+<tr>
+<td>规范路径：任务增强 <code>tools/call</code></td>
+<td>客户端收到 <code>MCPError: Handler returned an invalid result</code></td>
+<td><strong>规范语义走不通</strong>：SDK 的 <code>tools/call</code> 结果面只接受 <code>CallToolResult</code>（<code>SERVER_RESULTS[("tools/call","2025-11-25")]</code>），服务端把 <code>CreateTaskResult</code> 当非法结果（<code>mcp/server/runner.py:385</code>）</td>
+</tr>
+<tr>
+<td>显式建任务后的轮询/取结果/取消</td>
+<td><code>tasks/get</code> 7 次轮询 <code>working→…→completed</code>；<code>tasks/result</code> 返回 <code>_meta</code>；<code>tasks/cancel</code> 把状态改成 <code>cancelled</code></td>
+<td>这三条方法可以走通，但载荷类型 <code>GetTaskPayloadResult</code> 只有 <code>meta</code> 字段，工具结果内容无法按类型带回</td>
+</tr>
+</tbody>
+</table>
+<p>SDK 的支持范围可以直接在源码里对上：<code>mcp_types/methods.py</code> 的方法表在 2025-11-25 一行明确写着 <code>tasks/* deliberately absent</code>（第 101 行）与 <code>tasks/status deliberately absent</code>（第 146 行）——类型定义齐全（<code>GetTaskRequest</code>、<code>CreateTaskResult</code>、<code>ServerTasksCapability</code> 都在），但方法表刻意不收；<code>mcp/server/extension.py:59</code> 又把 <code>tasks/get</code> 举为「扩展可新增的方法」的例子。也就是说，<strong>要跑通 Tasks，得把它当扩展自己提供方法，而不能期待 SDK 按规范文本自动接上</strong>。这正是任务书说的"Tasks 为实验性且必须报告 SDK 支持范围"。</p>
+<h3 id="_8">取消通知不保证副作用回滚，两种实现都要数账本</h3>
+<p><code>tasks/cancel</code> 与 <code>notifications/cancelled</code> 都不构成回滚。用一个会写账本的工具做对照（<code>commit=first</code>：先写账本再等待；<code>commit=last</code>：等待后再写）：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th><code>commit=last</code>（可协作取消）</th>
+<th><code>commit=first</code>（已提交）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>任务运行中 <code>tasks/cancel</code></td>
+<td>—</td>
+<td>状态先变 <code>cancelled</code>，worker 跑完后账本 <strong>2 条</strong>记录仍在，任务记录被 worker 覆盖为 <code>completed</code></td>
+</tr>
+<tr>
+<td>客户端放弃在飞请求（SDK 自动发 <code>notifications/cancelled</code>）</td>
+<td>服务端收到取消通知，账本 <strong>0 条</strong>——取消在提交前生效</td>
+<td>服务端收到取消通知，账本 <strong>1 条</strong>——<strong>已发生的副作用不因取消而消失</strong></td>
+</tr>
+</tbody>
+</table>
+<p>服务端确实收到了取消通知（账本中留了两条 <code>notifications/cancelled</code> 记录，request id 17/18）。SDK 的默认取消模式是 <code>interrupt</code>（<code>mcp/shared/jsonrpc_dispatcher.py:81</code>：取消处理器的执行作用域；另一种 <code>signal</code> 只置位 <code>ctx.cancel_requested</code>），且<strong>被取消的请求一律不回包</strong>。所以「取消」在协议层的含义是「不再等待」，不是「撤销已经发生的事」；要撤销只能靠补偿或业务幂等键，这与 9.5-B 的结论一致。</p>
+<details class="fold srcfold"><summary>results/local/9.2/20260922-mcp-tasks/mcp_tasks.json 全文（278 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="w"> </span><span class="nt">"sdk_evidence"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">  3</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">  4</span> <span class="w">   </span><span class="nt">"file"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/Volumes/data/venvs/mcp/lib/python3.12/site-packages/mcp_types/methods.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="w">   </span><span class="nt">"line"</span><span class="p">:</span><span class="w"> </span><span class="mi">101</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="w">   </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"# 2025-11-25 (tasks/* deliberately absent)"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="w">   </span><span class="nt">"needle"</span><span class="p">:</span><span class="w"> </span><span class="s2">"tasks/* deliberately absent"</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="w">   </span><span class="nt">"file"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/Volumes/data/venvs/mcp/lib/python3.12/site-packages/mcp_types/methods.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 11</span> <span class="w">   </span><span class="nt">"line"</span><span class="p">:</span><span class="w"> </span><span class="mi">146</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="w">   </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"# 2025-11-25 (tasks/status deliberately absent)"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="w">   </span><span class="nt">"needle"</span><span class="p">:</span><span class="w"> </span><span class="s2">"tasks/status deliberately absent"</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="w">   </span><span class="nt">"file"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/Volumes/data/venvs/mcp/lib/python3.12/site-packages/mcp/server/extension.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="w">   </span><span class="nt">"line"</span><span class="p">:</span><span class="w"> </span><span class="mi">59</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="w">   </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"\"\"\"A new request method an extension serves, e.g. `tasks/get`."</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 19</span> <span class="w">   </span><span class="nt">"needle"</span><span class="p">:</span><span class="w"> </span><span class="s2">"e.g. `tasks/get`"</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="w">   </span><span class="nt">"file"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/Volumes/data/venvs/mcp/lib/python3.12/site-packages/mcp/shared/jsonrpc_dispatcher.py"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="w">   </span><span class="nt">"line"</span><span class="p">:</span><span class="w"> </span><span class="mi">81</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 24</span> <span class="w">   </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"PeerCancelMode = Literal[\"interrupt\", \"signal\"]"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 25</span> <span class="w">   </span><span class="nt">"needle"</span><span class="p">:</span><span class="w"> </span><span class="s2">"PeerCancelMode"</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 27</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="w">   </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"GetTaskPayloadResult.model_fields"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="w">   </span><span class="nt">"value"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="w">    </span><span class="s2">"meta"</span>
+<span class="linenos" aria-hidden="true"> 31</span> <span class="w">   </span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 32</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 33</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 34</span> <span class="w">   </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"CallToolRequestParams.has_task"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 35</span> <span class="w">   </span><span class="nt">"value"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos" aria-hidden="true"> 36</span> <span class="w">  </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 37</span> <span class="w"> </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 38</span> <span class="w"> </span><span class="nt">"cases"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 39</span> <span class="w">  </span><span class="nt">"plain_call"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 40</span> <span class="w">   </span><span class="nt">"is_error"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 41</span> <span class="w">   </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"hi"</span>
+<span class="linenos" aria-hidden="true"> 42</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 43</span> <span class="w">  </span><span class="nt">"task_augmented_call"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 44</span> <span class="w">   </span><span class="nt">"error"</span><span class="p">:</span><span class="w"> </span><span class="s2">"MCPError: Handler returned an invalid result"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 45</span> <span class="w">   </span><span class="nt">"effects"</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span>
+<span class="linenos" aria-hidden="true"> 46</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 47</span> <span class="w">  </span><span class="nt">"task_poll_and_result"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 48</span> <span class="w">   </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-3d036d51a045"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 49</span> <span class="w">   </span><span class="nt">"start_call_structured"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 50</span> <span class="w">    </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-3d036d51a045"</span>
+<span class="linenos" aria-hidden="true"> 51</span> <span class="w">   </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 52</span> <span class="w">   </span><span class="nt">"polls"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 53</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 54</span> <span class="w">     </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"working"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 55</span> <span class="w">     </span><span class="nt">"updated"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:23.710219+00:00"</span>
+<span class="linenos" aria-hidden="true"> 56</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 57</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 58</span> <span class="w">     </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"working"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 59</span> <span class="w">     </span><span class="nt">"updated"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:23.710219+00:00"</span>
+<span class="linenos" aria-hidden="true"> 60</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 61</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 62</span> <span class="w">     </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"working"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 63</span> <span class="w">     </span><span class="nt">"updated"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:23.710219+00:00"</span>
+<span class="linenos" aria-hidden="true"> 64</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 65</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 66</span> <span class="w">     </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"working"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 67</span> <span class="w">     </span><span class="nt">"updated"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:23.710219+00:00"</span>
+<span class="linenos" aria-hidden="true"> 68</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 69</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 70</span> <span class="w">     </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"working"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 71</span> <span class="w">     </span><span class="nt">"updated"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:23.710219+00:00"</span>
+<span class="linenos" aria-hidden="true"> 72</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 73</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 74</span> <span class="w">     </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"working"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 75</span> <span class="w">     </span><span class="nt">"updated"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:23.710219+00:00"</span>
+<span class="linenos" aria-hidden="true"> 76</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 77</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 78</span> <span class="w">     </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"completed"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 79</span> <span class="w">     </span><span class="nt">"updated"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:24.513585+00:00"</span>
+<span class="linenos" aria-hidden="true"> 80</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 81</span> <span class="w">   </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 82</span> <span class="w">   </span><span class="nt">"task_result_visible_fields"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 83</span> <span class="w">    </span><span class="nt">"_meta"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 84</span> <span class="w">     </span><span class="nt">"task"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 85</span> <span class="w">      </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-3d036d51a045"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 86</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"completed"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 87</span> <span class="w">      </span><span class="nt">"status_message"</span><span class="p">:</span><span class="w"> </span><span class="s2">"wrote t2"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 88</span> <span class="w">      </span><span class="nt">"created_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:23.710215+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 89</span> <span class="w">      </span><span class="nt">"last_updated_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:24.513585+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 90</span> <span class="w">      </span><span class="nt">"ttl"</span><span class="p">:</span><span class="w"> </span><span class="mi">60000</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 91</span> <span class="w">      </span><span class="nt">"poll_interval"</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 92</span> <span class="w">      </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"t2"</span>
+<span class="linenos" aria-hidden="true"> 93</span> <span class="w">     </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 94</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 95</span> <span class="w">   </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 96</span> <span class="w">   </span><span class="nt">"effects"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 97</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 98</span> <span class="w">     </span><span class="nt">"at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:24.513220+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 99</span> <span class="w">     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"t2"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">100</span> <span class="w">     </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-3d036d51a045"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">101</span> <span class="w">     </span><span class="nt">"commit"</span><span class="p">:</span><span class="w"> </span><span class="s2">"last"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">102</span> <span class="w">     </span><span class="nt">"phase"</span><span class="p">:</span><span class="w"> </span><span class="s2">"after_wait"</span>
+<span class="linenos" aria-hidden="true">103</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">104</span> <span class="w">   </span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">105</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">106</span> <span class="w">  </span><span class="nt">"task_cancel"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">107</span> <span class="w">   </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-6f41f9c591a4"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">108</span> <span class="w">   </span><span class="nt">"cancel_result"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">109</span> <span class="w">    </span><span class="nt">"taskId"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-6f41f9c591a4"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">110</span> <span class="w">    </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"cancelled"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">111</span> <span class="w">    </span><span class="nt">"statusMessage"</span><span class="p">:</span><span class="w"> </span><span class="s2">"cancel requested; 已提交的副作用不回滚"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">112</span> <span class="w">    </span><span class="nt">"createdAt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:24.639887+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">113</span> <span class="w">    </span><span class="nt">"lastUpdatedAt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:25.045397+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">114</span> <span class="w">    </span><span class="nt">"ttl"</span><span class="p">:</span><span class="w"> </span><span class="mi">60000</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">115</span> <span class="w">    </span><span class="nt">"pollInterval"</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span>
+<span class="linenos" aria-hidden="true">116</span> <span class="w">   </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">117</span> <span class="w">   </span><span class="nt">"status_after_worker_finishes"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">118</span> <span class="w">    </span><span class="nt">"taskId"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-6f41f9c591a4"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">119</span> <span class="w">    </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"completed"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">120</span> <span class="w">    </span><span class="nt">"statusMessage"</span><span class="p">:</span><span class="w"> </span><span class="s2">"wrote t3"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">121</span> <span class="w">    </span><span class="nt">"createdAt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:24.639887+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">122</span> <span class="w">    </span><span class="nt">"lastUpdatedAt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:26.645170+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">123</span> <span class="w">    </span><span class="nt">"ttl"</span><span class="p">:</span><span class="w"> </span><span class="mi">60000</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">124</span> <span class="w">    </span><span class="nt">"pollInterval"</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span>
+<span class="linenos" aria-hidden="true">125</span> <span class="w">   </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">126</span> <span class="w">   </span><span class="nt">"effects"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">127</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">128</span> <span class="w">     </span><span class="nt">"at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:24.641088+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">129</span> <span class="w">     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"t3"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">130</span> <span class="w">     </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-6f41f9c591a4"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">131</span> <span class="w">     </span><span class="nt">"commit"</span><span class="p">:</span><span class="w"> </span><span class="s2">"first"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">132</span> <span class="w">     </span><span class="nt">"phase"</span><span class="p">:</span><span class="w"> </span><span class="s2">"before_wait"</span>
+<span class="linenos" aria-hidden="true">133</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">134</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">135</span> <span class="w">     </span><span class="nt">"at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:26.642717+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">136</span> <span class="w">     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"t3"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">137</span> <span class="w">     </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"task-6f41f9c591a4"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">138</span> <span class="w">     </span><span class="nt">"commit"</span><span class="p">:</span><span class="w"> </span><span class="s2">"first"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">139</span> <span class="w">     </span><span class="nt">"phase"</span><span class="p">:</span><span class="w"> </span><span class="s2">"after_wait"</span>
+<span class="linenos" aria-hidden="true">140</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">141</span> <span class="w">   </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">142</span> <span class="w">   </span><span class="nt">"effects_rolled_back_by_cancel"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="linenos" aria-hidden="true">143</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">144</span> <span class="w">  </span><span class="nt">"abandon_last"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">145</span> <span class="w">   </span><span class="nt">"client_outcome"</span><span class="p">:</span><span class="w"> </span><span class="s2">"CancelledError"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">146</span> <span class="w">   </span><span class="nt">"effects"</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span>
+<span class="linenos" aria-hidden="true">147</span> <span class="w">   </span><span class="nt">"side_effect_survived"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">148</span> <span class="w">   </span><span class="nt">"server_saw_cancelled_notification"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">149</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">150</span> <span class="w">     </span><span class="nt">"at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:27.656463+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">151</span> <span class="w">     </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"notifications/cancelled"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">152</span> <span class="w">     </span><span class="nt">"request_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"17"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">153</span> <span class="w">     </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"caller cancelled"</span>
+<span class="linenos" aria-hidden="true">154</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">155</span> <span class="w">   </span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">156</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">157</span> <span class="w">  </span><span class="nt">"abandon_first"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">158</span> <span class="w">   </span><span class="nt">"client_outcome"</span><span class="p">:</span><span class="w"> </span><span class="s2">"CancelledError"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">159</span> <span class="w">   </span><span class="nt">"effects"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">160</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">161</span> <span class="w">     </span><span class="nt">"at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:29.258961+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">162</span> <span class="w">     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"abandon-first"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">163</span> <span class="w">     </span><span class="nt">"task_id"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">164</span> <span class="w">     </span><span class="nt">"commit"</span><span class="p">:</span><span class="w"> </span><span class="s2">"first"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">165</span> <span class="w">     </span><span class="nt">"phase"</span><span class="p">:</span><span class="w"> </span><span class="s2">"before_wait"</span>
+<span class="linenos" aria-hidden="true">166</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">167</span> <span class="w">   </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">168</span> <span class="w">   </span><span class="nt">"side_effect_survived"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">169</span> <span class="w">   </span><span class="nt">"server_saw_cancelled_notification"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">170</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">171</span> <span class="w">     </span><span class="nt">"at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:27.656463+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">172</span> <span class="w">     </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"notifications/cancelled"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">173</span> <span class="w">     </span><span class="nt">"request_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"17"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">174</span> <span class="w">     </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"caller cancelled"</span>
+<span class="linenos" aria-hidden="true">175</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">176</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">177</span> <span class="w">     </span><span class="nt">"at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-09-22T06:36:29.658912+00:00"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">178</span> <span class="w">     </span><span class="nt">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"notifications/cancelled"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">179</span> <span class="w">     </span><span class="nt">"request_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"18"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">180</span> <span class="w">     </span><span class="nt">"reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"caller cancelled"</span>
+<span class="linenos" aria-hidden="true">181</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">182</span> <span class="w">   </span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">183</span> <span class="w">  </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">184</span> <span class="w"> </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">185</span> <span class="w"> </span><span class="nt">"initialize"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">186</span> <span class="w">  </span><span class="nt">"protocol_version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2025-11-25"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">187</span> <span class="w">  </span><span class="nt">"capabilities"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">188</span> <span class="w">   </span><span class="nt">"tools"</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="linenos" aria-hidden="true">189</span> <span class="w">   </span><span class="nt">"tasks"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">190</span> <span class="w">    </span><span class="nt">"list"</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="linenos" aria-hidden="true">191</span> <span class="w">    </span><span class="nt">"cancel"</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<span class="linenos" aria-hidden="true">192</span> <span class="w">    </span><span class="nt">"requests"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">193</span> <span class="w">     </span><span class="nt">"tools"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">194</span> <span class="w">      </span><span class="nt">"call"</span><span class="p">:</span><span class="w"> </span><span class="p">{}</span>
+<span class="linenos" aria-hidden="true">195</span> <span class="w">     </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">196</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">197</span> <span class="w">   </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">198</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">199</span> <span class="w">  </span><span class="nt">"server_info"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">200</span> <span class="w">   </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"l9-mcp-tasks"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">201</span> <span class="w">   </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"1.0.0"</span>
+<span class="linenos" aria-hidden="true">202</span> <span class="w">  </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">203</span> <span class="w"> </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">204</span> <span class="w"> </span><span class="nt">"capabilities_tasks_present"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">205</span> <span class="w"> </span><span class="nt">"tools"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">206</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">207</span> <span class="w">   </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"echo"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">208</span> <span class="w">   </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"立即返回输入"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">209</span> <span class="w">   </span><span class="nt">"inputSchema"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">210</span> <span class="w">    </span><span class="nt">"properties"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">211</span> <span class="w">     </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">212</span> <span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"string"</span>
+<span class="linenos" aria-hidden="true">213</span> <span class="w">     </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">214</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">215</span> <span class="w">    </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"object"</span>
+<span class="linenos" aria-hidden="true">216</span> <span class="w">   </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">217</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">218</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">219</span> <span class="w">   </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"slow_write"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">220</span> <span class="w">   </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"等待 seconds 后写一条副作用账本记录"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">221</span> <span class="w">   </span><span class="nt">"inputSchema"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">222</span> <span class="w">    </span><span class="nt">"properties"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">223</span> <span class="w">     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">224</span> <span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"string"</span>
+<span class="linenos" aria-hidden="true">225</span> <span class="w">     </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">226</span> <span class="w">     </span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">227</span> <span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"number"</span>
+<span class="linenos" aria-hidden="true">228</span> <span class="w">     </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">229</span> <span class="w">     </span><span class="nt">"commit"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">230</span> <span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"string"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">231</span> <span class="w">      </span><span class="nt">"enum"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">232</span> <span class="w">       </span><span class="s2">"first"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">233</span> <span class="w">       </span><span class="s2">"last"</span>
+<span class="linenos" aria-hidden="true">234</span> <span class="w">      </span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">235</span> <span class="w">     </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">236</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">237</span> <span class="w">    </span><span class="nt">"required"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">238</span> <span class="w">     </span><span class="s2">"key"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">239</span> <span class="w">     </span><span class="s2">"seconds"</span>
+<span class="linenos" aria-hidden="true">240</span> <span class="w">    </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">241</span> <span class="w">    </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"object"</span>
+<span class="linenos" aria-hidden="true">242</span> <span class="w">   </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">243</span> <span class="w">   </span><span class="nt">"execution"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">244</span> <span class="w">    </span><span class="nt">"taskSupport"</span><span class="p">:</span><span class="w"> </span><span class="s2">"optional"</span>
+<span class="linenos" aria-hidden="true">245</span> <span class="w">   </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">246</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">247</span> <span class="w">  </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">248</span> <span class="w">   </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"start_task"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">249</span> <span class="w">   </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"显式创建一个后台任务并立刻返回 task_id（用于在 SDK 拒绝把 CreateTaskResult 作为 tools/call 结果时仍能测 tasks/get、tasks/cancel 与 tasks/result）"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">250</span> <span class="w">   </span><span class="nt">"inputSchema"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">251</span> <span class="w">    </span><span class="nt">"properties"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">252</span> <span class="w">     </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">253</span> <span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"string"</span>
+<span class="linenos" aria-hidden="true">254</span> <span class="w">     </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">255</span> <span class="w">     </span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">256</span> <span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"number"</span>
+<span class="linenos" aria-hidden="true">257</span> <span class="w">     </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">258</span> <span class="w">     </span><span class="nt">"commit"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">259</span> <span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"string"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">260</span> <span class="w">      </span><span class="nt">"enum"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">261</span> <span class="w">       </span><span class="s2">"first"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">262</span> <span class="w">       </span><span class="s2">"last"</span>
+<span class="linenos" aria-hidden="true">263</span> <span class="w">      </span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">264</span> <span class="w">     </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">265</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">266</span> <span class="w">    </span><span class="nt">"required"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">267</span> <span class="w">     </span><span class="s2">"key"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">268</span> <span class="w">     </span><span class="s2">"seconds"</span>
+<span class="linenos" aria-hidden="true">269</span> <span class="w">    </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">270</span> <span class="w">    </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"object"</span>
+<span class="linenos" aria-hidden="true">271</span> <span class="w">   </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">272</span> <span class="w">   </span><span class="nt">"execution"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">273</span> <span class="w">    </span><span class="nt">"taskSupport"</span><span class="p">:</span><span class="w"> </span><span class="s2">"optional"</span>
+<span class="linenos" aria-hidden="true">274</span> <span class="w">   </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">275</span> <span class="w">  </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">276</span> <span class="w"> </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">277</span> <span class="w"> </span><span class="nt">"ledger_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span>
+<span class="linenos" aria-hidden="true">278</span> <span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/local/9.2/20260922-mcp-tasks/mcp_tasks.json 全文（278 行）</code><a href="../code/results/local/9.2/20260922-mcp-tasks/mcp_tasks.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p>消融建议（先预测，再验证）：</p>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>先预测，再验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>工具数从 64 减到 4</td>
+<td>模板 token 掉到 1/13；如果每轮都重放模板，9.1 的 codefix 会话成本应显著下降</td>
+</tr>
+<tr>
+<td><code>tool_choice</code> 从 <code>auto</code> 改成 <code>required</code> 且工具只有一个</td>
+<td>调用率从 0/2 变 2/2，但选中的工具与问题无关——"调用率"不等于"任务成功率"</td>
+</tr>
+<tr>
+<td>把长数字换成一个 prompt 里没有的数字</td>
+<td>DFlash 接受率应从 0.59–0.84 掉到参数自由那一档（0.13–0.22）</td>
+</tr>
+<tr>
+<td>增量解析器把扣留窗口改成 0</td>
+<td>客户端会收到含 `</td>
+</tr>
+</tbody>
+</table></article><nav class="pagenav"><a class="nav-prev" href="../L9/9.1-agent-workload-shape.html">&#8592; 9.1 任务图、请求轨迹与 Agent 压测</a><a class="nav-next" href="../L9/9.3-session-kv-lifecycle.html">9.3 上下文与会话 KV 生命周期 &#8594;</a></nav>
+</main>
+</body>
+</html>

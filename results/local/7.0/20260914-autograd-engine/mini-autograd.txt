@@ -1,0 +1,79 @@
+========================================================================
+Mini autograd：Node / Edge / GraphTask / InputBuffer
+========================================================================
+
+[场景 1] 分支汇合（x 被两条支路使用）
+sum_loss(依赖计数=0) 执行 1 次
+  └─ edge[0] input_nr=0 → add
+    add(依赖计数=1) 执行 1 次
+      └─ edge[0] input_nr=0 → mul_a
+        mul_a(依赖计数=1) 执行 1 次
+          └─ edge[0] input_nr=0 → AccumulateGrad
+            AccumulateGrad(依赖计数=2，共享边 2 条) 执行 1 次
+          └─ edge[1] → (无梯度输入)
+      └─ edge[1] input_nr=0 → mul_b
+        mul_b(依赖计数=1) 执行 1 次
+          └─ edge[0] input_nr=0 → AccumulateGrad
+            AccumulateGrad  <已访问，共享节点，入边 2 条>
+          └─ edge[1] → (无梯度输入)
+执行顺序: sum_loss → add → mul_a → mul_b → AccumulateGrad
+x.grad = [8.0, 8.0]
+
+[场景 2] 同一输出被消费两次（InputBuffer 就地相加）
+loss(依赖计数=0) 执行 1 次
+  └─ edge[0] input_nr=0 → sum1
+    sum1(依赖计数=1) 执行 1 次
+      └─ edge[0] input_nr=0 → y
+        y(依赖计数=2，共享边 2 条) 执行 1 次
+          └─ edge[0] input_nr=0 → AccumulateGrad
+            AccumulateGrad(依赖计数=1) 执行 1 次
+          └─ edge[1] → (无梯度输入)
+  └─ edge[1] input_nr=0 → sum2
+    sum2(依赖计数=1) 执行 1 次
+      └─ edge[0] input_nr=0 → y
+        y  <已访问，共享节点，入边 2 条>
+执行顺序: loss → sum1 → sum2 → y → AccumulateGrad
+InputBuffer 事件: ['    InputBuffer[y][0] 就地相加']
+x.grad = [6.0]
+
+[场景 3] 一个节点两个输出
+loss(依赖计数=0) 执行 1 次
+  └─ edge[0] input_nr=0 → sum_head
+    sum_head(依赖计数=1) 执行 1 次
+      └─ edge[0] input_nr=0 → split
+        split(依赖计数=2，共享边 2 条) 执行 1 次
+          └─ edge[0] input_nr=0 → AccumulateGrad
+            AccumulateGrad(依赖计数=1) 执行 1 次
+  └─ edge[1] input_nr=0 → sum_tail
+    sum_tail(依赖计数=1) 执行 1 次
+      └─ edge[0] input_nr=1 → split
+        split  <已访问，共享节点，入边 2 条>
+执行顺序: loss → sum_head → sum_tail → split → AccumulateGrad
+每个节点执行次数: {'loss': 1, 'sum_head': 1, 'sum_tail': 1, 'split': 1, 'AccumulateGrad': 1}
+x.grad = [1.0, 1.0, 1.0, 1.0]
+
+[场景 4] 未使用叶子
+loss(依赖计数=0) 执行 1 次
+  └─ edge[0] input_nr=0 → mul
+    mul(依赖计数=1) 执行 1 次
+      └─ edge[0] input_nr=0 → AccumulateGrad
+        AccumulateGrad(依赖计数=1) 执行 1 次
+      └─ edge[1] → (无梯度输入)
+used.grad = [4.0]   unused.grad = None
+
+[场景 5] 叶子累积与 zero_grad
+  call 1 累积: [3.0]
+  call 2 累积: [6.0]
+  call 3 zero_grad(set_to_none=False): [0.0]
+  call 3 补零后 backward: [3.0]
+  call 4 zero_grad(set_to_none=True): None
+  call 4 置 None 后 backward: [3.0]
+
+[对拍] 与 PyTorch FP64 逐元素比较
+  分支/共享参数 x: mini=[3.5, 3.5] torch=[3.5, 3.5]
+  分支/共享参数 w: mini=[2.0, 3.0] torch=[2.0, 3.0]
+  同一输出两路消费 y: mini=[6.0] torch=[6.0]
+  多输出节点 z: mini=[1.0, 1.0, 1.0, 1.0] torch=[1.0, 1.0, 1.0, 1.0]
+  matmul+relu A: mini=[[0.0, 0.0, 0.0], [1.5, 5.5, 9.5]] torch=[[0.0, 0.0, 0.0], [1.5, 5.5, 9.5]]
+  matmul+relu B: mini=[[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0], [3.0, 3.0, 3.0, 3.0]] torch=[[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0], [3.0, 3.0, 3.0, 3.0]]
+  对拍通过 6/6，最大绝对差 0.0

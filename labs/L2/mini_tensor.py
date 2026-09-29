@@ -85,6 +85,29 @@ class MiniTensor:
         return MiniTensor(self.storage, self.sizes[::-1], self.strides[::-1],
                           self.offset, self.dtype)
 
+    def transpose(self, dim0, dim1):
+        """交换两个维度 —— 只换 sizes/strides，不动数据。"""
+        sizes = list(self.sizes)
+        strides = list(self.strides)
+        sizes[dim0], sizes[dim1] = sizes[dim1], sizes[dim0]
+        strides[dim0], strides[dim1] = strides[dim1], strides[dim0]
+        return MiniTensor(self.storage, sizes, strides, self.offset, self.dtype)
+
+    def reshape(self, *sizes):
+        """能 view 就 view，不能就拷贝 —— 与 torch.reshape 同一策略。
+
+        PyTorch 在个别不连续但形状仍可表达的场合会返回 view；这里只实现
+        “连续则 view、否则拷贝”这条主干，差异在正文说明。
+        """
+        if len(sizes) == 1 and isinstance(sizes[0], (tuple, list)):
+            sizes = tuple(sizes[0])
+        if numel_of(sizes) != self.numel():
+            raise ValueError(f"reshape 不能改变元素数: {self.sizes} -> {sizes}")
+        if self.is_contiguous():
+            return MiniTensor(self.storage, sizes, contiguous_strides(sizes),
+                              self.offset, self.dtype)
+        return self.contiguous().reshape(*sizes)
+
     def select(self, dim, i):
         """x[i] on dim —— 掉一个维度，offset 前进 i*stride[dim]。"""
         sizes = self.sizes[:dim] + self.sizes[dim + 1:]

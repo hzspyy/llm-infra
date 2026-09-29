@@ -1,0 +1,105 @@
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-13 14:39:40 2517360:2517360 SyncActivityProfilerHandler.cpp:59] profiler_stop
+torch 2.13.0+cu130  NVIDIA GeForce RTX 5090 D  sm_120  SM 170
+triton 3.7.1
+
+==============================================================================
+[A] 正确性：分块 kernel vs SDPA-MATH（fp32 参照）
+==============================================================================
+  bf16 输入、fp32 累加的 Triton kernel，对照 fp32 的显式参照。
+  容差按输出量级取 1%：bf16 的机器 epsilon 是 7.8e-3，末位舍入不该被判成实现错误。
+        S     D  causal     max|err|     |O|max   err/|O|max       判定
+      128    64    True   7.8125e-03      3.109   2.5126e-03       一致
+      128    64   False   3.9062e-03      1.000   3.9062e-03       一致
+      128   128    True   1.5625e-02      3.281   4.7619e-03       一致
+      128   128   False   3.9062e-03      1.000   3.9062e-03       一致
+     1024    64    True   7.8125e-03      2.922   2.6738e-03       一致
+     1024    64   False   1.9531e-03      1.000   1.9531e-03       一致
+     1024   128    True   7.8125e-03      3.469   2.2523e-03       一致
+     1024   128   False   9.7656e-04      1.000   9.7656e-04       一致
+     4096    64    True   7.8125e-03      2.875   2.7174e-03       一致
+     4096    64   False   9.7656e-04      1.000   9.7656e-04       一致
+     4096   128    True   7.8125e-03      3.453   2.2624e-03       一致
+     4096   128   False   9.7656e-04      1.000   9.7656e-04       一致
+
+==============================================================================
+[B] 实际发射了什么 kernel
+==============================================================================
+  S=4096 D=128 bf16 causal，每次只跑一个调用
+  Triton 分块            1 个 kernel
+      _attn_fwd
+  显式 QK-softmax-PV     8 个 kernel
+      void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x1_tn_align8>(cutlass_8
+      void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<c10::BFloat16, c10::BFlo
+      void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<bool>, std::array<char*, 1
+      void at::native::triu_tril_kernel<bool, int, true, 8, false>(at::cuda::detail::TensorInfo<bool, int>
+  SDPA-FLASH           2 个 kernel
+      void pytorch_flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, false, false, 
+      void pytorch_flash::flash_fwd_splitkv_combine_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, false,
+  SDPA-MATH            13 个 kernel
+      void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorB
+      void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<float, float, float, at:
+      void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<bool>, std::array<char*, 1
+      void at::native::triu_tril_kernel<bool, int, false, 8, false>(at::cuda::detail::TensorInfo<bool, int
+  SDPA-CUDNN           2 个 kernel
+      Memset (Device)
+      cudnn_generated_fort_native_sdpa_sm120_flash_fprop_f16_knob_3_64x64x128_4x1x1_cga1x1x1_kernel0_0
+  SDPA-EFFICIENT       1 个 kernel
+      fmha_cutlassF_bf16_aligned_64x128_rf_sm80(PyTorchMemEffAttention::AttentionKernel<cutlass::bfloat16_
+
+==============================================================================
+[C] 峰值显存与临时张量：显式写法的 O(S²) 对分块
+==============================================================================
+  bf16，B=1 H=4；“显式”一列包含打分矩阵与 softmax 概率两份 S×S。
+        S     D     Q/K/V     S×S 一份       显式峰值    Triton 峰值    SDPA 峰值
+      128    64     0.2MB      0.1MB      0.3MB        0.1MB      0.1MB
+      128   128     0.4MB      0.1MB      0.4MB        0.1MB      0.1MB
+     1024    64     1.5MB      8.0MB     17.5MB        0.5MB      4.6MB
+     1024   128     3.0MB      8.0MB     18.0MB        1.0MB      9.1MB
+     4096    64     6.0MB    128.0MB    274.0MB        2.0MB     26.4MB
+     4096   128    12.0MB    128.0MB    276.0MB        4.0MB     44.4MB
+    16384    64    24.0MB   2048.0MB   4360.0MB        8.0MB      8.3MB
+    16384   128    48.0MB   2048.0MB   4368.0MB       16.0MB     16.3MB
+
+  显式路径的峰值随 S² 增长；分块路径只有 Q/K/V/O 加上一块打分与 m/l/acc，与 S 无关。
+
+==============================================================================
+[D] 时间、达成 TFLOP/s 与按流量模型算的有效带宽
+==============================================================================
+  causal bf16，B=1 H=4。FLOP 按实际计算区域计（causal 取一半）。
+        S     D      显式 ms  Triton ms    SDPA ms  Triton TFLOP/s      占峰值      有效带宽 GB/s
+      128    64    0.049      0.010      0.011             0.8    0.3%           25.2
+      128   128    0.047      0.014      0.011             1.2    0.5%           36.4
+     1024    64    0.054      0.043      0.015            12.4    5.3%          120.9
+     1024   128    0.064      0.080      0.017            13.4    5.8%          130.6
+     4096    64    1.001      0.165      0.073            52.0   22.4%          432.0
+     4096   128    1.071      0.317      0.119            54.1   23.3%          449.4
+    16384    64   16.028      1.186      0.990           115.9   50.0%          919.6
+    16384   128   17.453      2.653      1.743           103.6   44.7%          822.0
+
+  有效带宽高于 DRAM 上限时说明 KV 被 L2 命中了（工作集小于 96 MiB 的档）；
+  只读带宽参照 1608.6 GB/s。
+
+==============================================================================
+[E] Triton kernel 的资源矩阵：block 大小与寄存器/共享内存
+==============================================================================
+  S=4096 D=128 bf16 causal；grid = B·H·⌈S/BM⌉ = 128（BM=128）
+     BM    BN  warps   regs  spills    smem B        ms   TFLOP/s
+     64    64      4    255       6     57344     0.198      86.6
+    128    64      4    255       6     57344     0.318      54.0
+    128    64      8    219       0     65536     0.229      74.9
+    128   128      4    255     320     98304     0.387      44.4
+    128   128      8    255       8     98304     0.234      73.5
+    256    64      8    255      72     98304     0.487      35.3
+
+[harness] 工件写入 /scratch/learn/work/out/3.1/20260913-tiled-kernel  (40 个 case)

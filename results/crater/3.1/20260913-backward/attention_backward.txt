@@ -1,0 +1,84 @@
+/scratch/learn/envs/serve/lib/python3.12/site-packages/torch/autograd/graph.py:979: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:408.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+torch 2.13.0+cu130
+gpu NVIDIA GeForce RTX 5090 D  sm_120
+
+==============================================================================
+[A] 推导：softmax 的 Jacobian 与重算策略
+==============================================================================
+  设 P = softmax(S)，S = QKᵀ/√D。已知 dO（O = P V 的上游梯度）：
+      dV = Pᵀ dO
+      dP = dO Vᵀ
+  softmax 的 Jacobian 作用在 dP 上：
+      ds_j = p_j · (dp_j − Σ_i p_i dp_i)
+  再回传到两个矩阵乘：
+      dQ = (ds K) · scale        dK = (dsᵀ Q) · scale
+
+  为什么必须有 p_j 这个因子：softmax 的每个输出都依赖整行，
+  归一化项把 dP 的公共分量消掉了 —— 这一项就是把公共分量减掉。
+
+  分块反向的关键：Σ_i p_i dp_i 看起来要把整行扫一遍，其实可以用正向输出换掉：
+      Σ_i p_i (dO·V_i) = dO · (Σ_i p_i V_i) = dO · O
+  于是每个 (q 块, k 块) 只需要 O 的一行，不用跨块归约。
+
+  重算策略的边界（正向只存 Q/K/V、m/l、O，不存 P）：
+      存的：Q/K/V（各 O(S·D)） + m/l（各 O(S)）
+      不存的：P（O(S²)）
+      代价：反向每个 (q 块, k 块) 重算一次 exp，正向的 exp 要做两遍
+  和 7.0 的 activation checkpointing 是同一笔交易：用算力换显存。
+  S 小时 P 装得下，重算反而多付一遍 exp；S 大时省下的是 O(S²)。
+
+  5 维 softmax 的 Jacobian：手写 diag(p) − p pᵀ 与 autograd 的 max|err| = 0.000e+00
+  同一 Jacobian 作用在随机 dp 上：两种写法 max|err| = 2.776e-17
+
+  Σ_i p_i (dO·V_i) 与 dO·O：max|err| = 4.441e-16（-1.493262 vs -1.493262）
+
+==============================================================================
+[B] 梯度对拍：autograd / 解析公式 / 分块重算
+==============================================================================
+  CPU FP64，小矩阵；三种实现都必须一致到机器精度。
+    B  Hq Hkv     S    D  causal       §解析 dQ       §重算 dQ       §重算 dK       §重算 dV
+    1   2   2    16    8    True    4.441e-16    1.138e-15    1.721e-15    8.882e-16
+    1   2   2    16    8   False    3.331e-16    6.106e-16    3.886e-16    4.441e-16
+    2   4   2    24   16    True    5.551e-16    8.882e-16    1.554e-15    1.776e-15
+    1   4   1    32    8    True    4.441e-16    5.551e-16    8.882e-16    1.499e-15
+    1   2   2    33    8    True    4.441e-16    7.078e-16    8.882e-16    1.776e-15
+
+  三种实现的差都在 1e-15 量级（FP64 机器精度）；
+  GQA 的 dK/dV 是把同一 KV 头上所有 query 头的贡献求和，不是平均。
+
+==============================================================================
+[C] GPU 峰值与完整调用时间：存 P vs 重算 vs SDPA-FLASH
+==============================================================================
+  bf16，B=1 H=4 D=128，causal；'完整' = 前向 + 反向（含 autograd 图）。
+       S     存 P 峰值       重算峰值    SDPA 峰值    存 P ms     重算 ms   SDPA ms     S²·2B
+    1024    103.0MB     26.1MB     12.1MB   0.221     9.977     0.112     8.0MB
+    4096    552.0MB     98.2MB     56.4MB   2.688   127.108     0.463   128.0MB
+    8192   2160.0MB    194.4MB     96.3MB  11.266   497.885     1.549   512.0MB
+
+  重算路径的峰值不随 S² 增长；代价是反向多付一遍 exp 与矩阵乘。
+  本实现是分块循环的 Python 版本，时间不能代表融合 kernel；
+  它要说明的是峰值曲线的形状。
+
+==============================================================================
+[D] Qwen3-1.7B 的真实 Q/K/V：GQA 原生布局 vs 展开成 MHA
+==============================================================================
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 23404.54it/s]
+  Qwen/Qwen3-1.7B: layers=28 Hq=16 Hkv=8 D=128
+  Q/K/V 取自第 14 层：hook 该层 self_attn 的输入 hidden，再走该层自己的 q/k/v_proj（RoPE 不改变形状与字节账）
+
+--- 字节账与时间：GQA 原生布局 vs 展开成 MHA（真实张量） ----------------------------------------
+       S               Q/K/V 实shape     原生读MB     展开读MB    GQA ms     展开 ms      比值      展开峰值MB
+    2048 q(1, 16, 2048, 128)k(1, 8, 2048, 128)      16.0      24.0    0.1547    0.1693   1.09×       24.1
+
+--- 真实张量上的重算 backward 对拍（FP64） ----------------------------------------------
+  重算 backward vs SDPA backward：dQ 1.599e-13  dK 2.984e-13  dV 2.416e-13
+    8192 q(1, 16, 8192, 128)k(1, 8, 8192, 128)      64.0      96.0    1.5326    1.6044   1.05×       96.5
+
+--- 因果 mask 与 GQA 布局在真实模型里允许什么 ----------------------------------------------
+  该模型 causal=True、无 padding mask、q_len==kv_len；GQA 组大小 2。
+  SDPA 的 enable_gqa 直接接受 Hkv<Hq，不需要在框架层 repeat_interleave；
+  展开成 MHA 会多读 1.5× 的 KV 字节并多一次全量拷贝。
+
+[harness] 工件写入 /scratch/learn/work/out/3.1/20260913-backward  (14 个 case)

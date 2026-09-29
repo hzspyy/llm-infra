@@ -1,0 +1,82 @@
+
+==========================================================================
+1. 上游源码里真实存在的字段与常量
+==========================================================================
+datatrove Document（data.py）字段: ['text', 'id', 'media', 'metadata']
+  Media 字段: ['id', 'type', 'url', 'alt', 'path', 'offset', 'length', 'media_bytes', 'metadata']
+  正文、id、media、metadata 四项分别承担监督内容、身份、媒体引用和一切审计字段；
+  过滤器把判定结果写回 metadata，所以「为什么被删」跟着样本走。
+
+datatrove MinHash 默认配置: {'n_grams': '5', 'num_buckets': '14', 'hashes_per_bucket': '8', 'seed': '1'}，总签名数 112
+  PipelineStep 子类: ['MinhashDedupSignature', 'MinhashDedupBuckets', 'MinhashDedupCluster', 'MinhashDedupFilter', 'MinhashBuildIndex']
+  去重按四步走：算签名 → 按桶找候选对 → 并查集聚类 → 过滤；MinhashBuildIndex 是另建索引的可选步骤。
+  banding LSH 的隐含阈值 (1/b)^(1/r) = (1/14)^(1/8) = 0.7190
+    真实 Jaccard=0.60 时成为候选对的概率 1-(1-J^8)^14 = 0.2111
+    真实 Jaccard=0.72 时成为候选对的概率 1-(1-J^8)^14 = 0.6499
+    真实 Jaccard=0.80 时成为候选对的概率 1-(1-J^8)^14 = 0.9235
+    真实 Jaccard=0.90 时成为候选对的概率 1-(1-J^8)^14 = 0.9996
+  这是一条 S 形曲线而不是硬阈值：0.6 的相似度也有几率被判为重复，0.8 也有几率漏掉。
+
+Qwen3-ASR SFT: load_audio 统一重采样到 16000 Hz 单声道；labels 用 -100 屏蔽的位置在第 [146, 150] 行
+  屏蔽的两处分别是 prompt 前缀与 padding——和纯文本 SFT 是同一套 loss mask 契约，
+  只是输入侧多了一步重采样。
+
+openpi DROID idle 过滤: {'min_idle_len': 7, 'min_non_idle_len': 16, 'filter_last_n_in_ranges': 10}，idle 判据 |Δjoint_velocity| < 1e-3（全关节同时成立）
+  episode 身份 = {recording_folderpath}--{file_path}，这也是唯一合法的拆分单元。
+
+Cosmos3 视频 SFT JSONL 顶层字段: ['uuid', 'duration', 'width', 'height', 'vision_path', 't2w_windows']
+  每个 t2w_window: ['start_frame', 'end_frame', 'temporal_interval', 'caption_json', 'caption']
+  caption_json 内部: ['subjects', 'background_setting', 'cinematography', 'actions', 'temporal_caption', 'resolution', 'aspect_ratio', 'duration', 'fps']
+  start_frame/end_frame/temporal_interval 决定这一段监督覆盖哪些帧；
+  caption 由 VLM 生成（文档里指定 Qwen3-VL-8B-Instruct-FP8 经 vLLM 产出），
+  所以视频样本同时是一条「教师生成记录」，teacher 的身份必须一起存。
+
+==========================================================================
+2. 七类样本的统一 schema
+==========================================================================
+类别         | 送进前向的字段 | 审计字段 | 拆分单元 | 恢复字段 | 字段依据
+文本文档         | input_ids / labels / 文档边界 | 来源、许可、质量分、过滤规则版本 | document id | shard、文件内偏移、全局样本号 | datatrove Document.metadata
+图文样本         | pixel_values / grid / input_ids / loss_mask | caption 来源、处理器版本、min_pixels/max_pixels | 图像或相册 id | annotation 文件 + 行号 | Qwen3-VL data_processor
+音频 utterance | audio(16 kHz 单声道) / text_ids / labels | 转写来源、语言前缀、信噪比 | speaker、session | JSONL 行号 | Qwen3-ASR collator
+视频 clip      | 帧序列 / start_frame..end_frame / prompt | caption 的生成模型与提示词版本、分辨率、fps | video uuid、clip 序号 | JSONL 行号 + window 序号 | Cosmos3 dataset_jsonl
+机器人轨迹        | 观测帧 / proprio / action / action_mask | 机器人配置、成功标志、normalizer 统计版本 | episode key | episode 内 step 区间 | openpi DROID
+偏好对          | prompt / chosen / rejected 及各自 loss_mask | 标注来源、一致性、模板版本 | prompt 归一化后的身份 | JSONL 行号 | TRL/handbook 的 DPO 列
+教师生成         | student 输入 / teacher logits 或 hidden | teacher revision、温度、topk、提取层 | 原始 prompt 身份 | 特征块 id + 块内偏移 | SpecForge / Cosmos caption
+
+四组字段的用途完全不同：model 决定梯度，audit 决定能不能复现和能不能用，
+partition 决定 train/val 怎么切，resume 决定中断后从哪继续。
+把它们压成一个扁平的 input_ids 之后，后三组就再也找不回来了。
+
+==========================================================================
+3. 拆分单元：随机切分与分组切分的泄漏量
+==========================================================================
+40 个说话人 × 25 条 = 1000 条
+  随机 9:1 切分: val 100 条，其中 100 条（100%）的说话人在 train 里出现过
+  按说话人分组切分: val 100 条（4 个说话人），泄漏 0 条
+  文本 hash 去重查不出这类泄漏：两条录音的字面内容可以完全不同，
+  但同一个说话人的音色已经被模型见过。视频的同一场景、机器人同一 episode 同理。
+
+==========================================================================
+4. 改一条数据规则的下游影响
+==========================================================================
+合成一条 600 帧的 episode，其中 idle 帧 258 帧
+min_idle_len | min_non_idle_len | filter_last_n | 区间数 | 保留帧 | 保留比例
+           7 |               16 |            10 |      4 |    496 |    82.7%
+           7 |               16 |             0 |      4 |    536 |    89.3%
+           3 |               16 |            10 |      8 |    415 |    69.2%
+           3 |               16 |             0 |      8 |    495 |    82.5%
+          15 |               16 |            10 |      3 |    522 |    87.0%
+          15 |               16 |             0 |      3 |    552 |    92.0%
+
+上游默认是 min_idle_len=7、min_non_idle_len=16、filter_last_n_in_ranges=10。
+把 min_idle_len 从 7 调到 3，同一条 episode 被切成更多更短的区间，保留帧数下降；
+这不是超参数微调，而是换了一个训练集。
+
+改一条数据规则时必须同时检查的下游：
+规则                | 直接改变      | 指标口径的影响 | 缓存与 checkpoint
+过滤/去重阈值             | 训练集组成         | 评测污染结论、数据混合比例 | 已缓存的 tokenized shard 全部作废
+packing 最大长度        | 每步有效 token 数  | loss 分母与学习率的有效标度 | batch 边界变了，游标不可直接复用
+图像 min/max_pixels   | 视觉 token 数    | 上下文长度与显存峰值 | 预计算的视觉特征缓存作废
+音频重采样率              | 编码器输入长度       | 每秒的监督量 | 预抽的特征与 codec token 作废
+action 归一化统计        | 回归目标的量纲       | 动作误差指标不可跨版本比较 | 导出的 normalizer 必须同版本更新
+teacher revision    | 监督信号本身        | 学生质量结论只对该 teacher 成立 | 特征 store 整体失效

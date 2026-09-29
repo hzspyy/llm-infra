@@ -1,450 +1,213 @@
 #!/usr/bin/env python3
+"""SmolLM2-360M 上的一次完整训练步，以及三条累积路径的真实模型对照。
+
+在真实 tokenizer、真实 causal LM 上重放 7.0b 的分母问题：
+  P1 直接大 batch                      model(labels=...) 对 4 条一起前向
+  P2 累积 + 全局分母                    逐条前向，传 num_items_in_batch=N_total
+  P3 累积 + 每份自己的均值再除以 M        逐条 model(labels=...) 后 /M
+三条路径从同一份初始权重各做一次 AdamW 更新，比较梯度与参数。
+
+不写 checkpoint：保存与恢复的实测在 7.4。
+
+Usage（crater，envs/serve）:
+    python labs/L7/training_step_smollm.py --outdir "$RUN_DIR/one-step"
 """
-SmolLM3 3B 完整训练步实验
+from __future__ import annotations
 
-验证：
-1. 真实模型的 labels 移位、loss mask、有效 token 归一化
-2. 梯度累积 vs 直接 batch
-3. AdamW 优化器状态
-4. Checkpoint 保存与恢复
-
-运行：
-  python training_step_smollm.py
-
-环境要求：
-  - transformers >= 4.40.0
-  - torch >= 2.0.0
-  - 单卡 24GB+ 显存（可调整 batch_size）
-"""
-
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-import os
+import argparse
+import copy
 import json
 from pathlib import Path
 
+import torch
+import torch.nn.functional as F
+import transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def prepare_batch(tokenizer, texts, max_length=512):
-    """
-    准备训练 batch：tokenization + padding + labels 移位
+IGNORE = -100
+LR, WD = 1e-4, 0.01
 
-    Returns:
-        input_ids: [batch_size, seq_len]
-        attention_mask: [batch_size, seq_len]
-        labels: [batch_size, seq_len]，padding 位置为 -100
-    """
-    # Tokenize
-    encoded = tokenizer(
-        texts,
-        padding="max_length",
-        max_length=max_length,
-        truncation=True,
-        return_tensors="pt"
-    )
-
-    input_ids = encoded["input_ids"]
-    attention_mask = encoded["attention_mask"]
-
-    # Labels: 右移一位（decoder-only 模型）
-    # input:  [A, B, C, D, pad, pad]
-    # labels: [B, C, D, pad, pad, pad]  但 padding 设为 -100
-    labels = input_ids.clone()
-    labels[attention_mask == 0] = -100  # padding 位置不计算 loss
-
-    # 注意：Hugging Face 的 forward 内部会自动处理移位
-    # 这里我们手动展示移位逻辑
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels
-    }
+TEXTS = [
+    "The first example sentence for gradient accumulation test.",
+    "The second example with different content and length.",
+    "Third sentence is about machine learning and deep learning.",
+    "Fourth and final sentence concludes the micro batch set.",
+]
 
 
-def compute_loss_breakdown(model, batch, device):
-    """
-    计算逐 token loss 与统计信息
-
-    Returns:
-        total_loss: 标量
-        per_token_losses: [num_valid_tokens]
-        valid_token_count: int
-    """
-    input_ids = batch["input_ids"].to(device)
-    labels = batch["labels"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
-
-    # 前向
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-    total_loss = outputs.loss
-
-    # 手动计算逐 token loss（验证）
-    logits = outputs.logits  # [B, L, V]
-
-    # Shift for decoder-only（与 labels 对齐）
-    shift_logits = logits[..., :-1, :].contiguous()  # [B, L-1, V]
-    shift_labels = labels[..., 1:].contiguous()      # [B, L-1]
-
-    # 逐 token loss
-    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
-    per_token_losses = loss_fct(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1)
-    )
-
-    # 过滤出有效 token 的 loss
-    valid_mask = (shift_labels.view(-1) != -100)
-    valid_losses = per_token_losses[valid_mask]
-
-    # 有效 token 数
-    valid_count = valid_mask.sum().item()
-
-    # 验证：手动计算的平均 loss 应该等于 model 输出的 loss
-    manual_loss = valid_losses.sum() / valid_count
-
-    print(f"  Model loss:  {total_loss.item():.6f}")
-    print(f"  Manual loss: {manual_loss.item():.6f}")
-    print(f"  差异:        {abs(total_loss.item() - manual_loss.item()):.9f}")
-
-    return total_loss, valid_losses, valid_count
+def encode(tokenizer, texts, width):
+    enc = tokenizer(texts, padding="max_length", max_length=width, truncation=True,
+                    return_tensors="pt")
+    labels = enc["input_ids"].clone()
+    labels[enc["attention_mask"] == 0] = IGNORE
+    return enc["input_ids"], enc["attention_mask"], labels
 
 
-def training_step_detailed(output_dir):
-    """完整训练步：包含所有状态检查"""
-    print("\n" + "="*70)
-    print("实验 1: 完整训练步分析")
-    print("="*70)
+def valid_count(labels):
+    """transformers v5 的对齐：右补一个 ignore 再左移，有效数 = 每条 token 数 − 1。"""
+    shifted = F.pad(labels, (0, 1), value=IGNORE)[..., 1:]
+    return int((shifted != IGNORE).sum())
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
 
-    # 加载模型（使用小模型，如果显存不足）
-    # SmolLM3-3B 需要约 12GB 显存（FP32）或 6GB（FP16）
-    model_name = "HuggingFaceTB/SmolLM2-360M"  # 先用 360M 测试，验证通过后换 3B
-    print(f"加载模型: {model_name}")
+def grad_snapshot(model):
+    return {name: p.grad.detach().float().cpu().clone()
+            for name, p in model.named_parameters() if p.grad is not None}
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
-    config = AutoConfig.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,  # FP32 便于数值验证
-        device_map=device
-    )
+def param_snapshot(model):
+    return {name: p.detach().float().cpu().clone() for name, p in model.named_parameters()}
+
+
+def max_diff(a, b):
+    return max(float((a[k] - b[k]).abs().max()) for k in a)
+
+
+def section(title):
+    print(f"\n{'=' * 72}\n{title}\n{'=' * 72}")
+
+
+def run_path(model, init_state, path, ids, attn, labels, device):
+    """从同一初始权重执行一次完整更新，返回 (梯度快照, 参数快照, 记录)。"""
+    model.load_state_dict(init_state)
     model.train()
-
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
-    print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.1f}M")
-
-    # 准备数据
-    texts = [
-        "The quick brown fox jumps over the lazy dog. This is a classic pangram used for typing practice.",
-        "Machine learning is a subset of artificial intelligence that focuses on learning from data.",
-    ]
-
-    batch = prepare_batch(tokenizer, texts, max_length=128)
-
-    # 打印样本信息
-    print("\n样本内容（前 50 token）:")
-    for i, text in enumerate(texts):
-        ids = batch["input_ids"][i][:50].tolist()
-        decoded = tokenizer.decode(ids, skip_special_tokens=False)
-        print(f"  样本 {i}: {decoded[:100]}...")
-        print(f"    input_ids[:10]:  {ids[:10]}")
-        print(f"    labels[:10]:     {batch['labels'][i][:10].tolist()}")
-        print(f"    有效 token 数:   {(batch['labels'][i] != -100).sum().item()}")
-
-    # 优化器
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-
-    # 训练一步
-    print("\n执行训练步...")
-    optimizer.zero_grad()
-
-    loss, per_token_losses, valid_count = compute_loss_breakdown(model, batch, device)
-
-    print(f"\nLoss 统计:")
-    print(f"  总 loss:        {loss.item():.6f}")
-    print(f"  有效 token 数:  {valid_count}")
-    print(f"  逐 token loss (前10): {per_token_losses[:10].tolist()}")
-    print(f"  最大 loss:      {per_token_losses.max().item():.6f}")
-    print(f"  最小 loss:      {per_token_losses.min().item():.6f}")
-
-    # 反向传播
-    loss.backward()
-
-    # 检查梯度
-    grad_norms = []
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.norm().item()
-            grad_norms.append(grad_norm)
-
-    print(f"\n梯度统计:")
-    print(f"  所有参数梯度范数均值: {sum(grad_norms) / len(grad_norms):.6f}")
-    print(f"  最大梯度范数:          {max(grad_norms):.6f}")
-    print(f"  最小梯度范数:          {min(grad_norms):.6f}")
-
-    # 查看第一层权重的梯度
-    first_param = next(model.parameters())
-    print(f"  第一层参数形状:        {first_param.shape}")
-    print(f"  第一层梯度 (前5):      {first_param.grad.flatten()[:5].tolist()}")
-
-    # 参数更新
-    param_before = {name: param.clone().detach() for name, param in model.named_parameters()}
-    optimizer.step()
-
-    # 检查参数变化
-    param_changes = []
-    for name, param in model.named_parameters():
-        change = (param - param_before[name]).abs().max().item()
-        param_changes.append(change)
-
-    print(f"\n参数更新统计:")
-    print(f"  最大参数变化:   {max(param_changes):.9f}")
-    print(f"  平均参数变化:   {sum(param_changes) / len(param_changes):.9f}")
-    print(f"  第一层参数变化: {(first_param - param_before[next(iter(param_before.keys()))]).flatten()[:5].tolist()}")
-
-    # 检查优化器状态
-    print(f"\nAdamW 优化器状态:")
-    state = optimizer.state[first_param]
-    print(f"  step:         {state['step']}")
-    print(f"  exp_avg (m):  形状 {state['exp_avg'].shape}, 前5个值 {state['exp_avg'].flatten()[:5].tolist()}")
-    print(f"  exp_avg_sq (v): 形状 {state['exp_avg_sq'].shape}, 前5个值 {state['exp_avg_sq'].flatten()[:5].tolist()}")
-
-    # 保存 checkpoint
-    ckpt_path = Path(output_dir) / "checkpoint_step1.pt"
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 确保 RNG state 是 uint8 类型且在 CPU 上
-    rng_state = torch.get_rng_state().cpu()
-    if rng_state.dtype != torch.uint8:
-        rng_state = rng_state.to(torch.uint8)
-
-    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    if cuda_rng_state is not None:
-        cuda_rng_state = [s.cpu().to(torch.uint8) if s.dtype != torch.uint8 else s.cpu() for s in cuda_rng_state]
-
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'rng_state': rng_state,
-        'cuda_rng_state': cuda_rng_state,
-        'step': 1,
-        'loss': loss.item(),
-    }
-
-    torch.save(checkpoint, ckpt_path)
-    ckpt_size = ckpt_path.stat().st_size / 1024 / 1024
-    print(f"\nCheckpoint 已保存:")
-    print(f"  路径: {ckpt_path}")
-    print(f"  大小: {ckpt_size:.1f} MB")
-    print(f"  包含键: {list(checkpoint.keys())}")
-
-    # 验证恢复
-    print("\n验证 checkpoint 恢复...")
-    model_recovered = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,
-        device_map=device
-    )
-    model_recovered.train()
-    optimizer_recovered = torch.optim.AdamW(model_recovered.parameters(), lr=1e-4, weight_decay=0.01)
-
-    # 加载 checkpoint（先加载到 CPU 避免 RNG state 被移到 GPU）
-    checkpoint_loaded = torch.load(ckpt_path, map_location='cpu')
-
-    # 先加载模型权重并移到 GPU
-    model_recovered.load_state_dict(checkpoint_loaded['model_state_dict'])
-    model_recovered = model_recovered.to(device)
-
-    # 重新创建优化器（关联到 GPU 上的参数）
-    optimizer_recovered = torch.optim.AdamW(model_recovered.parameters(), lr=1e-4, weight_decay=0.01)
-    # 然后加载优化器状态
-    optimizer_recovered.load_state_dict(checkpoint_loaded['optimizer_state_dict'])
-
-    # RNG state 必须在 CPU 上且是 uint8
-    rng_state = checkpoint_loaded['rng_state']
-    if rng_state.dtype != torch.uint8:
-        rng_state = rng_state.to(torch.uint8)
-    torch.set_rng_state(rng_state)
-
-    if checkpoint_loaded['cuda_rng_state'] is not None:
-        cuda_rng_state = checkpoint_loaded['cuda_rng_state']
-        if not isinstance(cuda_rng_state, list):
-            cuda_rng_state = [cuda_rng_state]
-        # 确保每个 state 都是 uint8
-        cuda_rng_state = [s.to(torch.uint8) if s.dtype != torch.uint8 else s for s in cuda_rng_state]
-        torch.cuda.set_rng_state_all(cuda_rng_state)
-
-    # 验证：恢复后的模型在相同输入上应产生相同的 loss
-    # 注意：我们保存的是 step 1 之后的模型，所以这里验证的是恢复后第二步的 loss
-    optimizer_recovered.zero_grad()
-    loss_step2, _, _ = compute_loss_breakdown(model_recovered, batch, device)
-    loss_step2.backward()
-    optimizer_recovered.step()
-
-    # 同时用原始模型跑第二步作为对照
-    optimizer.zero_grad()
-    loss_step2_original, _, _ = compute_loss_breakdown(model, batch, device)
-    loss_step2_original.backward()
-    optimizer.step()
-
-    print(f"\n恢复验证:")
-    print(f"  Step 1 后 loss:          {loss.item():.6f}")
-    print(f"  恢复模型 Step 2 loss:    {loss_step2.item():.6f}")
-    print(f"  原始模型 Step 2 loss:    {loss_step2_original.item():.6f}")
-    print(f"  两者差异:                {abs(loss_step2.item() - loss_step2_original.item()):.9f}")
-
-    assert abs(loss_step2.item() - loss_step2_original.item()) < 1e-5, "恢复后训练轨迹不一致"
-    print("  ✓ 恢复验证通过")
-
-    return {
-        'loss': loss.item(),
-        'valid_tokens': valid_count,
-        'grad_norm_mean': sum(grad_norms) / len(grad_norms),
-        'param_change_max': max(param_changes),
-        'checkpoint_size_mb': ckpt_size,
-    }
-
-
-def gradient_accumulation_comparison(output_dir):
-    """对比梯度累积 vs 直接大 batch"""
-    print("\n" + "="*70)
-    print("实验 2: 梯度累积 vs 直接大 batch")
-    print("="*70)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_name = "HuggingFaceTB/SmolLM2-360M"
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # 两个独立模型
-    model_accum = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,
-        device_map=device
-    )
-    model_direct = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,
-        device_map=device
-    )
-
-    # 确保初始权重相同
-    model_direct.load_state_dict(model_accum.state_dict())
-
-    model_accum.train()
-    model_direct.train()
-
-    optimizer_accum = torch.optim.AdamW(model_accum.parameters(), lr=1e-4)
-    optimizer_direct = torch.optim.AdamW(model_direct.parameters(), lr=1e-4)
-
-    # 准备数据：4 个 micro_batch
-    texts_all = [
-        "The first example sentence for gradient accumulation test.",
-        "The second example with different content and length.",
-        "Third sentence is about machine learning and deep learning.",
-        "Fourth and final sentence concludes the micro batch set.",
-    ]
-
-    micro_batches = [
-        prepare_batch(tokenizer, [text], max_length=64)
-        for text in texts_all
-    ]
-
-    # 路径 1: 梯度累积
-    print("\n梯度累积路径 (4 个 micro_batch)...")
-    optimizer_accum.zero_grad()
-    loss_accum_total = 0.0
-
-    for i, micro_batch in enumerate(micro_batches):
-        input_ids = micro_batch["input_ids"].to(device)
-        labels = micro_batch["labels"].to(device)
-        attention_mask = micro_batch["attention_mask"].to(device)
-
-        outputs = model_accum(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss / 4  # 除以累积步数
-        loss.backward()
-        loss_accum_total += loss.item()
-
-        print(f"  Micro-batch {i}: loss = {loss.item() * 4:.6f} (归一化前)")
-
-    optimizer_accum.step()
-
-    # 路径 2: 直接大 batch
-    print("\n直接大 batch 路径 (batch_size=4)...")
-    big_batch = prepare_batch(tokenizer, texts_all, max_length=64)
-
-    optimizer_direct.zero_grad()
-    input_ids_big = big_batch["input_ids"].to(device)
-    labels_big = big_batch["labels"].to(device)
-    attention_mask_big = big_batch["attention_mask"].to(device)
-
-    outputs_direct = model_direct(input_ids=input_ids_big, attention_mask=attention_mask_big, labels=labels_big)
-    loss_direct = outputs_direct.loss
-    loss_direct.backward()
-    optimizer_direct.step()
-
-    print(f"  Direct batch loss: {loss_direct.item():.6f}")
-
-    # 比较
-    print(f"\n结果对比:")
-    print(f"  梯度累积总 loss (×4): {loss_accum_total * 4:.6f}")
-    print(f"  直接 batch loss:      {loss_direct.item():.6f}")
-    print(f"  Loss 差异:            {abs(loss_accum_total * 4 - loss_direct.item()):.6f}")
-
-    # 比较最终参数
-    params_accum = torch.cat([p.data.flatten() for p in model_accum.parameters()])
-    params_direct = torch.cat([p.data.flatten() for p in model_direct.parameters()])
-    param_diff = (params_accum - params_direct).abs().max().item()
-
-    print(f"  参数最大差异:         {param_diff:.9f}")
-
-    # 注意：由于有效 token 数不同，loss 可能略有差异
-    # 但参数更新应该在数值误差范围内一致
-    if param_diff < 1e-5:
-        print("  ✓ 梯度累积与直接 batch 等价")
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD, foreach=False)
+    opt.zero_grad(set_to_none=True)
+    n_total = valid_count(labels)
+    record = {"path": path, "n_total": n_total, "micro": []}
+    if path == "P1":
+        out = model(input_ids=ids.to(device), attention_mask=attn.to(device),
+                    labels=labels.to(device))
+        record["loss"] = out.loss.item()
+        out.loss.backward()
     else:
-        print(f"  ⚠ 参数差异较大，可能由于归一化或有效 token 统计不同")
-
-    return {
-        'loss_accumulated': loss_accum_total * 4,
-        'loss_direct': loss_direct.item(),
-        'param_diff': param_diff,
-    }
+        running = 0.0
+        for i in range(ids.shape[0]):
+            row_ids = ids[i:i + 1].to(device)
+            row_attn = attn[i:i + 1].to(device)
+            row_labels = labels[i:i + 1].to(device)
+            n_i = valid_count(labels[i:i + 1])
+            if path == "P2":
+                out = model(input_ids=row_ids, attention_mask=row_attn, labels=row_labels,
+                            num_items_in_batch=n_total)
+                scaled = out.loss
+            else:
+                out = model(input_ids=row_ids, attention_mask=row_attn, labels=row_labels)
+                scaled = out.loss / ids.shape[0]
+            scaled.backward()
+            running += scaled.item()
+            record["micro"].append({"index": i, "n": n_i, "reported": out.loss.item(),
+                                    "contribution": scaled.item()})
+        record["loss"] = running
+    record["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9))
+    grads = grad_snapshot(model)
+    opt.step()
+    return grads, param_snapshot(model), record
 
 
 def main():
-    output_dir = "results/crater/7.0b"
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="HuggingFaceTB/SmolLM2-360M")
+    parser.add_argument("--outdir", required=True, type=Path)
+    parser.add_argument("--width", type=int, default=64)
+    args = parser.parse_args()
+    args.outdir.mkdir(parents=True, exist_ok=False)
 
-    print("="*70)
-    print("SmolLM3 训练步实验")
-    print("="*70)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32).to(device)
+    init_state = copy.deepcopy(model.state_dict())
 
-    results = {}
+    print(f"model={args.model}  device={device}  dtype={next(model.parameters()).dtype}")
+    print(f"transformers={transformers.__version__}  torch={torch.__version__}")
+    print(f"loss 入口：LlamaForCausalLM.forward → self.loss_function → ForCausalLMLoss "
+          f"→ fixed_cross_entropy（num_items_in_batch 为 None 时 reduction='mean'）")
+    if device == "cuda":
+        print(f"GPU={torch.cuda.get_device_name(0)}")
 
-    # 实验 1
-    results['detailed_step'] = training_step_detailed(output_dir)
+    section("1. batch 与有效 target 数")
+    ids, attn, labels = encode(tokenizer, TEXTS, args.width)
+    per_sample = []
+    for i, text in enumerate(TEXTS):
+        n_tok = int(attn[i].sum())
+        n_valid = valid_count(labels[i:i + 1])
+        per_sample.append({"index": i, "text": text, "tokens": n_tok, "targets": n_valid})
+        print(f"  [{i}] tokens={n_tok:3d}  有效 target={n_valid:3d}  «{text}»")
+    n_total = valid_count(labels)
+    print(f"  padding 到 {args.width}，合计有效 target N_total={n_total}")
 
-    # 实验 2
-    results['gradient_accumulation'] = gradient_accumulation_comparison(output_dir)
+    section("2. 一次完整更新的逐项读数（P1）")
+    model.load_state_dict(init_state)
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD, foreach=False)
+    opt.zero_grad(set_to_none=True)
+    out = model(input_ids=ids.to(device), attention_mask=attn.to(device),
+                labels=labels.to(device))
+    shifted = F.pad(labels, (0, 1), value=IGNORE)[..., 1:].to(device)
+    per_token = F.cross_entropy(out.logits.reshape(-1, out.logits.shape[-1]).float(),
+                                shifted.reshape(-1), ignore_index=IGNORE, reduction="none")
+    keep = shifted.reshape(-1) != IGNORE
+    manual = per_token[keep].sum() / n_total
+    print(f"  model.loss = {out.loss.item():.8f}")
+    print(f"  手算 Σ/N   = {manual.item():.8f}   差 {abs(out.loss - manual).item():.3e}")
+    print(f"  逐 token loss（前 10 个有效位置）: "
+          f"{[round(v, 6) for v in per_token[keep][:10].tolist()]}")
+    out.loss.backward()
+    norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
+    before = param_snapshot(model)
+    opt.step()
+    after = param_snapshot(model)
+    print(f"  clip 前 global grad norm = {norm:.6f}（max_norm=1.0，"
+          f"{'裁剪' if norm > 1 else '未裁剪'}）")
+    print(f"  一次 AdamW 更新后参数最大变化 = {max_diff(before, after):.3e}")
+    print(f"  有 optimizer 状态的张量 {sum(1 for p in model.parameters() if opt.state.get(p))}"
+          f"/{len(list(model.parameters()))}")
+    del before, after, opt, out, per_token
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
-    # 保存结果
-    results_path = Path(output_dir) / "training_step_results.json"
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
+    section("3. 三条累积路径")
+    results, grads, params = {}, {}, {}
+    for path in ("P1", "P2", "P3"):
+        g, p, rec = run_path(model, init_state, path, ids, attn, labels, device)
+        grads[path], params[path], results[path] = g, p, rec
+        if rec["micro"]:
+            print(f"\n[{path}] 逐 microbatch：")
+            for m in rec["micro"]:
+                print(f"    i={m['index']} N={m['n']} model.loss={m['reported']:.6f} "
+                      f"贡献={m['contribution']:.6f}")
+        print(f"[{path}] 累计 loss = {rec['loss']:.8f}   grad 全局范数 = {rec['grad_norm']:.6f}")
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
-    print(f"\n结果已保存到: {results_path}")
-    print("\n" + "="*70)
-    print("✓ 所有实验完成")
-    print("="*70)
+    scale = max(float(v.abs().max()) for v in grads["P1"].values())
+    print(f"\n  P1 梯度最大绝对值 = {scale:.6f}")
+    print("  对照            | 梯度最大差   | 相对梯度量级 | 一次更新后参数最大差")
+    for path in ("P2", "P3"):
+        gd = max_diff(grads["P1"], grads[path])
+        print(f"  P1 ↔ {path}         | {gd:.3e}    | {gd / scale:.3e}    |"
+              f" {max_diff(params['P1'], params[path]):.3e}")
+    weighted = sum(m["reported"] * m["n"] for m in results["P3"]["micro"]) / n_total
+    print(f"\n  P3 的四个 model.loss 按有效数加权平均 = {weighted:.8f}，"
+          f"P1 的 loss = {results['P1']['loss']:.8f}，差 {abs(weighted - results['P1']['loss']):.2e}")
+    print(f"  P3 的等权平均 = {sum(m['reported'] for m in results['P3']['micro']) / 4:.8f}")
+    print("  梯度是这里唯一有分辨力的量：P2 与 P1 差 1e-5 量级（fp32 归约顺序不同），"
+          "P3 与 P1 差 1e-1 量级。")
+    print(f"  参数差不能用来判断：m/v 从零起步时 Adam 的首步更新约等于 lr·sign(g)={LR:.0e}，"
+          "\n  只要梯度符号不同，参数差就被钉在 2·lr 附近，与两条路径的真实差距无关。")
+
+    summary = {"model": args.model, "device": device,
+               "transformers": transformers.__version__, "torch": torch.__version__,
+               "gpu": torch.cuda.get_device_name(0) if device == "cuda" else None,
+               "width": args.width, "n_total": n_total, "samples": per_sample,
+               "paths": results,
+               "grad_max_diff": {p: max_diff(grads["P1"], grads[p]) for p in ("P2", "P3")},
+               "param_max_diff": {p: max_diff(params["P1"], params[p]) for p in ("P2", "P3")},
+               "claim_scope": "单次机制对照，不含吞吐、收敛或质量结论"}
+    (args.outdir / "one_step.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    print(f"\n摘要写入 {args.outdir / 'one_step.json'}")
 
 
 if __name__ == "__main__":

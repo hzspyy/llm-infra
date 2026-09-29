@@ -1,0 +1,75 @@
+torch 2.14.0 | CPU | TinyLM vocab=64 dim=32 | 输入 shape=(2, 8)
+
+==============================================================================
+A 一次更新之后，各配置的实际 dtype
+==============================================================================
+配置                                       参数       梯度   master        m        v    logits
+FP32 参数与计算                             fp32     fp32        -     fp32     fp32      fp32
+FP32 参数 + autocast BF16                fp32     fp32        -     fp32     fp32      bf16
+FP32 参数 + autocast FP16 + scaler       fp32     fp32        -     fp32     fp32      fp16
+BF16 参数 + 原生 AdamW                     bf16     bf16        -     bf16     bf16      bf16
+BF16 参数 + FP32 master                  bf16     bf16     fp32     fp32     fp32      bf16
+
+step 计数器：torch.float32@cpu；loss 一律 torch.float32（本 lab 显式 .float() 算 CE）
+autocast 不转换持久参数：前两行的参数、梯度和 m/v 全是 FP32，只有算子输出变了。
+
+==============================================================================
+B 常驻状态的字节账（参数+梯度+master+m+v，不含激活与 workspace）
+==============================================================================
+配置                                     字节/参数     TinyLM 合计      3.09B 外推
+FP32 参数与计算                              16.0       161.5KiB       45.98GiB
+FP32 参数 + autocast BF16                 16.0       161.5KiB       45.98GiB
+FP32 参数 + autocast FP16 + scaler        16.0       161.5KiB       45.98GiB
+BF16 参数 + 原生 AdamW                       8.0        80.8KiB       22.99GiB
+BF16 参数 + FP32 master                   16.0       161.5KiB       45.98GiB
+BF16 参数省的是常驻状态；FP32 master 把省下的又加了回来，换回 FP32 精度的写回。
+3.09B 列是按每参数字节的算术外推，不是加载 3B 模型的显存实测。
+
+==============================================================================
+C autograd 为反向保存了什么
+==============================================================================
+FP32 参数与计算                         合计    79.9 KiB | bool×1=0.1KiB  float32×30=79.6KiB  int64×2=0.2KiB
+FP32 参数 + autocast BF16            合计    48.4 KiB | bfloat16×16=31.5KiB  bool×1=0.1KiB  float32×14=16.6KiB  int64×2=0.2KiB
+FP32 参数 + autocast FP16 + scaler   合计    48.4 KiB | bool×1=0.1KiB  float16×16=31.5KiB  float32×15=16.6KiB  int64×2=0.2KiB
+BF16 参数 + 原生 AdamW                 合计    42.2 KiB | bfloat16×28=37.8KiB  bool×1=0.1KiB  float32×2=4.0KiB  int64×2=0.2KiB
+autocast 行的保存值出现 BF16/FP16：省下来的是激活内存，
+而参数、梯度与 optimizer 状态仍按上表的 dtype 常驻。
+
+==============================================================================
+D 逐张量明细：FP32 参数 + autocast BF16
+==============================================================================
+张量                           shape     参数dtype     梯度dtype     m dtype        字节
+embed.weight              (64, 32)     float32     float32     float32     32768
+attn_norm.weight             (32,)     float32     float32     float32       512
+qkv.weight                (96, 32)     float32     float32     float32     49152
+proj.weight               (32, 32)     float32     float32     float32     16384
+mlp_norm.weight              (32,)     float32     float32     float32       512
+up.weight                 (64, 32)     float32     float32     float32     32768
+down.weight               (32, 64)     float32     float32     float32     32768
+final_norm.weight            (32,)     float32     float32     float32       512
+
+==============================================================================
+E 五种训练方法的状态账：谁被更新，谁只是常驻
+==============================================================================
+基座 Linear(1024,1024) 共 1,048,576 参数；LoRA rank=16 引入 32,768 个可训练参数
+方法                               可训练参数        合计 MiB       字节/基座参数
+全参 BF16 + FP32 master        1,048,576         18.00         18.00  master 4B + m/v 各 4B
+LoRA（BF16 冻结基座）                 32,768          2.50          2.50  基座无梯度、无 optimizer 状态
+QLoRA（NF4 冻结基座）                 32,768          1.03          1.03  基座 4.25 bit/参数，为公开格式定义的推算
+QAT（BF16 + fake quant）       1,048,576         18.06         18.06  加 master 与每 64 元素一个 scale
+KD 学生（teacher 常驻）            1,048,576         20.00         20.00  teacher 只前向：加一份 BF16 权重，无梯度无状态
+LoRA 把梯度与 optimizer 状态限制在 adapter 上，省下的是这两项，不是基座本身；
+QLoRA 再把常驻基座压到 4.25 bit，但反量化后的计算精度仍由 compute dtype 决定。
+teacher 常驻的是权重与前向激活，它不产生梯度和 optimizer 状态；
+若改为离线缓存 teacher logits，这笔开销从显存换成存储与带宽，见 7.7。
+
+==============================================================================
+F FSDP2 的 MixedPrecisionPolicy 是三个独立的 dtype
+==============================================================================
+  param_dtype              默认=None
+  reduce_dtype             默认=None
+  output_dtype             默认=None
+  cast_forward_inputs      默认=True
+  param_dtype 只作用于展开后的参数与计算，optimizer 看到的分片保持原 dtype；
+  reduce_dtype 决定梯度归约用什么精度，与 param_dtype 可以不同；
+  分片副本、短暂的完整参数、梯度归约缓冲要分开记账，实测见 7.2。

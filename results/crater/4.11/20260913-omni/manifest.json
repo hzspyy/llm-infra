@@ -1,0 +1,396 @@
+{
+  "chapter": "4.11",
+  "date": "2026-09-13",
+  "machine": "crater",
+  "run_id": "20260913-omni",
+  "tasks": "A（从 Qwen3-Omni-30B-A3B-Instruct 的 config 与 safetensors index 核算 Thinker/Talker/Code2Wav 参数、字节与按 stage 的部署预算，只下载 config+index）；B（跨阶段队列与背压：队列上限 × 消费延迟，成本驱动的会话模拟）；C（打断：四个位置 × session epoch，含在途帧反例）。原生推理（B/C 的真实运行）、E、F、G、H **未执行**：本机无 vLLM-Omni/SGLang-Omni，且多卡部署需先完成 6.2 的 TP 基础。",
+  "commands": [
+    "python labs/L4/omni_session_runtime.py --outdir out/4.11/20260913-omni"
+  ],
+  "exit_codes": {
+    "A_B_C": 0
+  },
+  "environment": {
+    "python": "3.12.14"
+  },
+  "env_sh": "/scratch/learn/env.sh",
+  "pins": {
+    "Qwen/Qwen3-Omni-30B-A3B-Instruct": {
+      "architectures": [
+        "Qwen3OmniMoeForConditionalGeneration"
+      ],
+      "thinker": "hidden 2048 / 48 层 / 32 头 / 4 KV 头 / head_dim 128 / 128 专家 top-8 / moe_inter 768 / vocab 152064",
+      "audio": "32 层 / d_model 1280 / ffn 5120 / mel 128",
+      "vision": "depth 27 / hidden 1152 / ffn 4304",
+      "talker": "hidden 1024 / 20 层 / num_code_groups 16 / accept_hidden_layer 24",
+      "code2wav": "8 层 / hidden 1024 / 16 quantizers / codebook 2048 / decoder_dim 1536"
+    }
+  },
+  "protocol": {
+    "A": "解析模型按 config 逐模块计算参数（MoE 每层 128 专家 × 3×768×2048、attention、embedding、audio/vision encoder、talker+code_predictor+16 码本头、code2wav DiT+码本+上采样），与 safetensors index 的 total_size 对照；部署账按计划的 Thinker TP=2 / Talker 一卡 / Code2Wav 一卡",
+    "B": "时间步进模拟（1 ms 步长）：生成每帧 85 ms（talker 80 + code2wav 5），播放每帧 80 ms + 消费延迟；队列上限 None/1/4/8 × 消费延迟 0/100/500 ms",
+    "C": "同样在时间轴上打断（epoch 递增），另加在途帧反例：打断时已在 codec/传输/播放缓冲里的旧 epoch 帧是否会被播放"
+  },
+  "derived": {
+    "A": {
+      "params": {
+        "thinker": 31262593024,
+        "talker": 369149952,
+        "code2wav": 128204800,
+        "total": 31759947776
+      },
+      "index": {
+        "n_tensors": 28010,
+        "total_size_bytes": 70519637090
+      },
+      "ratio_model_vs_index": 0.9007405337457048,
+      "active_thinker": 3029532672,
+      "kv_per_token_bytes": 196608,
+      "kv_gib_8k": 1.5,
+      "plan": [
+        {
+          "card": "GPU0-1（Thinker TP=2）",
+          "bytes_gib": 58.231117248535156,
+          "per_card": 29.115558624267578,
+          "kv_gib_per_card": 0.75
+        },
+        {
+          "card": "GPU2（Talker）",
+          "bytes_gib": 0.6875953674316406,
+          "per_card": 0.6875953674316406,
+          "kv_gib_per_card": 0.0
+        },
+        {
+          "card": "GPU3（Code2Wav）",
+          "bytes_gib": 0.238800048828125,
+          "per_card": 0.238800048828125,
+          "kv_gib_per_card": 0.0
+        }
+      ],
+      "config": {
+        "thinker": {
+          "hidden_size": 2048,
+          "num_hidden_layers": 48,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 4,
+          "head_dim": 128,
+          "num_experts": 128,
+          "num_experts_per_tok": 8,
+          "moe_intermediate_size": 768,
+          "vocab_size": 152064
+        },
+        "audio": {
+          "encoder_layers": 32,
+          "d_model": 1280,
+          "encoder_ffn_dim": 5120
+        },
+        "vision": {
+          "depth": 27,
+          "hidden_size": 1152,
+          "intermediate_size": 4304
+        },
+        "talker": {
+          "hidden_size": 1024,
+          "num_hidden_layers": 20,
+          "num_code_groups": 16,
+          "accept_hidden_layer": 24
+        },
+        "code2wav": {
+          "num_hidden_layers": 8,
+          "hidden_size": 1024,
+          "num_quantizers": 16,
+          "codebook_size": 2048,
+          "decoder_dim": 1536
+        }
+      }
+    },
+    "B": {
+      "costs": {
+        "asr_encode": 0.03,
+        "thinker_prefill": 0.0338,
+        "thinker_decode_step": 0.0121,
+        "talker_frame": 0.08,
+        "code2wav_frame": 0.005,
+        "play_frame": 0.08
+      },
+      "cost_sources": {
+        "asr_encode": "假设：ASR encoder 未实测（4.9 B/C 被权重键前缀阻塞）",
+        "thinker_prefill": "实测：4.8 vLLM 单图首 token 33.8 ms",
+        "thinker_decode_step": "实测：4.8 vLLM 单图重复 12.1 ms（首 token）",
+        "talker_frame": "定义：码帧 80 ms（4.10 实测帧长）；生成速度未实测",
+        "code2wav_frame": "假设：Code2Wav 每帧解码 5 ms",
+        "play_frame": "定义：播放一帧 80 ms"
+      },
+      "rows": [
+        {
+          "queue_bound": null,
+          "consumer_delay": 0.0,
+          "n_frames": 40,
+          "played": 40,
+          "dropped_stale": 0,
+          "dropped_full": 0,
+          "underruns": 3,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": null,
+          "consumer_delay": 0.1,
+          "n_frames": 40,
+          "played": 40,
+          "dropped_stale": 0,
+          "dropped_full": 0,
+          "underruns": 0,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": null,
+          "consumer_delay": 0.5,
+          "n_frames": 40,
+          "played": 40,
+          "dropped_stale": 0,
+          "dropped_full": 0,
+          "underruns": 0,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 1,
+          "consumer_delay": 0.0,
+          "n_frames": 40,
+          "played": 40,
+          "dropped_stale": 0,
+          "dropped_full": 0,
+          "underruns": 3,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 1,
+          "consumer_delay": 0.1,
+          "n_frames": 40,
+          "played": 20,
+          "dropped_stale": 0,
+          "dropped_full": 20,
+          "underruns": 0,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 1,
+          "consumer_delay": 0.5,
+          "n_frames": 40,
+          "played": 7,
+          "dropped_stale": 0,
+          "dropped_full": 33,
+          "underruns": 0,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 4,
+          "consumer_delay": 0.0,
+          "n_frames": 40,
+          "played": 40,
+          "dropped_stale": 0,
+          "dropped_full": 0,
+          "underruns": 3,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 4,
+          "consumer_delay": 0.1,
+          "n_frames": 40,
+          "played": 23,
+          "dropped_stale": 0,
+          "dropped_full": 17,
+          "underruns": 0,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 4,
+          "consumer_delay": 0.5,
+          "n_frames": 40,
+          "played": 10,
+          "dropped_stale": 0,
+          "dropped_full": 30,
+          "underruns": 0,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 8,
+          "consumer_delay": 0.0,
+          "n_frames": 40,
+          "played": 40,
+          "dropped_stale": 0,
+          "dropped_full": 0,
+          "underruns": 3,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 8,
+          "consumer_delay": 0.1,
+          "n_frames": 40,
+          "played": 27,
+          "dropped_stale": 0,
+          "dropped_full": 13,
+          "underruns": 0,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        },
+        {
+          "queue_bound": 8,
+          "consumer_delay": 0.5,
+          "n_frames": 40,
+          "played": 14,
+          "dropped_stale": 0,
+          "dropped_full": 26,
+          "underruns": 0,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": false
+        }
+      ]
+    },
+    "C": {
+      "interrupts": [
+        {
+          "point": "Thinker（生成中）",
+          "frame": 0,
+          "played": 40,
+          "dropped_stale": 0,
+          "dropped_full": 0,
+          "underruns": 3
+        },
+        {
+          "point": "Talker（第 5 帧）",
+          "frame": 5,
+          "played": 39,
+          "dropped_stale": 1,
+          "dropped_full": 0,
+          "underruns": 4
+        },
+        {
+          "point": "Code2Wav（第 12 帧）",
+          "frame": 12,
+          "played": 39,
+          "dropped_stale": 1,
+          "dropped_full": 0,
+          "underruns": 4
+        },
+        {
+          "point": "播放（第 20 帧）",
+          "frame": 20,
+          "played": 39,
+          "dropped_stale": 1,
+          "dropped_full": 0,
+          "underruns": 4
+        },
+        {
+          "inflight_demo": {
+            "with_epoch": [
+              [],
+              3
+            ],
+            "without_epoch": [
+              [
+                0,
+                1,
+                2
+              ],
+              0
+            ]
+          }
+        }
+      ],
+      "no_epoch_control": {
+        "talker5": {
+          "queue_bound": 8,
+          "consumer_delay": 0.0,
+          "n_frames": 40,
+          "played": 39,
+          "dropped_stale": 1,
+          "dropped_full": 0,
+          "underruns": 4,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": true
+        },
+        "play20": {
+          "queue_bound": 8,
+          "consumer_delay": 0.0,
+          "n_frames": 40,
+          "played": 39,
+          "dropped_stale": 1,
+          "dropped_full": 0,
+          "underruns": 4,
+          "first_playable_s": 0.0,
+          "gen_total_s": 3.4000000000000004,
+          "audio_s": 3.2,
+          "rtf_gen": 1.0625,
+          "interrupt": true
+        }
+      },
+      "after_interrupt": {
+        "cleared_frames": 30,
+        "note": "epoch 递增后旧包全部作废，新请求从新 epoch 开始"
+      }
+    }
+  },
+  "source_refs": {
+    "config.json": "thinker_config / talker_config / code2wav_config 的维度",
+    "model.safetensors.index.json": "28010 个张量、total_size 65.68 GiB（= 35.26 B 参数 @2 字节）"
+  },
+  "artifacts": [
+    "run.log",
+    "omni_session_runtime.json"
+  ],
+  "caveats": [
+    "A 段的解析模型覆盖 index 总量的 90.1%（31.76B vs 35.26B）：未覆盖部分主要是专家/encoder 的额外张量与未在 config 中显式给出的模块，绝对数字应按 index 校准",
+    "B/C 是成本驱动的会话模拟，不是原生 Omni 实测：ASR encoder（30 ms）与 code2wav（5 ms/帧）是按标注的假设值，talker 生成速度未实测；RTF_gen 1.06 来自「80+5 ms 生成 vs 80 ms 播放」的定义式",
+    "原生 Omni 推理未运行：本机没有 vLLM-Omni / SGLang-Omni，且多卡部署需 6.2 的 TP 基础；B（20 段音画片段）、E（两运行时矩阵）、F/G/H（训练与 RL）全部未执行",
+    "部署账只是权重+KV 的静态账，未含激活峰值、通信缓冲与 code2wav 中间张量"
+  ]
+}

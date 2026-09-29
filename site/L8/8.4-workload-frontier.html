@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.4 混合负载与系统容量边界</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">8.4</div>
+  <div class="sidebar-title">混合负载与系统容量边界</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：三类共享与一条边界</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 两类任务的资源画像</a></li>
+<li><a href="#2">2. 混部：份额扫描</a></li>
+<li><a href="#3">3. 干预：把"时间重合"与"因果"分开</a></li>
+<li><a href="#4">4. 准入与容量边界</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码与配置</a><ul>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a></li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：三类共享与一条边界</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 两类任务的资源画像</a></li>
+<li><a href="#2">2. 混部：份额扫描</a></li>
+<li><a href="#3">3. 干预：把"时间重合"与"因果"分开</a></li>
+<li><a href="#4">4. 准入与容量边界</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码与配置</a><ul>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a></li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L8 · 集群、生产与前沿</div>
+  <div class="mod-id">8.4</div>
+  <h1>混合负载与系统容量边界</h1>
+  <p class="lede">在文本生成、pooling、语音和扩散的真实负载画像上，分析共享资源、缓存亲和、排队和容量边界，检验单一负载下的优化结论。</p>
+  <div class="chips"><span class="chip">实测机器 crater（RTX 5090 32 GB）· Qwen3-1.7B（生成）+ Qwen3-Embedding-0.6B（向量化）· vLLM 0.29.0</span><span class="chip">前置 8.1（路由与网关）· 8.3（请求事件与压测口径）· 9.1（任务级输入，未集成）· 5.12（非生成服务）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><strong>哪些资源被不同任务争用？</strong> 生成与向量化在同一张卡上的资源画像完全不同：生成类在 6 QPS 下把 GPU 平均利用率压到 74.2%，向量化类在同样 QPS 下只有 <strong>0.76%</strong>，它的瓶颈在请求处理路径而不是算力。两类真正共享的是<strong>显存容量</strong>：混部时按 <code>gpu_memory_utilization</code> 各自预留 KV 池，实测峰值 28.4 GiB，远高于两者单独峰值之和 14.7 GiB。</li>
+<li><strong>单任务最优配置为什么会在混部下失效？</strong> 生成类单独跑时 p99 是 0.255 s；混部到向量化份额 0.25 时同样的生成负载 p99 翻到 0.503 s，同时峰值显存翻倍。单任务调优时看不见的资源（另一个进程的 KV 预留、显存高水位）在混部里成了主约束。</li>
+<li><strong>准入与隔离怎样形成容量边界？</strong> 用令牌桶按类控制进入量后，接受率随预算单调上升；本次两类 SLO 都 ≥90% 的可行点不存在，阈值放到 ≥80% 时边界是"生成 4 QPS／向量化 16 QPS"。边界不是一个最优点，而是<strong>一组拒绝率与每类 SLO 的交换曲线</strong>。</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的边界</p>
+<p>本章覆盖第一组（文本生成 + 向量化）与第二组任务（文本 + 语音）中的文本侧；第三组"文本 + 视频生成"依赖 10.3 的扩散服务、音画综合依赖 4.11，两者都未接入，因此视频与语音那一档标 <code>UNVERIFIED</code>。9.1 的任务级输入（Agent 负载）本轮没有集成，Agent 类请求不在混部实验内。GPU 资源与利用率来自 <code>nvidia-smi</code> 的 0.5 s 采样，是被动观测，不是 profiler。</p>
+</div>
+<hr />
+<h2 id="_2">心智模型：三类共享与一条边界</h2>
+<figure>
+
+
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="两类任务的资源画像与混部后的容量边界">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="20" font-size="13" font-weight="600">两类任务单独跑与混部跑的资源画像（crater，同一张卡）</text>
+
+    <rect x="16" y="38" width="352" height="96" rx="5" fill="#61afef" opacity="0.16"/>
+    <text x="28" y="58" font-size="11.5" font-weight="600">生成类单独跑（Qwen3-1.7B，6 QPS）</text>
+    <text x="28" y="78" font-size="10.5">p50 0.244 s / p99 0.255 s，TTFT p99 0.018 s</text>
+    <text x="28" y="95" font-size="10.5">峰值 10 578 MiB；平均 GPU 利用率 <tspan font-weight="600">74.2%</tspan></text>
+    <text x="28" y="112" font-size="10.5">368 个请求全部成功；前缀缓存稳态命中</text>
+    <rect x="28" y="120" width="330" height="8" fill="#61afef" opacity="0.5"/>
+
+    <rect x="388" y="38" width="354" height="96" rx="5" fill="#98c379" opacity="0.16"/>
+    <text x="400" y="58" font-size="11.5" font-weight="600">向量化类单独跑（Embedding-0.6B，6 QPS）</text>
+    <text x="400" y="78" font-size="10.5">p50 0.0111 s / p99 0.0176 s，首字节即结果</text>
+    <text x="400" y="95" font-size="10.5">峰值 4 092 MiB；平均 GPU 利用率 <tspan font-weight="600">0.76%</tspan></text>
+    <text x="400" y="112" font-size="10.5">瓶颈在请求路径与批处理，不在算力</text>
+    <rect x="400" y="120" width="34" height="8" fill="#98c379" opacity="0.6"/>
+
+    <rect x="16" y="150" width="726" height="74" rx="5" fill="none" stroke="currentColor" stroke-width="1"/>
+    <text x="28" y="170" font-size="11.5" font-weight="600">混部：两个进程各自预留 KV 池，共享的是显存容量而不是算力</text>
+    <text x="28" y="190" font-size="10.5">份额 0.25 时生成类 p99 0.503 s（单独跑 0.255 s），峰值显存 <tspan font-weight="600">28 436 MiB</tspan>（两类单独峰值之和 14 670 MiB）</text>
+    <text x="28" y="208" font-size="10.5">份额 ≥0.5 时生成类 p99 回到 0.253–0.254 s，向量化 p99 升到 0.021–0.023 s</text>
+
+    <rect x="16" y="238" width="726" height="66" rx="5" fill="#e5c07b" opacity="0.16"/>
+    <text x="28" y="258" font-size="11.5" font-weight="600">准入边界：拒绝率与两类 SLO 的交换曲线，不是一个最优点</text>
+    <text x="28" y="278" font-size="10.5">生成 4 QPS／向量化 16 QPS 时接受率 84.7% / 100%，两类已接受请求的 p99 分别为 0.253 s / 0.021 s</text>
+    <text x="28" y="295" font-size="10.5">要求两类达标率都 ≥90% 时没有可行点：生成类的爆发式到达让令牌桶无法在不拒绝的前提下放行</text>
+  </g>
+</svg>
+
+
+<figcaption>混部的约束主要落在显存与请求路径上；准入能给出可复算的容量曲线，但曲线上每一点都对应一组拒绝。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1">1. 两类任务的资源画像</h3>
+<p>基线在"每类单独跑、到达率取混部份额 0.5 时的值（各 6 QPS）"下测得：</p>
+<table>
+<thead>
+<tr>
+<th>类</th>
+<th>模型</th>
+<th style="text-align: right;">请求</th>
+<th style="text-align: right;">p50</th>
+<th style="text-align: right;">p95</th>
+<th style="text-align: right;">p99</th>
+<th style="text-align: right;">TTFT p50 / p99</th>
+<th style="text-align: right;">峰值显存</th>
+<th style="text-align: right;">平均 GPU 利用率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>生成</td>
+<td>Qwen3-1.7B</td>
+<td style="text-align: right;">368</td>
+<td style="text-align: right;">0.2443 s</td>
+<td style="text-align: right;">0.2517 s</td>
+<td style="text-align: right;">0.2551 s</td>
+<td style="text-align: right;">0.0107 / 0.0183 s</td>
+<td style="text-align: right;">10 578 MiB</td>
+<td style="text-align: right;">74.2%</td>
+</tr>
+<tr>
+<td>向量化</td>
+<td>Qwen3-Embedding-0.6B</td>
+<td style="text-align: right;">324</td>
+<td style="text-align: right;">0.0111 s</td>
+<td style="text-align: right;">0.0133 s</td>
+<td style="text-align: right;">0.0176 s</td>
+<td style="text-align: right;">0.0102 / 0.0151 s</td>
+<td style="text-align: right;">4 092 MiB</td>
+<td style="text-align: right;"><strong>0.76%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>两点需要分开看：</p>
+<ul>
+<li><strong>生成类的时延由解码主导</strong>：p50 0.244 s 里 prefill（512 token，稳态命中前缀缓存）只占约 11 ms，其余是 64 个输出 token 的逐 token 解码。</li>
+<li><strong>向量化类几乎不用 GPU</strong>：0.76% 的平均利用率说明它受限于请求进入与批处理的开销，而不是算力。把这类任务与生成类并置时，它争用的不是 SM，而是<strong>显存容量与进程侧的调度机会</strong>。</li>
+</ul>
+<h3 id="2">2. 混部：份额扫描</h3>
+<p>两个引擎进程常驻同一张卡，总到达率固定 12 QPS，只改变向量化类的份额：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">向量化份额</th>
+<th style="text-align: right;">生成 n</th>
+<th style="text-align: right;">生成 p50</th>
+<th style="text-align: right;">生成 p99</th>
+<th style="text-align: right;">生成 TTFT p99</th>
+<th style="text-align: right;">向量化 n</th>
+<th style="text-align: right;">向量化 p50</th>
+<th style="text-align: right;">向量化 p99</th>
+<th style="text-align: right;">峰值显存</th>
+<th style="text-align: right;">平均利用率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">698</td>
+<td style="text-align: right;">0.2403 s</td>
+<td style="text-align: right;">0.2510 s</td>
+<td style="text-align: right;">0.0142 s</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">14 887 MiB</td>
+<td style="text-align: right;">90.8%</td>
+</tr>
+<tr>
+<td style="text-align: right;">0.25</td>
+<td style="text-align: right;">533</td>
+<td style="text-align: right;">0.2424 s</td>
+<td style="text-align: right;"><strong>0.5032 s</strong></td>
+<td style="text-align: right;">0.0267 s</td>
+<td style="text-align: right;">156</td>
+<td style="text-align: right;">0.0154 s</td>
+<td style="text-align: right;">0.0287 s</td>
+<td style="text-align: right;"><strong>28 436 MiB</strong></td>
+<td style="text-align: right;">89.9%</td>
+</tr>
+<tr>
+<td style="text-align: right;">0.50</td>
+<td style="text-align: right;">368</td>
+<td style="text-align: right;">0.2383 s</td>
+<td style="text-align: right;">0.2536 s</td>
+<td style="text-align: right;">0.0145 s</td>
+<td style="text-align: right;">324</td>
+<td style="text-align: right;">0.0148 s</td>
+<td style="text-align: right;">0.0209 s</td>
+<td style="text-align: right;">20 050 MiB</td>
+<td style="text-align: right;">69.6%</td>
+</tr>
+<tr>
+<td style="text-align: right;">0.75</td>
+<td style="text-align: right;">189</td>
+<td style="text-align: right;">0.2246 s</td>
+<td style="text-align: right;">0.2534 s</td>
+<td style="text-align: right;">0.0151 s</td>
+<td style="text-align: right;">500</td>
+<td style="text-align: right;">0.0126 s</td>
+<td style="text-align: right;">0.0232 s</td>
+<td style="text-align: right;">14 887 MiB</td>
+<td style="text-align: right;">48.0%</td>
+</tr>
+<tr>
+<td style="text-align: right;">1.00</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">681</td>
+<td style="text-align: right;">0.0102 s</td>
+<td style="text-align: right;">0.0164 s</td>
+<td style="text-align: right;">14 887 MiB</td>
+<td style="text-align: right;">2.9%</td>
+</tr>
+</tbody>
+</table>
+<p>三个必须分开报告的量：</p>
+<ol>
+<li><strong>中位数几乎不动，尾部动了</strong>：份额 0.25 时生成类的 p50 只从 0.2403 s 变到 0.2424 s（+0.9%），p99 却从 0.2510 s 翻到 0.5032 s（+100%）。这正是本章开头"不能用总吞吐掩盖某类退化"的具体形态——如果只报平均时延或总 token/s，这次退化会被完全掩盖。</li>
+<li><strong>暂停常驻的两个引擎也要占显存</strong>：份额 0.0 与 1.0 时只有一类在跑，但两个进程都已启动，峰值仍有 14 887 MiB（约等于两个引擎按 <code>gpu_memory_utilization</code> 预留的 KV 池之和）。混部的成本从"进程启动"就开始付，而不是从"有请求"开始。</li>
+<li><strong>两类单独峰值之和不是混部峰值</strong>：10 578 + 4 092 = 14 670 MiB，而份额 0.25 实测 28 436 MiB。原因是两个进程各自预留、负载上升时两边同时增长；也不能反过来断言"混部必然超过求和"——份额 0.5/0.75 的峰值分别是 20 050/14 887 MiB，落到两者之间。<strong>唯一可靠的做法是实测每个组合的峰值，而不是按参数量或单跑峰值相加。</strong></li>
+</ol>
+<h3 id="3">3. 干预：把"时间重合"与"因果"分开</h3>
+<p>在三项干预下重放同一份份额 0.5 的负载：</p>
+<table>
+<thead>
+<tr>
+<th>干预</th>
+<th style="text-align: right;">生成 p50</th>
+<th style="text-align: right;">生成 p99</th>
+<th style="text-align: right;">向量化 p50</th>
+<th style="text-align: right;">向量化 p99</th>
+<th style="text-align: right;">峰值显存</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无（对照，即份额 0.5）</td>
+<td style="text-align: right;">0.2383 s</td>
+<td style="text-align: right;">0.2536 s</td>
+<td style="text-align: right;">0.0148 s</td>
+<td style="text-align: right;">0.0209 s</td>
+<td style="text-align: right;">20 050 MiB</td>
+</tr>
+<tr>
+<td>向量化串行化（<code>--max-num-seqs 1</code>）</td>
+<td style="text-align: right;">0.2392 s</td>
+<td style="text-align: right;"><strong>0.3829 s</strong></td>
+<td style="text-align: right;">0.0136 s</td>
+<td style="text-align: right;">0.0238 s</td>
+<td style="text-align: right;">28 436 MiB</td>
+</tr>
+<tr>
+<td>生成关前缀缓存</td>
+<td style="text-align: right;">0.2379 s</td>
+<td style="text-align: right;">0.2525 s</td>
+<td style="text-align: right;">0.0150 s</td>
+<td style="text-align: right;">0.0235 s</td>
+<td style="text-align: right;">14 887 MiB</td>
+</tr>
+<tr>
+<td>时间分片（两类轮流独占 30 s）</td>
+<td style="text-align: right;">0.2387 s</td>
+<td style="text-align: right;">0.2529 s</td>
+<td style="text-align: right;">0.0149 s</td>
+<td style="text-align: right;">0.0201 s</td>
+<td style="text-align: right;">14 887 MiB</td>
+</tr>
+</tbody>
+</table>
+<p><strong>三项干预都没有把生成类的 p99 拉回独跑水平，串行化那一项反而更差（0.3829 s）。</strong> 这是一个负面结果，按事实记录：</p>
+<ul>
+<li>在这组负载下（两个小模型、总计 12 QPS），两类请求在同一张卡上的时间重合<strong>没有</strong>转化为可被单因素开关消除的时延退化。第 2 节里份额 0.25 的 p99 翻倍只在那一档出现，份额 0.5/0.75 都回到基线，说明它更可能是显存高水位引起的偶发抖动，而不是稳定的算力争用。</li>
+<li>干预的方向本身是对的（关掉向量化的批处理、关掉生成的前缀缓存都是"去掉一个共享路径"），但本机可观测的差异落在噪声内。<strong>没有加速也可以形成有效结论</strong>：在这组条件下不能声称"共享导致 X，关掉 X 就好了"。</li>
+<li>真正稳定的证据只有两类资源的同步时间线：混部时显存峰值随份额变化（14.9/28.4/20.1/14.9 GiB），而两类单独跑时分别是 10.6/4.1 GiB。要验证因果需要在更接近饱和的负载下重做，并逐项记录同步资源时间线。</li>
+</ul>
+<h3 id="4">4. 准入与容量边界</h3>
+<p>准入控制器是应用侧的<strong>每类令牌桶 + 在途上限</strong>：请求到达时先扣 token（按 prompt 长度计），不足或该类在途已满就拒绝并计入分母。扫描生成/向量化两类的预算：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">生成预算</th>
+<th style="text-align: right;">向量化预算</th>
+<th style="text-align: right;">生成接受率</th>
+<th style="text-align: right;">生成 p99</th>
+<th style="text-align: right;">向量化接受率</th>
+<th style="text-align: right;">向量化 p99</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1 QPS</td>
+<td style="text-align: right;">4 QPS</td>
+<td style="text-align: right;">0.189</td>
+<td style="text-align: right;">0.2107 s</td>
+<td style="text-align: right;">0.547</td>
+<td style="text-align: right;">0.0169 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">1 QPS</td>
+<td style="text-align: right;">8 QPS</td>
+<td style="text-align: right;">0.189</td>
+<td style="text-align: right;">0.2132 s</td>
+<td style="text-align: right;">0.982</td>
+<td style="text-align: right;">0.0176 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">1 QPS</td>
+<td style="text-align: right;">16 QPS</td>
+<td style="text-align: right;">0.189</td>
+<td style="text-align: right;">0.2124 s</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">0.0175 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">2 QPS</td>
+<td style="text-align: right;">4 QPS</td>
+<td style="text-align: right;">0.438</td>
+<td style="text-align: right;">0.2389 s</td>
+<td style="text-align: right;">0.547</td>
+<td style="text-align: right;">0.0173 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">2 QPS</td>
+<td style="text-align: right;">8 QPS</td>
+<td style="text-align: right;">0.438</td>
+<td style="text-align: right;">0.2427 s</td>
+<td style="text-align: right;">0.982</td>
+<td style="text-align: right;">0.0183 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">2 QPS</td>
+<td style="text-align: right;">16 QPS</td>
+<td style="text-align: right;">0.438</td>
+<td style="text-align: right;">0.2423 s</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">0.0206 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">4 QPS</td>
+<td style="text-align: right;">4 QPS</td>
+<td style="text-align: right;">0.847</td>
+<td style="text-align: right;">0.2440 s</td>
+<td style="text-align: right;">0.547</td>
+<td style="text-align: right;">0.0180 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">4 QPS</td>
+<td style="text-align: right;">8 QPS</td>
+<td style="text-align: right;">0.847</td>
+<td style="text-align: right;">0.2505 s</td>
+<td style="text-align: right;">0.982</td>
+<td style="text-align: right;">0.0199 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">4 QPS</td>
+<td style="text-align: right;">16 QPS</td>
+<td style="text-align: right;">0.847</td>
+<td style="text-align: right;">0.2533 s</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">0.0209 s</td>
+</tr>
+</tbody>
+</table>
+<p>读法与结论：</p>
+<ul>
+<li><strong>被接受的请求在所有格子里都满足 SLO</strong>（生成 SLO 8 s、向量化 SLO 1 s、TTFT 1 s），因此"两类达标率"完全由<strong>接受率</strong>决定。准入起作用的方式就是把质量换算成拒绝：预算越松、接受越多、每类时延略涨但仍在门槛内。</li>
+<li><strong>边界依赖你愿意付多少拒绝</strong>。要求两类达标率都 ≥90% 时<strong>没有可行点</strong>（生成类到 4 QPS 预算也只接受 84.7%，因为泊松到达的突发会把令牌桶打空）；把阈值放到 ≥80% 时边界是"生成 4 QPS／向量化 16 QPS"，两类合计 653 个成功请求。这条曲线比一个"最大并发"更有用：它把"容量"定义成"某组 SLO 与拒绝率下的最大成功请求数"。</li>
+<li><strong>两类的预算相互几乎独立</strong>：向量化预算从 4 提到 16 时，生成类的接受率与 p99 完全不动（0.847 / 0.253 s）；反过来也一样。原因是两类的瓶颈不同（一个吃算力、一个吃请求路径），在这组负载下没有交叉耦合——这与第 3 节的负面结果一致。</li>
+</ul>
+<hr />
+<h2 id="_4">工程实现：源码与配置</h2>
+<p>本章不引入新的引擎实现，复用的是同一套 vLLM 0.29.0 配置面：</p>
+<ul>
+<li><strong>两类任务的 runner 不同</strong>：生成用默认 runner，向量化用 <code>--runner pooling</code>（<code>vllm/entrypoints/openai/api_server.py</code> 的 <code>--runner {auto,draft,generate,pooling}</code>）。前者走 <code>/v1/completions</code> 的流式解码，后者走 <code>/v1/embeddings</code> 的一次前向。</li>
+<li><strong>显存预留在启动时确定</strong>：<code>--gpu-memory-utilization</code> 决定每个引擎的 KV 池大小。本章混部用 0.30（生成）+ 0.12（向量化），这就是"常驻两个引擎也要占 14.9 GiB"的来源；它不是可以随负载回收的弹性量。</li>
+<li><strong>批处理参数是"共享路径"的开关</strong>：向量化侧的 <code>--max-num-seqs</code> 与 <code>--max-num-batched-tokens</code> 控制它一次能占多少批次位置，生成侧的 <code>--enable-prefix-caching</code> 决定共享前缀是否被复用。第 3 节的干预就是分别关掉这两条路径。</li>
+<li><strong>准入实现放在客户端</strong>：<code>labs/L8/admission_budget.py</code> 的 <code>AdmissionController</code> 在发请求前检查每类的令牌桶与在途数。这是应用层实现；引擎侧的对应能力是 <code>--scheduling-policy</code>、优先级与抢占（8.8 已说明它们改变顺序而不改变算力分配）。</li>
+</ul>
+<h3 id="_5">设计取舍</h3>
+<ol>
+<li><strong>混部还是分卡。</strong> 混部省显存与空闲，但把两个引擎的 KV 高水位叠在同一张卡上；分卡隔离干净，代价是每类各占一张卡。本章实测给出的判据是"混部峰值是否仍在余量内"，而不是"参数量是否装得下"。</li>
+<li><strong>准入放在哪一层。</strong> 客户端/网关侧准入实现简单、可复算，且能按任务质量计分母；引擎侧调度能改顺序但不能改总份额。本章选了前者，并把拒绝计入分母。</li>
+<li><strong>SLO 先冻结再比较。</strong> 本章的 SLO（生成 8 s、向量化 1 s、TTFT 1 s）在扫描之前固定，因此表中"达标率"的差别只来自接受率。</li>
+</ol>
+<hr />
+<h2 id="mini">工程实现：mini 实现</h2>
+<p>三个文件各管一件事：</p>
+<ul>
+<li><code>labs/L8/mixed_workload.py</code>：起引擎（<code>Server</code>）、按类发请求（生成走 8.3 的 <code>StreamingClient</code>，向量化走 <code>/v1/embeddings</code>）、按 0.5 s 采样 GPU（<code>GpuSampler</code>），三种模式分别是 <code>baseline</code>／<code>mixed</code>（份额 0/0.25/0.5/0.75/1.0，引擎只启动一次）／<code>intervene</code>（串行化、关前缀缓存、时间分片）。</li>
+<li><code>labs/L8/admission_budget.py</code>：在混部之上加每类令牌桶与在途上限，按 <code>gen × emb</code> 预算网格重放同一份到达清单，输出接受率、分位与达标率，并按阈值给出容量边界。</li>
+<li><code>labs/L8/run_8_4.sh</code>：把四段串起来跑。</li>
+</ul>
+<p>两个实现细节值得记录：GPU 采样线程的事件字段不能叫 <code>_stop</code>（会覆盖 <code>threading.Thread._stop</code>，<code>join()</code> 时抛 <code>TypeError</code>），改名成 <code>_stop_flag</code>；到达率 0 时泊松发生器要提前返回空表，否则除零。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># 四段全部跑一遍（约 30 分钟）</span>
+bash<span class="w"> </span>labs/L8/run_8_4.sh
+<span class="c1"># 或分开</span>
+python<span class="w"> </span>labs/L8/mixed_workload.py<span class="w"> </span>baseline<span class="w"> </span>--out-dir<span class="w"> </span>&lt;out&gt;/baseline
+python<span class="w"> </span>labs/L8/mixed_workload.py<span class="w"> </span>mixed<span class="w">    </span>--out-dir<span class="w"> </span>&lt;out&gt;/mixed<span class="w"> </span>--shares<span class="w"> </span><span class="m">0</span>,0.25,0.5,0.75,1.0
+python<span class="w"> </span>labs/L8/mixed_workload.py<span class="w"> </span>intervene<span class="w"> </span>--out-dir<span class="w"> </span>&lt;out&gt;/intervene<span class="w"> </span>--share-emb<span class="w"> </span><span class="m">0</span>.5
+python<span class="w"> </span>labs/L8/admission_budget.py<span class="w"> </span>--out-dir<span class="w"> </span>&lt;out&gt;/admission<span class="w"> </span>--gen-budgets<span class="w"> </span><span class="m">1</span>,2,4<span class="w"> </span>--emb-budgets<span class="w"> </span><span class="m">4</span>,8,16
+</code></pre></div>
+
+<p><strong>消融建议</strong>：</p>
+<ul>
+<li>把 <code>--gen-gpu-mem-util</code> 从 0.30 降到 0.22，观察混部时生成类的 p99 是否因为 KV 池变小而恶化——这是"显存容量是主约束"的直接检验。</li>
+<li>把 <code>--duration-s</code> 从 60 提到 180 并重复份额 0.25 那一档：如果 p99 翻倍的现象消失，它就是抖动；如果稳定复现，才值得进一步做同步时间线。</li>
+<li>把 <code>--gen-prompt-len</code> 从 512 提到 2048（关掉前缀缓存复用的前提），让生成类回到 prefill 主导，再跑一次干预，检验"关掉向量化串行化"是否开始有可测收益。</li>
+<li>在准入实验里把 <code>--gen-inflight</code> 从 8 调到 2，观察接受率是否由在途上限而不是令牌桶决定——两个限制谁先触发，决定了边界曲线是"速率型"还是"并发型"。</li>
+</ul>
+<hr />
+<h2 id="_6">原始现场</h2>
+<p>单任务基线的逐请求事件（生成类 368 条、向量化类 324 条）与混部五档的分租户统计：</p>
+<details class="fold">
+<summary>results/crater/8.4/20260921-mixed/mixed/summary_mixed_none_0.5.json 份额扫描（五档）</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">"share_emb"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span><span class="w"> </span><span class="nt">"cases"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w"> </span><span class="p">{</span><span class="nt">"tag"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mixed_none_s0.0"</span><span class="p">,</span><span class="w"> </span><span class="nt">"gen"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">698</span><span class="p">,</span><span class="w"> </span><span class="nt">"statuses"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"SUCCESS"</span><span class="p">:</span><span class="w"> </span><span class="mi">698</span><span class="p">},</span>
+<span class="w">   </span><span class="nt">"latency_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2403</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2510</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0142</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"gpu_peak_mib"</span><span class="p">:</span><span class="w"> </span><span class="mf">14887.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"gpu_mean_util_pct"</span><span class="p">:</span><span class="w"> </span><span class="mf">90.82</span><span class="p">},</span>
+<span class="w"> </span><span class="p">{</span><span class="nt">"tag"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mixed_none_s0.25"</span><span class="p">,</span><span class="w"> </span><span class="nt">"gen"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">533</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5032</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0267</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"emb"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">156</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0154</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0287</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"gpu_peak_mib"</span><span class="p">:</span><span class="w"> </span><span class="mf">28436.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"gpu_mean_util_pct"</span><span class="p">:</span><span class="w"> </span><span class="mf">89.94</span><span class="p">},</span>
+<span class="w"> </span><span class="p">{</span><span class="nt">"tag"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mixed_none_s0.5"</span><span class="p">,</span><span class="w"> </span><span class="nt">"gen"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">368</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2536</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"emb"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">324</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0209</span><span class="p">},</span><span class="w"> </span><span class="nt">"gpu_peak_mib"</span><span class="p">:</span><span class="w"> </span><span class="mf">20050.0</span><span class="p">},</span>
+<span class="w"> </span><span class="p">{</span><span class="nt">"tag"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mixed_none_s0.75"</span><span class="p">,</span><span class="w"> </span><span class="nt">"gen"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">189</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2534</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"emb"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">500</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0232</span><span class="p">},</span><span class="w"> </span><span class="nt">"gpu_peak_mib"</span><span class="p">:</span><span class="w"> </span><span class="mf">14887.0</span><span class="p">},</span>
+<span class="w"> </span><span class="p">{</span><span class="nt">"tag"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mixed_none_s1.0"</span><span class="p">,</span><span class="w"> </span><span class="nt">"emb"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">681</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0102</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0164</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"gpu_peak_mib"</span><span class="p">:</span><span class="w"> </span><span class="mf">14887.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"gpu_mean_util_pct"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.89</span><span class="p">}]}</span>
+</code></pre></div>
+
+</details>
+<p>三类干预与准入扫描的原始输出：</p>
+<details class="fold">
+<summary>results/crater/8.4/20260921-mixed/admission/admission_budget.json 准入边界（3×3 网格）</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">"offered"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"gen_rate"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"emb_rate"</span><span class="p">:</span><span class="w"> </span><span class="mf">8.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"duration_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">60.0</span><span class="p">},</span>
+<span class="w"> </span><span class="nt">"slo"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"gen_total_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">8.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"emb_total_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.0</span><span class="p">},</span>
+<span class="w"> </span><span class="nt">"rows"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">  </span><span class="p">{</span><span class="nt">"gen_budget_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"emb_budget_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.0</span><span class="p">,</span>
+<span class="w">   </span><span class="nt">"gen"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"offered"</span><span class="p">:</span><span class="w"> </span><span class="mi">249</span><span class="p">,</span><span class="w"> </span><span class="nt">"ok"</span><span class="p">:</span><span class="w"> </span><span class="mi">47</span><span class="p">,</span><span class="w"> </span><span class="nt">"accept_rate"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.1888</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2107</span><span class="p">},</span>
+<span class="w">   </span><span class="nt">"emb"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"offered"</span><span class="p">:</span><span class="w"> </span><span class="mi">442</span><span class="p">,</span><span class="w"> </span><span class="nt">"ok"</span><span class="p">:</span><span class="w"> </span><span class="mi">242</span><span class="p">,</span><span class="w"> </span><span class="nt">"accept_rate"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.547</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0169</span><span class="p">}},</span>
+<span class="w">  </span><span class="p">{</span><span class="nt">"gen_budget_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"emb_budget_qps"</span><span class="p">:</span><span class="w"> </span><span class="mf">16.0</span><span class="p">,</span>
+<span class="w">   </span><span class="nt">"gen"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"offered"</span><span class="p">:</span><span class="w"> </span><span class="mi">249</span><span class="p">,</span><span class="w"> </span><span class="nt">"ok"</span><span class="p">:</span><span class="w"> </span><span class="mi">211</span><span class="p">,</span><span class="w"> </span><span class="nt">"accept_rate"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.8474</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2533</span><span class="p">},</span>
+<span class="w">   </span><span class="nt">"emb"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"offered"</span><span class="p">:</span><span class="w"> </span><span class="mi">442</span><span class="p">,</span><span class="w"> </span><span class="nt">"ok"</span><span class="p">:</span><span class="w"> </span><span class="mi">442</span><span class="p">,</span><span class="w"> </span><span class="nt">"accept_rate"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"latency_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0209</span><span class="p">}}],</span>
+<span class="w"> </span><span class="nt">"capacity_boundary"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="w"> </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"SLO 在扫描前冻结; 接受率与拒绝都进分母; 边界只覆盖本次两类负载与这张卡"</span><span class="p">}</span>
+</code></pre></div>
+
+</details>
+<hr />
+<h2 id="_7">前沿</h2>
+<ol>
+<li><strong>按任务预算的准入与 SLO 曲线。</strong> 本章的令牌桶是准入的最小形式；工业实现把它做成"网关侧按类配额 + 引擎侧按 token 预算调度"的两层（8.1 的路由与 8.8 的配额分别覆盖这两层）。前沿的差别在于是否把<strong>质量</strong>纳入准入判据——拒绝一个低质量风险高的请求，和拒绝一个超预算的请求，对 SLO 曲线的影响不同。</li>
+<li><strong>异构批处理与 prefill/decode 分离。</strong> 6.4 的 PD 分离与 5.2 的分页调度都是为了减少"长 prefill 打断短解码"这类跨任务干扰；本章第 3 节的负面结果说明，只有当干扰真实存在且可复现时，这些机制才有可测收益。</li>
+<li><strong>显存容量作为一等资源。</strong> 混部峰值由两个进程的 KV 预留共同决定，8.5 的成本账与 8.6 的 KV 分层都可以直接接到这个约束上：把 KV 放到 CPU/磁盘层，本质上是把"显存容量约束"换成"搬运带宽约束"。</li>
+<li><strong>Agent 负载的混合。</strong> 9.1 的任务级输入（多轮、工具等待、分支）与本章的两类请求在资源画像上差别很大：它有大量"等待"而不是"计算"。把它接入混部是下一层的问题，本章未覆盖。</li>
+</ol>
+<hr />
+<h2 id="_8">陷阱</h2>
+<ol>
+<li><strong>用总 token/s 掩盖单类退化。</strong> 份额 0.25 时生成类 p99 翻倍而总吞吐仍在高位；只有分租户分位能看见它。</li>
+<li><strong>按参数量或单跑峰值相加估算混部显存。</strong> 实测 28.4 GiB 对"相加"的 14.7 GiB 差近一倍，反过来份额 0.5 又低于相加值。</li>
+<li><strong>把时间重合当因果。</strong> 三类干预都没有复现出可消除的退化，说明"同时变慢"不等于"互相争用某个资源"。</li>
+<li><strong>把准入当隔离。</strong> 准入决定谁进来；进来之后两类仍共享同一张卡与同一份带宽。</li>
+<li><strong>在比较策略之后才定 SLO。</strong> 本章的 SLO 在扫描前冻结，否则"达标率"可以随手调到达标。</li>
+<li><strong>采样分辨率当成瞬时值。</strong> <code>nvidia-smi</code> 的显存与利用率是 0.5 s 一次的被动采样，峰值是采样到的高水位而不是精确峰值。</li>
+</ol>
+<hr />
+<h2 id="_9">自测题</h2>
+<details class="fold">
+<summary>1. 为什么向量化类只把 GPU 利用率压到 0.76%，却仍然会和生成类互相影响？</summary>
+<p><strong>答案：</strong>
+因为它与生成类争用的不是 SM 算力而是<strong>显存容量与进程侧资源</strong>：两个引擎各自按 <code>gpu_memory_utilization</code> 预留 KV 池，这部分在启动时就占住、不随负载释放；向量化类自己的请求路径（tokenize、HTTP、小批次）也占 CPU。所以"利用率低"不等于"不占资源"，混部的峰值显存与单跑之和相差近一倍就是这条。</p>
+</details>
+<details class="fold">
+<summary>2. 份额 0.25 时生成类 p99 翻倍，为什么不能直接说&quot;向量化抢了算力&quot;？</summary>
+<p><strong>答案：</strong>
+因为同一份干预实验里，把向量化改成串行（<code>--max-num-seqs 1</code>）之后生成类的 p99 不但没有改善反而更差（0.3829 s），其它两项干预也没有变化；份额 0.5/0.75 又回到基线。也就是说这个现象不可用单因素开关消除，更像是显存高水位引起的抖动。要说"争用"，需要更饱和的负载与同步资源时间线（每类的批次占用、显存、带宽同时记录）。</p>
+</details>
+<details class="fold">
+<summary>3. 准入边界为什么写成&quot;阈值曲线&quot;而不是一个最大并发数？</summary>
+<p><strong>答案：</strong>
+因为两类的 SLO 达标率完全由接受率决定：预算紧时被接受的请求都很准时，但大量请求被拒绝；预算松时接受率高，但每类时延上移。所以"容量"必须同时说明"在哪组 SLO 下"和"允许多少拒绝"。本次要求两类达标率都 ≥90% 时不存在可行点，≥80% 时边界是生成 4 QPS／向量化 16 QPS——同一个系统在两套标准下给出不同答案。</p>
+</details>
+<details class="fold">
+<summary>4. 为什么&quot;时间分片&quot;没有被当作混部的替代方案？</summary>
+<p><strong>答案：</strong>
+时间分片把两类请求放进互不重叠的时间窗，代价是每一类在另一类的窗口里完全得不到服务，尾部延迟由"等到自己窗口"决定。本次实测里它的分位与混部接近（生成 p99 0.2529 s、向量化 0.0201 s），并没有变差，但这是因为它把每个类的负载也减半了（30 s 窗口内只有一半请求）。也就是说时间分片换来的"隔离"是用<strong>服务时间</strong>买的，而不是免费的资源划分；判断它是否值得，同样要看 SLO 与拒绝率。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L8/8.3-observability-benchmark.html">&#8592; 8.3 可观测性与正确的压测</a><a class="nav-next" href="../L8/8.5-cost-power-selection.html">8.5 成本、能耗与硬件选型 &#8594;</a></nav>
+</main>
+</body>
+</html>

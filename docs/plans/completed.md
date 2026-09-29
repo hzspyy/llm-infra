@@ -1,8 +1,10 @@
 # 已完成部分的修订计划
 
-本文件收录当前已有正文的 52 个模块，并逐章规定修订、深入实现和补测任务。“已完成部分”用于区分已有内容与尚未编写内容，不表示整章已验收。实际进度、工件和未解释结果只记录在 [STATUS](../../STATUS.md)；章节范围与依赖以 [outline](../../outline.json) 为准。尚无正文的模块见 [未完成部分的执行计划](pending.md)。
+本文件收录 54 个模块的正文修订、深入实现和补测任务；文件归属不表示整章已验收。实际进度、工件和未解释结果只记录在 [STATUS](../../STATUS.md)；章节范围与依赖以 [outline](../../outline.json) 为准。其余模块的任务见 [未完成部分的执行计划](pending.md)。
 
-各章统一采用“问题、对象与源码、执行步骤、交付与验收、反例”的粒度。表中 A/B/C 等按顺序执行；后续综合任务注明前置。先复用能支持同一结论的现有工件，补采缺少的状态与对照，不重复制造相同结果。原始 results 只读。源码入口在执行前固定 commit 和真实行号；新脚本列为待实现交付，不作为现有命令使用。通用采集协议、资源约束与批次见活计划，写作和测量分别遵循 [章节规范](../chapter-guidelines.md) 与 [实验规范](../experiment-guidelines.md)。
+各章统一采用“问题、对象与源码、执行步骤、交付与验收、反例”的粒度。表中 A/B/C 等按顺序执行；后续综合任务注明前置。先复用能支持同一结论的现有工件，补采缺少的状态与对照，不重复制造相同结果。原始 results 只读。源码使用对应版本的链接和实际文件位置；新脚本列为待实现交付，不作为现有命令使用。通用采集协议、资源约束与批次见全局执行计划（`~/.claude/plans/eventual-painting-peacock.md`），写作和测量分别遵循 [章节规范](../chapter-guidelines.md) 与 [实验规范](../experiment-guidelines.md)。
+
+各章共同完成[入门、术语、技术演进与前沿任务](pending.md#beginner-depth)，按该表的责任范围补齐解释、贯穿小例和迁移练习；0.0c 提供领域地图与索引。训练修订采用[全流程与资源约定](pending.md#training-workflow)：机制小验证、低资源完整教学项目与生产规模分析分别验收。训练系统的相关任务见 7.3–7.11。
 
 <a id="c-0-0"></a>
 ## 0.0 最小完整模型（上）
@@ -12,6 +14,8 @@
 **问题**：参数对象怎样组成模型；一次前向如何产生条件分布；KV 增量计算如何与完整前缀对齐。
 
 **对象与源码**：复用 `labs/L0/tiny_lm.py`、`walk_generate.py`；真实对照固定 `Qwen/Qwen3-1.7B` 的 Transformers `modeling_qwen3.py`，沿 embedding、RMSNorm、Q/K/V、MLP、lm_head 定位。
+
+**入门与演进任务**：从标量/向量/矩阵、维度与广播出发，用具体数值解释参数、activation、token、embedding 和 logits；先手算一层再扩到完整模型。交付与验收：不依赖未解释的线性代数或缩写；能说清模型的持久参数、输入与中间结果，前置概念接 0.0c。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
@@ -30,11 +34,13 @@
 
 **对象与源码**：复用 `labs/L0/walk_train.py` 与 `tiny_lm.py`；对照 PyTorch `autograd`、`CrossEntropyLoss`、AdamW；真实训练接口接 7.0b。
 
+**入门与演进任务**：用一元导数、链式法则和二维线性模型解释 loss、gradient、learning rate、optimizer；区分样本、batch、epoch、microstep 与 update。交付与验收：可从预测误差手算参数如何改变；能解释训练与推理、验证与测试的不同用途。
+
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 手推 softmax-cross-entropy、linear、残差和一个共享权重的梯度；在 FP64 下比较手算、autograd 和中心差分 | 每个梯度能追溯到本轮前向输入；逐 token loss 与有效 token 归一化一致 |
 | B | 用长度 3/7 的两条样本对比直接 batch、按样本平均和按 token 累积；记录更新前后的参数、梯度与 Adam 状态 | 展示错误归一化的反例并修正；不把 microbatch 数相同当有效 batch 相同 |
-| C | 注入 labels 未移位、detach、原地修改和重复 backward；把相应发现位置映射到 7.0 的 SavedVariable/version counter | 保留实际报错和梯度断点；自测要求解释原因并指出改动位置 |
+| C | 注入 labels 未移位、detach、原地修改和重复 backward；区分 TensorImpl 版本计数、view 共享版本与仅共享 Storage 的别名，沿 SavedVariable 定位保存值的消费者 | 保留实际报错和梯度断点；区分报错中张量的生产者与读取保存值的反向节点，自测解释原因并指出改动位置 |
 
 **反例与边界**：单样本 loss 下降只验证优化路径；泛化和完整训练性能由后续章节承担。
 
@@ -83,9 +89,9 @@
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
-| A | 统一模型 revision、token 输入、精度、输出长度与计时边界；列出驱动、时钟、功耗、软件和 kernel 的不同 | 两机共同配置可复现；无法一致的条件明确列出，不伪装成纯硬件实验 |
-| B | 固定 S=2048 扫 B=1/2/4/8/16/32，再固定 B=1/8 扫 S=128/2048/8192；分开 prefill、decode、完整调用和初始化 | 原始样本、阶段时间与资源账共同支撑交叉点；保留不符合峰值比例的点 |
-| C | 选一个差异最大的共同 shape，比较实际 kernel、工作集与 CPU 提交；以相同 SLO 下的 goodput 连接 8.5 | 结论限于相同任务；跨机计数器不能替代目标机的瓶颈证据 |
+| A | 统一模型版本、token 输入、精度、输出长度与计时边界；从 `ledger.py` 与模型配置重算 KV 字节、FLOP、算术强度及单位，区分权重、KV、激活和实际访存；源码示例对应 `bench_phases.py` 的真实差分流程 | Qwen3-1.7B 在 B=1、S=1024、BF16 的 KV 为 112 MiB；公式、图、表格和自测使用同一账本。算术强度标为公式估算；差分均摊调用耗时不称纯 GPU decode，prefill 调用时间不称大 GEMM 时间 |
+| B | 固定 S=2048 扫 B=1/2/4/8/16/32，再固定 B=1/8 扫 S=128/2048/8192；分开 prefill、decode、完整调用和初始化 | 原始样本、阶段时间与资源账共同支撑交叉点；功耗或温控归因需要同一时间窗的时钟、功耗、温度与节流信息，只有吞吐差异时保留未解释原因 |
+| C | 选一个差异最大的共同 shape，比较实际 kernel、工作集与 CPU 提交；以相同 SLO 下的 goodput 连接 8.5 | 选型结论限于相同任务、上下文和执行路径；区分实测延迟、理论下界与请求级 SLO，不用一次 eager 测量断言硬件物理上无法达标 |
 
 **反例与边界**：跨卡差值不能全部归因带宽；显存容量与短时速度分别参与选型。
 
@@ -204,9 +210,47 @@
 |---|---|---|
 | A | 将 checkpoint read/mmap、page fault、CPU 解码、H2D 分开；使用独立数据文件控制冷热，保留读取字节和介质信息 | 不通过共享机器全局 drop_caches 清缓存；“冷态”必须有实际证据 |
 | B | 在已允许的项目端点上比较 TCP 与可用传输后端，块大小 64 KiB/1/16/64 MiB，并发 1/4/16；先验证收发内容和完成语义 | 实际选中的 transport、链路与 buffer 注册可追踪；库存在不当作 RDMA 已启用 |
-| C | 为 6.4/8.6 提供注册、传输、等待、释放的小型适配器；注入接收端中断和重复完成事件 | 内容哈希、句柄生命周期与失败清理一致；报告注册成本是否被摊销 |
+| C | 为 6.4/8.6 提供注册、传输、等待、释放的小型适配器；注入接收端中断和重复完成事件 | 搬运前后数据、句柄生命周期与失败清理一致；报告注册成本是否被摊销 |
 
 **反例与边界**：磁盘吞吐、网络吞吐和端到端加载速度不是同一测量；未具备 RDMA/GDS 条件时保留源码及本地协议对照。
+
+<a id="c-1-6"></a>
+## 1.6 端侧推理栈
+
+**依赖**：1.1、4.3、5.1。
+
+**问题**：统一内存和独立显存的成本如何不同；预编译部署受哪些 ABI/算子限制；持续运行怎样改变最优配置。
+
+**对象与源码**：Jetson Orin 与 crater；共同模型 `Qwen/Qwen3-1.7B`，由固定 [llama.cpp](https://github.com/ggml-org/llama.cpp) 转换成 F16/Q4_K_M GGUF；前沿对照 [TensorRT Edge-LLM](https://nvidia.github.io/TensorRT-Edge-LLM/latest/overview.html) 的 ONNX→engine→C++ runtime，按[支持矩阵](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html)核对 SDK。Orin 路线限定 FP16/INT8/INT4，不安排 FP8/FP4 engine 实验。
+
+| 任务 | 执行步骤 | 交付与验收 |
+|---|---|---|
+| A | 固定 tokenizer/template/权重 revision；解析 GGUF tensor 与量化块，追踪 llama.cpp graph、KV 和 CUDA backend；核对 Edge-LLM 导出、builder 与 enqueue 边界 | F16 转换与 HF 参照对拍；预编译 wheel/运行库/engine 与目标平台匹配，不能在 Jetson 临时编译依赖 |
+| B | 同输入扫描 prompt=128/2048/8192、输出=128、并发=1/2/4；F16 与 Q4_K_M 分开测质量、内存和完整延迟 | 保存实际 backend 与 fallback；Edge-LLM 只有兼容目标的预制产物可用才运行，不能从支持“Jetson”推断支持 Orin |
+| C | 每个配置持续 30 分钟，同步记录 tegrastats、温度、功耗、频率和逐请求延迟；对照已有合法功耗模式 | 冷机与热稳态分别报告，给能量/有效输出与 deadline miss；不修改共享系统配置 |
+
+**交付**：新增 `labs/L1/edge_runtime_bench.py`、模型转换清单、持续运行记录和资源曲线；正文落入 outline 的 1.6 文件。
+
+**反例与边界**：架构名和格式名不等于运行后端；没有兼容预编译环境时保留相应路线 UNVERIFIED，不能回退为本机编译。
+
+<a id="c-1-7"></a>
+## 1.7 实时闭环预算
+
+**依赖**：1.4、1.6、5.1；动作头综合依赖 10.6。
+
+**问题**：输入年龄与处理时延有什么区别；排队和抖动如何造成 deadline miss；action chunk 怎样与控制频率协调。
+
+**对象与源码**：Qwen3-1.7B 端侧推理为系统负载，真实动作扩展用 10.6 的 DROID 策略；Python/C++ 单调时钟、进程队列、runtime 和传感/执行 harness。
+
+| 任务 | 执行步骤 | 交付与验收 |
+|---|---|---|
+| A | 实现固定时间戳输入重放器和周期消费者，记录采样、排队、开始推理、结束、动作取用/丢弃；注入 5/20/50 ms 抖动 | 同一时钟域能重建输入年龄与端到端关键路径；跨设备时钟先校准 |
+| B | 频率=5/10/20 Hz，队列容量=1/4/16；比较 FIFO、latest-only、丢弃过期输入/动作与 backpressure | 记录 deadline miss、有效动作率、输入年龄、p95/p99 与丢弃原因，保持同一任务输入 |
+| C | 在热稳态下接真实策略 action chunk=1/4/8，测试计算更快但消费旧动作的反例 | 离线动作误差、系统时延和闭环任务结果分别验收；无机器人时只完成重放与时间预算 |
+
+**交付**：新增 `labs/L1/closed_loop_budget.py`、统一事件 JSONL、时间轴与过期策略对照。
+
+**反例与边界**：独立测量的各阶段均值之和不是闭环分位数；推理时延下降不能替代任务成功率。
 
 <a id="c-2-0"></a>
 ## 2.0 张量、对象与存储
@@ -223,7 +267,7 @@
 | B | 在共享 Parameter、普通 tensor 属性和 register_buffer 三组模型中比较 parameters/state_dict/to(device)/optimizer 行为 | 解释状态为何被保存、迁移或更新；mini 复现注册与递归遍历 |
 | C | 用同一别名/原地修改程序比较 eager、functionalization 和 compile，连接 2.7 的副作用处理 | 提供 mutation 前后状态对拍与失效反例；不把所有 reshape 都描述成零拷贝 |
 
-**反例与边界**：释放一个 Python 引用不等于设备内存可重用；生命周期由 2.0c 继续验证。
+**反例与边界**：共享 Storage 不必共享版本计数；TorchDispatch 只见分解后的 t/addmm 不表示 aten::linear 未注册，需对照 schema 与 dispatch 表。释放 Python 引用与设备内存可重用的区别由 2.0c 继续验证。
 
 <a id="c-2-0b"></a>
 ## 2.0b 算子分发
@@ -287,7 +331,7 @@
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
-| A | 对同一 SAXPY/归约/GEMM 保留预处理、PTX、cubin、SASS 与编译日志；分别改变优化级别、目标架构和 fast-math | 每个制品有生成命令与哈希；源文件语句对应到实际指令或被优化删除的位置 |
+| A | 对同一 SAXPY/归约/GEMM 保留预处理、PTX、cubin、SASS 与编译日志；分别改变优化级别、目标架构和 fast-math | 编译产物注明生成命令、编译器版本与目标架构；源文件语句对应到实际指令或被优化删除的位置 |
 | B | 扫 unroll 和寄存器限制，保留寄存器、spill、local memory、occupancy 与时间 | 用访存/指令证据区分性能下降原因；不按寄存器数单独排序优劣 |
 | C | 导出一个 Triton 与一个 CuTe-DSL kernel 的中间表示，和 CUDA 实现对比 lowering；构造 PTX/driver 不兼容用例 | 编译与加载错误各有原文；解释 JIT/cache 命中对首次调用的影响 |
 
@@ -423,6 +467,8 @@
 
 **对象与源码**：复用 `labs/L3/online_softmax.py`、`attention_memory.py`；PyTorch SDPA、[FlashAttention](https://github.com/Dao-AILab/flash-attention) 的 reference 与 CUDA/Triton 实现。
 
+**入门与演进任务**：先用 3 token、单 head 的具体 Q/K/V 手算打分、缩放、mask、softmax 与加权和；再解释多头和显式 S×S 存储为何成为瓶颈，推导分块所需状态。交付与验收：初学者可在逐行数值与矩阵表达之间转换；区分 attention 运算、模型 head 结构与执行 kernel，之后进入 online softmax。
+
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 从 m/l/O 三个统计量推导分块更新、重缩放和合并；用块长 1/3/16 验证顺序与不同分块，加入极值和全 mask 行 | FP64 参照及逐块状态可检查；说明有限精度下的容差和全 mask 输出约定 |
@@ -461,7 +507,7 @@
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 推导 MHA/GQA/MQA 的读写和算术强度；实现 split-K 的局部 m/l/O 与最终归并，打印 grid 与 workspace | 连续小张量对拍；改变 split 数不会改变有效序列边界和 mask |
-| B | 用真实 paged kernel 直接读随机 block table，page=16/32/64，S=page−1/page/page+1/2048/8192/32768；与连续 reference 对拍 | 包含重排、尾页、不同请求长度和重复引用；保留 Python gather 作为额外搬运对照，不能替代分页结果 |
+| B | 用真实 paged kernel 直接读随机 block table，page=16/32/64，S=page−1/page/page+1/2048/8192/32768；与连续 reference 对拍 | 包含重排、尾页、不同请求长度和重复引用；连续与分页对照保持相同有效长度和数据，额外搬运单列。等长输入不能归因为节省 padding，正文、自测的 batch/shape 与对应运行一致 |
 | C | 从 DeepSeek-V2-Lite 单层权重提取低秩 latent、RoPE 分支与矩阵吸收公式；实现重建 K/V 和吸收两种路径，再对拍可用 MLA backend | 逐张量 shape/字节与输出可核对；完整 BF16 模型优先按 worldvln 48 GB 单卡预算，kernel 支持另核对 |
 | D | 在同输入下扫描 heads、KV heads、batch 和上下文，记录 split、缓存布局和真实临时内存；为 4.3 的 KV 量化提供已验证接口 | 形成分页/连续/MLA 的成本模型和适用范围；未运行的硬件专属路径单列 |
 
@@ -488,17 +534,18 @@
 <a id="c-4-0"></a>
 ## 4.0 Checkpoint 格式与加载
 
-**依赖**：0.0、2.0。
+**依赖**：0.0、2.0。 训练相关综合任务接 7.4/7.7，不依赖完整训练运行。
 
 **问题**：文件字节如何变成参数；命名与分片如何对应模型；量化和绑定权重怎样改变加载路径。
 
-**对象与源码**：复用 `labs/L4/checkpoint_formats.py`、`inspect_safetensors.py`；[safetensors](https://github.com/huggingface/safetensors)、Transformers model loading、vLLM weight loader；Qwen3-1.7B 与既有 Qwen2.5-1.5B AWQ/GPTQ。
+**对象与源码**：复用 `labs/L4/checkpoint_formats.py`、`inspect_safetensors.py`；[safetensors](https://github.com/huggingface/safetensors)、Transformers model loading、vLLM weight loader；Qwen3-1.7B 与既有 Qwen2.5-1.5B AWQ/GPTQ。 训练产物对照读取 PEFT adapter_config、SpecForge runtime/export、Cosmos DCP→HF→Diffusers 与 SmolLM3 阶段权重索引。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 手写长度/header/offset 解析器，验证 byte range、dtype、shape 和 index；随机抽取 embedding、QKV、MLP 的头尾元素 | 与 safe_open 对拍；截断、重叠 offset、缺分片和错 dtype 都有明确报错 |
 | B | 跟踪 checkpoint 名称→模型参数→融合 QKV/分片→设备 tensor，检查 tied weights 的指针与文件重复存储 | 文件字节、CPU 常驻、GPU 分配分别测量；参数身份与值一致 |
 | C | 解析 AWQ/GPTQ 的 qweight/qzeros/scales/g_idx 与 compressed-tensors 元数据，再追到加载后 repack；为 8.7 采加载阶段事件 | 说明磁盘布局与执行布局差异；完成一次 round-trip 或可信加载器的逐元素对照 |
+| D | 建立预训练权重、完整训练 checkpoint、adapter、EMA、quantizer/scale、draft 词表映射、processor/VAE/codec/normalizer 的文件清单；从保存入口追到推理 loader | 交付可检查的产物依赖表；仅权重 warm start 与精确 resume 分开，缺 processor 或错误 base revision 有轻量反例；无需下载全部权重 |
 
 **反例与边界**：config 声明绑定不保证文件只存一份；mmap 不意味着数据已在 GPU，也不意味着没有 page fault。
 
@@ -522,28 +569,29 @@
 <a id="c-4-2"></a>
 ## 4.2 数值系统与确定性
 
-**依赖**：0.0b、2.0、2.3。
+**依赖**：0.0b、2.0、2.3。 训练相关综合任务接 7.9，不依赖完整训练运行。
 
 **问题**：表示误差怎样传播；累加与归约顺序怎样改变结果；哪些确定性保证受后端与 batch 限制。
 
-**对象与源码**：复用 `labs/L4/numerics.py`；PyTorch dtype、autocast、deterministic algorithms；Qwen3-1.7B 的 eager/compile 与 vLLM sampler，格式文档参照 [Transformer Engine](https://docs.nvidia.com/deeplearning/transformer-engine/examples/fp8_primer.html)。
+**对象与源码**：复用 `labs/L4/numerics.py`；PyTorch dtype、autocast、deterministic algorithms；Qwen3-1.7B 的 eager/compile 与 vLLM sampler，格式文档参照 [Transformer Engine](https://docs.nvidia.com/deeplearning/transformer-engine/examples/fp8_primer.html)。 训练数值通过 PyTorch autocast/GradScaler、AdamW 和 Transformer Engine/torchao 的格式与缩放实现连接 7.9。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 实现 FP16/BF16/FP8 的可表示数枚举、舍入、溢出和 subnormal 示例；区分输入格式、乘法与累加精度 | 极值、抵消、长归约与 FP64 参照对齐；平均误差、最大误差和误差比值定义清楚 |
 | B | 固定 200 条输入，在 batch=1/2/8/32、不同排列与 padding 下保存 logits、top-2 margin、argmax 翻转和生成差异 | 配对样本与后端选择可复现；不用一个余弦相似度代替决策稳定性 |
 | C | 对照 eager/compile、TF32 开关、确定性设置和相同后端复跑；将第一处差异定位到某层或归约 | 报位级、容差级、分布级保证的实际范围；与 5.5/7.6 的验证及 logprob 对拍相连 |
+| D | 在 FP64 小参照中比较前向误差、dX/dW、长归约、更新小于权重 ULP 和 optimizer m/v；解释参数、计算、累加、梯度通信及更新各自的精度 | 原章浮点基础支持 7.9 的混合精度训练；用具体数值说明 TF32、BF16 autocast、显式 BF16 参数和 FP8/FP4 scaling 的差别，不将推理 logits 对拍代替训练稳定性 |
 
 **反例与边界**：小均方误差也可能改变接近并列的 argmax；开启确定性选项不保证跨设备或跨版本逐位一致。
 
 <a id="c-4-3"></a>
 ## 4.3 量化工程
 
-**依赖**：4.0、4.1、4.2、2.4；KV 实验依赖 3.3，服务实验依赖 5.1/5.2。
+**依赖**：4.0、4.1、4.2、2.4；KV 实验依赖 3.3，服务实验依赖 5.1/5.2。 训练相关综合任务接 7.5/7.7/7.9，不依赖完整训练运行。
 
 **问题**：校准与误差优化怎样改变模型；格式怎样约束真实 kernel；在哪些质量和负载条件下压缩有收益。
 
-**对象与源码**：复用 `labs/L4/quantization.py` 与既有 Qwen2.5-1.5B 三份 checkpoint；新主例固定 Qwen3-4B，扩展 Qwen3-8B。阅读 GPTQ/AWQ、SmoothQuant/QuaRot 的原始目标，沿 vLLM quantization config→loader/repack→linear/MoE method→kernel；前沿使用 [MR-GPTQ](https://arxiv.org/html/2509.23202)、[FP-Quant](https://github.com/IST-DASLab/FP-Quant)、[QuTLASS](https://github.com/IST-DASLab/qutlass) 与 [TurboQuant](https://arxiv.org/html/2504.19874)。
+**对象与源码**：复用 `labs/L4/quantization.py` 与既有 Qwen2.5-1.5B 三份 checkpoint；新主例固定 Qwen3-4B，扩展 Qwen3-8B。阅读 GPTQ/AWQ、SmoothQuant/QuaRot 的原始目标，沿 vLLM quantization config→loader/repack→linear/MoE method→kernel；前沿使用 [MR-GPTQ](https://arxiv.org/html/2509.23202)、[FP-Quant](https://github.com/IST-DASLab/FP-Quant)、[QuTLASS](https://github.com/IST-DASLab/qutlass) 与 [TurboQuant](https://arxiv.org/html/2504.19874)。 训练来源增加 [torchao QAT](https://docs.pytorch.org/ao/stable/workflows/qat.html) 和 [ModelOpt QAT/QAD](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_qat) 的 quantize.py、train.py、export.py 及 configs/train；全文按[训练共同任务](pending.md#training-workflow)执行资料与小验证。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
@@ -552,24 +600,27 @@
 | C | 在 Qwen3 q_proj/down_proj 实际 shape 上比较 BF16、显式反量化、融合 W4A16、W8A8/W4A4；M=1/8/32/128/512/2048，驻留与大于 L2 两组；给 MR-GPTQ 做 identity/旋转、融合/非融合消融 | 新增 `labs/L4/quantized_linear_bench.py`；记录真实 kernel、在线旋转、scale 重排、转换与 workspace 的完整成本；sm_100/sm_120 分开核对支持 |
 | D | 通过 3.3 的已验证分页接口运行真实 FP8 KV；研究 K/V 的不同误差传播，再用支持的 INT4 或 TurboQuant 路线作对照；S=2048/8192/32768，B=1/8 | 保存 scale、状态字节、attention 输出与长上下文质量；旋转/MSE 或内积保证不能外推为任务无损 |
 | E | WikiText-2 train 固定 seed 抽 128×2048 token 作校准，test 全量按冻结分块评 PPL；C-Eval validation 固定分层 200 题作独立任务。服务扫描采用共同协议 | 新增 `labs/L4/quantization_eval.py`；校准/调参/测试分离。文件大小、实际显存、prefill、decode、完整调用及质量—成本曲线齐备，减速结果同样保留 |
+| F | 为 PTQ、QAT、QAD、QLoRA、实际 FP8/FP4 训练逐项列数据用途、更新对象、loss、scale 状态、STE/反量化、optimizer 与部署格式；跟踪 torchao prepare→fake quant→convert | 一层 FP64/浮点参照比较前向量化误差与梯度路径；PTQ 校准不记为模型训练，QLoRA 不自动产出 QAT 权重；低精度模拟与硬件 kernel 分列 |
+| G | 研读 ModelOpt 的 Qwen3-8B NVFP4 配方：quantize→QAT 或 BF16 teacher 指导的 QAD→export；检查 calib/训练/评测拆分、trainable quantizer、checkpoint 中 scale/量化配置与目标 loader | 交付完整流程材料和导出元数据小例；区分任务适配、量化质量恢复与运行时压缩；使用公开权重/曲线分析训练作用，不开展 QAT/QAD 收敛训练 |
 
 **反例与边界**：无 clipping 且同一坐标系下的均匀 RTN 误差界不能套到所有量化过程；单文本 PPL、配置枚举和框架 dtype 转换均不能代替完整验证。
 
 <a id="c-4-4"></a>
 ## 4.4 MoE 的路由与执行
 
-**依赖**：4.1、2.4、3.3；跨 GPU 综合依赖 6.3。
+**依赖**：4.1、2.4、3.3；跨 GPU 综合依赖 6.3。 训练相关综合任务接 7.2/7.9，不依赖完整训练运行。
 
 **问题**：路由怎样变成具体工作；不均衡通过哪种调度影响时延；总参数、激活参数与实际读取量如何区分。
 
-**对象与源码**：复用 `labs/L4/moe.py`；`allenai/OLMoE-1B-7B-0924-Instruct` 为可运行基线，Qwen3-30B-A3B 为容量允许时的结构扩展；vLLM fused_moe、SGLang MoE runner、[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) 与 [EPLB](https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/)。
+**对象与源码**：复用 `labs/L4/moe.py`；`allenai/OLMoE-1B-7B-0924-Instruct` 为可运行基线，Qwen3-30B-A3B 为容量允许时的结构扩展；vLLM fused_moe、SGLang MoE runner、[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) 与 [EPLB](https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/)。 训练来源用 [OLMoE](https://github.com/allenai/OLMoE) 的数据/配置/路由损失材料，并与训练框架中的 expert parallel 梯度路径对照。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 实现 top-k、权重归一化、token pack、专家计算与 weighted combine；打印 permutation/inverse、expert offsets 和 padding | 小矩阵与逐 token dense expert 参照对拍；空专家、重复专家、非法路由与尾 tile 均覆盖 |
 | B | 用 vLLM/Triton 的真实 grouped kernel 替换 Python 循环，比较均匀、单专家 20%/50% 倾斜和真实 OLMoE 路由；tokens=1/32/256/4096 | 分别测路由、排序、pack、GEMM、combine 与完整调用；不能把 max/mean 直接当真实 GPU 效率上界 |
-| C | 采逐层、逐步专家访问集合与字节，比较 prefill/decode、batch 与量化；对 DeepGEMM 固定实际支持架构，追踪 scale 与 grouped layout | 真实流量/任务分工与简化专家覆盖公式分别报告；未运行的 Hopper/数据中心路线保留源码分析 |
+| C | 采逐层、逐步专家访问集合与字节，比较 prefill/decode、batch 与量化；对 DeepGEMM 固定实际支持架构，追踪 scale 与 grouped layout | 真实访问集合、读取量与概率预测分开；均匀且跨 token 独立的 top-k 无放回模型使用 E(1-(1-k/E)^T)，注明这是期望而非样本上界，均匀份额不是热点上限；未运行的硬件路线保留源码分析 |
 | D | 在 6.3 对照静态 placement 与 EPLB，记录统计窗口、迁移字节、冷专家和路由漂移；在同一负载下改变重平衡周期 | 解释迁移成本能否被后续收益抵消；不能只以负载均匀度判断端到端加速 |
+| E | 解释 router top-k 的梯度、负载/重要性辅助损失、router z-loss、capacity/drop token、专家初始化与训练路由分布；在两专家小模型中检查空专家、倾斜路由和 aux loss 对参数的作用 | 打印主损失/辅助损失、router 与 expert 梯度及 token 丢弃计数；与推理阶段 EPLB/placement 的作用分开；No-gradient 专家与通信 hang 的条件连接 7.2 |
 
 **反例与边界**：一个专家不等于一个独占 SM；专家可按 tile 切分，动态路由和缓存会改变实际权重读取量。
 
@@ -581,6 +632,8 @@
 **问题**：两阶段实际执行了什么；长度和 batch 怎样改变瓶颈；请求级时间如何与设备工作闭合。
 
 **对象与源码**：复用 `labs/L5/prefill_decode.py`；Qwen3-1.7B 与 Qwen3-4B，vLLM/SGLang scheduler、model runner 和 attention metadata。
+
+**入门与演进任务**：从逐 token 自回归循环和重复计算出发引入 KV cache；用同一请求的 prompt 与后续生成解释 prefill/decode、首 token 与输出间隔。交付与验收：画出每步 Q/K/V 形状、历史长度和权重/状态读写；明确阶段划分及 compute/memory-bound 的条件。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
@@ -599,10 +652,12 @@
 
 **对象与源码**：复用 `labs/L5/mini_block_pool.py`、`prefix_hits_per_request.py`、`prefix_probe.py`；vLLM `BlockPool`/KV manager/hash，SGLang `RadixCache` 与请求 token pool；Qwen3-1.7B。
 
+**入门与演进任务**：用相同请求长度对照连续预留、按需分页和碎片；手算 token 位置→逻辑块→物理槽位，再引入共享、引用计数、写时复制和回收；研读 PagedAttention 原始设计。交付与验收：给出 page/block/slot 的具体单位与小块表；区分 KV 分配管理、paged attention kernel 与 prefix cache，能解释其与 continuous batching 的协作。
+
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 扩展块池支持 allocate/append/fork/free/evict/COW；逐步打印 block table、refcount、有效长度与内容校验 | 单请求、共享前缀和分叉后写入与无缓存参考对拍；不只验块计数 |
-| B | page 边界前后、前缀长度 0/15/16/17/127/128/129，中间 token 改变、相同 suffix 不同 prefix、LRU 压力分别测试 | 逐请求记录命中块、重算 token、搬运和完整时间；复用已有命中工件，只补缺少的状态 |
+| B | page 边界前后、前缀长度 0/15/16/17/127/128/129，中间 token 改变、相同 suffix 不同 prefix、LRU 压力分别测试；为逐请求命中表恢复可读的原始输出入口，缺失时在新目录补采 | 逐请求记录命中块、重算 token、搬运和完整时间；正文数字可回到实际文件，不能把缺失的 `hits-20260921/prefix_hits.txt` 当已交付证据；复用其他可读工件 |
 | C | 固定 input_ids，改变模型/adapter revision、位置规则与多模态预处理身份；分析哪些字段进入真实缓存键 | 显式展示正确失效及不被系统自动识别的更新；adapter 热更新接 5.10，视觉身份接 4.8 |
 | D | 对比 vLLM 块哈希与 SGLang radix 的查找、驱逐、锁定和释放路径，改变共享前缀比例与活跃会话数 | 数值和资源先通过再比较速度；形成 8.6/9.3 的缓存接口与取回基线 |
 
@@ -615,7 +670,9 @@
 
 **问题**：预算怎样转换为实际工作；吞吐、公平和长尾怎样冲突；预测误差和过载怎样影响调度。
 
-**对象与源码**：复用 `labs/L5/scheduling.py`；vLLM `v1/core/sched/scheduler.py`、SGLang scheduler/prefill adder/overlap loop；Qwen3-1.7B。
+**对象与源码**：[Orca](https://www.usenix.org/conference/osdi22/presentation/yu) 的按轮调度；复用 `labs/L5/scheduling.py`；vLLM `v1/core/sched/scheduler.py`、SGLang scheduler/prefill adder/overlap loop；Qwen3-1.7B。
+
+**入门与演进任务**：以两槽位、A/B 分别剩余 2/8 token、C 中途到达的时间线比较静态 batching、按请求聚合的动态 batching 与按轮 continuous batching；沿 Orca 解释迭代调度，再插入长 prompt 推导 chunked prefill。交付与验收：手算队列、每轮成员与输出；相同到达/工作量比较等待、TTFT/TPOT、吞吐和公平性；区分历史动机、当代引擎机制与下列测量，不能直接从 token budget 开始。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
@@ -623,7 +680,7 @@
 | B | 长 prompt=8192 插入 8 条 decode，token budget=128/256/512/2048/8192；采每请求 TTFT/TPOT、scheduled tokens 与重算 | 修正固定观察窗口和预算估计吞吐的口径；每档相同工作量且保存重复样本 |
 | C | 用 ARRIVAL 协议比较两引擎与 mini 预测，加入历史长度预测的 step-time 预算；对预测误差注入 ±25%/50% 偏差 | goodput、p95/p99、最长等待与拒绝一并报告；预测式策略通过同任务可控对照验收 |
 
-**反例与边界**：token budget 相同不代表各 step 时长相同；仅记录 step 慢不能恢复每条请求的 TPOT。
+**反例与边界**：token budget 相同不代表各 step 时长相同；仅记录 step 慢不能恢复每条请求的 TPOT。本章负责引擎 iteration 与独立请求调度；任务图、跨轮优先级和 CPU/GPU 联合准入由 [9.7](pending.md#c-9-7) 复用本章接口完成。
 
 <a id="c-5-4"></a>
 ## 5.4 图执行与流水重叠
@@ -645,11 +702,11 @@
 <a id="c-5-5"></a>
 ## 5.5 投机解码
 
-**依赖**：3.3、4.2、5.1、5.4；混合状态实验在 5.13 基础任务后执行。
+**依赖**：3.3、4.2、5.1、5.4；混合状态实验在 5.13 基础任务后执行。 训练相关综合任务接 7.7，不依赖完整训练运行。
 
 **问题**：多 token 验证如何保持分布；草稿来源怎样改变成本；验证和回滚怎样与调度及状态集成。
 
-**对象与源码**：复用 `labs/L5/speculative.py` 的 ngram 基线；读 vLLM rejection sampler/spec decode 与 [SGLang speculative](https://docs.sglang.io/docs/advanced_features/speculative_decoding)。前沿主例为 `Qwen/Qwen3-4B` + [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16)；EAGLE3 对照 `Qwen/Qwen3-8B` + [thoughtworks/Qwen3-8B-Eagle3](https://huggingface.co/thoughtworks/Qwen3-8B-Eagle3)。
+**对象与源码**：复用 `labs/L5/speculative.py` 的 ngram 基线；读 vLLM rejection sampler/spec decode 与 [SGLang speculative](https://docs.sglang.io/docs/advanced_features/speculative_decoding)。前沿主例为 `Qwen/Qwen3-4B` + [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16)；EAGLE3 对照 `Qwen/Qwen3-8B` + [thoughtworks/Qwen3-8B-Eagle3](https://huggingface.co/thoughtworks/Qwen3-8B-Eagle3)。 草稿生产过程读取 [SpecForge 固定源码](https://github.com/sgl-project/SpecForge/tree/3d64e7a61f5fcc7f7d78ba6164c881f831943947) 的 data preparation、EAGLE3/DFlash 配方和 export；训练系统与监督数学由 7.7 提供。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
@@ -657,6 +714,8 @@
 | B | 为引擎单次安装统计 hook，预热后清零；逐轮保存各位置提案、条件概率、接受长度、额外 token、KV 有效区间和时间 | 草稿/验证/采样/回滚完整计时；聚合接受率不冒充逐位置条件概率 |
 | C | 分别在各自目标模型内比较普通 decode、ngram、EAGLE3 或 DFlash；k=1/2/4/8/15，batch=1/4/16，任务取 GSM8K 固定 128 题、代码补全 64 题与重复文本 | 记录任务质量、接受长度、完整延迟和容量；不同 target 的结果不能直接作为草稿方法排名。DFlash 示例中的 FA3 不直接用于 sm_120，先固定可支持 backend |
 | D | 以 `Qwen/Qwen3.5-4B` 检查实际 MTP 权重与 NEXTN/对应配置，读 [Qwen3.5 cookbook](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.5)；通过加载与数值门后测 MTP 与 recurrent rollback | 模型族声明不代替具体 checkpoint 支持；状态快照、提交与回滚与 5.13 共用同一用例；未有 MTP 权重保持未完成 |
+| E | 对已发布 target/draft 建立训练来源材料：样本/模板、teacher 特征层、token 对齐、EAGLE3 training-time test、DFlash block mask/loss、词表映射、验证集与 checkpoint；用 B=2、L=8 的小张量展示监督位置 | 区分普通小 LM、专用 feature-conditioned 草稿、MTP head 与 block diffusion 草稿的训练；数据分布和 target revision 如何影响接受长度有具体例子；不要求训练新 draft |
+| F | 沿 SpecForge runtime checkpoint→EAGLE3 SGLang export 或 DFlash HF export→引擎 loader 核对 config、权重键、embedding 引用、t2d/d2t 与 block size；训练材料和发布权重的来源分别记录 | 复用本章已有部署质量/接受长度任务；adapter/量化/目标更新导致 draft 不再匹配的边界有检查；高训练准确率不替代逐位置接受率和完整成本 |
 
 **反例与边界**：高接受率也可能不加速；相同 seed 的 token 一致不是随机分布保证；草稿模型与目标 revision 必须匹配。
 
@@ -692,6 +751,7 @@
 | B | 将 gather+SDPA 执行器替换为真实 paged attention，保持其余调度与采样不变；比较 B=1/8、长短混批、共享前缀、取消 | 两执行器逐 token/logit 对拍，KV 内容与资源回收一致；性能包含 metadata 和必要布局处理 |
 | C | 对四引擎运行共同支持的固定 Qwen3 配置；llama.cpp 的 GGUF 与 TensorRT-LLM engine 单独记录转换和精度 | 比较同一任务的初始化、稳态、峰值和扩展面；不可同精度的配置只作独立路线，不给无条件排名 |
 | D | 新增一种调度策略或采样后端，记录跨模块改动和故障定位；将这个具体 diff 交给 M0 分析 | 抽象边界通过实际修改验证；不以接口层数或代码量判断架构优劣 |
+| E | 把教学项目导出的模型接入可支持其结构的 HF/现有 nanoserve 路径，核对 tokenizer/config/权重与生成结果，再执行已有调度、分页和取消实验；不支持的结构完成最小适配并明确范围 | 训练导出与直接加载对拍，读者能从数据训练到 HTTP/CLI 服务；先用公开权重学习引擎亦可，教学模型回填时不重复所有性能扫描 |
 
 **反例与边界**：分页寻址的 mini 不等于高效分页 kernel；引擎相同输出不说明内部机制相同。
 
@@ -710,7 +770,7 @@
 | B | 对重算与可用换出路径运行相同长度分布，记录牺牲请求、重算 token、复制字节、请求结果和恢复时延 | 先确认目标版本存在换出实现；不存在时在 nanoserve 验证协议并明确真实引擎限制 |
 | C | 用 ARRIVAL 的过载与突发比较无界排队、有界准入和抢占，改变 oldest/youngest 策略 | 统计全部请求的 p95/p99、拒绝、超时与最长等待；恢复后合法请求在同一服务继续成功 |
 
-**反例与边界**：捕获异常不代表恢复；独立进程重启成功与同进程继续服务分别验收。
+**反例与边界**：捕获异常不代表恢复；独立进程重启成功与同进程继续服务分别验收。本章提供引擎 abort 与资源回收接口；[9.5](pending.md#c-9-5) 负责跨模型、工具和持久任务的提交、重试与取消，[9.8](pending.md#c-9-8) 负责工具进程树与环境回收。
 
 <a id="c-5-9"></a>
 ## 5.9 采样引擎
@@ -732,20 +792,24 @@
 <a id="c-5-10"></a>
 ## 5.10 LoRA 多租户服务
 
-**依赖**：4.1、5.3、5.4；真实训练 adapter 的对照接 7.5。
+**依赖**：4.1、5.3、5.4；训练/导出契约接 7.5，质量与服务对照不要求先训练新 adapter。
 
-**问题**：混合 adapter 的 token 怎样分段；slot 容量怎样改变执行波次；热更新如何影响缓存身份与恢复。
+**问题**：混合 adapter 的 token 怎样分段；slot 容量怎样改变执行波次；训练产物和热更新怎样影响缓存身份与恢复。
 
-**对象与源码**：复用 `labs/L5/lora_scaling_audit.py`、`sglang_lora_kernel_probe.py`、`lora_recovery_test.py`、`lora_kv_invalidation_test.py`；vLLM Punica/LoRA manager 与 SGLang LoRABatchInfo、内存池、分段 kernel。
+**对象与源码**：复用 `labs/L5/lora_scaling_audit.py`、`sglang_lora_kernel_probe.py`、`lora_recovery_test.py`、`lora_kv_invalidation_test.py`；vLLM Punica/LoRA manager 与 SGLang LoRABatchInfo、内存池、分段 kernel。公开已训练产物例为 [trl-lib/Qwen3-4B-LoRA](https://huggingface.co/trl-lib/Qwen3-4B-LoRA)，其 adapter_config 指向 Qwen/Qwen3-4B、r=8、alpha=8、q_proj/v_proj；卡未给出训练数据和精确 base commit，这些信息保留未知。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 对照 mini、逐行 merged dense 与真实 shrink/expand，记录 token→adapter、rank、scale、segment 和 base 哨兵 | 数值、未适配行与 TP slice 对齐；保留已核对工件，补漏项不重做全部扫描 |
 | B | slot=2/4/8，adapter 数覆盖每个上限的前一档、相等、后一档及两倍；rank=8/16/32，均匀/倾斜访问 | 验证拐点随 slot 迁移；分开 CPU cache 命中、H2D、分轮与 base GEMM 摊销，解释不够的趋势不归因 |
-| C | 在 HTTP 服务测试非法 rank 后合法请求、同名不同版本更新、请求执行中卸载/替换；与独立引擎重启对照 | cache key、slot、请求版本和恢复结果一致；不能把重启恢复写成同进程恢复 |
-| D | 在两引擎对齐真实完整路径，比较 eager/graph、驻留/换入；使用 7.5 训练并固定 revision 的 adapter 检查任务质量 | 随机 adapter 的调度证据与训练 adapter 的质量证据分开；新增后端的改动范围可定位 |
+| C | 在 HTTP 服务测试非法 rank 后合法请求、同名不同版本更新、请求执行中卸载/替换；分开同一已加载 ID 的权重替换与更换 adapter ID，并与独立引擎重启对照 | 记录缓存命中或实际 KV 状态，与关闭缓存的新版本参照比较；名称、ID、权重版本、slot 和请求保持对应，不从生成文本相同或不同推断 KV 是否失效；重启恢复与同进程恢复分开 |
+| D | 在两引擎对齐完整路径，比较 eager/graph、驻留/换入；用公开已训练 adapter＋匹配 base，在冻结当前 revision/模板/输入后检查 merged/unmerged 与服务输出 | 取消依赖 7.5 新训练 adapter；随机 adapter 的调度证据、公开 adapter 的功能/输出证据和微调质量提升分别处理。缺失训练/验证数据时不宣称已复现训练质量，不跨 base 比性能 |
+| E | 追踪 PEFT 的保存、base 引用、target_modules、rank/alpha、额外训练模块和 tokenizer/template；分析 full/LoRA/QLoRA 训练如何决定 merge、量化和服务加载 | 复用 7.5 的小模型 round-trip，给出 adapter→loader→kernel 的产物清单；base_model_name_or_path 不是精确 revision，合并量化 base 需要单独误差检查 |
 
-**反例与边界**：adapter 总数不等于同时活跃数；同名热更新不保证引擎自动使旧 KV 失效。
+**交付**：继续完善既有服务实验，增加公开训练产物的配置/加载材料及其训练信息边界；正文恢复实验的源码入口使用实际的 `labs/L5/run_lora_recovery_tests.sh`，并核对关联命令与完整源码展示。
+
+**反例与边界**：adapter 总数不等于同时活跃数；同名热更新不保证引擎自动使旧 KV 失效；能加载公开 adapter 不等于重现其原始微调流程。
+
 
 <a id="c-5-11"></a>
 ## 5.11 API、序列化与流协议
@@ -777,7 +841,7 @@
 |---|---|---|
 | A | 对 embedding 的 mask、取 last/mean/CLS、归一化与维度截断逐项对拍；对 reranker 保存完整模板、token IDs、yes/no logits 与最终分数公式 | HF 与引擎先对齐输入及计算链，再比较分数/排序；保留现有不等价链的失败输入 |
 | B | 在同一 checkpoint 内比较首轮/固定长度 decode/池化任务，按参数、激活、workspace、KV 分阶段采内存 | 不将不同大小 encoder/decoder 的容量比解释为架构收益；缓存长度固定且每轮可核查 |
-| C | 相同文本内容和长度分布比较 padding、packing、独立/合批；两引擎服务采客户端与服务端事件 | 逐请求分解闭合，禁止以不同样本中位数相减或以接收耗时冒充网络开销 |
+| C | 相同文本内容和长度分布比较 padding、packing、独立/合批；两引擎服务采客户端与服务端事件。并发对照固定相同请求清单、客户端库、响应校验与计时终点，只改变连接复用；采连接、前端、入队和完成事件，并用独立发生器检查客户端限制 | histogram 的增量 sum/count 明确为均值；客户端 p50 减服务端均值只能作两种统计量的差，不能命名残差 p50。阶段分位数由同请求差值计算；无前端事件时不能把差额归因 accept 排队，未压满引擎也不能确定限制只在客户端 |
 | D | 固定 BEIR NFCorpus 的语料/查询/qrels，接 embedding→候选→rerank；比较 Recall@k、nDCG@10 与完整时延 | 将模型质量、batch 收益与服务开销联系起来，为 9.6 提供可复用数据和计分器 |
 
 **反例与边界**：decoder 架构可提供一次性 pooling 服务；不能据服务接口名称推断一定持有跨请求 KV。
@@ -793,114 +857,136 @@
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
-| A | 逐层打印 KV、conv、recurrent state 的 shape/stride/dtype 与生命周期；实现混合 pool 的 allocate/snapshot/commit/rollback | 短序列逐步状态与不缓存参照对拍；窗口层与全 attention 层分列 |
+| A | 从实际执行的实现逐层读取独立 KV、conv 和 recurrent 张量，打印 shape/stride/dtype 与生命周期；实现混合 pool 的 allocate/snapshot/commit/rollback | 短序列逐步状态与不缓存参照对拍；conv 与 recurrent 状态分别计字节，窗口 attention 与全 attention 分列；配置估算不当成运行期观测 |
 | B | 共享前缀后分叉、前缀边界前后、LRU 驱逐与重算分别测试，记录实际状态值和命中 | 不能以 prefill 更快证明状态复用正确；更换层配置和模型版本必须检查身份 |
-| C | 强制在草稿第 1/2/末位拒绝，记录回滚前后值、copy kernel 和字节；与不投机输出及完整调用比较 | 直接测量回滚成本，不用理论状态字节代替耗时；快照成本计入完整调用 |
-| D | 两引擎扫描 S=512/2048/4096/8192/16384，B=1/4/8，并测试取消回收 | 状态增长曲线与逐层账闭合；旧 2048 点之外的结论需要新增数据，架构间质量不假定相同 |
+| C | 强制在草稿第 1/2/末位拒绝，记录回滚前后值、copy kernel 和字节；与不投机输出及完整调用比较 | 回滚、快照和提交计入完整调用；合成张量池的 copy 时间与真实模型回滚分别表述，模型状态与不投机参照一致后再解释收益 |
+| D | 两引擎扫描 S=512/2048/4096/8192/16384，B=1/4/8，并测试取消回收 | 状态曲线、字节公式、正文和自测一致，说明窗口上限与容量比例的方向和极限；区分序列独立的 recurrent state 与 batch 共享的投影权重；各长度的性能使用对应实测数据，架构间质量单独评价 |
 
 **反例与边界**：递推状态被更新后通常不能靠缩短长度恢复；需要合法快照、重算或算法特定回滚机制。
 
 <a id="c-7-0"></a>
 ## 7.0 Autograd 引擎
 
-**依赖**：0.0b、2.0b、2.0c。
+**依赖**：0.0b、2.0b、2.0c；训练知识与验证边界按[共同任务](pending.md#training-workflow)。
 
-**问题**：反向图何时构建；依赖计数怎样调度节点；保存值、流与梯度模式如何决定正确性和内存。
+**问题**：反向依赖如何执行；哪些值必须保存；冻结、重算与不同训练目标怎样改变梯度路径。
 
-**对象与源码**：复用 `labs/L7/mini_autograd.py`、`trace_grad_fn.py`、`trace_backward.py`；PyTorch `torch/csrc/autograd/engine.cpp`、`function.h`、`saved_variable.cpp`、AccumulateGrad。
+**对象与源码**：复用 `labs/L7/mini_autograd.py`、`trace_grad_fn.py`、`trace_backward.py`；PyTorch `torch/csrc/autograd/engine.cpp`、`function.h`、`saved_variable.cpp`、AccumulateGrad。共同参照为小型语言模型、冻结 encoder＋可训练 projector、teacher/student 两条分支。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
-| A | 将有分支、共享 Parameter、多个输出的前向映射到 Node/Edge/GraphTask；记录依赖计数、ready queue、InputBuffer 与梯度汇合 | mini 与 autograd 的执行依赖和梯度对拍；节点执行次数由依赖而非简单链式次序解释 |
-| B | 分别测试 retain_graph、create_graph、no_grad、inference_mode、saved tensor hooks 与原地修改；记录保存值释放和 version counter | 数值、二阶梯度和错误原文齐备；解释推理模式与仅关闭梯度的状态差异 |
-| C | 在 crater 用两个 CUDA stream 验证前向/反向和梯度消费的依赖；对 checkpoint 重算记录保存张量与峰值 | CPU 机制与 CUDA 完成语义分别验收；把生命周期结果连接 7.1 的重算策略 |
+| A | 将分支、共享 Parameter、多个输出的前向映射到 Node/Edge/GraphTask；记录依赖计数、ready queue、InputBuffer 与梯度汇合，核对叶子梯度累计和 zero_grad(set_to_none) 的行为 | mini 与 autograd 的依赖和梯度对拍；打印 Node/Edge 的完整遍历结果，标明共享边并保持示例输出一致；能解释节点执行次数、共享参数累加与未使用参数状态 |
+| B | 分别测试 retain_graph、create_graph、no_grad、inference_mode、saved tensor hooks、detach 与原地修改；在 FP64 小例检查一阶/二阶梯度、保存值释放和 version counter | 矩阵梯度维度正确，内建 Node 保存值用实际字段或 hooks 观测；区分叶子原地写入限制、保存值版本不匹配和保存值释放，记录报错阶段，说明保存值释放后哪些反向计算仍可执行 |
+| C | 复用现有 GPU 证据；需要补证时用小网络的两个 CUDA stream 检查反向与梯度消费；以需要保存激活的矩阵/非线性函数比较原始前向和 checkpoint 的保存张量、RNG 与重算次数 | CPU 图机制与 CUDA 完成语义分别验证；保存值和重算由实际观测说明，包含非重入 checkpoint 的 early-stop；这里只验证依赖和状态，不开展训练吞吐扫描 |
+| D | 对 encoder→projector→loss 分别冻结 encoder 参数、对 encoder 使用 no_grad、在 projector 后 detach；再加入冻结 teacher 的监督分支和仅训练 LoRA 的线性层 | 列出参数 requires_grad、输入梯度、保存值、optimizer 参数组；解释“冻结权重仍可能需要输入梯度”的条件，连接 7.5/7.7/7.10 |
 
-**反例与边界**：图可遍历不代表实际引擎按 DFS 执行；释放 Python 节点不证明相关 GPU 工作结束。
+**交付**：修订正文和既有 mini，补梯度图、保存值清单与冻结/teacher 分支反例。
+
+**反例与边界**：图可遍历不代表引擎按 DFS 执行；训练模式、梯度模式和参数冻结是三个独立控制面。
+
 
 <a id="c-7-0b"></a>
 ## 7.0b 完整训练步
 
-**依赖**：7.0、4.0、4.1、4.2。
+**依赖**：7.0、4.0、4.1、4.2；执行边界按[共同任务](pending.md#training-workflow)。
 
-**问题**：样本如何决定有效 loss；累积和大 batch 怎样等价；更新后恢复需要哪些状态。
+**问题**：监督对象和归一化怎样决定梯度；一次有效更新包含哪些操作；参数初始化、继续训练和恢复怎样区分。
 
-**对象与源码**：复用 `labs/L7/training_step_smollm.py`、`gradient_accumulation.py`；已测 SmolLM2-360M；代表性扩展用 [SmolLM3-3B-Base](https://huggingface.co/HuggingFaceTB/SmolLM3-3B-Base) 与 [官方训练配置](https://github.com/huggingface/smollm/tree/main/text/pretraining/smollm3)。
+**对象与源码**：复用 `labs/L7/training_step_smollm.py`、`gradient_accumulation.py` 与已有 SmolLM2-360M 工件；SmolLM3-3B-Base 只用于[官方配置](https://github.com/huggingface/smollm/tree/main/text/pretraining/smollm3)与[阶段权重元数据](https://huggingface.co/HuggingFaceTB/SmolLM3-3B-checkpoints)分析。增加二维 flow 和线性 projector 的 CPU 小例，使完整训练步不依赖语言模型目标。
+
+**入门与演进任务**：先区分前向、反向、累积、更新、epoch 与恢复的时间尺度，再把教学项目的一批数据映射到本章状态检查。交付与验收：能解释哪些操作每 microbatch 执行、哪些每 optimizer update 执行；本章的小例为完整训练项目提供参照。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
-| A | 对齐样本 ID、labels、loss mask、packing 与有效 token；手写 cross-entropy 和 AdamW 一步，对拍框架逐参数更新 | 本文模型名称、配置与原始工件一致；不能把 SmolLM2 结果写成 SmolLM3 测量 |
-| B | 固定同一组变长样本，microbatch=1/2/4，对比直接 batch、累积及错误按 microbatch 均值归一化；控制 dropout/RNG/clip 顺序 | 输出 loss、梯度和参数差异，定位现有累积不一致；容差由精度和归约确定 |
-| C | 在第 1/3/7 步保存模型、optimizer、scheduler、scaler、RNG 和数据游标，再恢复执行两步，与不中断参考对照 | 样本序列、状态和更新可重建；缺 optimizer/RNG/游标分别构造失败例 |
-| D | 迁移同一语义到 SmolLM3，先按真实状态 dtype 核算容量；不足时接 7.2 的 FSDP2，不擅自将全参数训练改为 LoRA | 原生 NoPE/GQA、有效 token 和优化器语义保持；规模实验与基础正确性分别报告 |
+| A | 从样本 ID、labels、shift、attention/loss mask 到逐位置 CE 与有效 token 分母；对照连续目标的逐坐标 MSE/有效帧分母，手写 AdamW 一次更新 | 打印 batch、逐项 loss、梯度、参数和 m/v；同一模型与框架逐参数对拍；不同目标的 loss 数值不直接比较 |
+| B | 用长度不同的固定样本，对比直接 batch、按有效元素累积和错误地平均 microbatch loss；控制 dropout/RNG、unscale、clip、step 与 scheduler 次序 | 解释现有 SmolLM2 累积差异；分母跨 microbatch/rank 的归约语义明确；不以生成相似或 loss 接近代替梯度一致 |
+| C | 在一次更新后保存并恢复，再执行同一下一批；分别移除 optimizer、scheduler、RNG、scaler、数据游标，记录哪个不变量先破坏 | 用 TinyLM 或现有小模型短序列完成；区分 state_dict、完整 resume 和新的 fine-tuning 初始化；大 checkpoint 不入库 |
+| D | 从 SmolLM3 config 和 Nanotron YAML 重建参数组、NoPE/GQA、全局 batch、token 预算、学习率阶段和状态字节；对照 SmolLM2 的真实结构，不默认两者架构相同 | 交付“配置字段→数学/状态→实现位置→导出影响”表；取消把 SmolLM3 全参更新或 FSDP 迁移作为本章必做任务 |
+| E | 对同一小网络列出从零初始化、加载预训练权重、冻结部分模块、adapter 初始化、teacher 初始化五种启动方式；比较第一次 step 的更新对象和 optimizer 状态创建 | 读者能说明训练/微调/蒸馏共用哪些步骤、哪些监督和状态不同；只执行一至两次机制更新，不判断收敛和泛化 |
 
-**反例与边界**：一次 loss 相近不足以证明恢复一致；仅权重恢复与完整训练恢复是不同任务。
+**交付**：完整更新的数值参照、batch/loss/optimizer 状态材料、短恢复轨迹、SmolLM3 公开配方映射。
+
+**反例与边界**：模型名称、配置和旧实测对象必须一致；公开中间权重不保证带有可继续原训练的全部状态。
+
 
 <a id="c-7-1"></a>
 ## 7.1 训练循环的系统视角
 
-**依赖**：7.0b、2.0c、2.6。
+**依赖**：7.0b、2.0c、2.6；数据生产接 7.8，完整优化器/混合精度机制接 7.9。
 
-**问题**：样本到更新的关键路径是什么；重算和混合精度改变哪些状态；数据等待怎样与设备工作重叠。
+**问题**：供数、计算和更新怎样构成关键路径；重算/冻结/累积怎样改变内存；怎样区分数值失败与系统加速。
 
-**对象与源码**：复用 `labs/L7/training_loop_systems.py`；PyTorch DataLoader/pin_memory、autocast/GradScaler、checkpoint/optimizer；SmolLM2-360M 基线与 SmolLM3-3B 扩展。
+**对象与源码**：复用 `labs/L7/training_step_timeline.py`、`labs/L7/loop_lifecycles.py` 和 SmolLM2-360M 工件；PyTorch DataLoader/pin_memory、autocast/GradScaler、checkpoint/optimizer。连续目标、音频时长 batch 和冻结 encoder 的工作流使用 7.10 的配置及小张量，不要求加载大模型。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
-| A | 记录 sample read、collate、pin、H2D、forward、backward、clip、optimizer；分别比较纯预加载数据与固定读取延迟的控制组 | 同一有效训练更新下建立完整时间线；CPU 提交和 GPU 执行重叠不重复相加 |
-| B | workers=0/2/4、prefetch=1/2/4、pin on/off；activation checkpoint 按层/每两层/on-off，固定 batch 与 tokens | saved tensors、重算调用、峰值和吞吐共同支持解释；数据等待与算子速度分开 |
-| C | 对 FP32/BF16/FP16+scaler 保存参数/梯度/Adam 状态 dtype、scale、finite 检查和跳过更新次数 | 定位 FP16 inf 的首个发生层/步骤；比较真实更新吞吐，不能把跳过 optimizer 当加速 |
+| A | 追踪 read/decode/augment、collate、pin、H2D、forward、loss、backward、unscale/clip、optimizer、scheduler、zero_grad 与异步保存；区别 microstep 和 optimizer step | 用现有时间线补齐状态归属；CPU 提交和 GPU 执行重叠不重复相加；吞吐分为样本、有效 token/帧、正常 optimizer 更新三种口径 |
+| B | 根据既有 DataLoader/重算结果选择一个待解释瓶颈：预加载与读取延迟对照，或一层重算开关；记录 saved tensors、RNG、重复前向、CPU/pinned/GPU 峰值 | 只补与问题有关的一组小型对照；不默认扫描 workers×prefetch×pin×重算的组合；解释激活峰值与参数/optimizer 常驻的区别 |
+| C | 对 FP32、BF16 autocast、FP16＋scaler 打印参数/激活/梯度/Adam 状态 dtype、scale、finite、更新是否跳过；沿已有 FP16 inf 找首个非有限输入/层 | 混合精度训练机制深化指向 7.9；不默认 BF16 optimizer 是 FP32，也不把 skip step 当吞吐提升；保存数值失败原始样本 |
+| D | 比较全参、LoRA、冻结 encoder＋projector、teacher/student 四种训练 loop 的生命周期；列 teacher forward、feature cache、encoder cache 和 learner backward 的复用条件 | 交付每种方案的训练状态账和时间线模板；冻结 encoder 后哪些增强/梯度需求禁止缓存须明确；材料可由源码与一层小例完成 |
+| E | 分析 compile/融合 optimizer/梯度累积/activation offload 如何改变启动成本、重编译、峰值、传输与通信重叠；给出多分辨率或变长 batch 触发重编译的最小反例 | 性能解释连接 2.7 与 7.11；短 trace 只支持执行路径结论，稳定吞吐与长程数值结论引用公开或已有充分测量 |
+| F | 承接 7.8-A/B/D/I 与 7.9-A/B 的基础任务，完成教学小语言模型从随机初始化到预算内预训练；持续记录有效 token、训练/验证 loss、grad norm、LR、吞吐和峰值；按预定规则选择阶段权重并接 7.5-I | 交付完整数据/训练/验证/保存命令、学习曲线、随机初始化与阶段模型的留出对照、样例和资源账；基础恢复先复用 7.0b-C，后接 7.4-H；不以两步 loss 下降替代项目质量验收 |
 
-**反例与边界**：优化器时间可能不随前向 dtype 同比下降；短热循环不代表完整数据流水。
+**交付**：修订既有实验解释、完整 step 时间线、四种训练状态账与数值诊断入口。
+
+**反例与边界**：短循环吞吐不代表生产数据流水；降低前向精度不保证 optimizer 加快；梯度累积减少 microbatch 激活，不自动减少参数与优化器状态。
+
 
 <a id="c-7-2"></a>
 ## 7.2 分片训练与流水并行
 
-**依赖**：7.1、6.0b、6.1。
+**依赖**：7.1、6.0b、6.1；精度/全局 norm 接 7.9，作业恢复接 7.4/7.11。
 
-**问题**：各并行方法分片了什么；通信为何在特定 hook 发生；流水与重叠怎样改变内存和有效更新速度。
+**问题**：参数、梯度、optimizer 和激活各归哪个 rank；并行怎样保持更新语义；通信、重算与调度如何共同决定代价。
 
-**对象与源码**：SmolLM2-360M 数值基线、SmolLM3-3B-Base 代表性模型；DDP reducer、[FSDP2 fully_shard](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.md)、DeepSpeed ZeRO、[PyTorch pipeline schedules](https://docs.pytorch.org/docs/stable/distributed.pipelining.md)、Megatron parallel layers。
+**对象与源码**：DDP reducer、[FSDP2 fully_shard](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.md)、DeepSpeed ZeRO、[PyTorch pipeline schedules](https://docs.pytorch.org/docs/stable/distributed.pipelining.md)、Megatron Core 和 TorchTitan。实测参照限 TinyLM/SmolLM2 与两 rank；SmolLM3 用公开配置进行资源推演，不要求多框架真实训练。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
-| A | 将通信原语材料归入 6.0/6.1 的引用范围，正文按 DDP、ZeRO-1/2/3、FSDP2 重建参数/梯度/优化器/激活归属表 | 章节内容与 outline 一致；不以通信带宽实验代替分片训练 |
-| B | 两 rank 运行同一训练步，对齐不同有效 token 数的 loss、梯度和更新；追踪 FSDP2 wrap 单元、all-gather/reduce-scatter、reshard 与预取 | 与单机全局 batch 对拍；按 hook 和真实 group 边界解释通信，不能沿用 DDP bucket 参数假设 |
-| C | 在 2/4 张 L40S 上对照 DDP/FSDP2/ZeRO 的完整峰值和时间，扫描 microbatch/累积，记录参数暂时展开与通信 buffer | 数值条件一致；模型/optimizer dtype 与全局 batch 冻结；五卡仅用于合法并行配置 |
-| D | 四阶段小模型在两卡上比较 GPipe、1F1B、interleaved 与 ScheduleInterleavedZeroBubble/ZBV，microbatch=4/8/16/32 | 导出 F、backward-input、backward-weight 依赖 DAG 与真实时间线；空泡、激活峰值和通信一起测，不能凭名字宣称零空泡 |
-| E | 给 TP/SP/CP/EP 与上述训练步增加分片/聚合说明，选择满足整除条件的 2D 组合做实测；其余组合按 6.2/6.5 的接口分任务验证 | 全球梯度重建与成本模型一致；未运行组合不作为吞吐结论 |
+| A | 将纯通信实验归入 6.0/6.1；逐项比较 DDP、ZeRO-1/2/3、FSDP2 的参数驻留、梯度分片、m/v、master weight、激活和临时展开；追踪初始化和 optimizer 参数身份 | 给每 rank 字节账和一次更新的通信时序；解释 wrap 粒度、预取、reshard 与 no_sync/累积行为；world_size=1 不产生跨 rank 分片收益 |
+| B | 两 rank 对同一小训练步采用不同有效 token 数；核对 loss 分母、DDP 默认梯度平均、FSDP2 参数重建、global clip norm、optimizer 更新与单机全局 batch | 共用一组 FP64/小模型参照；最多两次更新；保存 all-gather/reduce-scatter 与首个差异。未具备目标 GPU 时 CPU 只验通信/归约数学，GPU FSDP 性能保持 UNVERIFIED |
+| C | 沿 DeepSpeed ZeRO 与 FSDP2 固定源码比较 hook、bucket/group、CPU offload、通信 buffer、optimizer state 和保存逻辑；用配置计算 2/4 rank 的峰值组成 | 不再要求 2/4 卡三框架吞吐网格；框架所有权、真实支持与公开性能材料分别交付，不把理论字节比当加速比 |
+| D | CPU 实现四阶段 GPipe、1F1B、interleaved、ZeroBubble/ZBV 的事件模拟，区分 forward、backward-input、backward-weight 与 weight version；microbatch 取 4/8 两组 | 输出依赖 DAG、空泡、在途激活和合法更新点；需要 GPU 机制证据时仅补两卡小网络一组，模拟时间不冒充真实性能 |
+| E | 对 TP/SP/CP/EP 标出激活/参数布局、梯度归约组、embedding/loss 的分布式处理、MoE aux loss 与专家并行；选择一项非均匀样本/冻结模块的反例 | 结合 6.2/6.3/6.5 分析一份合法 2D 配置，注明整除条件和网络；不强制运行所有并行组合，不用推理并行图替代反向与 optimizer 分片 |
+| F | 对 LoRA、teacher/student 和多模态模型检查未使用参数、冻结分支、adapter 分片、teacher 仅前向组和跨 rank 模态不一致 | 给出死锁/错误归约的发现位置与修复原则；把通信正确性与质量、规模性能分别记录 |
 
-**反例与边界**：用 ring 通信量公式除以耗时不能证明 NCCL 选择了 ring；跨节点不能使用单机 NVLink 带宽直接估算。
+**交付**：状态归属与通信时序、两 rank 更新参照、流水模拟、四框架源码比较及训练特有的失败案例。
+
+**反例与边界**：FSDP2 不等于 DDP bucket 的别名；不同 world size 的 loss/clip 分母不一致会改变优化目标；通信量公式不能证明 NCCL 实际选用的算法。
+
 
 <a id="c-M1"></a>
 ## M1 阅读大型代码库
 
-**依赖**：0.0；完整案例复用 2.0b、5.7。
+**依赖**：0.0；完整案例复用 2.0b、5.7。 训练相关综合任务接 7.3/7.7/7.10，不依赖完整训练运行。
 
 **问题**：怎样从用户入口找到真实实现；如何验证某条路径确实运行；怎样界定扩展点和上游设计证据。
 
-**对象与源码**：复用 `labs/M/trace_dispatch.py`、`version_manifest.py`；PyTorch linear/SDPA 与 vLLM/SGLang 请求路径；前沿迁移练习使用 Cosmos3-Edge 的 reasoner/generator 分派。
+**对象与源码**：复用 `labs/M/trace_dispatch.py` 与已有软件版本信息；PyTorch linear/SDPA 与 vLLM/SGLang 请求路径；前沿迁移练习使用 Cosmos3-Edge 的 reasoner/generator 分派。 训练源码阅读增加一个 optimizer step 和一个 teacher/student 或多模态训练阶段作为完整案例。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
-| A | 演示 `rg` 找入口、schema/registry、调用者与实现；维护 commit、file:line、源码片段和观察层次 | 读者可独立复现定位过程；不会把注册表或注释当运行证据 |
+| A | 演示 `rg` 找入口、schema/registry、调用者与实现；记录软件版本、file:line、源码片段和观察层次 | 读者可独立复现定位过程；不会把注册表或注释当运行证据 |
 | B | 对未知输入配置先预测分支，再用最小 probe、日志和 trace 验证；构造一个 Python hook 看不到但仍存在的分解算子 | 静态关系、运行事实与推断分开，预测错误保留具体反例 |
 | C | 以 Cosmos3-Edge 的 `Cosmos3OmniPipeline` 到 scheduler/transformer 为迁移练习；挑一个扩展点，查实现与原始 PR/RFC | 完成入口、状态、约束和改动位置表；自行提出的替代设计不能写成上游否决理由 |
+| D | 沿配置→batch→loss→backward hook→collective→optimizer→checkpoint 追踪状态；对比只有 forward 的调用图，增加冻结参数、loss mask 和恢复状态三个错误定位练习 | 读者能定位训练特有的责任边界与改动点；复用 7.3/7.7/7.10 源码材料，不重复运行大型训练 |
 
 **反例与边界**：源码阅读不等于全文搜索名称；一个类名不能证明对应后端已经被选中。
 
 <a id="c-M2"></a>
 ## M2 可信性能测量
 
-**依赖**：0.2；GPU 实现依赖 2.1。
+**依赖**：0.2；GPU 实现依赖 2.1。 训练相关综合任务接 7.9/7.11，不依赖完整训练运行。
 
 **问题**：计时范围如何定义；缓存/预热/同步怎样改变结论；怎样量化不确定性并检验因果解释。
 
-**对象与源码**：复用 `labs/M/measure_warmup.py`；新增 `labs/M/measurement_protocol.py`，验证对象取 2.3 归约、5.1 请求和 7.1 训练步，依赖 PyTorch benchmark/profiler 与 CUDA event。
+**对象与源码**：复用 `labs/M/measure_warmup.py`；新增 `labs/M/measurement_protocol.py`，验证对象取 2.3 归约、5.1 请求和 7.1 训练步，依赖 PyTorch benchmark/profiler 与 CUDA event。 训练测量复用 7.1/7.11 的事件、7.9 的有效更新与精度信息。
 
 | 任务 | 执行步骤 | 交付与验收 |
 |---|---|---|
 | A | 用同一算子展示 CPU 未同步、event、墙钟、单次同步、批量提交的区别；拆开首次加载、编译、缓存、allocator 预热 | 每个计时结果能说明包含和遗漏的工作；现有 CPU 工件只支持 CPU 结论 |
 | B | 工作集按实测 L2 的 0.5/1/2/4 倍扫描，交错运行基线和候选，保留至少 5 轮原始样本 | 明确在 L2 与轮转条件；中位数、区间和异常点均可重算，不选最佳样本代表总体 |
-| C | 请求按独立任务/时间窗重采样，生成尾延迟与差值区间；用单因素干预区分频率、缓存和实现切换 | 输出统计脚本及一个结论被对照推翻的完整案例；观测、公式预测和解释分别表述 |
+| C | 请求按独立任务/时间窗重采样，生成尾延迟与差值区间；用单因素干预区分频率、缓存和实现切换。以 5.12 的客户端分位数/服务端均值和 8.4 的准入预算/实际到达率作为统计口径练习 | 阶段分位数来自逐请求配对事件，sum/count 不当分位数；配置预算不当测得容量。输出统计脚本及一个结论被对照推翻的完整案例，观测、公式预测和解释分别表述 |
+| D | 区别 microstep/successful optimizer update、有效 token/帧/样本、重算 FLOP、teacher/reward 额外工作、保存/评测停顿和失败重跑；分析一份公开长程学习曲线和既有短 trace | 给出正确性、收敛质量、稳态吞吐、作业 goodput 的证据边界；toy 单步、本机短测与作者完整训练结果分别标注 |
 
 **反例与边界**：确定性评测重复同一输入不能增加独立样本量；父子事件相加与不同运行中位数相减不能构成时间分解。

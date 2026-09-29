@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>5.12 非生成模型的服务</title>
-<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
-<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
 
 </head>
 <body>
@@ -45,7 +45,8 @@
 <li><a href="#6-token-pooling">6. token 预算边界：同一组参数，生成能起、pooling 起不来</a></li>
 <li><a href="#7-batch">7. batch 上限的估算与测量范围</a></li>
 <li><a href="#8-rerank-qwen3-reranker-06b">8. rerank 真实链路：Qwen3-Reranker-0.6B</a></li>
-<li><a href="#9">9. 消融与未测范围</a></li>
+<li><a href="#9">9. 并发容量与残差分解</a></li>
+<li><a href="#10">10. 消融与未测范围</a></li>
 </ul>
 </li>
 <li><a href="#_6">原始现场</a></li>
@@ -88,7 +89,8 @@
 <li><a href="#6-token-pooling">6. token 预算边界：同一组参数，生成能起、pooling 起不来</a></li>
 <li><a href="#7-batch">7. batch 上限的估算与测量范围</a></li>
 <li><a href="#8-rerank-qwen3-reranker-06b">8. rerank 真实链路：Qwen3-Reranker-0.6B</a></li>
-<li><a href="#9">9. 消融与未测范围</a></li>
+<li><a href="#9">9. 并发容量与残差分解</a></li>
+<li><a href="#10">10. 消融与未测范围</a></li>
 </ul>
 </li>
 <li><a href="#_6">原始现场</a></li>
@@ -106,7 +108,7 @@
   <div class="mod-id">5.12</div>
   <h1>非生成模型的服务</h1>
   <p class="lede">比较 embedding、rerank 和分类服务的计算过程，分析 pooling、padding、批处理与容量。</p>
-  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen2.5-1.5B-Instruct · BAAI/bge-small-en-v1.5 · vLLM 0.29.0 · transformers 5.17.0</span><span class="chip">前置 0.2（资源账本）· 3.1（attention 内存墙）· 5.1（两相）· 5.11（前门）</span></div>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen2.5-1.5B-Instruct · BAAI/bge-small-en-v1.5 · Qwen3-Embedding-0.6B · vLLM 0.29.0 · transformers 5.17.0</span><span class="chip">前置 0.2（资源账本）· 3.1（attention 内存墙）· 5.1（两相）· 5.11（前门）</span></div>
 </header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
 <p>前面的章节主要讨论自回归生成。本章介绍一次前向就返回向量或分数的服务，例如 embedding、rerank 和分类，并分析它们与生成服务的计算和状态差异。</p>
 <ol>
@@ -119,7 +121,8 @@
 <li>本章把一次前向返回向量的 pooling 服务与自回归生成对照。pooling 不需要跨 decode 步保留 KV；前向内部仍有 Q/K/V，具体引擎也可能分配缓存或临时 buffer。</li>
 <li>大 batch 的容量取决于权重、激活、workspace 与持久状态。权重读取的摊薄影响吞吐，不能直接决定显存容量。</li>
 <li>既有框架计时支持比较所测形状的耗时。roofline 的 FLOP 与字节均为公式估计；图中位置不能单独证明实际瓶颈。旧容量实验存在执行范围和对象释放问题，不能用于两类服务的容量比值。</li>
-<li>容量公式已与 meta 模型参数核对；rerank、classifier 和 SGLang 真实链路仍为 <code>UNVERIFIED</code>。</li>
+<li>容量公式已与 meta 模型参数核对；rerank 的等价链已按生成式加载建立（两标签 softmax，
+  max|Δ| 1.05e-03、τ 1.000、第一名一致）；classifier 与 SGLang 真实链路仍为 <code>UNVERIFIED</code>。</li>
 </ul>
 <hr />
 <h2 id="vs">心智模型：一次前向 vs 一串前向</h2>
@@ -590,6 +593,11 @@ python<span class="w"> </span>labs/L5/mini_pooling.py
 
 <span class="c1"># 重新统计已有数据</span>
 python<span class="w"> </span>labs/L5/summarize_pooling.py<span class="w"> </span>results/crater/pooling/20260912-0400<span class="w"> </span>outputs/pooling-summary-new.json
+
+<span class="c1"># 并发容量与残差分解（需先起 pooling 服务；脚本会打印启动日志里的显存分段）</span>
+<span class="nv">RUN_ID</span><span class="o">=</span>&lt;run&gt;<span class="w"> </span>bash<span class="w"> </span>labs/L5/run_pooling_concurrency.sh
+<span class="c1"># keep-alive 对照（每线程一条连接复发）</span>
+<span class="nv">RUN_ID</span><span class="o">=</span>&lt;run&gt;<span class="w"> </span><span class="nv">LEVELS</span><span class="o">=</span><span class="m">64</span>,256,512<span class="w"> </span><span class="nv">REQCAP</span><span class="o">=</span><span class="m">1024</span><span class="w"> </span><span class="nv">EXTRA</span><span class="o">=</span>--keepalive<span class="w"> </span>bash<span class="w"> </span>labs/L5/run_pooling_concurrency.sh
 </code></pre></div>
 
 <h3 id="2">2. 三点位置</h3>
@@ -819,8 +827,8 @@ batch 都取到总 token 数约 8192（decode 除外，它一个 token 就是一
 </tr>
 </tbody>
 </table>
-<p>分桶值是 16 个桶各自计时中位数之和，不是整轮墙钟中位数。原脚本分桶还重新采样 token，并对包含 padding 的 hidden states 直接求均值；这只用于执行成本观察，未验证 embedding 等价。</p>
-<p>分桶改变了前向次数和 GEMM shape。BERT 权重小于 L2，不能把 16 次前向直接换算成 16 次完整 DRAM 权重读取。<strong>这条趋势未解释，不要引用</strong>作带宽归因；需要同输入、正确 masked pooling、整轮计时和缓存/launch 证据。</p>
+<p>分桶测试统计了各桶计时中位数之和而非整轮墙钟；测试中重新采样了 token 且直接对包含 padding 的 hidden states 求均值，该项仅用于评估计算开销，未验证 embedding 的数学等价性。</p>
+<p>分桶改变了前向执行次数与 GEMM 形状；在 BERT 模型权重小于 L2 缓存时，不可将 16 次前向简单等同于 16 次完整的 DRAM 权重读取，该耗时趋势标记为 <span class="unverified">UNVERIFIED</span>，待补齐严格受控实验。</p>
 <h3 id="4-batch-76">4. batch 扫描：吞吐涨 7.6 倍，引擎时间几乎不动</h3>
 <p>bge-small，目标长度参数 128（字符近似构造；实际每请求 102 token），每个并发档跑 3 次取中位数：</p>
 <table>
@@ -891,6 +899,59 @@ batch 都取到总 token 数约 8192（decode 除外，它一个 token 就是一
 </table>
 <p>表中是每档三次运行的统计中位数。吞吐随提交请求数增加，但客户端并发不等于引擎 batch。引擎 inference 是请求时间指标，不能解释成把一次 GPU 时间除以 batch 后得到的摊销成本。</p>
 <p>并发 256 的客户端均值减引擎均值得到约 60.61 ms；两项分别取中位数，差值也不等于逐请求残差中位数。缺少分段插桩，不能得出“93% 的时间在 HTTP 层”的结论。</p>
+<p><strong>并发 1 的两侧事件对齐。</strong> 上表的残差是「客户端均值 − 引擎均值」，两侧样本与
+时间窗口都不完全对应。换成同一批 40 条<strong>顺序</strong>请求、两侧各自记录事件
+（<code>labs/L5/pooling_client_server_align.py</code>，<code>results/crater/pooling/pooling-align-20260913/</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th style="text-align: right;">值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>客户端墙钟均值 / 中位</td>
+<td style="text-align: right;">2.357 / 1.902 ms（范围 1.850–16.284）</td>
+</tr>
+<tr>
+<td>其中客户端序列化 / 反序列化</td>
+<td style="text-align: right;">0.0002 / 0.0488 ms</td>
+</tr>
+<tr>
+<td>服务端 e2e 均值（count=40）</td>
+<td style="text-align: right;">1.623 ms</td>
+</tr>
+<tr>
+<td>服务端排队均值</td>
+<td style="text-align: right;">0.004 ms</td>
+</tr>
+<tr>
+<td>服务端 inference 均值</td>
+<td style="text-align: right;">1.180 ms</td>
+</tr>
+<tr>
+<td>服务端 prefill 均值</td>
+<td style="text-align: right;">1.180 ms</td>
+</tr>
+<tr>
+<td>客户端均值 − 服务端 e2e 均值</td>
+<td style="text-align: right;">0.735 ms</td>
+</tr>
+</tbody>
+</table>
+<p>三点结论：</p>
+<ol>
+<li><strong>两侧计数可以对上。</strong> 服务端四个直方图的 <code>_count</code> 都是 40，与客户端发出的
+   请求数相同；比较的是同一批请求的平均值，而不是两个不同样本的中位数相减。</li>
+<li><strong>池化请求的 inference 等于 prefill</strong>（两者都是 1.180 ms，逐请求求和也相同：
+   47.207 ms）。这是「一次前向、没有 decode」在服务端事件里的直接体现，
+   不是靠推算得出。</li>
+<li><strong>残差不能当成网络开销。</strong> 0.735 ms 里客户端自己量得到的只有 0.049 ms
+   序列化+反序列化，剩下 0.686 ms 同时含 TCP 往返、Uvicorn 入队/出队、
+   客户端线程调度与指标窗口边界，本节不做进一步归因。首条请求的 16.284 ms
+   包含建连，因此均值与中位差 0.46 ms，不能只报均值。</li>
+</ol>
 <p>把同一个 1.5B 因果 backbone 用 <code>--runner pooling --convert embed</code> 当 embedding 服务
 （目标长度参数 256，实际每请求 193 token）：</p>
 <table>
@@ -1048,15 +1109,14 @@ and makes vLLM reject longer sequences.
 32k 的 prompt 可以拆成 512 token 一段慢慢算。pooling 请求默认不被 chunk
 （<code>scheduler.py:988-996</code>），于是 <code>max_num_batched_tokens</code> 直接变成长度上限，
 vLLM 索性在启动时拦住。</p>
-<p><strong>这条约束的实践含义</strong>：给 embedding 服务调 <code>max_num_batched_tokens</code> 时，
-它不是一个可以随便压小的吞吐旋钮——压到 <code>max_model_len</code> 以下，服务根本起不来。</p>
+<p><strong>这条约束的工程实践含义</strong>：为 embedding 服务配置 <code>max_num_batched_tokens</code> 时，
+不可无界调小：若其设定值低于 <code>max_model_len</code>，服务进程将在启动参数校验阶段直接报错退出。</p>
 <h3 id="7-batch">7. batch 上限的估算与测量范围</h3>
 <p>在显存预算分析中，精确的参数与显存账本需要按具体架构逐项拆解：按 GQA 的 Q/K/V/O 投影、MLP（区分经典双投影与 SwiGLU 三投影）、bias、LayerNorm/RMSNorm、词嵌入及共享 head 分别计数，并与 transformers meta 模型对照验证：</p>
 <table>
 <thead>
 <tr>
 <th>模型</th>
-<th>固定 revision</th>
 <th style="text-align: right;">完整参数量</th>
 <th style="text-align: right;">BF16 权重字节</th>
 </tr>
@@ -1064,13 +1124,11 @@ vLLM 索性在启动时拦住。</p>
 <tbody>
 <tr>
 <td>bge-small-en-v1.5</td>
-<td><code>5c38ec7c405ec4b44b94cc5a9bb96e735b38267a</code></td>
 <td style="text-align: right;">33 360 000</td>
 <td style="text-align: right;">66 720 000</td>
 </tr>
 <tr>
 <td>Qwen2.5-1.5B-Instruct</td>
-<td><code>989aa7980e4cf806f80c7fef2b1adb7bc71aa306</code></td>
 <td style="text-align: right;">1 543 714 304</td>
 <td style="text-align: right;">3 087 428 608</td>
 </tr>
@@ -1158,8 +1216,624 @@ vLLM 索性在启动时拦住。</p>
 <span class="linenos" aria-hidden="true">79</span> <span class="p">}</span>
 </pre></div>
 <div class="srcref"><code>results/crater/pooling/20260912-ledger-audit/ledger-meta.json 全文（79 行）</code><a href="../code/results/crater/pooling/20260912-ledger-audit/ledger-meta.json.html">在完整文件中打开 &rarr;</a></div></div></details>
-<p>在实测中，decode 分支在 batch=256 时成功、512 时 OOM；encoder 扫描至 4096 未发生 OOM。这两种负载的显存机制存在本质差异：decode 分支在进入生成前需先执行完整的 1024-token prefill 并持续持有全量 KV 缓存；而纯 encoder（如 BERT/BGE）不维持 KV 缓存，显存主要由单次前向激活峰值决定。两者的容量差异受模型结构、序列长度与框架 workspace 的共同影响。</p>
-<p>对于精确的端到端稳态容量边界（<code>UNVERIFIED</code>），需要分阶段记录峰值 allocated/reserved 与 OOM 触发点，严格区分 prefill 建缓存成本和稳态 decode 成本。</p>
+<p>客户端/服务端计时对齐的原始输出（含两侧 metrics 文本）：</p>
+<details class="fold srcfold"><summary>results/crater/pooling/pooling-align-20260913/align.json 全文（385 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="w">  </span><span class="nt">"summary"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">  3</span> <span class="w">    </span><span class="nt">"requests"</span><span class="p">:</span><span class="w"> </span><span class="mi">40</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  4</span> <span class="w">    </span><span class="nt">"client"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="w">      </span><span class="nt">"wall_mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.3574988823384047</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="w">      </span><span class="nt">"wall_median_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.902306918054819</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="w">      </span><span class="nt">"wall_min_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8503665924072266</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="w">      </span><span class="nt">"wall_max_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">16.28350466489792</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="w">      </span><span class="nt">"serialize_mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00015720725059509277</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="w">      </span><span class="nt">"parse_mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04880409687757492</span>
+<span class="linenos" aria-hidden="true"> 11</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="w">    </span><span class="nt">"server"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="w">      </span><span class="nt">"e2e"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="w">        </span><span class="nt">"sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0649106502532959</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="w">        </span><span class="nt">"count"</span><span class="p">:</span><span class="w"> </span><span class="mf">40.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="w">        </span><span class="nt">"mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.6227662563323975</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="w">      </span><span class="nt">"queue"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 19</span> <span class="w">        </span><span class="nt">"sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0001592487096786499</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="w">        </span><span class="nt">"count"</span><span class="p">:</span><span class="w"> </span><span class="mf">40.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="w">        </span><span class="nt">"mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0039812177419662476</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="w">      </span><span class="nt">"inference"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 24</span> <span class="w">        </span><span class="nt">"sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.047207205556333065</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 25</span> <span class="w">        </span><span class="nt">"count"</span><span class="p">:</span><span class="w"> </span><span class="mf">40.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="w">        </span><span class="nt">"mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.1801801389083266</span>
+<span class="linenos" aria-hidden="true"> 27</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="w">      </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="w">        </span><span class="nt">"sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.047207205556333065</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="w">        </span><span class="nt">"count"</span><span class="p">:</span><span class="w"> </span><span class="mf">40.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 31</span> <span class="w">        </span><span class="nt">"mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.1801801389083266</span>
+<span class="linenos" aria-hidden="true"> 32</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 33</span> <span class="w">      </span><span class="nt">"success"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 34</span> <span class="w">        </span><span class="nt">"sum"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 35</span> <span class="w">        </span><span class="nt">"count"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 36</span> <span class="w">        </span><span class="nt">"mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="linenos" aria-hidden="true"> 37</span> <span class="w">      </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 38</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 39</span> <span class="w">    </span><span class="nt">"closure"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 40</span> <span class="w">      </span><span class="nt">"client_wall_mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.3574988823384047</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 41</span> <span class="w">      </span><span class="nt">"server_e2e_mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.6227662563323975</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 42</span> <span class="w">      </span><span class="nt">"client_minus_server_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.7347326260060072</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 43</span> <span class="w">      </span><span class="nt">"known_client_side_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04896130412817001</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 44</span> <span class="w">      </span><span class="nt">"server_inference_mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.1801801389083266</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 45</span> <span class="w">      </span><span class="nt">"server_queue_mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0039812177419662476</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 46</span> <span class="w">      </span><span class="nt">"server_prefill_mean_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.1801801389083266</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 47</span> <span class="w">      </span><span class="nt">"server_count_matches_requests"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 48</span> <span class="w">      </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"服务端直方图给的是同一批请求的 sum/count（平均），与客户端平均墙钟可比；两者之差含网络往返与调度抖动，未逐项分解。"</span>
+<span class="linenos" aria-hidden="true"> 49</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 50</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 51</span> <span class="w">  </span><span class="nt">"rows"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 52</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 53</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 54</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 55</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0004302710294723511</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 56</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">16.28350466489792</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 57</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.12392085045576096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 58</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true"> 59</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 60</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 61</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 62</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 63</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0015497207641601562</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 64</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.7118829786777496</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 65</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05741976201534271</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 66</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true"> 67</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 68</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 69</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 70</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 71</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00021047890186309814</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 72</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.409207634627819</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 73</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05149003118276596</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 74</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true"> 75</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 76</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 77</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 78</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 79</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00013969838619232178</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 80</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.5948891416192055</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 81</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05058944225311279</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 82</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true"> 83</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 84</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 85</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 86</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 87</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0001695007085800171</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 88</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.2477786988019943</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 89</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0482192263007164</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 90</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true"> 91</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 92</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 93</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 94</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 95</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00013969838619232178</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 96</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.0557567477226257</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 97</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.048500485718250275</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 98</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true"> 99</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">100</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">101</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">6</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">102</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">103</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.96515154838562e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">104</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.987856812775135</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">105</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04887022078037262</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">106</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">107</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">108</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">109</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">110</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">111</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00014994293451309204</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">112</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9589178264141083</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">113</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04731956869363785</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">114</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">115</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">116</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">117</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">118</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">119</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010989606380462646</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">120</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9567571580410004</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">121</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.046280212700366974</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">122</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">123</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">124</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">125</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">9</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">126</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">127</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">8.940696716308594e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">128</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.918897032737732</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">129</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04621036350727081</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">130</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">131</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">132</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">133</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">134</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">135</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.033828973770142e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">136</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9421661272644997</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">137</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04697125405073166</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">138</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">139</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">140</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">141</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">142</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">143</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00018067657947540283</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">144</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9485456869006157</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">145</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.047789886593818665</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">146</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">147</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">148</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">149</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">150</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">151</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010058283805847168</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">152</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.908586360514164</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">153</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04540011286735535</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">154</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">155</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">156</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">157</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">13</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">158</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">159</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010058283805847168</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">160</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8813759088516235</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">161</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.045940279960632324</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">162</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">163</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">164</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">165</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">14</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">166</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">167</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00012945383787155151</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">168</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8814066424965858</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">169</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04553981125354767</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">170</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">171</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">172</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">173</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">15</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">174</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">175</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.96515154838562e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">176</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8960274755954742</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">177</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.046090222895145416</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">178</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">179</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">180</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">181</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">182</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">183</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00012014061212539673</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">184</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8717152997851372</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">185</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04548020660877228</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">186</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">187</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">188</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">189</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">17</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">190</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">191</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.96515154838562e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">192</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8669869750738144</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">193</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04600081592798233</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">194</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">195</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">196</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">197</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">18</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">198</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">199</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00012945383787155151</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">200</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8651066347956657</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">201</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04542991518974304</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">202</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">203</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">204</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">205</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">19</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">206</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">207</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010989606380462646</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">208</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8653171136975288</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">209</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.045379623770713806</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">210</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">211</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">212</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">213</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">214</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">215</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.033828973770142e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">216</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8643559888005257</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">217</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.046030618250370026</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">218</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">219</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">220</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">221</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">21</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">222</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">223</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010058283805847168</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">224</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8602553755044937</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">225</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04631001502275467</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">226</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">227</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">228</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">229</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">22</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">230</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">231</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.96515154838562e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">232</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8646176904439926</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">233</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04650931805372238</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">234</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">235</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">236</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">237</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">23</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">238</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">239</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010989606380462646</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">240</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8515558913350105</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">241</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04622992128133774</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">242</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">243</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">244</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">245</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">24</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">246</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">247</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.033828973770142e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">248</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.855446957051754</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">249</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.045989640057086945</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">250</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">251</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">252</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">253</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">25</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">254</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">255</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010989606380462646</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">256</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.889335922896862</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">257</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04606042057275772</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">258</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">259</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">260</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">261</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">26</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">262</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">263</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010989606380462646</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">264</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.1058479323983192</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">265</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04602968692779541</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">266</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">267</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">268</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">269</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">27</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">270</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">271</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010989606380462646</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">272</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.0252270624041557</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">273</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.045930035412311554</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">274</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">275</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">276</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">277</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">28</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">278</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">279</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010989606380462646</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">280</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.0276475697755814</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">281</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0454997643828392</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">282</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">283</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">284</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">285</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">29</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">286</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">287</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.033828973770142e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">288</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9664373248815536</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">289</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.044910237193107605</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">290</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">291</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">292</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">293</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">30</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">294</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">295</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.033828973770142e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">296</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.949765719473362</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">297</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.046401284635066986</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">298</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">299</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">300</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">301</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">31</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">302</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">303</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010989606380462646</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">304</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9362857565283775</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">305</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04722084850072861</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">306</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">307</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">308</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">309</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">310</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">311</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">8.940696716308594e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">312</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9346168264746666</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">313</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.045600347220897675</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">314</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">315</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">316</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">317</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">33</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">318</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">319</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00012014061212539673</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">320</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8934272229671478</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">321</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04499964416027069</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">322</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">323</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">324</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">325</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">34</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">326</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">327</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.916241884231567e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">328</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8877862021327019</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">329</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.045711174607276917</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">330</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">331</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">332</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">333</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">35</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">334</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">335</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00012014061212539673</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">336</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8793661147356033</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">337</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.05029980093240738</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">338</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">339</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">340</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">341</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">36</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">342</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">343</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.96515154838562e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">344</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.88346765935421</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">345</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04590954631567001</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">346</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">347</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">348</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">349</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">37</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">350</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">351</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00010058283805847168</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">352</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8601054325699806</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">353</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04631001502275467</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">354</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">355</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">356</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">357</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">38</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">358</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">359</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">9.033828973770142e-05</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">360</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8613571301102638</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">361</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04594959318637848</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">362</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">363</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">364</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">365</span> <span class="w">      </span><span class="nt">"i"</span><span class="p">:</span><span class="w"> </span><span class="mi">39</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">366</span> <span class="w">      </span><span class="nt">"status"</span><span class="p">:</span><span class="w"> </span><span class="mi">200</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">367</span> <span class="w">      </span><span class="nt">"serialize_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00011920928955078125</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">368</span> <span class="w">      </span><span class="nt">"wall_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.8503665924072266</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">369</span> <span class="w">      </span><span class="nt">"parse_ms"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.04541967064142227</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">370</span> <span class="w">      </span><span class="nt">"dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">384</span>
+<span class="linenos" aria-hidden="true">371</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">372</span> <span class="w">  </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">373</span> <span class="w">  </span><span class="nt">"metrics_after"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">374</span> <span class="w">    </span><span class="nt">"e2e_sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0649106502532959</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">375</span> <span class="w">    </span><span class="nt">"e2e_count"</span><span class="p">:</span><span class="w"> </span><span class="mf">40.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">376</span> <span class="w">    </span><span class="nt">"queue_sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0001592487096786499</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">377</span> <span class="w">    </span><span class="nt">"queue_count"</span><span class="p">:</span><span class="w"> </span><span class="mf">40.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">378</span> <span class="w">    </span><span class="nt">"inference_sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.047207205556333065</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">379</span> <span class="w">    </span><span class="nt">"inference_count"</span><span class="p">:</span><span class="w"> </span><span class="mf">40.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">380</span> <span class="w">    </span><span class="nt">"prefill_sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.047207205556333065</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">381</span> <span class="w">    </span><span class="nt">"prefill_count"</span><span class="p">:</span><span class="w"> </span><span class="mf">40.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">382</span> <span class="w">    </span><span class="nt">"success_sum"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">383</span> <span class="w">    </span><span class="nt">"success_count"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="linenos" aria-hidden="true">384</span> <span class="w">  </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">385</span> <span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/pooling/pooling-align-20260913/align.json 全文（385 行）</code><a href="../code/results/crater/pooling/pooling-align-20260913/align.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p>同一 checkpoint 的三态账（池化 / 建缓存 / 定长 decode）：</p>
+<details class="fold srcfold"><summary>results/crater/pooling/state-budget-20260913/state_budget.json 全文（155 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/scratch/learn/models/hf/hub/models--Qwen--Qwen3-Reranker-0.6B/snapshots/e61197ed45024b0ed8a2d74b80b4d909f1255473"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  3</span> <span class="w">  </span><span class="nt">"torch"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2.13.0+cu130"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  4</span> <span class="w">  </span><span class="nt">"transformers"</span><span class="p">:</span><span class="w"> </span><span class="s2">"5.17.0"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="w">  </span><span class="nt">"dtype"</span><span class="p">:</span><span class="w"> </span><span class="s2">"bfloat16"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="w">  </span><span class="nt">"kv_geometry"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="w">    </span><span class="nt">"layers"</span><span class="p">:</span><span class="w"> </span><span class="mi">28</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="w">    </span><span class="nt">"kv_heads"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="w">    </span><span class="nt">"head_dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="w">    </span><span class="nt">"dtype_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<span class="linenos" aria-hidden="true"> 11</span> <span class="w">  </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="w">  </span><span class="nt">"param_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">1191553024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="w">  </span><span class="nt">"param_gib"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.1097</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="w">  </span><span class="nt">"kv_bytes_per_token"</span><span class="p">:</span><span class="w"> </span><span class="mi">114688</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="w">  </span><span class="nt">"decode_steps"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="w">  </span><span class="nt">"rows"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="w">      </span><span class="nt">"seq_len_requested"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 19</span> <span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="w">      </span><span class="nt">"actual_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="w">      </span><span class="nt">"pooling"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="w">        </span><span class="nt">"activation_peak_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">9096192</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.2218</span>
+<span class="linenos" aria-hidden="true"> 24</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 25</span> <span class="w">      </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="w">        </span><span class="nt">"kv_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">29360128</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 27</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.2416</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 28</span> <span class="w">        </span><span class="nt">"cache_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="w">        </span><span class="nt">"kv_formula_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">29360128</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="w">        </span><span class="nt">"kv_formula_match"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos" aria-hidden="true"> 31</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 32</span> <span class="w">      </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 33</span> <span class="w">        </span><span class="nt">"activation_peak_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">1472512</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 34</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.1702</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 35</span> <span class="w">        </span><span class="nt">"steps"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 36</span> <span class="w">          </span><span class="mi">257</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 37</span> <span class="w">          </span><span class="mi">258</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 38</span> <span class="w">          </span><span class="mi">259</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 39</span> <span class="w">          </span><span class="mi">260</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 40</span> <span class="w">          </span><span class="mi">261</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 41</span> <span class="w">          </span><span class="mi">262</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 42</span> <span class="w">          </span><span class="mi">263</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 43</span> <span class="w">          </span><span class="mi">264</span>
+<span class="linenos" aria-hidden="true"> 44</span> <span class="w">        </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 45</span> <span class="w">        </span><span class="nt">"step_ms_median"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.1287360191345215</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 46</span> <span class="w">        </span><span class="nt">"kv_growth_per_step_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mf">114688.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 47</span> <span class="w">        </span><span class="nt">"kv_growth_formula_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">114688</span>
+<span class="linenos" aria-hidden="true"> 48</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 49</span> <span class="w">      </span><span class="nt">"kv_per_token_formula"</span><span class="p">:</span><span class="w"> </span><span class="mi">114688</span>
+<span class="linenos" aria-hidden="true"> 50</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 51</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 52</span> <span class="w">      </span><span class="nt">"seq_len_requested"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 53</span> <span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 54</span> <span class="w">      </span><span class="nt">"actual_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 55</span> <span class="w">      </span><span class="nt">"pooling"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 56</span> <span class="w">        </span><span class="nt">"activation_peak_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">54921216</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 57</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.7712</span>
+<span class="linenos" aria-hidden="true"> 58</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 59</span> <span class="w">      </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 60</span> <span class="w">        </span><span class="nt">"kv_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">234881024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 61</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9462</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 62</span> <span class="w">        </span><span class="nt">"cache_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 63</span> <span class="w">        </span><span class="nt">"kv_formula_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">234881024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 64</span> <span class="w">        </span><span class="nt">"kv_formula_match"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos" aria-hidden="true"> 65</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 66</span> <span class="w">      </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 67</span> <span class="w">        </span><span class="nt">"activation_peak_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">11767808</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 68</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.3746</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 69</span> <span class="w">        </span><span class="nt">"steps"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true"> 70</span> <span class="w">          </span><span class="mi">257</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 71</span> <span class="w">          </span><span class="mi">258</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 72</span> <span class="w">          </span><span class="mi">259</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 73</span> <span class="w">          </span><span class="mi">260</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 74</span> <span class="w">          </span><span class="mi">261</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 75</span> <span class="w">          </span><span class="mi">262</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 76</span> <span class="w">          </span><span class="mi">263</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 77</span> <span class="w">          </span><span class="mi">264</span>
+<span class="linenos" aria-hidden="true"> 78</span> <span class="w">        </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 79</span> <span class="w">        </span><span class="nt">"step_ms_median"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.15177583694458</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 80</span> <span class="w">        </span><span class="nt">"kv_growth_per_step_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mf">917504.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 81</span> <span class="w">        </span><span class="nt">"kv_growth_formula_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">917504</span>
+<span class="linenos" aria-hidden="true"> 82</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 83</span> <span class="w">      </span><span class="nt">"kv_per_token_formula"</span><span class="p">:</span><span class="w"> </span><span class="mi">114688</span>
+<span class="linenos" aria-hidden="true"> 84</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 85</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 86</span> <span class="w">      </span><span class="nt">"seq_len_requested"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 87</span> <span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 88</span> <span class="w">      </span><span class="nt">"actual_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 89</span> <span class="w">      </span><span class="nt">"pooling"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 90</span> <span class="w">        </span><span class="nt">"activation_peak_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">27926528</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 91</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.4602</span>
+<span class="linenos" aria-hidden="true"> 92</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true"> 93</span> <span class="w">      </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true"> 94</span> <span class="w">        </span><span class="nt">"kv_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">117440512</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 95</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.5436</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 96</span> <span class="w">        </span><span class="nt">"cache_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 97</span> <span class="w">        </span><span class="nt">"kv_formula_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">117440512</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 98</span> <span class="w">        </span><span class="nt">"kv_formula_match"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos" aria-hidden="true"> 99</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">100</span> <span class="w">      </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">101</span> <span class="w">        </span><span class="nt">"activation_peak_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">3044352</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">102</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.2552</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">103</span> <span class="w">        </span><span class="nt">"steps"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">104</span> <span class="w">          </span><span class="mi">1025</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">105</span> <span class="w">          </span><span class="mi">1026</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">106</span> <span class="w">          </span><span class="mi">1027</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">107</span> <span class="w">          </span><span class="mi">1028</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">108</span> <span class="w">          </span><span class="mi">1029</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">109</span> <span class="w">          </span><span class="mi">1030</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">110</span> <span class="w">          </span><span class="mi">1031</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">111</span> <span class="w">          </span><span class="mi">1032</span>
+<span class="linenos" aria-hidden="true">112</span> <span class="w">        </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">113</span> <span class="w">        </span><span class="nt">"step_ms_median"</span><span class="p">:</span><span class="w"> </span><span class="mf">6.862815856933594</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">114</span> <span class="w">        </span><span class="nt">"kv_growth_per_step_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mf">114688.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">115</span> <span class="w">        </span><span class="nt">"kv_growth_formula_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">114688</span>
+<span class="linenos" aria-hidden="true">116</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">117</span> <span class="w">      </span><span class="nt">"kv_per_token_formula"</span><span class="p">:</span><span class="w"> </span><span class="mi">114688</span>
+<span class="linenos" aria-hidden="true">118</span> <span class="w">    </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">119</span> <span class="w">    </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">120</span> <span class="w">      </span><span class="nt">"seq_len_requested"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">121</span> <span class="w">      </span><span class="nt">"batch"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">122</span> <span class="w">      </span><span class="nt">"actual_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">123</span> <span class="w">      </span><span class="nt">"pooling"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">124</span> <span class="w">        </span><span class="nt">"activation_peak_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">219684864</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">125</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.6621</span>
+<span class="linenos" aria-hidden="true">126</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">127</span> <span class="w">      </span><span class="nt">"prefill"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">128</span> <span class="w">        </span><span class="nt">"kv_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">939524096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">129</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.3618</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">130</span> <span class="w">        </span><span class="nt">"cache_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">131</span> <span class="w">        </span><span class="nt">"kv_formula_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">939524096</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">132</span> <span class="w">        </span><span class="nt">"kv_formula_match"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="linenos" aria-hidden="true">133</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">134</span> <span class="w">      </span><span class="nt">"decode"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="linenos" aria-hidden="true">135</span> <span class="w">        </span><span class="nt">"activation_peak_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">24350720</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">136</span> <span class="w">        </span><span class="nt">"peak"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.0544</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">137</span> <span class="w">        </span><span class="nt">"steps"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="linenos" aria-hidden="true">138</span> <span class="w">          </span><span class="mi">1025</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">139</span> <span class="w">          </span><span class="mi">1026</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">140</span> <span class="w">          </span><span class="mi">1027</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">141</span> <span class="w">          </span><span class="mi">1028</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">142</span> <span class="w">          </span><span class="mi">1029</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">143</span> <span class="w">          </span><span class="mi">1030</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">144</span> <span class="w">          </span><span class="mi">1031</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">145</span> <span class="w">          </span><span class="mi">1032</span>
+<span class="linenos" aria-hidden="true">146</span> <span class="w">        </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">147</span> <span class="w">        </span><span class="nt">"step_ms_median"</span><span class="p">:</span><span class="w"> </span><span class="mf">7.284832000732422</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">148</span> <span class="w">        </span><span class="nt">"kv_growth_per_step_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mf">917504.0</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">149</span> <span class="w">        </span><span class="nt">"kv_growth_formula_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">917504</span>
+<span class="linenos" aria-hidden="true">150</span> <span class="w">      </span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">151</span> <span class="w">      </span><span class="nt">"kv_per_token_formula"</span><span class="p">:</span><span class="w"> </span><span class="mi">114688</span>
+<span class="linenos" aria-hidden="true">152</span> <span class="w">    </span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">153</span> <span class="w">  </span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">154</span> <span class="w">  </span><span class="nt">"acceptance"</span><span class="p">:</span><span class="w"> </span><span class="s2">"KV 公式与实测相对差 ≤1%；每步缓存长度增量恰为 1；pooling 与 decode 的激活峰值在同一 checkpoint 下分别报告"</span>
+<span class="linenos" aria-hidden="true">155</span> <span class="p">}</span>
+</pre></div>
+<div class="srcref"><code>results/crater/pooling/state-budget-20260913/state_budget.json 全文（155 行）</code><a href="../code/results/crater/pooling/state-budget-20260913/state_budget.json.html">在完整文件中打开 &rarr;</a></div></div></details>
+<p>在实测中，decode 分支在 batch=256 时成功、512 时 OOM；encoder 扫描至 4096 未发生 OOM。
+但这两次扫描用的是两个不同大小的模型，差值里同时含架构、参数量和上下文三个变量，
+<strong>不能读成「池化省显存」</strong>。要分离变量，只能在<strong>同一个 checkpoint</strong> 上换服务方式。</p>
+<p><strong>同一 checkpoint 的三态账。</strong> <code>Qwen/Qwen3-Reranker-0.6B</code>（因果 LM，可同时做池化与自回归，
+revision <code>e61197ed</code>）在 bf16 下权重 1 191.55 MB；KV 的闭式几何是
+28 层 × 8 KV head × 128 dim × 2(K,V) × 2 byte = <strong>114 688 byte / token / 序列</strong>。
+对 <code>seq_len ∈ {256, 1024}</code> × <code>batch ∈ {1, 8}</code> 各跑三种模式
+（<code>labs/L5/pooling_state_budget.py</code>，<code>results/crater/pooling/state-budget-20260913/</code>）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">实际长度</th>
+<th style="text-align: right;">batch</th>
+<th style="text-align: right;">池化激活峰值</th>
+<th style="text-align: right;">建缓存后的 KV 字节（闭式公式）</th>
+<th>公式吻合</th>
+<th style="text-align: right;">decode 峰值增量</th>
+<th style="text-align: right;">decode 每步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">9.10 MB</td>
+<td style="text-align: right;">29.36 MB（29.36 MB）</td>
+<td>是</td>
+<td style="text-align: right;">1.47 MB</td>
+<td style="text-align: right;">7.13 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">54.92 MB</td>
+<td style="text-align: right;">234.88 MB（234.88 MB）</td>
+<td>是</td>
+<td style="text-align: right;">11.77 MB</td>
+<td style="text-align: right;">7.15 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">27.93 MB</td>
+<td style="text-align: right;">117.44 MB（117.44 MB）</td>
+<td>是</td>
+<td style="text-align: right;">3.04 MB</td>
+<td style="text-align: right;">6.86 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">219.68 MB</td>
+<td style="text-align: right;">939.52 MB（939.52 MB）</td>
+<td>是</td>
+<td style="text-align: right;">24.35 MB</td>
+<td style="text-align: right;">7.29 ms</td>
+</tr>
+</tbody>
+</table>
+<p>四条可以直接引用的结论：</p>
+<ol>
+<li><strong>KV 是可以用公式算准的。</strong> 实测的 KV 张量字节与 <code>2 × 层数 × KV head × head_dim × dtype × 长度 × batch</code> 完全一致；decode 阶段每步的 KV 增量也正好等于 <code>114 688 × batch</code> 字节（0.1147 MB / 0.9175 MB）。缓存长度每步恰好 +1，脚本在每步前后断言，不靠事后估算。</li>
+<li><strong>同一形状下，池化与 decode 的激活峰值同量级，差别在持久状态。</strong> 池化没有 KV；
+   decode 在被测的 8 步里峰值只比「已经建好缓存的基线」高 1.5–24 MB，
+   真正的增量是那 29 MB–940 MB 的 KV 本身，而它由上下文长度与并发决定，与「池化还是生成」无关。</li>
+<li><strong>KV 可以超过权重。</strong> 1024 × 8 时 KV 是 939.52 MB，达到权重字节的 79%——
+   这才是 decode 分支早 OOM 的主因，而不是激活。</li>
+<li><strong>激活峰值对 batch 与长度都近似线性</strong>（256→1024 是 3.07×，1→8 是 6.0×/7.9×），
+   与第 2 节的 <code>16 × d × dtype_bytes × tokens</code> 估计同量级，可以直接用于容量账。</li>
+</ol>
+<p>对于精确的端到端稳态容量边界（<code>UNVERIFIED</code>），仍需分阶段记录峰值 allocated/reserved
+与 OOM 触发点；本节给出的是同一 checkpoint 下的分段账，不含 vLLM 的 workspace 与图池。</p>
 <p>本地可复算，<code>--check-meta</code> 需安装对应 transformers 与 torch；不加载权重、不运行 GPU：</p>
 <div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L5/pooling_ledger_audit.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--configs<span class="w"> </span>results/crater/pooling/20260912-ledger-audit/config<span class="w"> </span><span class="se">\</span>
@@ -1289,11 +1963,347 @@ vLLM 索性在启动时拦住。</p>
 </tr>
 </tbody>
 </table>
+<p>同一脚本在链路核对那一轮重测（<code>rerank-20260913-chain</code>，预热 2 次后 3 次）为
+3.54 / 6.05 / 7.60 / 17.49 ms，形状一致：文档数翻倍带来的额外时间远小于线性。</p>
 <p>时延随文档数增加，但增幅较小，说明多文档在同一批次内完成打分。token 数与文档数线性增长，约 23 token/doc（本实验的 query+doc 对）。</p>
-<p><strong>HF reference 与 vLLM <code>/score</code> 的数值对照。</strong></p>
-<p>vLLM <code>/score</code> 返回的分数（0.77–0.88，分布紧凑）与 HF reference <code>sigmoid(yes_logit − no_logit)</code>（0.0001–0.9987，分布极宽）不匹配，二者对同一组文档给出不同排序（HF reference 排第一的是 doc 0「Prefix caching&hellip;」，vLLM 排第一的是 doc 4「A prefix cache lookup&hellip;」）。根因未确认：vLLM 走 <code>CrossEncoderIOProcessor</code> → pooler 路径，而 HF reference 是手动提取 LM head 的 <code>yes</code>/<code>no</code> 两行（token id 9693/2152）计算 sigmoid(logit 差），两条路径并不等价。<code>1_LogitScore/config.json</code> 里只含 <code>true_token_id</code>/<code>false_token_id</code>，未见 <code>logit_mean</code>/<code>logit_sigma</code> 仿射标定参数。<strong>vLLM 与 HF 两条路径的 score 不应直接比较，需确认两者的完整计算链才能做数值对照。</strong> 两者的排序差异也保留为未解释结论。</p>
-<p>实验前后 GPU 均为 1 MiB、0% 利用率，计算进程列表为空；vLLM 服务端退出码 0；HF 前向退出码 0；在线阶段因 <code>/classify</code> 404 导致合约脚本以退出码 1 结束，原始响应均已保留。</p>
-<h3 id="9">9. 消融与未测范围</h3>
+<p><strong>两条计算链的逐项核对（<code>results/crater/pooling/rerank-20260913-chain/</code>）。</strong></p>
+<p>先固定 HF 一侧的完整链路，这是 reranker 的判定规则本身：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>取值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模板</td>
+<td><code>apply_chat_template([{'role':'query'},{'role':'document'}])</code>，末尾是 <code>&lt;think&gt;\n\n&lt;/think&gt;\n\n</code></td>
+</tr>
+<tr>
+<td>序列长度</td>
+<td>96 / 91 / 96 / 91 / 96 / 89 token</td>
+</tr>
+<tr>
+<td>判定位置</td>
+<td><code>last_hidden_state[:, -1, :]</code>，shape <code>[6, 1024]</code>，stride <code>[98304, 1]</code></td>
+</tr>
+<tr>
+<td>判定用的两行 LM head</td>
+<td>token id <code>9693</code>(yes) 与 <code>2152</code>(no)，shape <code>[2, 1024]</code></td>
+</tr>
+<tr>
+<td>yes/no logits</td>
+<td><code>[13.095, 19.724]</code>、<code>[12.999, 5.879]</code>、<code>[13.745, 7.247]</code>、<code>[13.174, 5.030]</code>、<code>[15.877, 14.558]</code>、<code>[13.127, 3.328]</code></td>
+</tr>
+<tr>
+<td>分数公式</td>
+<td><code>softmax([no, yes])[1]</code>，即 yes 概率</td>
+</tr>
+<tr>
+<td>yes 概率</td>
+<td><code>0.99868 / 0.00081 / 0.00150 / 0.00029 / 0.21102 / 0.00006</code></td>
+</tr>
+<tr>
+<td>排序（高→低）</td>
+<td><code>0, 4, 2, 1, 3, 5</code></td>
+</tr>
+</tbody>
+</table>
+<p>再核对引擎一侧，这条链<strong>对不上</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>实测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /openapi.json</code> 暴露的路径</td>
+<td>17 条：<code>/pooling</code>、<code>/rerank</code>、<code>/score</code>、<code>/v1/embeddings</code>、<code>/v1/rerank</code>、<code>/v1/score</code>、<code>/v2/embed</code>、<code>/v2/rerank</code> 等</td>
+</tr>
+<tr>
+<td>能返回原始 logits 的端点</td>
+<td>无（<code>/classify</code> 不在 schema 里，请求返回 404）</td>
+</tr>
+<tr>
+<td>引擎自报的池化配置</td>
+<td><code>pooling_type=LAST, tok_pooling_type=ALL, use_activation=True, supported_tasks=('embed','token_embed')</code></td>
+</tr>
+<tr>
+<td><code>/score</code> 返回</td>
+<td><code>0.88112 / 0.86517 / 0.86975 / 0.83699 / 0.88609 / 0.77131</code>，量程 <code>[0.771, 0.886]</code></td>
+</tr>
+<tr>
+<td>排序（高→低）</td>
+<td><code>4, 0, 2, 1, 3, 5</code></td>
+</tr>
+<tr>
+<td>与 HF 排序的 Kendall τ</td>
+<td><code>0.867</code>（只差一对相邻交换），但<strong>第一名不同</strong></td>
+</tr>
+</tbody>
+</table>
+<p>根因在路由与 head 的组合上，而不是数值误差。这个模型被解析成
+<code>supported_tasks=('embed','token_embed')</code>，于是走的是
+<code>pooler_for_embed</code>（<code>vllm/model_executor/layers/pooler/seqwise/poolers.py:98</code>）那条分支，
+head 是 <code>EmbeddingPoolerHead(..., activation=PoolerNormalize())</code>：
+<code>/score</code> 拿到的是<strong>归一化后的末位向量分数</strong>，量程自然挤在 0.77–0.89。
+而 yes/no 判定需要的是 <code>pooler_for_classify</code>（同文件 <code>:112</code>）那条分支的
+<code>ClassifierPoolerHead</code>——它才会做 <code>activation((logit−mean)/sigma)</code>
+（<code>.../seqwise/heads.py:180-186</code>），并且要用 <code>logit_mean</code>/<code>logit_sigma</code> 标定。
+本模型的 <code>pooler_config</code> 里这两个字段都是 <code>None</code>，<code>returned_token_ids</code> 也是 <code>None</code>。</p>
+<p><strong>保留的最小失败输入</strong>：doc 0「Prefix caching reuses computed key and value blocks…」
+与 doc 4「A prefix cache lookup depends on the preceding token sequence…」。
+HF 给出的 yes 概率是 <code>0.99868</code> 与 <code>0.21102</code>（差 0.79），
+引擎给出的 score 是 <code>0.88112</code> 与 <code>0.88609</code>（差 0.005 且方向相反）。</p>
+<p>结论：<strong>以池化方式加载时这两条链不应做数值对照</strong>，也不应把引擎的 <code>/rerank</code> 排序
+当作该模型的判定结果。</p>
+<p><strong>换成生成式加载后，等价链可以建立</strong>（<code>results/crater/5.12/rerank-logprob-20260921/</code>）。
+同一个 checkpoint 的 config 声明的是 <code>architectures=["Qwen3ForCausalLM"]</code>，
+所以把它当<strong>生成模型</strong>起服务，用 <code>/v1/completions</code> 取第一个生成位置的 <code>logprobs</code>，
+再按官方口径算两标签 softmax：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>P</mi><mo stretchy="false">&#x00028;</mo><mtext>yes</mtext><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>&#x003C3;</mi><mo minsize="1.2em" maxsize="1.2em">(</mo><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">p</mi></mrow><mo stretchy="false">&#x00028;</mo><mtext>yes</mtext><mo stretchy="false">&#x00029;</mo><mo>&#x02212;</mo><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">p</mi></mrow><mo stretchy="false">&#x00028;</mo><mtext>no</mtext><mo stretchy="false">&#x00029;</mo><mo minsize="1.2em" maxsize="1.2em">)</mo><mo>&#x0003D;</mo><mrow><mi mathvariant="normal">s</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">f</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">m</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">x</mi></mrow><mo stretchy="false">&#x00028;</mo><mo stretchy="false">[</mo><msub><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">g</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">t</mi></mrow><mrow><mtext>no</mtext></mrow></msub><mo>&#x0002C;</mo><msub><mrow><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">g</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">t</mi></mrow><mrow><mtext>yes</mtext></mrow></msub><mo stretchy="false">]</mo><msub><mo stretchy="false">&#x00029;</mo><mn>1</mn></msub></mrow></math></div></p>
+<p>词表归一化在相减时抵消，所以这个量与 HF 参照<strong>代数等价</strong>。一个容易踩的坑：
+<code>top_logprobs</code> 返回的是 <code>{token 文本: logprob}</code>，而词表里的 <code>yes</code>/<code>Yes</code>/<code>YES</code>
+是<strong>三个不同的 token</strong>——按文本匹配会读到别的量，必须把文本映射回 id、
+只认参照用的那两个 id（<code>no=2152</code>、<code>yes=9693</code>）。</p>
+<p>六条文档的对拍（<code>labs/L5/rerank_logprob_chain.py</code>）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">文档</th>
+<th style="text-align: right;">引擎 P(yes)（两标签 softmax）</th>
+<th style="text-align: right;">HF 参照 P(yes)</th>
+<th style="text-align: right;">绝对差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.9985896</td>
+<td style="text-align: right;">0.9986798</td>
+<td style="text-align: right;">9.0e-05</td>
+</tr>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0.0007794</td>
+<td style="text-align: right;">0.0008081</td>
+<td style="text-align: right;">2.9e-05</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.0015488</td>
+<td style="text-align: right;">0.0015039</td>
+<td style="text-align: right;">4.5e-05</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">0.0003150</td>
+<td style="text-align: right;">0.0002903</td>
+<td style="text-align: right;">2.5e-05</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">0.2120688</td>
+<td style="text-align: right;">0.2110225</td>
+<td style="text-align: right;">1.0e-03</td>
+</tr>
+<tr>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">0.0000531</td>
+<td style="text-align: right;">0.0000555</td>
+<td style="text-align: right;">2.4e-06</td>
+</tr>
+</tbody>
+</table>
+<p><strong>max|Δ| = 1.05e-03，Kendall τ = 1.000，第一名一致</strong>（HF 的第一名是 doc 0，
+引擎也是 doc 0）。差异量级就是 bf16 逐位置的舍入，不是口径差。</p>
+<p>这一条同时修正了前面的读法：<strong>"引擎分数与 HF 不同"不是数值误差，而是"加载方式决定了
+量什么"</strong>。同一个 checkpoint 可以是 embed 模型（池化末位向量）、也可以是生成模型
+（LM head 概率），两个量都"正确"，但只有后者能复现 rerank 的官方判定。
+选服务形态时要先问：这个 checkpoint 的判定到底定义在哪一层。</p>
+<h3 id="9">9. 并发容量与残差分解</h3>
+<p>前面对齐都用顺序请求。把并发从 1 拉到 512（Qwen3-Embedding-0.6B、<code>/pooling</code>、每档
+4×并发 条请求、输入约 100 token），两种连接方式各扫一遍
+（<code>labs/L5/pooling_concurrency_limit.py</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>连接</th>
+<th style="text-align: right;">并发</th>
+<th style="text-align: right;">请求</th>
+<th style="text-align: right;">成功</th>
+<th style="text-align: right;">QPS</th>
+<th style="text-align: right;">客户端 p50 ms</th>
+<th style="text-align: right;">客户端 p99 ms</th>
+<th style="text-align: right;">服务端 e2e ms</th>
+<th style="text-align: right;">inference ms</th>
+<th style="text-align: right;">queue ms</th>
+<th style="text-align: right;">差值 p50 ms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每请求新建</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">206.5</td>
+<td style="text-align: right;">4.50</td>
+<td style="text-align: right;">6.27</td>
+<td style="text-align: right;">3.47</td>
+<td style="text-align: right;">2.80</td>
+<td style="text-align: right;">0.005</td>
+<td style="text-align: right;">0.94</td>
+</tr>
+<tr>
+<td>每请求新建</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">669.4</td>
+<td style="text-align: right;">12.01</td>
+<td style="text-align: right;">14.26</td>
+<td style="text-align: right;">5.47</td>
+<td style="text-align: right;">2.59</td>
+<td style="text-align: right;">0.008</td>
+<td style="text-align: right;">6.53</td>
+</tr>
+<tr>
+<td>每请求新建</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">1016.3</td>
+<td style="text-align: right;">29.16</td>
+<td style="text-align: right;">35.48</td>
+<td style="text-align: right;">9.67</td>
+<td style="text-align: right;">2.79</td>
+<td style="text-align: right;">0.009</td>
+<td style="text-align: right;">19.44</td>
+</tr>
+<tr>
+<td>每请求新建</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">966.9</td>
+<td style="text-align: right;">63.68</td>
+<td style="text-align: right;">73.39</td>
+<td style="text-align: right;">8.77</td>
+<td style="text-align: right;">2.36</td>
+<td style="text-align: right;">0.005</td>
+<td style="text-align: right;">54.88</td>
+</tr>
+<tr>
+<td>每请求新建</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">999.2</td>
+<td style="text-align: right;">125.48</td>
+<td style="text-align: right;">135.99</td>
+<td style="text-align: right;">8.61</td>
+<td style="text-align: right;">2.31</td>
+<td style="text-align: right;">0.004</td>
+<td style="text-align: right;">116.86</td>
+</tr>
+<tr>
+<td>每请求新建</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">986.0</td>
+<td style="text-align: right;">254.07</td>
+<td style="text-align: right;">269.44</td>
+<td style="text-align: right;">8.65</td>
+<td style="text-align: right;">2.33</td>
+<td style="text-align: right;">0.004</td>
+<td style="text-align: right;">245.42</td>
+</tr>
+<tr>
+<td>每请求新建</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">966.9</td>
+<td style="text-align: right;">500.43</td>
+<td style="text-align: right;">525.38</td>
+<td style="text-align: right;">8.75</td>
+<td style="text-align: right;">2.35</td>
+<td style="text-align: right;">0.005</td>
+<td style="text-align: right;">491.56</td>
+</tr>
+<tr>
+<td>keep-alive</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">1061.1</td>
+<td style="text-align: right;">50.75</td>
+<td style="text-align: right;">133.93</td>
+<td style="text-align: right;">16.95</td>
+<td style="text-align: right;">2.72</td>
+<td style="text-align: right;">0.008</td>
+<td style="text-align: right;">33.80</td>
+</tr>
+<tr>
+<td>keep-alive</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1082.6</td>
+<td style="text-align: right;">63.05</td>
+<td style="text-align: right;">796.17</td>
+<td style="text-align: right;">21.58</td>
+<td style="text-align: right;">2.68</td>
+<td style="text-align: right;">0.008</td>
+<td style="text-align: right;">41.47</td>
+</tr>
+<tr>
+<td>keep-alive</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1043.4</td>
+<td style="text-align: right;">39.73</td>
+<td style="text-align: right;">899.49</td>
+<td style="text-align: right;">12.80</td>
+<td style="text-align: right;">2.51</td>
+<td style="text-align: right;">0.006</td>
+<td style="text-align: right;">26.79</td>
+</tr>
+</tbody>
+</table>
+<p><code>差值 = 客户端 p50 − 服务端 e2e</code>；服务端三个量取自 <code>/metrics</code> 的 histogram 增量。
+四点：</p>
+<ol>
+<li><strong>服务端没有被压满。</strong> 十档里 <code>queue</code> 始终 &lt;0.01 ms、<code>inference</code> 稳定在 2.3–2.8 ms、
+   服务端 e2e 在 8.6–21.6 ms；显存峰值恒定（14 910 MiB，启动日志给出 KV 11.98 GiB、
+   图池 0.06 GiB、峰值激活 0.51 GiB）。按 1000 QPS × 8.7 ms 估计，服务端平均只有约
+   9 条请求在途。</li>
+<li><strong>QPS 在 32 并发以上就锁在 970–1083</strong>，与连接方式无关。这是<strong>客户端</strong>的上限
+   （Python 线程 + 阻塞 socket），不是服务端容量：本次扫描没有触到服务端边界，
+   1024 条请求全部成功也不能读成"容量无穷"。</li>
+<li><strong>每请求新建连接的成本在高并发下主导客户端观测。</strong> 同样 1024 条请求：512 并发下
+   新建连接 p50 500.4 ms，keep-alive 只有 39.7 ms（12.6×）；差值从 491.6 ms 降到
+   26.8 ms。顺序请求里 0.735 ms 的残差是同一件事的小并发版本，<strong>"客户端 − 服务端"
+   在高并发下主要买的是连接建立与前端 accept 排队，不是模型或网络往返</strong>。</li>
+<li>
+<p><strong>keep-alive 把 p50 拉平，却把 p99 抬高</strong>（256 并发 63.1 对 796.2 ms；512 并发
+   39.7 对 899.5 ms）。复用连接后少数请求落到长尾上；只报 p50 会得出"keep-alive
+   全面更好"的结论，只报 p99 会得出相反的结论。</p>
+</li>
+<li>
+<p><strong>加长输入也压不满服务端。</strong> 把输入放大 13×（TEXT×40 ≈ 1300 token）后
+   <code>inference</code> 从 2.3 涨到 3.7 ms、QPS 降到 690–730（并发 32/64/128/256），但 <code>queue</code>
+   仍是 0.007 ms、显存峰值只从 14 910 涨到 14 950 MiB。<strong>瓶颈在最前面的客户端</strong>：
+   要测这台服务端的容量边界，必须换异步客户端或专用压测器；本章不宣称已经找到边界。</p>
+</li>
+</ol>
+<h3 id="10">10. 消融与未测范围</h3>
 <p>建议消融，每种配置另存结果：</p>
 <ul>
 <li>把 bge-small 换成 <code>--dtype float32</code> 跑一遍，看权重字节翻倍后 roofline 点怎么移动；</li>
@@ -1307,16 +2317,54 @@ vLLM 索性在启动时拦住。</p>
 <ul>
 <li><strong>SGLang / TensorRT-LLM 的 pooling 路径未对照。</strong> 仅实测了 vLLM 0.29.0。</li>
 <li><strong><code>max_num_batched_tokens</code> 边界只测了启动行为</strong>，没有测「启动成功之后，
-  接近上限的请求会怎样排队」。</li>
+  接近上限的请求会怎样排队」；本轮补的并发/长输入扫描到 512 并发与 1 300 token 输入
+  都没让服务端 <code>queue</code> 起来，边界仍在客户端之外。</li>
 <li><strong>生成侧在 256 token 预算下跑长 prompt 没有实测。</strong> 第 6 节第一个服务端只记录了
   「启动成功」；用它跑 1024 token 的 prompt 需要另起一次服务并用 chat 接口，
   这里使用 embeddings 接口访问生成服务，返回了 404。</li>
 <li><strong><code>enable_chunked_processing</code> 未打开</strong>，超长输入的分段与加权平均只有源码依据。</li>
+<li><strong>残差已分解到连接方式这一层，服务端前端仍无独立事件。</strong> 同一批 1024 条请求，
+  512 并发下"每请求新建连接"与 keep-alive 的客户端 p50 是 500.4 与 39.7 ms（12.6×），
+  差值 491.6 对 26.8 ms——连接建立与 accept 排队是主要成分；但 Uvicorn 的入队/出队
+  仍没有独立计时点，只能由"服务端 histogram 已从进入引擎开始计时"反推。</li>
+<li><strong>rerank 的等价链已用生成式加载补上</strong>（<code>sigmoid(lp(yes) − lp(no))</code> 与 HF 对拍，
+  六条文档 max|Δ| 1.05e-03、Kendall τ 1.000），但池化加载路径下的 <code>/score</code> 仍与判定
+  不是同一个量，这条不等价保持记录。</li>
 <li><strong>batch 上限的实测用的是 transformers 前向，不是 vLLM 服务</strong>，两者对激活的
   处理不同（vLLM 有预分配与 CUDA Graph）。</li>
 </ul>
 <hr />
 <h2 id="_6">原始现场</h2>
+<p>本节补测的并发扫描（新建连接 / keep-alive / 长输入）与启动日志的显存分段：</p>
+<details>
+<summary>⑪ 并发容量与残差分解（Qwen3-Embedding-0.6B）</summary>
+<details class="fold srcfold"><summary>results/crater/5.12/pooling-concurrency-20260922full/pooling_concurrency.txt 全文（9 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.12 池化服务并发容量与残差分解 · http://127.0.0.1:8125
+     并发     请求    成功    失败     QPS     客户端p50     客户端p99     服务端e2e  inference    queue     残差p50      显存峰值MiB
+      1      4     4     0   206.5      4.497      6.269      3.465      2.797    0.005     0.942        14910
+      8     32    32     0   669.4     12.011     14.264      5.466      2.589    0.008     6.533        14910
+     32    128   128     0  1016.3     29.161      35.48      9.674      2.793    0.009    19.443        14910
+     64    256   256     0   966.9     63.682     73.394      8.765      2.363    0.005    54.878        14910
+    128    512   512     0   999.2    125.479    135.992      8.606      2.312    0.004   116.862        14910
+    256   1024  1024     0   986.0    254.068    269.437      8.649      2.328    0.004   245.417        14910
+    512   1024  1024     0   966.9    500.427    525.381      8.754      2.346    0.005    491.56        14910
+</pre></div>
+<div class="srcref"><code>results/crater/5.12/pooling-concurrency-20260922full/pooling_concurrency.txt 全文（9 行）</code><a href="../code/results/crater/5.12/pooling-concurrency-20260922full/pooling_concurrency.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/crater/5.12/pooling-concurrency-20260922ka/pooling_concurrency.txt 全文（5 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.12 池化服务并发容量与残差分解 · http://127.0.0.1:8125
+     并发     请求    成功    失败     QPS     客户端p50     客户端p99     服务端e2e  inference    queue     残差p50      显存峰值MiB
+     64    256   256     0  1061.1     50.747    133.929     16.949      2.717    0.008    33.796        14910
+    256   1024  1024     0  1082.6     63.051    796.166     21.579      2.682    0.008    41.466        14910
+    512   1024  1024     0  1043.4     39.728     899.49     12.803      2.511    0.006    26.788        14910
+</pre></div>
+<div class="srcref"><code>results/crater/5.12/pooling-concurrency-20260922ka/pooling_concurrency.txt 全文（5 行）</code><a href="../code/results/crater/5.12/pooling-concurrency-20260922ka/pooling_concurrency.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+<details class="fold srcfold"><summary>results/crater/5.12/pooling-concurrency-20260922long/pooling_concurrency.txt 全文（6 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span>L5.12 池化服务并发容量与残差分解 · http://127.0.0.1:8125
+     并发     请求    成功    失败     QPS     客户端p50     客户端p99     服务端e2e  inference    queue     残差p50      显存峰值MiB
+     32    128   128     0   651.5     45.256     60.747     10.004      3.659    0.006    34.826        14950
+     64    256   256     0   723.9     83.734    104.092      9.222      3.638    0.006    74.401        14950
+    128    512   512     0   729.0    169.639    198.168      9.415      3.622    0.006   160.075        14950
+    256    512   512     0   689.6    340.555    448.045      10.93      3.736    0.007   329.473        14950
+</pre></div>
+<div class="srcref"><code>results/crater/5.12/pooling-concurrency-20260922long/pooling_concurrency.txt 全文（6 行）</code><a href="../code/results/crater/5.12/pooling-concurrency-20260922long/pooling_concurrency.txt.html">在完整文件中打开 &rarr;</a></div></div></details>
+</details>
 <p>先读 <code>summary.json</code> 与 <code>roofline.json</code>，再看各阶段的原始日志；
 定位细节时打开带行号的完整源码页。原始结果只读，派生统计保存在独立文件。</p>
 <ul>
@@ -1335,9 +2383,15 @@ vLLM 索性在启动时拦住。</p>
 <li><code>/score</code> 原始响应：<a href="../raw/results/crater/pooling/rerank-20260912/score.json">score.json</a></li>
 <li><code>/rerank</code> 原始响应：<a href="../raw/results/crater/pooling/rerank-20260912/rerank.json">rerank.json</a></li>
 <li><code>/classify</code> 404 记录：<a href="../raw/results/crater/pooling/rerank-20260912/classify.json">classify.json</a></li>
-<li>文档数扫描（1/4/16/64）：<code>scan-n*.json</code></li>
-<li>服务端启动日志：<a href="../raw/results/crater/pooling/rerank-20260912/server.log">server.log</a></li>
 </ul>
+<p>链路核对那一轮的工件在 <code>results/crater/pooling/rerank-20260913-chain/</code>：
+<a href="../raw/results/crater/pooling/rerank-20260913-chain/chain.json">链路口径</a>、
+<a href="../raw/results/crater/pooling/rerank-20260913-chain/openapi.json">端点清单</a>、
+<a href="../raw/results/crater/pooling/rerank-20260913-chain/server-pooling-config.txt">引擎自报池化配置</a>、
+<a href="../raw/results/crater/pooling/rerank-20260913-chain/reference.json">HF 参考</a>、
+<a href="../raw/results/crater/pooling/rerank-20260913-chain/score.json"><code>/score</code> 响应</a>。
+- 文档数扫描（1/4/16/64）：<code>scan-n*.json</code>
+- 服务端启动日志：<a href="../raw/results/crater/pooling/rerank-20260912/server.log">server.log</a></p>
 <p>各阶段分目录存放：<code>data/</code>（roofline 与 batch 上限）、<code>data-bge/</code>、<code>data-qwen/</code>、
 <code>data-boundary-*</code>。第一次运行时两个服务端写到了同一个 <code>serving-fixed.json</code>，
 bge 那组被覆盖，已分目录重跑——<strong>同一个脚本给不同阶段用同一个输出目录，
@@ -2693,6 +3747,11 @@ bge 那组被覆盖，已分目录重跑——<strong>同一个脚本给不同�
    本章的 47–50% 是估计 FLOP 除以框架时间，再相对 GEMM 基准归一化；原因尚未定位。</li>
 <li>用 embedding 的 batch 上限去规划生成服务，或反过来。</li>
 <li>只看吞吐不看客户端时延。本章并发 256 时引擎时间几乎没变，客户端时延涨了 15 倍。</li>
+<li>把「客户端 − 服务端」的差值直接算成服务端开销。同一台机器、同一批 1024 条请求，
+   512 并发下这个差值可以从 26.8 ms（keep-alive）变到 491.6 ms（每请求新建连接）——
+   它主要是连接建立与前端 accept 排队。要归因服务端，读它自己的 histogram。</li>
+<li>用"没有失败"推断"容量足够"。本章把并发推到 512、输入放大 13×，服务端 <code>queue</code>
+   始终 &lt;0.01 ms：测到的是客户端上限，不是服务端边界。</li>
 </ol>
 <hr />
 <h2 id="_9">自测题</h2>

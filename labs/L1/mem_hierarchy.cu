@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <algorithm>
 #include <random>
@@ -251,7 +252,227 @@ static void concurrency_sweep(int sm_count, double dram_ref_gbs) {
 
 // ---------------------------------------------------------------------------
 
-int main() {
+// ===========================================================================
+// 修订实验（执行计划 1.1-A/B 的硬件侧）
+// 运行：./mem_hierarchy revision
+//
+// 与默认 A–D 的区别：
+//   E. 同一工作集下，依赖链的随机 / 连续 / 跨页访问模式（纯延迟）
+//   F. 合并访问 stride 扫描（有效载荷随 stride 崩塌）
+//   G. 常驻 warp 数扫描（Little's Law 的带宽饱和曲线）
+//   H. shared-memory bank conflict 的 stride 全扫描
+// ===========================================================================
+
+enum { CM_RANDOM = 0, CM_SEQUENTIAL = 1, CM_CROSSPAGE = 2 };
+
+// 依赖链：链节点落在 128 B 的 cache line 上，按 mode 排列。
+// 每次访存依赖上一次结果，因此测到的是这一层级的纯延迟。
+static double chain_latency(size_t bytes, int mode) {
+    const size_t LINE = 128;
+    size_t n_lines = bytes / LINE;
+    if (n_lines < 2) return -1.0;
+    size_t n = n_lines * (LINE / sizeof(uint32_t));
+
+    std::vector<uint32_t> order(n_lines);
+    for (size_t i = 0; i < n_lines; ++i) order[i] = (uint32_t)i;
+    if (mode == CM_RANDOM) {
+        std::mt19937 rng(12345);
+        std::shuffle(order.begin() + 1, order.end(), rng);
+    } else if (mode == CM_CROSSPAGE) {
+        const size_t lines_per_page = (2ull << 20) / LINE;   // 2 MiB 大页，16384 行
+        size_t n_pages = n_lines / lines_per_page;
+        if (n_pages == 0) return -1.0;
+        // 先在同一页内走一行，再跳到下一页；相邻两次访问必然跨页
+        for (size_t i = 0; i < n_lines; ++i) {
+            size_t pg = i % n_pages;
+            size_t ln = i / n_pages;
+            order[i] = (uint32_t)(pg * lines_per_page + ln);
+        }
+    }
+
+    std::vector<uint32_t> host(n, 0);
+    const size_t STEP = LINE / sizeof(uint32_t);
+    for (size_t i = 0; i + 1 < n_lines; ++i)
+        host[(size_t)order[i] * STEP] = (uint32_t)(order[i + 1] * STEP);
+    host[(size_t)order[n_lines - 1] * STEP] = (uint32_t)(order[0] * STEP);
+
+    size_t steps = std::max<size_t>(4096, n_lines * 3);
+    steps = std::min<size_t>(steps, 30'000'000);              // 控制最坏情况时长
+
+    uint32_t* d_buf; uint32_t* d_out; long long* d_cyc;
+    CHECK(cudaMalloc(&d_buf, n * sizeof(uint32_t)));
+    CHECK(cudaMalloc(&d_out, sizeof(uint32_t)));
+    CHECK(cudaMalloc(&d_cyc, sizeof(long long)));
+    CHECK(cudaMemcpy(d_buf, host.data(), n * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    cudaEvent_t ea, eb; CHECK(cudaEventCreate(&ea)); CHECK(cudaEventCreate(&eb));
+    CHECK(cudaEventRecord(ea));
+    chase_kernel<<<1, 1>>>(d_buf, (int)std::min<size_t>(steps, INT32_MAX), d_out, d_cyc);
+    CHECK(cudaEventRecord(eb));
+    CHECK(cudaEventSynchronize(eb));
+    long long cyc = 0;
+    CHECK(cudaMemcpy(&cyc, d_cyc, sizeof(long long), cudaMemcpyDeviceToHost));
+    CHECK(cudaFree(d_buf)); CHECK(cudaFree(d_out)); CHECK(cudaFree(d_cyc));
+    CHECK(cudaEventDestroy(ea)); CHECK(cudaEventDestroy(eb));
+    return (double)cyc / (double)steps;
+}
+
+// 固定 span、改变访问 stride：stride 越大，每次 warp 事务浪费越多。
+template <int STRIDE>
+__global__ void bw_read_stride_kernel(const float4* __restrict__ buf, size_t loads,
+                                      float* sink) {
+    size_t tid = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    size_t step = (size_t)gridDim.x * blockDim.x;
+    float4 acc = make_float4(0, 0, 0, 0);
+    for (size_t i = tid; i < loads; i += step) {
+        float4 v = buf[i * STRIDE];
+        acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+    }
+    if (acc.x == 1234.5678f) *sink = acc.x + acc.y + acc.z + acc.w;
+}
+
+static void stride_sweep(const cudaDeviceProp& p) {
+    const size_t bytes = 1024ull << 20;                       // 1 GiB span
+    size_t n4 = bytes / sizeof(float4);
+    float4* d_buf; float* d_sink;
+    CHECK(cudaMalloc(&d_buf, bytes));
+    CHECK(cudaMemset(d_buf, 1, bytes));
+    CHECK(cudaMalloc(&d_sink, sizeof(float)));
+
+    int grid = p.multiProcessorCount * 8, block = 256;
+    printf("\n[F] 合并访问 stride 扫描（1 GiB span，block=%d，grid=%d×%d）\n",
+           block, p.multiProcessorCount, 8);
+    printf("    %-9s %-12s %-15s %-12s %s\n", "stride", "有效载荷MB", "有效载荷带宽", "DRAM流量MB", "DRAM带宽");
+
+#define RUN_STRIDE(S) do { \
+    size_t loads = n4 / (S); \
+    bw_read_stride_kernel<S><<<grid, block>>>(d_buf, loads, d_sink); \
+    CHECK(cudaDeviceSynchronize()); \
+    float best = 1e30f; \
+    for (int r = 0; r < 3; ++r) { \
+        cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b); \
+        cudaEventRecord(a); \
+        bw_read_stride_kernel<S><<<grid, block>>>(d_buf, loads, d_sink); \
+        cudaEventRecord(b); cudaEventSynchronize(b); \
+        float ms = 0; cudaEventElapsedTime(&ms, a, b); \
+        best = std::min(best, ms); \
+        cudaEventDestroy(a); cudaEventDestroy(b); \
+    } \
+    double used = (double)loads * sizeof(float4); \
+    double dram = std::min((double)bytes, (double)loads * 32.0); /* 32 B sector 粒度 */ \
+    printf("    stride=%-3d %-12.2f %-15.1f %-12.2f %-5.1f\n", \
+           (S), used / 1e6, used / (best * 1e-3) / 1e9, \
+           dram / 1e6, dram / (best * 1e-3) / 1e9); \
+} while (0)
+
+    RUN_STRIDE(1); RUN_STRIDE(2); RUN_STRIDE(4);
+    RUN_STRIDE(8); RUN_STRIDE(16); RUN_STRIDE(32);
+#undef RUN_STRIDE
+
+    CHECK(cudaFree(d_buf)); CHECK(cudaFree(d_sink));
+}
+
+static void warp_sweep(const cudaDeviceProp& p) {
+    const size_t bytes = 1024ull << 20;
+    size_t n4 = bytes / sizeof(float4);
+    float4* d_buf; float* d_sink;
+    CHECK(cudaMalloc(&d_buf, bytes));
+    CHECK(cudaMemset(d_buf, 1, bytes));
+    CHECK(cudaMalloc(&d_sink, sizeof(float)));
+
+    printf("\n[G] 常驻 warp 数 vs 带宽（1 GB，单遍扫描）\n");
+    printf("    %-10s %-9s %-11s %s\n", "warps/SM", "block", "blocks/SM", "带宽 GB/s");
+    int axis[] = {1, 2, 4, 8, 16, 24, 32, 40, 48};
+    for (int warps : axis) {
+        int block, bps;
+        if (warps <= 8) { block = warps * 32; bps = 1; }       // 1 个 block，精确控制 warp 数
+        else            { block = 256;        bps = warps / 8; }
+        int grid = p.multiProcessorCount * bps;
+        bw_read_kernel<<<grid, block>>>(d_buf, n4, 1, d_sink);
+        CHECK(cudaDeviceSynchronize());
+        float best = 1e30f;
+        for (int r = 0; r < 3; ++r) {
+            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+            cudaEventRecord(a);
+            bw_read_kernel<<<grid, block>>>(d_buf, n4, 1, d_sink);
+            cudaEventRecord(b); cudaEventSynchronize(b);
+            float ms = 0; cudaEventElapsedTime(&ms, a, b);
+            best = std::min(best, ms);
+            cudaEventDestroy(a); cudaEventDestroy(b);
+        }
+        double gbs = (double)bytes / (best * 1e-3) / 1e9;
+        printf("    %-10d %-9d %-11d %-12.1f\n", warps, block, bps, gbs);
+    }
+    CHECK(cudaFree(d_buf)); CHECK(cudaFree(d_sink));
+}
+
+template <int STRIDE>
+static double smem_cycles(uint32_t* d_out, long long* d_cyc) {
+    smem_kernel<STRIDE><<<1, 32>>>(4096, d_out, d_cyc);
+    CHECK(cudaDeviceSynchronize());
+    long long c = 0;
+    CHECK(cudaMemcpy(&c, d_cyc, sizeof(long long), cudaMemcpyDeviceToHost));
+    return (double)c / (4096.0 * 8);                          // steps × 每步 8 个独立 load
+}
+
+static void bank_stride_sweep() {
+    printf("\n[H] shared-memory bank conflict：stride 全扫描（1 warp，每线程 8 个独立 load）\n");
+    uint32_t* d_out; long long* d_cyc;
+    CHECK(cudaMalloc(&d_out, sizeof(uint32_t)));
+    CHECK(cudaMalloc(&d_cyc, sizeof(long long)));
+    int strides[] = {1, 2, 4, 8, 16, 32};
+    double base = 0;
+    for (int i = 0; i < 6; ++i) {
+        double cyc = 0;
+        switch (strides[i]) {
+            case 1:  cyc = smem_cycles<1>(d_out, d_cyc);  break;
+            case 2:  cyc = smem_cycles<2>(d_out, d_cyc);  break;
+            case 4:  cyc = smem_cycles<4>(d_out, d_cyc);  break;
+            case 8:  cyc = smem_cycles<8>(d_out, d_cyc);  break;
+            case 16: cyc = smem_cycles<16>(d_out, d_cyc); break;
+            case 32: cyc = smem_cycles<32>(d_out, d_cyc); break;
+        }
+        if (i == 0) base = cyc;
+        printf("    stride=%-3d %8.2f 周期/次访存   %6.2f×\n", strides[i], cyc, cyc / base);
+    }
+    CHECK(cudaFree(d_out)); CHECK(cudaFree(d_cyc));
+}
+
+static void run_revision_experiments(const cudaDeviceProp& p) {
+    printf("\n=== 1.1 修订实验：依赖/独立、合并、并发、bank ===\n");
+    printf("    SM=%d  L2=%.0f MiB  smem/SM=%d KB  寄存器文件/SM=%d KB  线程/SM=%d\n",
+           p.multiProcessorCount, p.l2CacheSize / 1048576.0,
+           (int)(p.sharedMemPerMultiprocessor / 1024), (int)(p.regsPerMultiprocessor * 4 / 1024),
+           p.maxThreadsPerMultiProcessor);
+
+    double eff_ghz = pointer_chase2(64ull << 10, 2'000'000).effective_ghz;
+    printf("    有效 SM 频率 %.2f GHz（单线程标定）\n", eff_ghz);
+
+    // E. 依赖链三种模式，工作集取 L2 的 0.25/0.5/1/2/4 倍
+    printf("\n[E] 依赖延迟 vs 独立 load 吞吐（同工作集；延迟 cycle/access，吞吐 GB/s）\n");
+    printf("    %-10s %-11s %-11s %-11s %-10s %-14s %s\n",
+           "工作集", "随机", "连续", "跨页", "ns(随机)", "独立load带宽", "在途=带宽x延迟");
+    size_t l2 = (size_t)p.l2CacheSize;
+    size_t sizes[] = {l2 / 4, l2 / 2, l2, l2 * 2, l2 * 4};
+    for (size_t s : sizes) {
+        if (s > (size_t)p.totalGlobalMem / 3) continue;
+        double r  = chain_latency(s, CM_RANDOM);
+        double q  = chain_latency(s, CM_SEQUENTIAL);
+        double cp = chain_latency(s, CM_CROSSPAGE);
+        double bw = read_bandwidth(s, p.multiProcessorCount);   // 独立 load 的吞吐口径
+        double ns = r / eff_ghz;
+        double inflight_kb = bw * ns / 1024.0;                   // GB/s × ns = B
+        char buf[32]; snprintf(buf, sizeof buf, "%zu MiB", s >> 20);
+        printf("    %-10s %-11.1f %-11.1f %-11.1f %-10.1f %-14.0f %.0f KB\n",
+               buf, r, q, cp, ns, bw, inflight_kb);
+    }
+
+    stride_sweep(p);
+    warp_sweep(p);
+    bank_stride_sweep();
+}
+
+int main(int argc, char** argv) {
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
     int clk_khz = 0;
@@ -263,6 +484,11 @@ int main() {
            p.l2CacheSize / 1048576.0, p.totalGlobalMem / 1e9, ghz);
     printf("    每 SM 最大线程 %d，每 block 最大共享内存 %zu KB，warp 大小 %d\n",
            p.maxThreadsPerMultiProcessor, p.sharedMemPerBlockOptin / 1024, p.warpSize);
+
+    if (argc > 1 && std::strcmp(argv[1], "revision") == 0) {
+        run_revision_experiments(p);
+        return 0;
+    }
 
     // ---- A ----
     // 先用一次小工作集的追逐把**有效 SM 频率**标定出来。

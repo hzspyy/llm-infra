@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.4 PD 分离：KV cache 成为数据平面</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">6.4</div>
+  <div class="sidebar-title">PD 分离：KV cache 成为数据平面</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#kv-cache">心智模型：KV cache 是一份需要交接的「状态资产」</a></li>
+<li><a href="#_2">机制拆解与推导</a><ul>
+<li><a href="#1-kv">1. 交接描述符：接收方凭什么相信这份 KV</a></li>
+<li><a href="#2">2. 为什么这次交接过得去：逐位对拍</a></li>
+<li><a href="#3">3. 搬运的两条参照与一档慢状态</a></li>
+<li><a href="#4">4. 分离相对并置多付了多少</a></li>
+<li><a href="#5">5. 分离要赚回来，只能靠跨请求重叠</a></li>
+<li><a href="#6">6. 失败与取消：两侧都要收干净</a></li>
+<li><a href="#7">7. 连接器：本机跑不了生产路径</a></li>
+</ul>
+</li>
+<li><a href="#_3">工程实现 · 源码解析</a><ul>
+<li><a href="#vllm-0290">代码入口（vLLM 0.29.0）</a></li>
+<li><a href="#_4">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_5">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_6">命令</a></li>
+<li><a href="#_7">实测数字</a></li>
+<li><a href="#_8">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_9">原始现场</a></li>
+<li><a href="#_10">前沿</a></li>
+<li><a href="#_11">陷阱</a></li>
+<li><a href="#_12">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#kv-cache">心智模型：KV cache 是一份需要交接的「状态资产」</a></li>
+<li><a href="#_2">机制拆解与推导</a><ul>
+<li><a href="#1-kv">1. 交接描述符：接收方凭什么相信这份 KV</a></li>
+<li><a href="#2">2. 为什么这次交接过得去：逐位对拍</a></li>
+<li><a href="#3">3. 搬运的两条参照与一档慢状态</a></li>
+<li><a href="#4">4. 分离相对并置多付了多少</a></li>
+<li><a href="#5">5. 分离要赚回来，只能靠跨请求重叠</a></li>
+<li><a href="#6">6. 失败与取消：两侧都要收干净</a></li>
+<li><a href="#7">7. 连接器：本机跑不了生产路径</a></li>
+</ul>
+</li>
+<li><a href="#_3">工程实现 · 源码解析</a><ul>
+<li><a href="#vllm-0290">代码入口（vLLM 0.29.0）</a></li>
+<li><a href="#_4">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_5">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_6">命令</a></li>
+<li><a href="#_7">实测数字</a></li>
+<li><a href="#_8">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_9">原始现场</a></li>
+<li><a href="#_10">前沿</a></li>
+<li><a href="#_11">陷阱</a></li>
+<li><a href="#_12">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L6 · 分布式：通信、并行、分离</div>
+  <div class="mod-id">6.4</div>
+  <h1>PD 分离：KV cache 成为数据平面</h1>
+  <p class="lede">DistServe / Splitwise / Mooncake；NIXL / LMCache / Mooncake Store 的 KV 传输；并置 vLLM 与 SGLang 的 PD 分离实现，在 worldvln 上真跑。</p>
+  <div class="chips"><span class="chip">实测机器 worldvln（2× L40S，PCIe，无 NVLink）· Qwen3-1.7B（BF16）· vLLM 0.29.0</span><span class="chip">前置 6.2（推理并行）· 5.2（KV 分页）· 5.8（失败路径）· 1.5（网络与存储）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>前面几章把「一张卡怎么跑模型」「多张卡怎么切模型」讲完了。PD 分离换了一个问法：<strong>prefill 和 decode 是两种性质完全不同的负载，为什么要把它们绑在同一张卡上？</strong> prefill 是算力受限的大矩阵乘，decode 是权重带宽受限的逐 token 小步长；合在一起调度，两边互相拖。</p>
+<p>分离的代价也很直白：KV cache 必须从 P 实例搬到 D 实例。这一章要回答的就是这笔搬运值不值。</p>
+<ol>
+<li>KV 交接的所有权怎样转移？接收方凭什么相信这份 KV 是自己的？</li>
+<li>传输和两侧排队怎样共同影响收益？</li>
+<li>取消和重复交接怎样回收资源？</li>
+</ol>
+<hr />
+<h2 id="kv-cache">心智模型：KV cache 是一份需要交接的「状态资产」</h2>
+<figure>
+
+
+<svg viewBox="0 0 830 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PD 分离的 KV 交接">
+  <defs>
+    <marker id="g64" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">P 实例算完 prefill 之后，KV cache 的归属要变一次</text>
+
+    <!-- P -->
+    <rect x="12" y="34" width="240" height="200" rx="5" fill="none" stroke="currentColor"/>
+    <text x="24" y="54" font-size="11.5" font-weight="600">P 实例（GPU0）</text>
+    <text x="24" y="74" font-size="10">算力受限：一次吃掉 S 个 token</text>
+    <text x="24" y="92" font-size="10">产出 KV cache 与最后一个位置的 logits</text>
+    <rect x="24" y="104" width="216" height="52" rx="3" fill="none" stroke="currentColor"/>
+    <text x="32" y="122" font-size="9.5">本机实测（Qwen3-1.7B，S=2048）：</text>
+    <text x="32" y="138" font-size="9.5">KV = 224.0 MiB，114688 B/token</text>
+    <text x="32" y="152" font-size="9.5">28 层 × 8 kv_head × 128 × 2 × 2B</text>
+    <text x="24" y="176" font-size="10">交接完成后必须释放自己持有的 block</text>
+    <text x="24" y="196" font-size="10">（收到接收方的 ACK 才释放）</text>
+    <text x="24" y="218" font-size="10" font-weight="600">只做 prefill，不进入 decode 循环</text>
+
+    <!-- 交接 -->
+    <line x1="254" y1="130" x2="330" y2="130" stroke="currentColor" marker-end="url(#g64)"/>
+    <text x="258" y="122" font-size="9.5" font-weight="600">① 描述符校验</text>
+    <text x="258" y="150" font-size="9.5">② 传输 KV</text>
+    <text x="258" y="166" font-size="9.5">③ 接收方 ACK</text>
+
+    <!-- D -->
+    <rect x="338" y="34" width="240" height="200" rx="5" fill="none" stroke="currentColor"/>
+    <text x="350" y="54" font-size="11.5" font-weight="600">D 实例（GPU1）</text>
+    <text x="350" y="74" font-size="10">权重带宽受限：每步只推进 1 个 token</text>
+    <text x="350" y="92" font-size="10">接手 KV 后继续 decode</text>
+    <rect x="350" y="104" width="216" height="52" rx="3" fill="none" stroke="currentColor"/>
+    <text x="358" y="122" font-size="9.5">对拍结论（本机实测）：</text>
+    <text x="358" y="138" font-size="9.5">首 token 与后续 8 步 token 序列相同</text>
+    <text x="358" y="152" font-size="9.5">logits 最大绝对差 = 0.0（逐位相同）</text>
+    <text x="350" y="176" font-size="10">它必须能拒绝不属于自己的 KV</text>
+    <text x="350" y="196" font-size="10">（身份/布局/token 数/block 表 10 项校验）</text>
+    <text x="350" y="218" font-size="10" font-weight="600">decoding 期间持有 block 直到自己用完</text>
+
+    <!-- 右侧：代价 -->
+    <rect x="598" y="34" width="220" height="200" rx="5" fill="none" stroke="currentColor"/>
+    <text x="610" y="54" font-size="11.5" font-weight="600">搬运的代价（本机实测）</text>
+    <text x="610" y="76" font-size="10">GPU→CPU→GPU（暂存）</text>
+    <text x="610" y="92" font-size="10" font-family="monospace">1.34 GB/s</text>
+    <text x="610" y="112" font-size="10">GPU→GPU P2P 直连</text>
+    <text x="610" y="128" font-size="10" font-family="monospace">10.88 GB/s</text>
+    <text x="610" y="150" font-size="10">同一台机器的 P2P 有慢状态：</text>
+    <text x="610" y="166" font-size="10">实测见过每操作 98.9 ms</text>
+    <text x="610" y="182" font-size="10">（1.3 记录过同一现象）</text>
+    <text x="610" y="204" font-size="10" font-weight="600">两档相差 25 倍</text>
+    <text x="610" y="222" font-size="10" opacity="0.85">搬运前必须确认机器处在哪一档</text>
+
+    <!-- 底部 -->
+    <line x1="12" y1="252" x2="818" y2="252" stroke="currentColor" opacity="0.3"/>
+    <text x="12" y="274" font-size="11.5" font-weight="600">这笔搬运在请求总时间里的占比（并置 TTFT + 搬运 = 分离的单请求 TTFT）</text>
+    <g font-size="10">
+      <text x="12" y="298">S=128：</text>
+      <rect x="90" y="286" width="74" height="15" rx="2" fill="currentColor" opacity="0.25"/>
+      <text x="172" y="298">搬运 3.40 ms，占 TTFT 的 10.6%–13.4%</text>
+      <text x="12" y="322">S=2048：</text>
+      <rect x="90" y="310" width="372" height="15" rx="2" fill="currentColor" opacity="0.25"/>
+      <text x="470" y="322">搬运 33.66 ms，占 TTFT 的 <tspan font-weight="600">46%–48%</tspan></text>
+      <text x="12" y="346">S=8192：</text>
+      <rect x="90" y="334" width="372" height="15" rx="2" fill="currentColor" opacity="0.25"/>
+      <text x="470" y="346">搬运 127.44 ms，占 TTFT 的 41.6%</text>
+    </g>
+    <text x="12" y="374" font-size="10">分离并不免费：TTFT 变长，多出来的正好是搬运时间。</text>
+    <text x="12" y="392" font-size="10" font-weight="600">它要赚回来，只能靠「P 的 prefill 不再阻塞 D 的 decode」这层跨请求的重叠。</text>
+    <text x="12" y="410" font-size="10" opacity="0.85">S=8192 时 prefill 178 ms 对搬运 127 ms，重叠的空间最大；S=2048 时两者几乎相等，收益最脆弱。</text>
+  </g>
+</svg>
+
+
+</figure>
+
+<hr />
+<h2 id="_2">机制拆解与推导</h2>
+<h3 id="1-kv">1. 交接描述符：接收方凭什么相信这份 KV</h3>
+<p>KV cache 是一块没有自描述信息的裸张量。接收方拿到 224 MiB 的字节之后，必须能回答：这是哪个请求的？哪个模型版本？多少 token？什么布局？如果答不上来，它就无法判断该不该把这份 KV 接进自己的分页缓存。</p>
+<p>所以交接的第一步不是传数据，是<strong>交换描述符并校验</strong>。本机实测的描述符包含 15 个字段，其中 10 项被强制要求一致：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+<th>不一致时的实测行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>request_id</code> / <code>session_id</code></td>
+<td>这是哪个请求、哪个会话</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>model_revision</code></td>
+<td>权重与层结构版本</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>prompt_sha256</code></td>
+<td>前缀内容校验</td>
+<td>拒绝（与 token 数一起用）</td>
+</tr>
+<tr>
+<td><code>num_tokens</code></td>
+<td>KV 覆盖的 token 数</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>dtype</code> / <code>kv_scale</code></td>
+<td>数值格式与量化尺度</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>tp_size</code> / <code>tp_rank</code></td>
+<td><strong>TP 布局</strong>：这一份是哪一片</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>num_layers</code> / <code>num_kv_heads</code> / <code>head_dim</code></td>
+<td>形状自校验</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>block_size</code> / <code>block_ids</code> / <code>block_table</code></td>
+<td>分页身份与物理块映射</td>
+<td>拒绝</td>
+</tr>
+</tbody>
+</table>
+<p>实测 10 类非法交接（逐个字段改错 + block 表错）<strong>全部被拒绝，没有一次静默接受</strong>。其中 <code>tp_rank</code>/<code>tp_size</code> 与 <code>block_table</code> 这两项是分离场景特有的：同一个请求在 P 侧可能按 TP=2 切成两份，D 侧如果按 TP=1 接手，就不能把某一 rank 的 KV 当成完整的 KV 用——这正是任务书里「异构 TP 仅在支持的布局转换下运行」的意思。</p>
+<h3 id="2">2. 为什么这次交接过得去：逐位对拍</h3>
+<p>正确性的判据不能只是「没报错」。本机的做法是：以 prefill 之后立刻取的 CPU 快照为唯一真值，两个分支各自从同一份快照重建 cache，再比较后续解码。</p>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>KV 往返（GPU→CPU→GPU，同设备）最大绝对差</td>
+<td>0.0</td>
+</tr>
+<tr>
+<td>KV 跨设备拷贝最大绝对差</td>
+<td>0.0</td>
+</tr>
+<tr>
+<td>首 token 与后续 8 步 token 序列</td>
+<td>完全相同</td>
+</tr>
+<tr>
+<td>每步 logits 最大绝对差</td>
+<td><strong>0.0</strong></td>
+</tr>
+</tbody>
+</table>
+<p>logits 逐位相同说明这份交接没有引入任何数值变化——这不是「足够接近」，是同一条计算路径。能做到这一点的前提是快照取自同一个 prefill，两侧用的是同一份 bf16 权重。</p>
+<h3 id="3">3. 搬运的两条参照与一档慢状态</h3>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th style="text-align: right;">时间（224 MiB）</th>
+<th style="text-align: right;">速率</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU→CPU→GPU（D2H + H2D 暂存）</td>
+<td style="text-align: right;">175.71 ms</td>
+<td style="text-align: right;">1.34 GB/s</td>
+<td>每 rank 都要过一次主机内存</td>
+</tr>
+<tr>
+<td>GPU→GPU（P2P 直连，56 个拷贝）</td>
+<td style="text-align: right;">21.59 ms</td>
+<td style="text-align: right;">10.88 GB/s</td>
+<td>每操作 0.385 ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>0.385 ms/操作与 98.9 ms/操作是同一台机器的两档状态。</strong> 1.3 在驱动层量 PCIe P2P 时记录过这个现象：同一个二进制连跑两次，一次全慢一次全快，成因未定位。本章第一次跑 task A 时拿到的就是慢状态（5346 ms / 224 MiB ≈ 每操作 98.9 ms），重跑同一条命令落回快状态。所以搬运时间<strong>必须在运行前确认机器处在哪一档</strong>，否则同一个实验会得到差 25 倍的结论。</p>
+<p>CPU 暂存路线的 1.34 GB/s 是一个关键瓶颈点：它反映的并非 PCIe 的物理带宽能力（6.1 测到单向 24 GB/s），而是「D2H + H2D 两次拷贝 + Python 逐层循环」的合成开销。真实实现不会这样搬——它们用 RDMA 直接写对端显存，或者把 KV 注册成可远端寻址的对称窗口。</p>
+<h3 id="4">4. 分离相对并置多付了多少</h3>
+<p>并置基线用 vLLM 0.29.0 实测（Qwen3-1.7B、BF16、关 prefix caching 与 CUDA Graph、贪心解码），输入 × 输出共 9 个组合：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">out</th>
+<th style="text-align: right;">并置 TTFT</th>
+<th style="text-align: right;">TPOT</th>
+<th style="text-align: right;">goodput</th>
+<th style="text-align: right;">峰值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">28.70 ms</td>
+<td style="text-align: right;">12.025 ms</td>
+<td style="text-align: right;">79.7 tok/s</td>
+<td style="text-align: right;">26.57 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">22.47 ms</td>
+<td style="text-align: right;">10.924 ms</td>
+<td style="text-align: right;">91.4 tok/s</td>
+<td style="text-align: right;">26.57 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">37.94 ms</td>
+<td style="text-align: right;">10.623 ms</td>
+<td style="text-align: right;">87.1 tok/s</td>
+<td style="text-align: right;">26.57 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">39.39 ms</td>
+<td style="text-align: right;">10.963 ms</td>
+<td style="text-align: right;">91.0 tok/s</td>
+<td style="text-align: right;">26.57 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">178.73 ms</td>
+<td style="text-align: right;">10.673 ms</td>
+<td style="text-align: right;">62.8 tok/s</td>
+<td style="text-align: right;">26.57 GiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">178.79 ms</td>
+<td style="text-align: right;">11.028 ms</td>
+<td style="text-align: right;">89.3 tok/s</td>
+<td style="text-align: right;">26.57 GiB</td>
+</tr>
+</tbody>
+</table>
+<p>把实测的搬运时间加到并置 TTFT 上，就得到分离的单请求 TTFT：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">搬运</th>
+<th style="text-align: right;">分离 TTFT（并置 + 搬运）</th>
+<th style="text-align: right;">搬运占 TTFT</th>
+<th style="text-align: right;">搬运占整个请求（out=32）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">3.40 ms</td>
+<td style="text-align: right;">25.4 – 32.1 ms</td>
+<td style="text-align: right;">10.6% – 13.4%</td>
+<td style="text-align: right;">0.8%</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">33.66 ms</td>
+<td style="text-align: right;">69.6 – 73.1 ms</td>
+<td style="text-align: right;"><strong>46.1% – 48.4%</strong></td>
+<td style="text-align: right;">9.2%</td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">127.44 ms</td>
+<td style="text-align: right;">305.7 – 306.2 ms</td>
+<td style="text-align: right;">41.6%</td>
+<td style="text-align: right;"><strong>25.0%</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>在 S=2048 与 8192 上，搬运吃掉了分离后 TTFT 的四成以上。</strong> 短输入（S=128）时搬运只占一成，因为 KV 本身很小（3.4 ms）；输入一长，KV 线性增长而搬运速率不变，占比就封顶在 40% 附近（封顶是因为 prefill 时间本身也随 S 线性增长）。</p>
+<h3 id="5">5. 分离要赚回来，只能靠跨请求重叠</h3>
+<p>上面的账是<strong>单请求</strong>的：分离让 TTFT 变长，多出来的正好是搬运时间。单请求视角下 PD 分离永远是亏的。</p>
+<p>它的收益在系统层面：并置时 P 的 prefill 会把 D 的 decode 挡在后面（同一条 GPU 队列），分离之后两者在不同的 GPU 上并行。于是收益条件是</p>
+<div class="highlight"><pre><span></span><code>（被重叠掉的 prefill 时间）× 每单位时间的请求数  &gt;  每次请求的搬运时间
+</code></pre></div>
+
+<p>用实测数代入，看单请求那条时间线的两个量：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">S</th>
+<th style="text-align: right;">prefill（并置 TTFT 的绝大部分）</th>
+<th style="text-align: right;">搬运</th>
+<th>重叠空间</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">22–29 ms</td>
+<td style="text-align: right;">3.40 ms</td>
+<td>充足</td>
+</tr>
+<tr>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">36–39 ms</td>
+<td style="text-align: right;">33.66 ms</td>
+<td><strong>几乎相等，收益最脆弱</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">8192</td>
+<td style="text-align: right;">178 ms</td>
+<td style="text-align: right;">127.44 ms</td>
+<td>最大</td>
+</tr>
+</tbody>
+</table>
+<p>S=8192 时 prefill 178 ms 远大于搬运 127 ms，只要 D 侧有排队，重叠就能把搬运赚回来；S=2048 时两者几乎相等，<strong>分离的收益完全取决于能不能做到接近满重叠</strong>——任何一侧的排队或拷贝串行化都会把这点微薄的空间吃掉。</p>
+<p>这也解释了为什么真实系统把 PD 分离和高并发绑在一起用：单请求不划算，只有 D 侧持续有 decode 工作可做，重叠才有东西可叠。</p>
+<h3 id="6">6. 失败与取消：两侧都要收干净</h3>
+<p>交接是两阶段提交式的：发送方持有 block，接收方 ACK 之后发送方才释放；接收方用完自己的那份再释放。任何一个时点取消，都必须把两侧状态收回基线。实测五个时点：</p>
+<table>
+<thead>
+<tr>
+<th>时点</th>
+<th>已发出 token</th>
+<th style="text-align: right;">refcount 干净</th>
+<th style="text-align: right;">staging 干净</th>
+<th style="text-align: right;">显存回到基线</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>注册之后、传输之前</td>
+<td>0</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">+0.0 MiB</td>
+</tr>
+<tr>
+<td>传输中</td>
+<td>0</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">+0.0 MiB</td>
+</tr>
+<tr>
+<td>接收之后、decode 之前</td>
+<td>0</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">+0.0 MiB</td>
+</tr>
+<tr>
+<td>decode 中</td>
+<td>1</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">+0.0 MiB</td>
+</tr>
+<tr>
+<td>正常完成</td>
+<td>4</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">✓</td>
+<td style="text-align: right;">+1.2 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>四条读法：</p>
+<p><strong>取消路径要主动释放，不能指望 GC。</strong> 第一版实现里取消路径只回收了 staging、没有释放发送方持有的 block，五个时点全部报「refcount 不干净」。这不是系统缺陷，而是实现里少了「未完成 ACK 的交接由发送方自己释放」这条规则。补上之后四个取消时点都回到 0.0 MiB。</p>
+<p><strong>「decode 中取消」只发出 1 个 token 是对的。</strong> 取消发生在第一层 decode 之后，已经产生的那个 token 不能撤回，也不该重复提交。</p>
+<p><strong>重复 ACK 必须被拒绝。</strong> 接收方对同一个 block 再 ACK 一次，实测报 <code>consumer: block 0 释放次数超过持有次数</code>。若静默接受，refcount 会变成负数，后续的块分配会把还在用的块复用出去。</p>
+<p><strong>失败之后实例要能继续服务。</strong> 五个时点跑完，同一个实例仍能用同一份 prefill 正常解码出 4 个 token，说明状态没有被污染。</p>
+<h3 id="7">7. 连接器：本机跑不了生产路径</h3>
+<table>
+<thead>
+<tr>
+<th>连接器</th>
+<th>依赖</th>
+<th>完成接口</th>
+<th>本机</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NIXL</td>
+<td><code>nixl</code>、RDMA 或 POSIX 后端</td>
+<td><code>get_finished</code> / <code>wait_for_save</code></td>
+<td>✗ 未安装</td>
+</tr>
+<tr>
+<td>Mooncake</td>
+<td><code>mooncake.engine.TransferEngine</code>、RDMA</td>
+<td><code>get_finished</code> / <code>wait_for_save</code></td>
+<td>✗ 未安装</td>
+</tr>
+<tr>
+<td>LMCache</td>
+<td><code>lmcache</code></td>
+<td><code>get_finished</code> / <code>wait_for_save</code></td>
+<td>✗ 未安装</td>
+</tr>
+<tr>
+<td>ExampleConnector</td>
+<td>无</td>
+<td>同左</td>
+<td>✓ 共享目录落盘，<strong>可用但未接入服务栈</strong></td>
+</tr>
+<tr>
+<td>DecodeBenchConnector</td>
+<td>无</td>
+<td>同左</td>
+<td>✓ 但只<strong>模拟</strong>填充 KV，不是真实交接</td>
+</tr>
+</tbody>
+</table>
+<p>三个生产连接器的完成接口形状是统一的：<code>get_finished(finished_req_ids)</code> 返回 <code>(finished_sending, finished_recving)</code> 两个集合，配合 <code>wait_for_save()</code>。<strong>这个统一形状是 PD 分离能被多种后端替换的基础</strong>——调度器只依赖「哪些请求的 KV 已经传完」。</p>
+<p>NIXL 还带一份异构 TP 布局转换（<code>tp_mapping.py:69 compute_tp_mapping</code>）：当 <code>tp_size &lt; remote_tp_size</code> 时按 kv head 建立 <code>head_to_slot</code> 映射做 GQA 去重（<code>:101-132</code>），<code>is_mla</code> 或 <code>tp_size &gt;= remote_tp_size</code> 时走直通分支（<code>:87</code>）。也就是说<strong>跨不同 TP 度的交接只在特定关系下被定义</strong>，超出范围必须拒绝而不是猜。</p>
+<hr />
+<h2 id="_3">工程实现 · 源码解析</h2>
+<h3 id="vllm-0290">代码入口（vLLM 0.29.0）</h3>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kv_connector/v1/base.py</code></td>
+<td><code>KVConnectorBase_V1</code>：<code>start_load_kv</code> / <code>save_kv_layer</code> / <code>wait_for_save</code> / <code>get_finished</code> 的契约</td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/nixl/connector.py:76</code></td>
+<td><code>NixlBaseConnector</code></td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/nixl/connector.py:241</code></td>
+<td><code>get_finished</code>：完成集合的来源</td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/nixl/connector.py:288/298</code></td>
+<td><code>save_kv_layer</code> / <code>wait_for_save</code></td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/nixl/connector.py:334/362</code></td>
+<td><code>NixlPullConnector</code> / <code>NixlPushConnector</code>：两种搬运方向</td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/nixl/tp_mapping.py:40/69</code></td>
+<td><code>TPMapping</code> / <code>compute_tp_mapping</code>：异构 TP 布局转换</td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/nixl/tp_mapping.py:87,101-132</code></td>
+<td>直通分支与 GQA 去重的 <code>head_to_slot</code></td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/mooncake/mooncake_connector.py:70,447,546</code></td>
+<td><code>TransferEngine</code> 依赖、<code>MooncakeConnector</code>、<code>get_finished</code></td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/lmcache_connector.py:72,204,214</code></td>
+<td><code>LMCacheConnectorV1</code>、<code>wait_for_save</code>、<code>get_finished</code></td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/example_connector.py:85,245</code></td>
+<td><code>ExampleConnector</code> 与 safetensors 落盘搬运</td>
+</tr>
+<tr>
+<td><code>kv_connector/v1/decode_bench_connector.py</code></td>
+<td><code>DecodeBenchConnector</code>：自述为模拟，不是真实交接</td>
+</tr>
+</tbody>
+</table>
+<p>来源版本与文件位置见 <a href="../raw/results/worldvln/6.4/20260914-pd/D/connector_matrix.json">connector_matrix.json</a>。</p>
+<h3 id="_4">设计取舍</h3>
+<p><strong>为什么把完成接口做成集合而不是回调。</strong> <code>get_finished</code> 返回两个 request id 集合，调度器每一轮去查。这让连接器可以是推送式（P 主动发）也可以是拉取式（D 主动取），调度器都不用改——NIXL 的 Pull/Push 两个连接器共用同一套完成接口就是证据。代价是完成信息有轮询延迟，调度器要按步对齐。</p>
+<p><strong>为什么要 block 级 refcount 而不是请求级。</strong> 一个请求的 KV 跨多个 block，交接过程中接收方可能只拿到一部分；block 级计数才能表达「这部分已经归你了，那部分还在路上」。取消时也要按 block 回收，否则会漏掉半传的块。</p>
+<p><strong>为什么描述符要带去重后的指纹。</strong> 每次交接都逐字段比 15 项开销不小，实际实现会先比一个短指纹，只有不匹配才逐项报错。本章的实现直接逐项比并给出差异字段，是为了让「错在哪一项」可读。</p>
+<p><strong>为什么 RDMA 是生产路径的前提。</strong> CPU 暂存路线在本机只有 1.34 GB/s，而 KV 在 S=2048 时是 224 MiB。用 RDMA 直接写对端显存可以跳过两次主机内存拷贝，这也是 NIXL/Mooncake 都要 RDMA 的原因。本机没有 <code>/dev/infiniband</code>，这条路线只能做源码分析。</p>
+<hr />
+<h2 id="_5">工程实现 · 自己写一遍</h2>
+<p><code>labs/L6/kv_handoff.py</code> 把描述符与校验写成可检查的数据结构——<strong>校验失败要报出是哪一项不一致</strong>，而不是一个布尔：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">74</span> <span class="n">REQUIRED_MATCH</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"request_id"</span><span class="p">,</span> <span class="s2">"session_id"</span><span class="p">,</span> <span class="s2">"model_revision"</span><span class="p">,</span> <span class="s2">"dtype"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">75</span>                   <span class="s2">"tp_size"</span><span class="p">,</span> <span class="s2">"tp_rank"</span><span class="p">,</span> <span class="s2">"num_layers"</span><span class="p">,</span> <span class="s2">"num_kv_heads"</span><span class="p">,</span> <span class="s2">"head_dim"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">76</span>                   <span class="s2">"block_size"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">77</span> 
+<span class="linenos" aria-hidden="true">78</span> 
+<span class="linenos" aria-hidden="true">79</span> <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="n">producer</span><span class="p">:</span> <span class="n">HandoffDescriptor</span><span class="p">,</span> <span class="n">consumer</span><span class="p">:</span> <span class="n">HandoffDescriptor</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">80</span> <span class="w">    </span><span class="sd">"""接收方校验：身份、布局、token 数、block 表全部要对上。"""</span>
+<span class="linenos" aria-hidden="true">81</span>     <span class="n">bad</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">82</span>     <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">REQUIRED_MATCH</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">83</span>         <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">producer</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">consumer</span><span class="p">,</span> <span class="n">k</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">84</span>             <span class="n">bad</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">getattr</span><span class="p">(</span><span class="n">producer</span><span class="p">,</span><span class="w"> </span><span class="n">k</span><span class="p">)</span><span class="si">!r}</span><span class="s2"> != </span><span class="si">{</span><span class="nb">getattr</span><span class="p">(</span><span class="n">consumer</span><span class="p">,</span><span class="w"> </span><span class="n">k</span><span class="p">)</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">85</span>     <span class="k">if</span> <span class="n">producer</span><span class="o">.</span><span class="n">num_tokens</span> <span class="o">!=</span> <span class="n">consumer</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">86</span>         <span class="n">bad</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"num_tokens: </span><span class="si">{</span><span class="n">producer</span><span class="o">.</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2"> != </span><span class="si">{</span><span class="n">consumer</span><span class="o">.</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">87</span>     <span class="k">if</span> <span class="nb">abs</span><span class="p">(</span><span class="n">producer</span><span class="o">.</span><span class="n">kv_scale</span> <span class="o">-</span> <span class="n">consumer</span><span class="o">.</span><span class="n">kv_scale</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mf">1e-9</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">88</span>         <span class="n">bad</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"kv_scale: </span><span class="si">{</span><span class="n">producer</span><span class="o">.</span><span class="n">kv_scale</span><span class="si">}</span><span class="s2"> != </span><span class="si">{</span><span class="n">consumer</span><span class="o">.</span><span class="n">kv_scale</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">89</span>     <span class="k">if</span> <span class="nb">list</span><span class="p">(</span><span class="n">producer</span><span class="o">.</span><span class="n">block_table</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">list</span><span class="p">(</span><span class="n">consumer</span><span class="o">.</span><span class="n">block_table</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">90</span>         <span class="n">bad</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">"block_table 不一致"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">91</span>     <span class="k">if</span> <span class="n">bad</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">92</span>         <span class="k">raise</span> <span class="n">LayoutMismatch</span><span class="p">(</span><span class="s2">"; "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">bad</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">93</span>     <span class="k">return</span> <span class="kc">True</span>
+<span class="linenos" aria-hidden="true">94</span> 
+<span class="linenos" aria-hidden="true">95</span> 
+<span class="linenos" aria-hidden="true">96</span> <span class="c1"># ==========================================================================</span>
+<span class="linenos" aria-hidden="true">97</span> <span class="c1"># refcount 与 staging 生命周期</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/kv_handoff.py 第 74–97 行</code><a href="../code/labs/L6/kv_handoff.py.html#labs-L6-kv_handoff-py-L-74">在完整文件中打开 &rarr;</a></div></div>
+<p>两侧的 block 引用计数是取消路径能收干净的关键：未完成 ACK 的交接由发送方释放自己那一份：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">100</span> <span class="k">class</span><span class="w"> </span><span class="nc">RefCounted</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">101</span> <span class="w">    </span><span class="sd">"""两侧共享的 block 引用计数：接手方必须显式 ACK，发送方才释放。"""</span>
+<span class="linenos" aria-hidden="true">102</span> 
+<span class="linenos" aria-hidden="true">103</span>     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">104</span>         <span class="bp">self</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">name</span>
+<span class="linenos" aria-hidden="true">105</span>         <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span> <span class="o">=</span> <span class="p">{}</span>          <span class="c1"># block_id -&gt; count</span>
+<span class="linenos" aria-hidden="true">106</span>         <span class="bp">self</span><span class="o">.</span><span class="n">staging</span> <span class="o">=</span> <span class="p">{}</span>         <span class="c1"># buffer_id -&gt; bytes</span>
+<span class="linenos" aria-hidden="true">107</span>         <span class="bp">self</span><span class="o">.</span><span class="n">events</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">108</span> 
+<span class="linenos" aria-hidden="true">109</span>     <span class="k">def</span><span class="w"> </span><span class="nf">retain</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block_id</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">110</span>         <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">block_id</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="n">n</span>
+<span class="linenos" aria-hidden="true">111</span>         <span class="bp">self</span><span class="o">.</span><span class="n">events</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"retain"</span><span class="p">,</span> <span class="n">block_id</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">block_id</span><span class="p">]))</span>
+<span class="linenos" aria-hidden="true">112</span> 
+<span class="linenos" aria-hidden="true">113</span>     <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block_id</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">114</span>         <span class="n">cur</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">block_id</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> <span class="n">n</span>
+<span class="linenos" aria-hidden="true">115</span>         <span class="k">if</span> <span class="n">cur</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">116</span>             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">: block </span><span class="si">{</span><span class="n">block_id</span><span class="si">}</span><span class="s2"> 释放次数超过持有次数"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">117</span>         <span class="k">if</span> <span class="n">cur</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">118</span>             <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">block_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">119</span>         <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">120</span>             <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">cur</span>
+<span class="linenos" aria-hidden="true">121</span>         <span class="bp">self</span><span class="o">.</span><span class="n">events</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"release"</span><span class="p">,</span> <span class="n">block_id</span><span class="p">,</span> <span class="n">cur</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">122</span> 
+<span class="linenos" aria-hidden="true">123</span>     <span class="k">def</span><span class="w"> </span><span class="nf">alloc_staging</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">buf_id</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">124</span>         <span class="bp">self</span><span class="o">.</span><span class="n">staging</span><span class="p">[</span><span class="n">buf_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">nbytes</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/kv_handoff.py 第 100–124 行</code><a href="../code/labs/L6/kv_handoff.py.html#labs-L6-kv_handoff-py-L-100">在完整文件中打开 &rarr;</a></div></div>
+<p><code>labs/L6/pd_serving_bench.py</code> 的 1P1D 把 prefill、搬运、decode 三段分别计时，搬运这一段是分离相对并置<strong>新增</strong>的成本：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">147</span>     <span class="k">for</span> <span class="n">idx</span><span class="p">,</span> <span class="p">(</span><span class="n">seq</span><span class="p">,</span> <span class="n">out_len</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">combos</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">148</span>         <span class="n">prompt</span> <span class="o">=</span> <span class="n">kh</span><span class="o">.</span><span class="n">build_prompt</span><span class="p">(</span><span class="n">tok</span><span class="p">,</span> <span class="n">seq</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dev_p</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">149</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">150</span>         <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">151</span>         <span class="n">legacy</span><span class="p">,</span> <span class="n">logits</span> <span class="o">=</span> <span class="n">kh</span><span class="o">.</span><span class="n">prefill</span><span class="p">(</span><span class="n">model_p</span><span class="p">,</span> <span class="n">prompt</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">152</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">153</span>         <span class="n">prefill_s</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true">154</span>         <span class="n">first</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">155</span>         <span class="n">frozen</span> <span class="o">=</span> <span class="n">kh</span><span class="o">.</span><span class="n">kv_to_cpu</span><span class="p">(</span><span class="n">legacy</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">156</span>         <span class="n">nbytes</span> <span class="o">=</span> <span class="n">kh</span><span class="o">.</span><span class="n">kv_bytes</span><span class="p">(</span><span class="n">frozen</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">157</span> 
+<span class="linenos" aria-hidden="true">158</span>         <span class="n">d</span> <span class="o">=</span> <span class="n">d_devs</span><span class="p">[</span><span class="n">idx</span> <span class="o">%</span> <span class="nb">len</span><span class="p">(</span><span class="n">d_devs</span><span class="p">)]</span>                    <span class="c1"># 1P2D 时轮转</span>
+<span class="linenos" aria-hidden="true">159</span>         <span class="n">mi</span> <span class="o">=</span> <span class="n">idx</span> <span class="o">%</span> <span class="nb">len</span><span class="p">(</span><span class="n">models_d</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">160</span>         <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">161</span>         <span class="n">moved</span> <span class="o">=</span> <span class="n">kh</span><span class="o">.</span><span class="n">kv_to_device</span><span class="p">(</span><span class="n">frozen</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">162</span>         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">(</span><span class="n">d</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">163</span>         <span class="n">transfer_s</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span>
+<span class="linenos" aria-hidden="true">164</span> 
+<span class="linenos" aria-hidden="true">165</span>         <span class="n">tokens</span><span class="p">,</span> <span class="n">ttft_d</span><span class="p">,</span> <span class="n">tpot</span><span class="p">,</span> <span class="n">decode_s</span> <span class="o">=</span> <span class="n">decode_timed</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">166</span>             <span class="n">models_d</span><span class="p">[</span><span class="n">mi</span><span class="p">],</span> <span class="n">moved</span><span class="p">,</span> <span class="n">first</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">d</span><span class="p">),</span> <span class="n">out_len</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">167</span>         <span class="n">total</span> <span class="o">=</span> <span class="n">prefill_s</span> <span class="o">+</span> <span class="n">transfer_s</span> <span class="o">+</span> <span class="n">decode_s</span>
+<span class="linenos" aria-hidden="true">168</span>         <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+<span class="linenos" aria-hidden="true">169</span>             <span class="s2">"mode"</span><span class="p">:</span> <span class="sa">f</span><span class="s2">"1p</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">decode_instances</span><span class="si">}</span><span class="s2">d"</span><span class="p">,</span> <span class="s2">"seq"</span><span class="p">:</span> <span class="n">seq</span><span class="p">,</span> <span class="s2">"out"</span><span class="p">:</span> <span class="n">out_len</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">170</span>             <span class="s2">"prefill_s"</span><span class="p">:</span> <span class="n">prefill_s</span><span class="p">,</span> <span class="s2">"transfer_s"</span><span class="p">:</span> <span class="n">transfer_s</span><span class="p">,</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/pd_serving_bench.py 第 147–170 行</code><a href="../code/labs/L6/pd_serving_bench.py.html#labs-L6-pd_serving_bench-py-L-147">在完整文件中打开 &rarr;</a></div></div>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="_6">命令</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 任务 A：交接协议、搬运参照与逐位对拍</span>
+python<span class="w"> </span>labs/L6/kv_handoff.py<span class="w"> </span>A<span class="w"> </span>--model<span class="w"> </span>&lt;qwen3-1.7b&gt;<span class="w"> </span>--seq<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--tokens<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>results/worldvln/6.4/run/A
+
+<span class="c1"># 任务 C：五个取消时点与重复 ACK</span>
+python<span class="w"> </span>labs/L6/kv_handoff.py<span class="w"> </span>C<span class="w"> </span>--model<span class="w"> </span>&lt;qwen3-1.7b&gt;<span class="w"> </span>--seq<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>results/worldvln/6.4/run/C
+
+<span class="c1"># 任务 B：并置基线与 1P1D</span>
+python<span class="w"> </span>labs/L6/pd_serving_bench.py<span class="w"> </span>colocated<span class="w"> </span>--model<span class="w"> </span>&lt;qwen3-1.7b&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>results/worldvln/6.4/run/B<span class="w"> </span>--full
+python<span class="w"> </span>labs/L6/pd_serving_bench.py<span class="w"> </span>1p1d<span class="w"> </span>--model<span class="w"> </span>&lt;qwen3-1.7b&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--out<span class="w"> </span>results/worldvln/6.4/run/B<span class="w"> </span>--full
+</code></pre></div>
+
+<p>跑之前先确认 P2P 处在哪一档：同一台机器上 224 MiB 的 GPU→GPU 拷贝见过 21.59 ms 与 5346 ms 两种结果，差 25 倍。</p>
+<h3 id="_7">实测数字</h3>
+<ul>
+<li><strong>KV 体量</strong>：Qwen3-1.7B 每 token 114688 B（28 层 × 8 kv_head × 128 × 2 × 2B），S=2048 共 224.0 MiB。</li>
+<li><strong>搬运速率</strong>：GPU→CPU→GPU 1.34 GB/s；GPU→GPU P2P 10.88 GB/s（每操作 0.385 ms，快档）。</li>
+<li><strong>对拍</strong>：首 token 与后续 8 步 token 序列相同，每步 logits 最大绝对差 <strong>0.0</strong>。</li>
+<li><strong>拒绝</strong>：10 类非法交接（含 TP 布局与 block 表）全部拒绝，0 次静默接受。</li>
+<li><strong>取消回收</strong>：5 个时点全部 refcount 干净、staging 干净、显存回到基线（最长路径 +1.2 MiB 分配器残差）。</li>
+<li><strong>并置基线</strong>：TTFT 22.5–178.8 ms、TPOT 10.6–12.0 ms、goodput 62.8–91.4 tok/s、峰值 26.57 GiB。</li>
+<li><strong>分离的额外成本</strong>：搬运占 TTFT 的 10.6%（S=128）、46–48%（S=2048）、41.6%（S=8192）；S=8192、out=32 时占整个请求的 25.0%。</li>
+</ul>
+<h3 id="_8">消融建议</h3>
+<ol>
+<li>把 <code>kv_to_cpu</code> 换成直接 GPU→GPU，重跑 task A 的搬运段，确认 CPU 暂存路线的 1.34 GB/s 里各有多少来自两次拷贝与逐层循环。</li>
+<li>在 task A 里把 <code>seq</code> 从 2048 扫到 128/8192，画出「KV 字节 vs 搬运时间」的直线，确认是否线性、斜率是否等于实测速率。</li>
+<li>在 task C 里去掉「未完成 ACK 由发送方释放」这条规则，观察五个时点是否全部报 refcount 泄漏——用来确认这条规则是必需的而不是冗余的。</li>
+<li>把描述符里的 <code>tp_size</code> 改成 2、同时把 KV 按 head 切成两半，尝试实现 head_to_slot 式布局转换并与并置对拍——这是接 NIXL <code>tp_mapping</code> 的入口。</li>
+</ol>
+<hr />
+<h2 id="_9">原始现场</h2>
+<p><strong>交接描述符与校验结果</strong>（<code>results/worldvln/6.4/20260914-pd/A/handoff.json</code>）</p>
+<div class="highlight"><pre><span></span><code>KV 224.0 MiB（114688 B/token）  28 层 × 8 kv_head × 128
+GPU→CPU→GPU 175.71 ms (1.34 GB/s)  GPU→GPU(P2P) 最快 21.59 ms (10.88 GB/s，
+    每次 56 个拷贝操作，状态：fast（每操作 0.385 ms）)
+首 token 与后续 8 步：token 序列相同=True logits 最大绝对差=0.000e+00
+非法交接拒绝 10/10：request_id, session_id, model_revision, num_tokens, dtype,
+    tp_size, tp_rank, block_size, kv_scale, block_table
+</code></pre></div>
+
+<p><strong>取消与重复 ACK</strong>（<code>results/worldvln/6.4/20260914-pd/C/failure_paths.json</code>）</p>
+<div class="highlight"><pre><span></span><code>注册后取消   发出 token=[] refcount 干净=True staging 干净=True alloc Δ=+0.0 MiB
+传输中取消   发出 token=[] refcount 干净=True staging 干净=True alloc Δ=+0.0 MiB
+接收后取消   发出 token=[] refcount 干净=True staging 干净=True alloc Δ=+0.0 MiB
+decode 中取消 发出 token=[38835] refcount 干净=True staging 干净=True alloc Δ=+0.0 MiB
+正常完成     发出 token=[38835, 34208, 916, 279] refcount 干净=True alloc Δ=+1.2 MiB
+重复 ACK：已拒绝：consumer: block 0 释放次数超过持有次数
+失败后同一实例仍可用=True，refcount 全干净=True，无重复 token=True
+</code></pre></div>
+
+<p><strong>并置基线（vLLM 0.29.0，9 个输入×输出组合）</strong>见 <a href="../raw/results/worldvln/6.4/20260914-pd/B/colocated.json">colocated.json</a>；完整运行日志（含后续 1P1D 尝试与它触发的 CUDA assert）见 <a href="../raw/results/worldvln/6.4/20260914-pd/B/6_4_coloc.log">6_4_coloc.log</a>。</p>
+<p><strong>本轮工件的完整入口</strong></p>
+<ul>
+<li>任务 A：<a href="../raw/results/worldvln/6.4/20260914-pd/A/handoff.json">handoff.json</a></li>
+<li>任务 C：<a href="../raw/results/worldvln/6.4/20260914-pd/C/failure_paths.json">failure_paths.json</a></li>
+<li>任务 B：<a href="../raw/results/worldvln/6.4/20260914-pd/B/colocated.json">colocated.json</a> 与 <a href="../raw/results/worldvln/6.4/20260914-pd/B/6_4_coloc.log">运行日志</a></li>
+<li>任务 D：<a href="../raw/results/worldvln/6.4/20260914-pd/D/connector_matrix.json">connector_matrix.json</a></li>
+</ul>
+<hr />
+<h2 id="_10">前沿</h2>
+<p><strong>把 KV 放进独立的数据平面。</strong> 本章把 KV 当成「一次性交接的资产」。更进一步的路线是让 KV 常驻在一个共享存储/内存层（Mooncake Store、LMCache），P 写一次、多个 D 复用，前缀命中直接跳过 prefill。这条路线把「搬运」变成「寻址」，收益模型也从带宽问题变成命中率问题。</p>
+<p><strong>对称内存与 RDMA 直写。</strong> 6.1 里 NCCL 在本机注册了 48 GB 对称虚拟地址空间，但 NVLS 不可用。真正的 PD 数据平面依赖「对端显存可直接寻址」——NIXL 的 POSIX/RDMA 后端、Mooncake 的 TransferEngine 都是这条路。本机没有 <code>/dev/infiniband</code>，保持 <code>UNVERIFIED</code>。</p>
+<p><strong>调度与分离的耦合。</strong> 分离只是把 P 和 D 拆开，谁给谁派活是另一层问题（Dynamo 的 disaggregated serving 文档给的是一套 router + planner）。本章没有触及调度策略，只量了单条链路的成本结构。</p>
+<p><strong>异构 TP 的交接。</strong> NIXL 的 <code>compute_tp_mapping</code> 只在 <code>is_mla</code> 或 <code>tp_size &gt;= remote_tp_size</code> 时走直通，否则做 GQA 去重。P 侧 TP=2、D 侧 TP=1 这类组合需要真实的 head 级重排，本章只做了源码分析，没有实测这条转换路径。</p>
+<hr />
+<h2 id="_11">陷阱</h2>
+<p><strong>1. 以为交接只要把字节搬过去。</strong> 没有描述符校验，接收方无法判断这 224 MiB 是不是自己要的。实测 10 类错配都必须在接入分页缓存之前就被拒绝。</p>
+<p><strong>2. 不确认 P2P 状态就报搬运时间。</strong> 同一台机器上 224 MiB 的 GPU→GPU 拷贝见过 21.59 ms 与 5346 ms 两种结果（每操作 0.385 ms vs 98.9 ms），差 25 倍。1.3 已经记录过这个慢状态；每次多卡实验前都要先测一次。</p>
+<p><strong>3. 把 CPU 暂存的 1.34 GB/s 当成链路能力。</strong> 它是 D2H + H2D + 逐层 Python 循环的合成结果，而 6.1 测到的单向链路是 24 GB/s。两者不是一回事。</p>
+<p><strong>4. 用单请求 TTFT 论证分离的收益。</strong> 单请求视角下分离永远亏——多出来的正好是搬运时间（S=2048 时占 46%–48%）。收益只在跨请求重叠里，而且要求重叠接近满格。</p>
+<p><strong>5. 认为 S 越大越划算。</strong> 搬运占 TTFT 的比例在 S=2048 已到 46%，S=8192 反而略降到 41.6%（prefill 涨得更快）。真正的判据是「prefill 时间 vs 搬运时间」的比值，不是输入长度本身。</p>
+<p><strong>6. 取消路径只回收缓冲、不释放 block。</strong> 第一版实现就是这样，五个时点全部报 refcount 泄漏。未完成 ACK 的交接必须由发送方释放自己持有的 block。</p>
+<p><strong>7. 静默接受重复 ACK。</strong> refcount 会变负，之后块分配会把还在用的块复用出去。实测的正确行为是直接报错。</p>
+<p><strong>8. 把 DecodeBenchConnector 的结果当成 PD 收益。</strong> 它的自述是「emulates prefill-decode disaggregation」——用哑值填 KV，只测 decode 侧在大 ISL 下的表现。它能回答「D 侧要花多久」，不能回答「分离比并置好多少」。</p>
+<p><strong>9. 跨 TP 度直接接手 KV。</strong> 同一次 prefill 在 TP=2 下被切成两份，TP=1 的接收方拿到其中一份不能当完整 KV 用。布局转换只在特定关系下被定义（NIXL 的 <code>tp_mapping.py:87</code>），范围外必须拒绝。</p>
+<hr />
+<h2 id="_12">自测题</h2>
+<details class="fold">
+<summary>1. Qwen3-1.7B 在 S=2048 时 KV cache 有多大？怎么算出来的？</summary>
+<p>224.0 MiB。每 token = 2（K 和 V）× 28 层 × 8 个 kv_head × 128 head_dim × 2 字节（bf16）= 114688 B；乘以 2048 得 234881024 B = 224.0 MiB。</p>
+</details>
+<details class="fold">
+<summary>2. 交接描述符里为什么必须有 `tp_size`/`tp_rank`？</summary>
+<p>因为同一份 KV 在不同 TP 度下是不同的分片。P 侧 TP=2 时每个 rank 只持有自己那半 head 的 KV；D 侧按 TP=1 接手就必须做 head 级重排，否则会把半份当成完整的。实测把 <code>tp_size</code> 改错会被直接拒绝，这是防止静默错位的必要字段。</p>
+</details>
+<details class="fold">
+<summary>3. 分离之后单请求 TTFT 变长了多少？这笔成本能靠什么赚回来？</summary>
+<p>变长的部分正好等于搬运时间：S=128 加 3.40 ms（占 TTFT 10.6%–13.4%），S=2048 加 33.66 ms（46%–48%），S=8192 加 127.44 ms（41.6%）。单请求永远亏，只能靠「P 的 prefill 不再阻塞 D 的 decode」这层跨请求重叠赚回来；S=2048 时 prefill 与搬运几乎相等，重叠空间最脆弱。</p>
+</details>
+<details class="fold">
+<summary>4. 为什么 task C 的第一版实现里五个时点全部报 refcount 泄漏？</summary>
+<p>因为取消路径只回收了 staging buffer，没有释放发送方持有的 block 引用。交接是两阶段提交式的：发送方持有 block，收到接收方 ACK 之后才释放。取消意味着 ACK 永远不会来，所以必须由发送方在取消路径上自己释放。补上这条规则后四个取消时点都回到 0.0 MiB。</p>
+</details>
+<details class="fold">
+<summary>5. 「decode 中取消」发出 1 个 token，这算不算重复提交？</summary>
+<p>不算。取消发生在第一层 decode 完成之后，那个 token 已经真实产生，既不能撤回也不该被撤销；要检查的是它没有被提交第二次。实测该时点的 token 列表长度为 1、无重复。</p>
+</details>
+<details class="fold">
+<summary>6. 为什么不能拿 DecodeBenchConnector 的结果说「PD 分离提升了 X%」？</summary>
+<p>它用哑值填充 KV cache，目的是让 decode 实例在受限环境里也能测大 ISL 下的解码性能，自述为 emulates prefill-decode disaggregation。它不含任何真实交接，因此测得到 D 侧成本，测不到分离相对并置的净收益。</p>
+</details>
+<details class="fold">
+<summary>7. 同一台机器上同一个拷贝操作，为什么两次运行能差 25 倍？</summary>
+<p>worldvln 的 PCIe P2P 存在两档状态：快档每操作约 0.385 ms、慢档约 98.9 ms。1.3 在驱动层测 PCIe 时记录过同一现象（同一二进制连跑两次，一次全慢一次全快），成因未定位。所以多卡实验前要先测一次搬运，把状态记进本轮 manifest，否则同一个实验会给出差 25 倍的结论。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L6/6.3-moe-distributed.html">&#8592; 6.3 MoE 分布式与 all-to-all</a><a class="nav-next" href="../L6/6.5-long-context-parallel.html">6.5 长上下文分布式 &#8594;</a></nav>
+</main>
+</body>
+</html>

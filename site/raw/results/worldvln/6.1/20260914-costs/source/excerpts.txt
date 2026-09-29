@@ -1,0 +1,122 @@
+==============================================================================
+# graph/tuning.cc  (nccl v2.29.7-1)  src/graph/tuning.cc
+==============================================================================
+
+--- 行 44-46：NCCL_ALGO 的写法：按 collective 覆盖允许的算法 ---
+   44  //
+   45  //     NCCL_ALGO="ring,collnetdirect;allreduce:tree,collnetdirect;broadcast:ring"
+   46  // Enable ring and collnetdirect for all functions, then select tree
+
+--- 行 265-279：算法合法性表：Broadcast/Reduce 只允许 Ring，AllGather/ReduceScatter 不允许 Tree ---
+  265    for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) intraHw[a] = graphs[a]->typeIntra == LINK_NVL ? NCCL_HW_NVLINK : NCCL_HW_PCI;
+  266    for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) hw[a] = nNodes == 1 ? intraHw[a] : NCCL_HW_NET;
+  267  
+  268    for (int coll=0; coll<NCCL_NUM_FUNCTIONS; coll++) {
+  269      int nsteps = coll == ncclFuncAllReduce ? 2*(nRanks-1) :
+  270        coll == ncclFuncReduceScatter || coll == ncclFuncAllGather ? nRanks-1 :
+  271        nRanks;
+  272  
+  273      for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
+  274        if ((coll == ncclFuncBroadcast || coll == ncclFuncReduce) && a != NCCL_ALGO_RING) continue;
+  275        if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
+  276            && a != NCCL_ALGO_PAT && a != NCCL_ALGO_RING
+  277            && a != NCCL_ALGO_NVLS && a != NCCL_ALGO_COLLNET_DIRECT) continue;
+  278        if (coll == ncclFuncAllReduce && a == NCCL_ALGO_PAT) continue;
+  279  
+
+--- 行 280-300：NVLS/NVLSTree 的通道数与带宽修正 ---
+  280        for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+  281          if ((a == NCCL_ALGO_NVLS || a == NCCL_ALGO_NVLS_TREE) && p != NCCL_PROTO_SIMPLE) continue;
+  282          if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
+  283              && a == NCCL_ALGO_PAT && (p != NCCL_PROTO_SIMPLE || ncclPatEnable(comm) == 0)) continue;
+  284          int collnet = (a == NCCL_ALGO_COLLNET_DIRECT || a == NCCL_ALGO_COLLNET_CHAIN) ? 1 : 0;
+  285          float bw = nNodes <= 2 || collnet ? graphs[a]->bwIntra : graphs[a]->bwInter;
+  286          if (a == NCCL_ALGO_NVLS_TREE || a == NCCL_ALGO_NVLS)
+  287          {
+  288            // NVLS/NVLStree needs at least 2 channels
+  289            if (graphs[a]->nChannels < 2 ) continue;
+  290            // Convert to NVLS busBW/channel
+  291            float intraBw = graphs[a]->bwIntra * nvlsEfficiency[compCapIndex] * (graphs[a]->nChannels - 1) / graphs[a]->nChannels;
+  292  	  // AllReduce pipelines two operations.
+  293            if (coll == ncclFuncAllReduce) {
+  294              intraBw *= 2.0f;
+  295            } else {
+  296              intraBw *= (ppn - 1) / ppn;
+  297            }
+  298            // Handle 2 node case of NVLSTree
+  299            float interBw = graphs[a]->bwInter * ((nNodes <= 2 && a == NCCL_ALGO_NVLS_TREE) ? 2 : 1);
+  300            bw = std::min( {intraBw, interBw, a == NCCL_ALGO_NVLS_TREE ? (float)perChMaxNVLSTreeBw : std::numeric_limits<float>::max()} );
+
+--- 行 310-320：总线带宽 busBw 的模型口径 ---
+  310          if (a == NCCL_ALGO_TREE && comm->maxTreePattern == NCCL_TOPO_PATTERN_TREE) busBw *= .85;
+  311          if (a == NCCL_ALGO_PAT) busBw *= .75;
+  312          if (a == NCCL_ALGO_COLLNET_DIRECT && p != NCCL_PROTO_SIMPLE) busBw = 0;  // Not used
+  313          if (a == NCCL_ALGO_COLLNET_CHAIN && p != NCCL_PROTO_SIMPLE) busBw = 0;  // Not used
+  314          if (a == NCCL_ALGO_COLLNET_DIRECT && p == NCCL_PROTO_SIMPLE) {
+  315            if (coll == ncclFuncAllGather || coll == ncclFuncReduceScatter) {
+  316              busBw = ppn * std::min(graphs[a]->bwIntra, graphs[a]->bwInter * 0.9f);
+  317            } else {
+  318              // Collnet+Direct requires all GPUs to have a local NIC to work at full speed
+  319              float factor = ppn / (1.0*graphs[a]->nChannels); // GPU/NIC ratio
+  320              factor -= (factor-1)/2;
+==============================================================================
+# init.cc  (nccl v2.29.7-1)  src/init.cc
+==============================================================================
+
+--- 行 1468-1478：GIN（设备发起网络）支持的判定入口 ---
+ 1468  
+ 1469    NCCLCHECKGOTO(ncclTopoPathAllDirectNVLink(comm->topo, &comm->isAllDirectNvlink), ret, fail);
+ 1470    comm->globalGinSupport = NCCL_GIN_CONNECTION_NONE;
+ 1471    if (globalGinSupport && !globalNicFused && globalCuMemGdrSupport) {
+ 1472      comm->globalGinSupport = globalCrossNicSupport ? NCCL_GIN_CONNECTION_FULL : NCCL_GIN_CONNECTION_RAIL;
+ 1473    }
+ 1474    comm->globalRmaProxySupport = globalRmaPluginSupport && globalCrossNicSupport && !globalNicFused && globalCuMemGdrSupport;
+ 1475    comm->symmetricSupport = comm->isAllCudaP2p && ncclParamWinEnable() && ncclCuMemEnable() &&
+ 1476      (comm->globalGinSupport != NCCL_GIN_CONNECTION_NONE || (ncclTeamLsa(comm).nRanks == comm->nRanks));
+ 1477    comm->hostRmaSupport = comm->symmetricSupport && ((ncclTeamLsa(comm).nRanks == comm->nRanks) || comm->globalRmaProxySupport);
+ 1478    if (!comm->symmetricSupport) {
+==============================================================================
+# collectives.cc  (nccl v2.29.7-1)  src/collectives.cc
+==============================================================================
+
+--- 行 1-40：ncclFunc 与算法/协议的公开枚举 ---
+    1  /*************************************************************************
+    2   * SPDX-FileCopyrightText: Copyright (c) 2015-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    3   * SPDX-License-Identifier: Apache-2.0
+    4   *
+    5   * See LICENSE.txt for more license information
+    6   *************************************************************************/
+    7  
+    8  #include "argcheck.h" // Need some checks here since we access comm
+    9  #include "collectives.h"
+   10  #include "enqueue.h"
+   11  #include "nccl.h"
+   12  #include "nvtx_payload_schemas.h"
+   13  
+   14  const char* ncclFuncToString(ncclFunc_t fn) {
+   15    switch (fn) {
+   16    case ncclFuncAllGather: return "AllGather";
+   17    case ncclFuncAllReduce: return "AllReduce";
+   18    case ncclFuncAlltoAll: return "AlltoAll";
+   19    case ncclFuncBroadcast: return "Broadcast";
+   20    case ncclFuncGather: return "Gather";
+   21    case ncclFuncRecv: return "Recv";
+   22    case ncclFuncReduce: return "Reduce";
+   23    case ncclFuncReduceScatter: return "ReduceScatter";
+   24    case ncclFuncScatter: return "Scatter";
+   25    case ncclFuncSendRecv: return "SendRecv";
+   26    case ncclFuncSend: return "Send";
+   27    case ncclFuncPutSignal: return "PutSignal";
+   28    case ncclFuncSignal: return "Signal";
+   29    case ncclFuncWaitSignal: return "WaitSignal";
+   30    default: return "Invalid";
+   31    }
+   32  }
+   33  
+   34  const char* ncclDevRedOpToString(ncclDevRedOp_t op) {
+   35    switch (op) {
+   36    case ncclDevSum: return "Sum";
+   37    case ncclDevProd: return "Prod";
+   38    case ncclDevMinMax: return "MinMax";
+   39    case ncclDevPreMulSum: return "PreMulSum";
+   40    case ncclDevSumPostDiv: return "SumPostDiv";

@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.11 全模态服务：音画同步、跨阶段调度与打断</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">4.11</div>
+  <div class="sidebar-title">全模态服务：音画同步、跨阶段调度与打断</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#epoch">心智模型：三段流水线、两条队列、一个 epoch</a></li>
+<li><a href="#_2">机制拆解</a><ul>
+<li><a href="#_3">容量账：按总量买显存，按激活量用算力</a></li>
+<li><a href="#underrun">背压：谁决定 underrun</a></li>
+<li><a href="#_4">打断：清空队列不够，必须作废在途帧</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#config">工程实现 · 源码解析：config 揭示的阶段契约</a></li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_8">原始现场</a></li>
+<li><a href="#_9">前沿</a></li>
+<li><a href="#_10">陷阱</a></li>
+<li><a href="#_11">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#epoch">心智模型：三段流水线、两条队列、一个 epoch</a></li>
+<li><a href="#_2">机制拆解</a><ul>
+<li><a href="#_3">容量账：按总量买显存，按激活量用算力</a></li>
+<li><a href="#underrun">背压：谁决定 underrun</a></li>
+<li><a href="#_4">打断：清空队列不够，必须作废在途帧</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#config">工程实现 · 源码解析：config 揭示的阶段契约</a></li>
+<li><a href="#_6">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_7">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_8">原始现场</a></li>
+<li><a href="#_9">前沿</a></li>
+<li><a href="#_10">陷阱</a></li>
+<li><a href="#_11">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L4 · 模型架构与数值</div>
+  <div class="mod-id">4.11</div>
+  <h1>全模态服务：音画同步、跨阶段调度与打断</h1>
+  <p class="lede">贯通文本/图像/视频/音频输入与文本/语音输出，对照原生 Omni 和 ASR→LLM/VLM→TTS 级联；世界模型的视觉/动作生成衔接 L10。全模态按实际输入输出矩阵定义。 分析 Omni 模块预训练、联合/后训练与实际开放程度。</p>
+  <div class="chips"><span class="chip">实测机器 crater (RTX 5090 D, sm_120) · Qwen3-Omni-30B-A3B-Instruct（config 与 index 级）</span><span class="chip">前置 4.8（多模态服务）· 4.9（语音输入）· 4.10（语音生成）· 5.8（失败与取消）· 5.11（事件）· 6.2（TP 基础）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答的三个问题</h2>
+<ol>
+<li><strong>原生 Omni 的容量账怎么算？</strong> Thinker / Talker / Code2Wav 三段各占多少参数与字节，计划的 TP=2 + 一卡 + 一卡能否装下？</li>
+<li><strong>跨阶段的压力怎么传播？</strong> 阶段队列满了会怎样，生成速度与播放速度谁决定 underrun？</li>
+<li><strong>打断要终止什么？</strong> 只清空队列够不够；在途帧为什么会重新播放？</li>
+</ol>
+<p>本章完成的是第 1 问的完整核算与第 2、3 问的<strong>机制级模拟</strong>（任务 A 真实配置算术 + B/C 成本驱动）。原生 Omni 的真实推理、两运行时矩阵与训练相关任务（B 的真实音画片段、E、F、G、H）<strong>没有执行</strong>——本机没有 vLLM-Omni / SGLang-Omni，多卡部署还需要 6.2 的 TP 基础。正文把实测与模拟、已做与未做分开写。</p>
+<hr />
+<h2 id="epoch">心智模型：三段流水线、两条队列、一个 epoch</h2>
+<figure>
+
+
+<svg viewBox="0 0 820 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Omni 三阶段、容量账与打断">
+  <rect width="820" height="470" fill="#0A0D12"/>
+  <text x="410" y="28" fill="#E9A568" font-size="17" font-weight="bold" text-anchor="middle">原生 Omni：三段、容量账、队列背压与 epoch 打断</text>
+
+  <text x="30" y="60" fill="#38BDF8" font-size="13" font-weight="bold">容量账（config + index 实测算术）</text>
+  <rect x="30" y="72" width="360" height="128" fill="#1E2636" stroke="#38BDF8" stroke-width="1.4"/>
+  <text x="44" y="94" fill="#E8EEF7" font-size="11">Thinker 31.26 B（58.2 GiB bf16）</text>
+  <text x="44" y="114" fill="#E8EEF7" font-size="11">Talker 0.37 B / Code2Wav 0.13 B</text>
+  <text x="44" y="134" fill="#E8EEF7" font-size="11">合计 31.76 B = 59.2 GiB bf16</text>
+  <text x="44" y="154" fill="#E8EEF7" font-size="11">每 token 只激活 3.03 B（9.5%）</text>
+  <text x="44" y="174" fill="#E8EEF7" font-size="11">KV 196,608 B/token → 8k 单会话 1.50 GiB</text>
+  <text x="44" y="192" fill="#9FB3C8" font-size="11">index 记录 28,010 张量 / 65.68 GiB</text>
+
+  <text x="410" y="60" fill="#6EE7B7" font-size="13" font-weight="bold">部署预算（32 GB 卡）</text>
+  <rect x="410" y="72" width="380" height="128" fill="#1E2636" stroke="#6EE7B7" stroke-width="1.4"/>
+  <text x="424" y="94" fill="#E8EEF7" font-size="11">Thinker TP=2：每卡 29.12 GiB 权重</text>
+  <text x="424" y="114" fill="#E8EEF7" font-size="11">+ 8k KV 0.75 GiB = 29.87 GiB</text>
+  <text x="424" y="134" fill="#E8EEF7" font-size="11">→ 余量只有 2.13 GiB（很紧）</text>
+  <text x="424" y="154" fill="#E8EEF7" font-size="11">fp8 时每卡 14.56 GiB，余量 16.69 GiB</text>
+  <text x="424" y="174" fill="#E8EEF7" font-size="11">Talker 0.69 GiB、Code2Wav 0.24 GiB 各占一卡</text>
+  <text x="424" y="192" fill="#9FB3C8" font-size="11">静态账，未含激活/通信/code2wav 中间张量</text>
+
+  <text x="30" y="236" fill="#E9A568" font-size="13" font-weight="bold">背压（成本驱动模拟）</text>
+  <rect x="30" y="248" width="360" height="104" fill="#1E2636" stroke="#E9A568" stroke-width="1.4"/>
+  <text x="44" y="270" fill="#E8EEF7" font-size="11">生成 85 ms/帧（talker 80 + code2wav 5）</text>
+  <text x="44" y="290" fill="#E8EEF7" font-size="11">播放 80 ms/帧 → RTF 1.06 &gt; 1</text>
+  <text x="44" y="310" fill="#E8EEF7" font-size="11">无界队列 40/40 帧但 3 次 underrun（启动期）</text>
+  <text x="44" y="330" fill="#E8EEF7" font-size="11">队列≤1 + 延迟 500 ms → 只播 7/40（丢 33）</text>
+
+  <text x="410" y="236" fill="#9FB3C8" font-size="13" font-weight="bold">打断：epoch 才是关键</text>
+  <rect x="410" y="248" width="380" height="104" fill="#1E2636" stroke="#9FB3C8" stroke-width="1.4"/>
+  <text x="424" y="270" fill="#E8EEF7" font-size="11">清空队列只能拦住「已排队」的帧</text>
+  <text x="424" y="290" fill="#E8EEF7" font-size="11">在途 1/3/8 帧：无 epoch 校验时全部播放</text>
+  <text x="424" y="310" fill="#E8EEF7" font-size="11">有 epoch 校验：0 帧播放（全部丢弃）</text>
+  <text x="424" y="330" fill="#E8EEF7" font-size="11">→ 打断必须同时作废计算、传输与播放缓冲</text>
+
+  <text x="410" y="392" fill="#9FB3C8" font-size="12" text-anchor="middle">容量按总量买、算力按激活量用：3B 激活不等于能放进 3B 的显存</text>
+  <text x="410" y="420" fill="#9FB3C8" font-size="12" text-anchor="middle">一个 stage 成功不代表全链路成功；首响应时间不等于首可播放</text>
+</svg>
+
+
+<figcaption>三段容量账、队列背压与 epoch 打断的机制；B/C 是成本驱动模拟，非原生实测。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_2">机制拆解</h2>
+<h3 id="_3">容量账：按总量买显存，按激活量用算力</h3>
+<p><code>Qwen/Qwen3-Omni-30B-A3B-Instruct</code> 的 config 与 safetensors index（只下载这两者，不下载 30B 权重）给出：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>组成</th>
+<th style="text-align: right;">参数量</th>
+<th style="text-align: right;">bf16 字节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Thinker</strong></td>
+<td>文本 MoE（48 层、128 专家 top-8、hidden 2048、moe_inter 768）+ audio encoder（32 层、d_model 1280）+ vision encoder（27 层、hidden 1152）</td>
+<td style="text-align: right;">31.263 B</td>
+<td style="text-align: right;">58.23 GiB</td>
+</tr>
+<tr>
+<td><strong>Talker</strong></td>
+<td>文本塔（20 层、hidden 1024）+ 16 码本头 + code predictor（5 层）</td>
+<td style="text-align: right;">0.369 B</td>
+<td style="text-align: right;">0.69 GiB</td>
+</tr>
+<tr>
+<td><strong>Code2Wav</strong></td>
+<td>DiT（8 层、hidden 1024）+ 16 个码本（2048×512）+ 上采样</td>
+<td style="text-align: right;">0.128 B</td>
+<td style="text-align: right;">0.24 GiB</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td></td>
+<td style="text-align: right;"><strong>31.760 B</strong></td>
+<td style="text-align: right;"><strong>59.16 GiB</strong></td>
+</tr>
+</tbody>
+</table>
+<p>对照 index：<strong>28,010 个张量、total_size 65.68 GiB（= 35.26 B 参数 @2 字节）</strong>。解析模型覆盖了 index 总量的 <strong>90.1%</strong>——差值主要来自 config 未显式给出的额外张量（专家偏置、encoder 的辅助层等）。<strong>绝对数字应以 index 为准，解析模型用来分阶段归因。</strong></p>
+<p><strong>激活量与总量的对比</strong>（这是计划里反复强调的一条）：</p>
+<div class="highlight"><pre><span></span><code>Thinker 每 token 激活 8/128 专家 → 3.030 B（占总参数 9.5%）
+但显存必须放下 31.760 B（59.16 GiB bf16）
+Talker / Code2Wav 是稠密的：激活即总量（0.497 B）
+</code></pre></div>
+
+<p><strong>"30B-A3B"里的 3B 是算力口径，不是容量口径。</strong> 计划里的部署方案是 Thinker TP=2、Talker 一卡、Code2Wav 一卡，实测账如下：</p>
+<table>
+<thead>
+<tr>
+<th>卡</th>
+<th style="text-align: right;">权重</th>
+<th style="text-align: right;">8k 上下文的 KV</th>
+<th style="text-align: right;">合计</th>
+<th style="text-align: right;">32 GB 卡余量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU0-1（Thinker TP=2）</td>
+<td style="text-align: right;">29.12 GiB/卡</td>
+<td style="text-align: right;">0.75 GiB/卡</td>
+<td style="text-align: right;"><strong>29.87 GiB</strong></td>
+<td style="text-align: right;"><strong>2.13 GiB</strong></td>
+</tr>
+<tr>
+<td>GPU2（Talker）</td>
+<td style="text-align: right;">0.69 GiB</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.69 GiB</td>
+<td style="text-align: right;">31.31 GiB</td>
+</tr>
+<tr>
+<td>GPU3（Code2Wav）</td>
+<td style="text-align: right;">0.24 GiB</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.24 GiB</td>
+<td style="text-align: right;">31.76 GiB</td>
+</tr>
+</tbody>
+</table>
+<p>Thinker 的单 token KV 是 <code>2(K/V) × 48 层 × 4 KV 头 × 128 × 2 B = 196,608 B</code> → 8k 上下文单会话 1.50 GiB（TP=2 每卡 0.75 GiB）。</p>
+<p>两条结论：</p>
+<ul>
+<li><strong>bf16 + TP=2 只剩 2.13 GiB 余量</strong>，而激活峰值、通信缓冲与 Code2Wav 的中间张量都还没算进去——<strong>这个配置处在临界线上</strong>，要么降精度（fp8：每卡 14.56 GiB，余量 16.69 GiB），要么换更细的切分。</li>
+<li><strong>Talker 与 Code2Wav 各占一整张卡是巨大的浪费</strong>（0.69 / 0.24 GiB）。它们的显存需求小，但<strong>延迟敏感</strong>（在生成链路上串行），所以计划把它们独立部署的原因不是容量，而是<strong>跨阶段流水线不能被 Thinker 的 batching 拖住</strong>。这正是"阶段队列"存在的原因。</li>
+</ul>
+<h3 id="underrun">背压：谁决定 underrun</h3>
+<p>用一张<strong>成本表</strong>驱动会话模拟（每项的来源都标注，这是本章可核查性的基础）：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th style="text-align: right;">成本</th>
+<th>来源</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ASR encoder</td>
+<td style="text-align: right;">30 ms</td>
+<td><strong>假设</strong>（4.9 的 B/C 被权重键前缀阻塞，未实测）</td>
+</tr>
+<tr>
+<td>Thinker prefill</td>
+<td style="text-align: right;">33.8 ms</td>
+<td><strong>实测</strong>（4.8：vLLM 单图首 token）</td>
+</tr>
+<tr>
+<td>Thinker decode step</td>
+<td style="text-align: right;">12.1 ms</td>
+<td><strong>实测</strong>（4.8：单图重复请求）</td>
+</tr>
+<tr>
+<td>Talker 每帧</td>
+<td style="text-align: right;">80 ms</td>
+<td><strong>定义</strong>（4.10 实测码帧 80 ms；生成速度未实测。同章用非自回归替代模型 VITS 实测到的是 RTF 0.002–0.009、首可播放=全部生成时间——<strong>那是另一种架构的形状</strong>，不能替换这里的 AR 假设）</td>
+</tr>
+<tr>
+<td>Code2Wav 每帧</td>
+<td style="text-align: right;">5 ms</td>
+<td><strong>假设</strong></td>
+</tr>
+<tr>
+<td>播放每帧</td>
+<td style="text-align: right;">80 ms</td>
+<td><strong>定义</strong></td>
+</tr>
+</tbody>
+</table>
+<p>生成一帧需要 85 ms（80 + 5），播放一帧占 80 ms → <strong>RTF = 1.06 &gt; 1</strong>。这个 &gt;1 是结构性的：<strong>只要生成比播放慢，任何队列大小都无法避免断流</strong>。队列上限 × 消费延迟的扫描（40 帧，1 ms 步长）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">队列上限</th>
+<th style="text-align: right;">消费延迟</th>
+<th style="text-align: right;">播放</th>
+<th style="text-align: right;">丢弃（队列满）</th>
+<th style="text-align: right;">underrun</th>
+<th style="text-align: right;">首可播放</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">无界</td>
+<td style="text-align: right;">0 ms</td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">0.0 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">无界</td>
+<td style="text-align: right;">500 ms</td>
+<td style="text-align: right;">40/40</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">≤1</td>
+<td style="text-align: right;">100 ms</td>
+<td style="text-align: right;">20/40</td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">≤1</td>
+<td style="text-align: right;">500 ms</td>
+<td style="text-align: right;">7/40</td>
+<td style="text-align: right;">33</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">≤4</td>
+<td style="text-align: right;">500 ms</td>
+<td style="text-align: right;">10/40</td>
+<td style="text-align: right;">30</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0 ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">≤8</td>
+<td style="text-align: right;">500 ms</td>
+<td style="text-align: right;">14/40</td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0 ms</td>
+</tr>
+</tbody>
+</table>
+<p>四条读法：</p>
+<ul>
+<li><strong>无界队列 + 快消费者</strong>：全部帧都能播，但启动期有 3 次 underrun（生成速度略慢于播放，缓冲被抽空）。</li>
+<li><strong>有界队列</strong>把过载转成<strong>丢弃</strong>：队列越小、消费者越慢，丢得越多（≤1 + 500 ms 只播 7/40）。丢弃在音频里是<strong>可听的断裂</strong>，不是"降低质量"。</li>
+<li><strong>队列越大丢得越少</strong>（≤1→≤8 在 500 ms 下：7→10→14 帧），但代价是<strong>延迟与内存</strong>：队列里的帧要等。</li>
+<li><strong>首可播放恒为 0</strong>，因为模拟里第一帧一生成就开始播。真实系统里首可播放 ≥ 首帧生成 + 解码 + 缓冲填充——<strong>这就是"首响应时间不等于首可播放"的量化形式</strong>。</li>
+</ul>
+<h3 id="_4">打断：清空队列不够，必须作废在途帧</h3>
+<p>打断可以发生在四个位置：Thinker（还在生成 hidden）、Talker（还在出码本）、Code2Wav（还在解码音频）、播放（已经在出声）。时间轴模拟（队列≤8、无消费延迟）：</p>
+<div class="highlight"><pre><span></span><code>在 Thinker（生成中）打断：旧 epoch 丢弃 0 帧，播放 40/40 帧
+在 Talker（第 5 帧）打断：旧 epoch 丢弃 1 帧，播放 39/40 帧
+在 Code2Wav（第 12 帧）打断：旧 epoch 丢弃 1 帧，播放 39/40 帧
+在 播放（第 20 帧）打断：旧 epoch 丢弃 1 帧，播放 39/40 帧
+</code></pre></div>
+
+<p><strong>清空队列只影响"已排队"的那 1 帧。</strong> 真正的风险在<strong>在途帧</strong>：打断发生时，已经离开 codec、正在网络/播放缓冲里的旧 epoch 音频仍会到达。对照实验：</p>
+<div class="highlight"><pre><span></span><code>在途 1 帧：有 epoch 校验 → 播放 0 帧（丢弃 1）；无校验 → 播放 1 帧
+在途 3 帧：有 epoch 校验 → 播放 0 帧（丢弃 3）；无校验 → 播放 3 帧
+在途 8 帧：有 epoch 校验 → 播放 0 帧（丢弃 8）；无校验 → 播放 8 帧
+</code></pre></div>
+
+<p><strong>没有 epoch 校验时，在途的旧音频会全部播放出来</strong>——用户打断之后又听到上一轮的语音，这是最典型的"打断失败"。所以打断协议必须三件事同时做：</p>
+<ol>
+<li><strong>计算</strong>：取消 Thinker/Talker/Code2Wav 的当前步（释放 KV 与中间张量）；</li>
+<li><strong>传输</strong>：让在途 chunk 携带 epoch（或 session 版本），接收端丢弃不匹配的包；</li>
+<li><strong>播放</strong>：清空播放缓冲，并把"当前 epoch 已播放到哪一帧"记账，避免交错。</li>
+</ol>
+<h3 id="_5">设计取舍</h3>
+<p><strong>为什么 Talker/Code2Wav 要独立成阶段而不是塞进 Thinker。</strong> 容量上它们很小（0.69 / 0.24 GiB），但<strong>它们的输出速率决定首可播放</strong>：Thinker 负责理解（可以 batching），Talker 负责逐帧生成（延迟敏感），Code2Wav 负责把码本变成波形（吞吐敏感）。把三者放在一条串行链上时，<strong>任何一个阶段的队列积压都会直接变成首可播放的延迟</strong>。</p>
+<p><strong>为什么"按激活参数估显存"是错的。</strong> 本章实测：3.03 B 激活 / 31.76 B 总量。MoE 的每 token 激活只决定算力与带宽需求，权重必须全部驻留。<strong>容量规划用总量，性能规划用激活量</strong>——两个数字混用会得到"这张卡放得下"的错误结论（29.87 GiB 对 32 GB 只剩 2.13 GiB 余量，而激活峰值还没算）。</p>
+<p><strong>为什么本章的 B/C 是模拟而不是实测。</strong> 原生 Omni 需要 vLLM-Omni / SGLang-Omni（本机没有）与 6.2 的 TP 基础（未做）。在这个约束下，能确定的是<strong>容量算术</strong>（来自真实 config 与 index）与<strong>协议机制</strong>（队列、epoch、丢弃语义）；不能确定的是<strong>绝对延迟与真实音质</strong>。把两者分开写，是这一章唯一诚实的做法。</p>
+<hr />
+<h2 id="config">工程实现 · 源码解析：config 揭示的阶段契约</h2>
+<div class="highlight"><pre><span></span><code>config.json
+  architectures          ["Qwen3OmniMoeForConditionalGeneration"]   ← transformers 5.17 有此类
+  thinker_config.text_config
+      hidden 2048 / 48 层 / 32 头 / 4 KV 头 / head_dim 128
+      num_experts 128 / num_experts_per_tok 8 / moe_intermediate_size 768
+      vocab_size 152064
+  thinker_config.audio_config   32 层 / d_model 1280 / ffn 5120 / mel 128
+  thinker_config.vision_config  depth 27 / hidden 1152 / ffn 4304 / patch 16 / merge 2
+  talker_config.text_config     hidden 1024 / 20 层 / vocab 3072
+  talker_config.num_code_groups 16    accept_hidden_layer 24
+  talker_config.code_predictor_config  5 层 / hidden 1024 / 16 组
+  code2wav_config              8 层 / hidden 1024 / num_quantizers 16 / codebook 2048 / decoder_dim 1536
+</code></pre></div>
+
+<p>三处值得单独读：</p>
+<ul>
+<li><strong><code>accept_hidden_layer: 24</code></strong>：Talker 取 Thinker 第 24 层的 hidden 作为条件（48 层的一半）。这是"跨阶段传输"的契约：<strong>传的是中间层 hidden，不是最终 logits</strong>，所以 Thinker 必须在第 24 层就能输出给 Talker（流水线切分点）。</li>
+<li><strong><code>position_id_per_seconds: 13</code> 与 <code>seconds_per_chunk: 2</code></strong>：音画共享时间轴时，位置编号按"每秒 13"推进，chunk 为 2 秒。<strong>音频位置与视频位置用的是同一套时间刻度</strong>，这是"音画共享时间轴"的配置级依据。</li>
+<li><strong><code>num_semantic_quantizers: 1</code></strong>：第 1 个码本是语义层（codebook 4096），其余 15 个是声学层（2048）——<strong>语义与声学在同一 RVQ 结构里，但码本大小不同</strong>，生成侧的码本头必须按层区分大小。</li>
+</ul>
+<hr />
+<h2 id="_6">工程实现 · 自己写一遍</h2>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">Session</span><span class="p">:</span>                       <span class="c1"># epoch 打断的核心</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bound</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">q</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">bound</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">epoch</span> <span class="o">=</span> <span class="n">collections</span><span class="o">.</span><span class="n">deque</span><span class="p">(),</span> <span class="n">bound</span><span class="p">,</span> <span class="mi">0</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">produce</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">frame_id</span><span class="p">,</span> <span class="n">epoch</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">epoch</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">epoch</span><span class="p">:</span>      <span class="c1"># 旧 epoch 的产物直接丢</span>
+            <span class="k">return</span> <span class="s2">"stale"</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bound</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bound</span><span class="p">:</span>
+            <span class="k">return</span> <span class="s2">"full"</span>            <span class="c1"># 队列满：丢弃（可听断裂），不无限排队</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">q</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">frame_id</span><span class="p">,</span> <span class="n">epoch</span><span class="p">))</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">interrupt</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">epoch</span> <span class="o">+=</span> <span class="mi">1</span>              <span class="c1"># 关键：让所有在途包失效</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q</span><span class="p">);</span> <span class="bp">self</span><span class="o">.</span><span class="n">q</span><span class="o">.</span><span class="n">clear</span><span class="p">();</span> <span class="k">return</span> <span class="n">n</span>
+</code></pre></div>
+
+<p>时间步进模拟（生成与播放同一时间轴）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">gen_per_frame</span> <span class="o">=</span> <span class="n">talker</span> <span class="o">+</span> <span class="n">code2wav</span>      <span class="c1"># 85 ms</span>
+<span class="n">play_per_frame</span> <span class="o">=</span> <span class="mi">80</span> <span class="o">+</span> <span class="n">consumer_delay</span>   <span class="c1"># 播放一帧</span>
+<span class="k">while</span> <span class="n">t</span> <span class="o">&lt;=</span> <span class="n">t_end</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">t</span> <span class="o">&gt;=</span> <span class="n">next_gen</span> <span class="ow">and</span> <span class="n">produced</span> <span class="o">&lt;</span> <span class="n">n</span><span class="p">:</span> <span class="n">produce</span><span class="p">(</span><span class="o">...</span><span class="p">);</span> <span class="n">next_gen</span> <span class="o">=</span> <span class="n">t</span> <span class="o">+</span> <span class="n">gen_per_frame</span>
+    <span class="k">if</span> <span class="n">t</span> <span class="o">&gt;=</span> <span class="n">next_play</span><span class="p">:</span> <span class="n">play_or_underrun</span><span class="p">();</span> <span class="n">next_play</span> <span class="o">=</span> <span class="n">t</span> <span class="o">+</span> <span class="n">play_per_frame</span>
+    <span class="n">t</span> <span class="o">+=</span> <span class="mf">0.001</span>
+</code></pre></div>
+
+<hr />
+<h2 id="lab">动手 lab</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># A：config + index 的容量与部署账（只下载 config 与 index）</span>
+<span class="c1"># B/C：队列背压与 epoch 打断的会话模拟</span>
+python<span class="w"> </span>labs/L4/omni_session_runtime.py<span class="w"> </span>--outdir<span class="w"> </span>out/4.11/run
+</code></pre></div>
+
+<p>原始输出：<code>results/crater/4.11/20260913-omni/</code>（<code>run.log</code>、<code>omni_session_runtime.json</code>）。</p>
+<details class="fold srcfold"><summary>labs/L4/omni_session_runtime.py 全文（349 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""L4.11 —— 原生 Omni、跨阶段调度与打断。</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">[A] 从 Qwen3-Omni-30B-A3B-Instruct 的 config 与 safetensors index 核算</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">    Thinker / Talker / Code2Wav 的参数、字节与按 stage 的部署预算</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="sd">    （只下载 config 与 index，不下载 30B 权重）</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="sd">[B] 跨阶段队列与背压：stage 队列上限 × 消费者延迟，记录 stage 工作、</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">    跨阶段 chunk、首可播放与持续输出（用实测/标注来源的 stage 成本驱动）</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="sd">[C] 打断：Thinker / Talker / Code2Wav / 播放四处发起，session epoch 丢弃旧包，</span>
+<span class="linenos" aria-hidden="true"> 10</span> <span class="sd">    记录「打断→静音」、旧包是否泄漏、资源是否回收、同会话下一请求是否正常</span>
+<span class="linenos" aria-hidden="true"> 11</span> 
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">原生 Omni 的真实推理需要 vLLM-Omni / SGLang-Omni（本机没有）与 6.2 的 TP 基础，</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="sd">B/C 的耗时来自标注来源的成本表，不是原生模型实测；A 段是真实配置与索引的算术。</span>
+<span class="linenos" aria-hidden="true"> 14</span> 
+<span class="linenos" aria-hidden="true"> 15</span> <span class="sd">用法：</span>
+<span class="linenos" aria-hidden="true"> 16</span> <span class="sd">    python labs/L4/omni_session_runtime.py --outdir out/4.11/run</span>
+<span class="linenos" aria-hidden="true"> 17</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 18</span> 
+<span class="linenos" aria-hidden="true"> 19</span> <span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="linenos" aria-hidden="true"> 20</span> <span class="kn">import</span><span class="w"> </span><span class="nn">collections</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="kn">import</span><span class="w"> </span><span class="nn">glob</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos" aria-hidden="true"> 23</span> <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="linenos" aria-hidden="true"> 24</span> <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos" aria-hidden="true"> 25</span> <span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+<span class="linenos" aria-hidden="true"> 26</span> <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="linenos" aria-hidden="true"> 27</span> 
+<span class="linenos" aria-hidden="true"> 28</span> <span class="n">HUB</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"HF_HOME"</span><span class="p">,</span> <span class="s2">"/scratch/learn/models/hf"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">"/hub"</span>
+<span class="linenos" aria-hidden="true"> 29</span> <span class="n">REPO</span> <span class="o">=</span> <span class="s2">"Qwen/Qwen3-Omni-30B-A3B-Instruct"</span>
+<span class="linenos" aria-hidden="true"> 30</span> <span class="n">SUMMARY</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true"> 31</span> 
+<span class="linenos" aria-hidden="true"> 32</span> 
+<span class="linenos" aria-hidden="true"> 33</span> <span class="k">def</span><span class="w"> </span><span class="nf">title</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 34</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="mi">78</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 35</span> 
+<span class="linenos" aria-hidden="true"> 36</span> 
+<span class="linenos" aria-hidden="true"> 37</span> <span class="k">def</span><span class="w"> </span><span class="nf">sub</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 38</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">--- "</span> <span class="o">+</span> <span class="n">s</span> <span class="o">+</span> <span class="s2">" "</span> <span class="o">+</span> <span class="s2">"-"</span> <span class="o">*</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">70</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">s</span><span class="p">)),</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 39</span> 
+<span class="linenos" aria-hidden="true"> 40</span> 
+<span class="linenos" aria-hidden="true"> 41</span> <span class="k">def</span><span class="w"> </span><span class="nf">snap</span><span class="p">(</span><span class="n">repo</span><span class="o">=</span><span class="n">REPO</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 42</span>     <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">HUB</span><span class="si">}</span><span class="s2">/models--</span><span class="si">{</span><span class="n">repo</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">'/'</span><span class="p">,</span><span class="w"> </span><span class="s1">'--'</span><span class="p">)</span><span class="si">}</span><span class="s2">/snapshots/*"</span><span class="p">))[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 43</span> 
+<span class="linenos" aria-hidden="true"> 44</span> 
+<span class="linenos" aria-hidden="true"> 45</span> <span class="c1"># ---------------------------------------------------------------- A</span>
+<span class="linenos" aria-hidden="true"> 46</span> <span class="k">def</span><span class="w"> </span><span class="nf">attn_params</span><span class="p">(</span><span class="n">hidden</span><span class="p">,</span> <span class="n">heads</span><span class="p">,</span> <span class="n">kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 47</span>     <span class="n">q</span> <span class="o">=</span> <span class="n">hidden</span> <span class="o">*</span> <span class="n">heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+<span class="linenos" aria-hidden="true"> 48</span>     <span class="n">k</span> <span class="o">=</span> <span class="n">hidden</span> <span class="o">*</span> <span class="n">kv_heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+<span class="linenos" aria-hidden="true"> 49</span>     <span class="n">v</span> <span class="o">=</span> <span class="n">hidden</span> <span class="o">*</span> <span class="n">kv_heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+<span class="linenos" aria-hidden="true"> 50</span>     <span class="n">o</span> <span class="o">=</span> <span class="n">heads</span> <span class="o">*</span> <span class="n">head_dim</span> <span class="o">*</span> <span class="n">hidden</span>
+<span class="linenos" aria-hidden="true"> 51</span>     <span class="n">b</span> <span class="o">=</span> <span class="p">(</span><span class="n">heads</span> <span class="o">*</span> <span class="n">head_dim</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">kv_heads</span> <span class="o">*</span> <span class="n">head_dim</span> <span class="o">+</span> <span class="n">hidden</span><span class="p">)</span> <span class="k">if</span> <span class="n">bias</span> <span class="k">else</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true"> 52</span>     <span class="k">return</span> <span class="n">q</span> <span class="o">+</span> <span class="n">k</span> <span class="o">+</span> <span class="n">v</span> <span class="o">+</span> <span class="n">o</span> <span class="o">+</span> <span class="n">b</span>
+<span class="linenos" aria-hidden="true"> 53</span> 
+<span class="linenos" aria-hidden="true"> 54</span> 
+<span class="linenos" aria-hidden="true"> 55</span> <span class="k">def</span><span class="w"> </span><span class="nf">mlp_params</span><span class="p">(</span><span class="n">hidden</span><span class="p">,</span> <span class="n">inter</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 56</span>     <span class="k">return</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">hidden</span> <span class="o">*</span> <span class="n">inter</span>
+<span class="linenos" aria-hidden="true"> 57</span> 
+<span class="linenos" aria-hidden="true"> 58</span> 
+<span class="linenos" aria-hidden="true"> 59</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_A</span><span class="p">(</span><span class="n">args</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 60</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[A] 三个阶段：参数、字节与部署预算（config + index 算术）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 61</span>     <span class="n">d</span> <span class="o">=</span> <span class="n">snap</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 62</span>     <span class="n">cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/config.json"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 63</span>     <span class="n">idx</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">d</span> <span class="o">+</span> <span class="s2">"/model.safetensors.index.json"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 64</span>     <span class="n">wm</span> <span class="o">=</span> <span class="n">idx</span><span class="p">[</span><span class="s2">"weight_map"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 65</span>     <span class="n">on_disk</span> <span class="o">=</span> <span class="n">idx</span><span class="p">[</span><span class="s2">"metadata"</span><span class="p">][</span><span class="s2">"total_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 66</span>     <span class="n">tk</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"thinker_config"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 67</span>     <span class="n">tt</span><span class="p">,</span> <span class="n">ta</span><span class="p">,</span> <span class="n">tv</span> <span class="o">=</span> <span class="n">tk</span><span class="p">[</span><span class="s2">"text_config"</span><span class="p">],</span> <span class="n">tk</span><span class="p">[</span><span class="s2">"audio_config"</span><span class="p">],</span> <span class="n">tk</span><span class="p">[</span><span class="s2">"vision_config"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 68</span>     <span class="n">talk</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"talker_config"</span><span class="p">][</span><span class="s2">"text_config"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 69</span>     <span class="n">tkc</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"talker_config"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 70</span>     <span class="n">cpred</span> <span class="o">=</span> <span class="n">tkc</span><span class="p">[</span><span class="s2">"code_predictor_config"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 71</span>     <span class="n">c2w</span> <span class="o">=</span> <span class="n">cfg</span><span class="p">[</span><span class="s2">"code2wav_config"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 72</span> 
+<span class="linenos" aria-hidden="true"> 73</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"A1 逐阶段的解析模型"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 74</span>     <span class="c1"># Thinker 文本：MoE，每层 128 专家取 8</span>
+<span class="linenos" aria-hidden="true"> 75</span>     <span class="n">per_expert</span> <span class="o">=</span> <span class="n">mlp_params</span><span class="p">(</span><span class="n">tt</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"moe_intermediate_size"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 76</span>     <span class="n">moe_per_layer</span> <span class="o">=</span> <span class="n">per_expert</span> <span class="o">*</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"num_experts"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 77</span>     <span class="n">attn_per_layer</span> <span class="o">=</span> <span class="n">attn_params</span><span class="p">(</span><span class="n">tt</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 78</span>                                  <span class="n">tt</span><span class="p">[</span><span class="s2">"num_key_value_heads"</span><span class="p">],</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"head_dim"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 79</span>     <span class="n">norms</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 80</span>     <span class="n">thinker_layers</span> <span class="o">=</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="n">attn_per_layer</span> <span class="o">+</span> <span class="n">moe_per_layer</span> <span class="o">+</span> <span class="n">norms</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 81</span>     <span class="n">thinker_embed</span> <span class="o">=</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"vocab_size"</span><span class="p">]</span> <span class="o">*</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 82</span>     <span class="c1"># audio encoder（32 层、d_model 1280、ffn 5120，含卷积下采样与投影）</span>
+<span class="linenos" aria-hidden="true"> 83</span>     <span class="n">audio_layers</span> <span class="o">=</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"encoder_layers"</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="mi">4</span> <span class="o">*</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"d_model"</span><span class="p">]</span> <span class="o">**</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"d_model"</span><span class="p">]</span> <span class="o">*</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"encoder_ffn_dim"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 84</span>     <span class="n">audio_conv</span> <span class="o">=</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"num_mel_bins"</span><span class="p">]</span> <span class="o">*</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"d_model"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">9</span> <span class="o">+</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"d_model"</span><span class="p">]</span> <span class="o">*</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"downsample_hidden_size"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">9</span>
+<span class="linenos" aria-hidden="true"> 85</span>     <span class="n">audio_proj</span> <span class="o">=</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"d_model"</span><span class="p">]</span> <span class="o">*</span> <span class="n">ta</span><span class="p">[</span><span class="s2">"output_dim"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 86</span>     <span class="c1"># vision encoder（27 层、1152、ffn 4304，含 patch embed 与投影）</span>
+<span class="linenos" aria-hidden="true"> 87</span>     <span class="n">vis_layers</span> <span class="o">=</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"depth"</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="mi">4</span> <span class="o">*</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span> <span class="o">**</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span> <span class="o">*</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 88</span>     <span class="n">vis_embed</span> <span class="o">=</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"in_chans"</span><span class="p">]</span> <span class="o">*</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"temporal_patch_size"</span><span class="p">]</span> <span class="o">*</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"patch_size"</span><span class="p">]</span> <span class="o">**</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 89</span>     <span class="n">vis_proj</span> <span class="o">=</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span> <span class="o">*</span> <span class="n">tv</span><span class="p">[</span><span class="s2">"out_hidden_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 90</span>     <span class="n">thinker</span> <span class="o">=</span> <span class="n">thinker_layers</span> <span class="o">+</span> <span class="n">thinker_embed</span> <span class="o">+</span> <span class="n">audio_layers</span> <span class="o">+</span> <span class="n">audio_conv</span> <span class="o">+</span> <span class="n">audio_proj</span> <span class="o">+</span> <span class="n">vis_layers</span> <span class="o">+</span> <span class="n">vis_embed</span> <span class="o">+</span> <span class="n">vis_proj</span>
+<span class="linenos" aria-hidden="true"> 91</span>     <span class="c1"># Talker：文本塔 + 码本 embedding + 16 个码本头 + code predictor</span>
+<span class="linenos" aria-hidden="true"> 92</span>     <span class="n">talk_layers</span> <span class="o">=</span> <span class="n">talk</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="n">attn_params</span><span class="p">(</span><span class="n">talk</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">talk</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true"> 93</span>                                                           <span class="n">talk</span><span class="p">[</span><span class="s2">"num_key_value_heads"</span><span class="p">],</span> <span class="n">talk</span><span class="p">[</span><span class="s2">"head_dim"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 94</span>                                                <span class="o">+</span> <span class="n">mlp_params</span><span class="p">(</span><span class="n">talk</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">talk</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 95</span>                                                <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">talk</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 96</span>     <span class="n">talk_embed</span> <span class="o">=</span> <span class="n">talk</span><span class="p">[</span><span class="s2">"vocab_size"</span><span class="p">]</span> <span class="o">*</span> <span class="n">talk</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 97</span>     <span class="n">code_heads</span> <span class="o">=</span> <span class="n">tkc</span><span class="p">[</span><span class="s2">"num_code_groups"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">2048</span> <span class="o">*</span> <span class="n">talk</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 98</span>     <span class="n">cpred_layers</span> <span class="o">=</span> <span class="n">cpred</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span>
+<span class="linenos" aria-hidden="true"> 99</span>         <span class="n">attn_params</span><span class="p">(</span><span class="n">cpred</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">cpred</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">100</span>                     <span class="n">cpred</span><span class="p">[</span><span class="s2">"num_key_value_heads"</span><span class="p">],</span> <span class="n">cpred</span><span class="p">[</span><span class="s2">"head_dim"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">101</span>         <span class="o">+</span> <span class="n">mlp_params</span><span class="p">(</span><span class="n">cpred</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">cpred</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">])</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">cpred</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">102</span>     <span class="n">cpred_heads</span> <span class="o">=</span> <span class="n">cpred</span><span class="p">[</span><span class="s2">"num_code_groups"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">2048</span> <span class="o">*</span> <span class="n">cpred</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">103</span>     <span class="n">talker</span> <span class="o">=</span> <span class="n">talk_layers</span> <span class="o">+</span> <span class="n">talk_embed</span> <span class="o">+</span> <span class="n">code_heads</span> <span class="o">+</span> <span class="n">cpred_layers</span> <span class="o">+</span> <span class="n">cpred_heads</span>
+<span class="linenos" aria-hidden="true">104</span>     <span class="c1"># Code2Wav：8 层 DiT + 码本 + 上采样</span>
+<span class="linenos" aria-hidden="true">105</span>     <span class="n">c2w_layers</span> <span class="o">=</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span>
+<span class="linenos" aria-hidden="true">106</span>         <span class="n">attn_params</span><span class="p">(</span><span class="n">c2w</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">107</span>                     <span class="n">c2w</span><span class="p">[</span><span class="s2">"num_key_value_heads"</span><span class="p">],</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span> <span class="o">//</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">108</span>         <span class="o">+</span> <span class="n">mlp_params</span><span class="p">(</span><span class="n">c2w</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">],</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"intermediate_size"</span><span class="p">])</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">109</span>     <span class="n">c2w_codebooks</span> <span class="o">=</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"num_quantizers"</span><span class="p">]</span> <span class="o">*</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"codebook_size"</span><span class="p">]</span> <span class="o">*</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"codebook_dim"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">110</span>     <span class="n">c2w_up</span> <span class="o">=</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"codebook_dim"</span><span class="p">]</span> <span class="o">*</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"decoder_dim"</span><span class="p">]</span> <span class="o">+</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"decoder_dim"</span><span class="p">]</span> <span class="o">*</span> <span class="n">c2w</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">111</span>     <span class="n">code2wav</span> <span class="o">=</span> <span class="n">c2w_layers</span> <span class="o">+</span> <span class="n">c2w_codebooks</span> <span class="o">+</span> <span class="n">c2w_up</span>
+<span class="linenos" aria-hidden="true">112</span>     <span class="n">total</span> <span class="o">=</span> <span class="n">thinker</span> <span class="o">+</span> <span class="n">talker</span> <span class="o">+</span> <span class="n">code2wav</span>
+<span class="linenos" aria-hidden="true">113</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">"thinker（文本 MoE + audio + vision）"</span><span class="p">,</span> <span class="n">thinker</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">114</span>             <span class="p">(</span><span class="s2">"talker（文本塔 + 16 码本头 + code predictor）"</span><span class="p">,</span> <span class="n">talker</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">115</span>             <span class="p">(</span><span class="s2">"code2wav（DiT + 码本 + 上采样）"</span><span class="p">,</span> <span class="n">code2wav</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">116</span>     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">rows</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">117</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;44</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">p</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> B 参数  bf16 </span><span class="si">{</span><span class="n">p</span><span class="o">*</span><span class="mi">2</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="si">:</span><span class="s2">7.2f</span><span class="si">}</span><span class="s2"> GiB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">118</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="s1">'合计'</span><span class="si">:</span><span class="s2">&lt;44</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">total</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">7.3f</span><span class="si">}</span><span class="s2"> B 参数  bf16 </span><span class="si">{</span><span class="n">total</span><span class="o">*</span><span class="mi">2</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="si">:</span><span class="s2">7.2f</span><span class="si">}</span><span class="s2"> GiB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">119</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  index 记录：</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">wm</span><span class="p">)</span><span class="si">}</span><span class="s2"> 个张量，total_size </span><span class="si">{</span><span class="n">on_disk</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB"</span>
+<span class="linenos" aria-hidden="true">120</span>           <span class="sa">f</span><span class="s2">"（= </span><span class="si">{</span><span class="p">(</span><span class="n">on_disk</span><span class="o">/</span><span class="mi">2</span><span class="p">)</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> B 参数 @2 字节）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">121</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  解析模型 / index 之比：</span><span class="si">{</span><span class="n">total</span><span class="o">/</span><span class="p">(</span><span class="n">on_disk</span><span class="o">/</span><span class="mi">2</span><span class="p">)</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">"</span>
+<span class="linenos" aria-hidden="true">122</span>           <span class="sa">f</span><span class="s2">"（接近 1 说明解析模型覆盖了全部参数族）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">123</span> 
+<span class="linenos" aria-hidden="true">124</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"A2 激活量与总量的对比（为什么不能按 A3B 估容量）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">125</span>     <span class="n">active_experts</span> <span class="o">=</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"num_experts_per_tok"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">126</span>     <span class="n">active_thinker</span> <span class="o">=</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span>
+<span class="linenos" aria-hidden="true">127</span>         <span class="n">attn_per_layer</span> <span class="o">+</span> <span class="n">active_experts</span> <span class="o">*</span> <span class="n">per_expert</span> <span class="o">+</span> <span class="n">norms</span><span class="p">)</span> <span class="o">+</span> <span class="n">thinker_embed</span>
+<span class="linenos" aria-hidden="true">128</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  Thinker 每 token 激活：</span><span class="si">{</span><span class="n">active_experts</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">tt</span><span class="p">[</span><span class="s1">'num_experts'</span><span class="p">]</span><span class="si">}</span><span class="s2"> 专家 "</span>
+<span class="linenos" aria-hidden="true">129</span>           <span class="sa">f</span><span class="s2">"→ </span><span class="si">{</span><span class="n">active_thinker</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> B（占总参数 </span><span class="si">{</span><span class="n">active_thinker</span><span class="o">/</span><span class="n">total</span><span class="o">*</span><span class="mi">100</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2">%）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">130</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  但显存必须放下 </span><span class="si">{</span><span class="n">total</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> B（</span><span class="si">{</span><span class="n">total</span><span class="o">*</span><span class="mi">2</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GiB bf16）——"</span>
+<span class="linenos" aria-hidden="true">131</span>           <span class="sa">f</span><span class="s2">"**容量按总量，算力按激活量**"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">132</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  Talker/Code2Wav 的激活即总量（稠密）："</span>
+<span class="linenos" aria-hidden="true">133</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">(</span><span class="n">talker</span><span class="o">+</span><span class="n">code2wav</span><span class="p">)</span><span class="o">/</span><span class="mf">1e9</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2"> B"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">134</span> 
+<span class="linenos" aria-hidden="true">135</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"A3 按 stage 的部署预算（计划中的 Thinker TP=2 / Talker 一卡 / Code2Wav 一卡）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">136</span>     <span class="n">per</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"thinker"</span><span class="p">:</span> <span class="n">thinker</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">/</span> <span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="p">,</span> <span class="s2">"talker"</span><span class="p">:</span> <span class="n">talker</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">/</span> <span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">137</span>            <span class="s2">"code2wav"</span><span class="p">:</span> <span class="n">code2wav</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">/</span> <span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">138</span>     <span class="n">kv_per_token</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"num_hidden_layers"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"num_key_value_heads"</span><span class="p">]</span> <span class="o">*</span> <span class="n">tt</span><span class="p">[</span><span class="s2">"head_dim"</span><span class="p">]</span> <span class="o">*</span> <span class="mi">2</span>
+<span class="linenos" aria-hidden="true">139</span>     <span class="n">kv_gib_8k</span> <span class="o">=</span> <span class="n">kv_per_token</span> <span class="o">*</span> <span class="mi">8192</span> <span class="o">/</span> <span class="mi">2</span><span class="o">**</span><span class="mi">30</span>
+<span class="linenos" aria-hidden="true">140</span>     <span class="n">plan</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos" aria-hidden="true">141</span>         <span class="p">{</span><span class="s2">"card"</span><span class="p">:</span> <span class="s2">"GPU0-1（Thinker TP=2）"</span><span class="p">,</span> <span class="s2">"bytes_gib"</span><span class="p">:</span> <span class="n">per</span><span class="p">[</span><span class="s2">"thinker"</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">142</span>          <span class="s2">"per_card"</span><span class="p">:</span> <span class="n">per</span><span class="p">[</span><span class="s2">"thinker"</span><span class="p">]</span> <span class="o">/</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">"kv_gib_per_card"</span><span class="p">:</span> <span class="n">kv_gib_8k</span> <span class="o">/</span> <span class="mi">2</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">143</span>         <span class="p">{</span><span class="s2">"card"</span><span class="p">:</span> <span class="s2">"GPU2（Talker）"</span><span class="p">,</span> <span class="s2">"bytes_gib"</span><span class="p">:</span> <span class="n">per</span><span class="p">[</span><span class="s2">"talker"</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">144</span>          <span class="s2">"per_card"</span><span class="p">:</span> <span class="n">per</span><span class="p">[</span><span class="s2">"talker"</span><span class="p">],</span> <span class="s2">"kv_gib_per_card"</span><span class="p">:</span> <span class="mf">0.0</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">145</span>         <span class="p">{</span><span class="s2">"card"</span><span class="p">:</span> <span class="s2">"GPU3（Code2Wav）"</span><span class="p">,</span> <span class="s2">"bytes_gib"</span><span class="p">:</span> <span class="n">per</span><span class="p">[</span><span class="s2">"code2wav"</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">146</span>          <span class="s2">"per_card"</span><span class="p">:</span> <span class="n">per</span><span class="p">[</span><span class="s2">"code2wav"</span><span class="p">],</span> <span class="s2">"kv_gib_per_card"</span><span class="p">:</span> <span class="mf">0.0</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">147</span>     <span class="p">]</span>
+<span class="linenos" aria-hidden="true">148</span>     <span class="k">for</span> <span class="n">p_</span> <span class="ow">in</span> <span class="n">plan</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">149</span>         <span class="n">tot</span> <span class="o">=</span> <span class="n">p_</span><span class="p">[</span><span class="s2">"per_card"</span><span class="p">]</span> <span class="o">+</span> <span class="n">p_</span><span class="p">[</span><span class="s2">"kv_gib_per_card"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">150</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  </span><span class="si">{</span><span class="n">p_</span><span class="p">[</span><span class="s1">'card'</span><span class="p">]</span><span class="si">:</span><span class="s2">&lt;22</span><span class="si">}</span><span class="s2"> 权重 </span><span class="si">{</span><span class="n">p_</span><span class="p">[</span><span class="s1">'per_card'</span><span class="p">]</span><span class="si">:</span><span class="s2">6.2f</span><span class="si">}</span><span class="s2"> GiB + 8k KV "</span>
+<span class="linenos" aria-hidden="true">151</span>               <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">p_</span><span class="p">[</span><span class="s1">'kv_gib_per_card'</span><span class="p">]</span><span class="si">:</span><span class="s2">5.2f</span><span class="si">}</span><span class="s2"> GiB = </span><span class="si">{</span><span class="n">tot</span><span class="si">:</span><span class="s2">6.2f</span><span class="si">}</span><span class="s2"> GiB"</span>
+<span class="linenos" aria-hidden="true">152</span>               <span class="sa">f</span><span class="s2">"（32 GB 卡的余量 </span><span class="si">{</span><span class="mi">32</span><span class="o">-</span><span class="n">tot</span><span class="si">:</span><span class="s2">6.2f</span><span class="si">}</span><span class="s2"> GiB）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">153</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  Thinker 单 token KV 字节 = 2(K/V) × </span><span class="si">{</span><span class="n">tt</span><span class="p">[</span><span class="s1">'num_hidden_layers'</span><span class="p">]</span><span class="si">}</span><span class="s2"> 层 × "</span>
+<span class="linenos" aria-hidden="true">154</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">tt</span><span class="p">[</span><span class="s1">'num_key_value_heads'</span><span class="p">]</span><span class="si">}</span><span class="s2"> KV 头 × </span><span class="si">{</span><span class="n">tt</span><span class="p">[</span><span class="s1">'head_dim'</span><span class="p">]</span><span class="si">}</span><span class="s2"> × 2 字节 = </span><span class="si">{</span><span class="n">kv_per_token</span><span class="si">}</span><span class="s2"> B"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">155</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  → 8k 上下文单会话 </span><span class="si">{</span><span class="n">kv_gib_8k</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB；TP=2 每卡 </span><span class="si">{</span><span class="n">kv_gib_8k</span><span class="o">/</span><span class="mi">2</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">156</span>     <span class="n">fp8</span> <span class="o">=</span> <span class="n">total</span> <span class="o">/</span> <span class="mi">2</span><span class="o">**</span><span class="mi">30</span>
+<span class="linenos" aria-hidden="true">157</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  若 Thinker 用 fp8：</span><span class="si">{</span><span class="n">thinker</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB，两卡各 "</span>
+<span class="linenos" aria-hidden="true">158</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">thinker</span><span class="o">/</span><span class="mi">2</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB（余量 "</span>
+<span class="linenos" aria-hidden="true">159</span>           <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="mi">32</span><span class="o">-</span><span class="n">thinker</span><span class="o">/</span><span class="mi">2</span><span class="o">/</span><span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="o">-</span><span class="n">kv_gib_8k</span><span class="o">/</span><span class="mi">2</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> GiB）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">160</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  注：以上是权重+KV 的静态账，未含激活峰值、通信缓冲与 Code2Wav 的 "</span>
+<span class="linenos" aria-hidden="true">161</span>           <span class="sa">f</span><span class="s2">"中间张量；真实部署要预留更多"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">162</span>     <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"A"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"params"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"thinker"</span><span class="p">:</span> <span class="n">thinker</span><span class="p">,</span> <span class="s2">"talker"</span><span class="p">:</span> <span class="n">talker</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">163</span>                                <span class="s2">"code2wav"</span><span class="p">:</span> <span class="n">code2wav</span><span class="p">,</span> <span class="s2">"total"</span><span class="p">:</span> <span class="n">total</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">164</span>                     <span class="s2">"index"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"n_tensors"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">wm</span><span class="p">),</span> <span class="s2">"total_size_bytes"</span><span class="p">:</span> <span class="n">on_disk</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">165</span>                     <span class="s2">"ratio_model_vs_index"</span><span class="p">:</span> <span class="n">total</span> <span class="o">/</span> <span class="p">(</span><span class="n">on_disk</span> <span class="o">/</span> <span class="mi">2</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">166</span>                     <span class="s2">"active_thinker"</span><span class="p">:</span> <span class="n">active_thinker</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">167</span>                     <span class="s2">"kv_per_token_bytes"</span><span class="p">:</span> <span class="n">kv_per_token</span><span class="p">,</span> <span class="s2">"kv_gib_8k"</span><span class="p">:</span> <span class="n">kv_gib_8k</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">168</span>                     <span class="s2">"plan"</span><span class="p">:</span> <span class="n">plan</span><span class="p">,</span> <span class="s2">"config"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">169</span>                         <span class="s2">"thinker"</span><span class="p">:</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">tt</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span>
+<span class="linenos" aria-hidden="true">170</span>                                     <span class="p">(</span><span class="s2">"hidden_size"</span><span class="p">,</span> <span class="s2">"num_hidden_layers"</span><span class="p">,</span> <span class="s2">"num_attention_heads"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">171</span>                                      <span class="s2">"num_key_value_heads"</span><span class="p">,</span> <span class="s2">"head_dim"</span><span class="p">,</span> <span class="s2">"num_experts"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">172</span>                                      <span class="s2">"num_experts_per_tok"</span><span class="p">,</span> <span class="s2">"moe_intermediate_size"</span><span class="p">,</span> <span class="s2">"vocab_size"</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true">173</span>                         <span class="s2">"audio"</span><span class="p">:</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">ta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"encoder_layers"</span><span class="p">,</span> <span class="s2">"d_model"</span><span class="p">,</span> <span class="s2">"encoder_ffn_dim"</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true">174</span>                         <span class="s2">"vision"</span><span class="p">:</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">tv</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"depth"</span><span class="p">,</span> <span class="s2">"hidden_size"</span><span class="p">,</span> <span class="s2">"intermediate_size"</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true">175</span>                         <span class="s2">"talker"</span><span class="p">:</span> <span class="p">{</span><span class="o">**</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">talk</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"hidden_size"</span><span class="p">,</span> <span class="s2">"num_hidden_layers"</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true">176</span>                                    <span class="s2">"num_code_groups"</span><span class="p">:</span> <span class="n">tkc</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"num_code_groups"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">177</span>                                    <span class="s2">"accept_hidden_layer"</span><span class="p">:</span> <span class="n">tkc</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"accept_hidden_layer"</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true">178</span>                         <span class="s2">"code2wav"</span><span class="p">:</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">c2w</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span>
+<span class="linenos" aria-hidden="true">179</span>                                      <span class="p">(</span><span class="s2">"num_hidden_layers"</span><span class="p">,</span> <span class="s2">"hidden_size"</span><span class="p">,</span> <span class="s2">"num_quantizers"</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">180</span>                                       <span class="s2">"codebook_size"</span><span class="p">,</span> <span class="s2">"decoder_dim"</span><span class="p">)}}}</span>
+<span class="linenos" aria-hidden="true">181</span>     <span class="k">return</span> <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"A"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">182</span> 
+<span class="linenos" aria-hidden="true">183</span> 
+<span class="linenos" aria-hidden="true">184</span> <span class="c1"># ---------------------------------------------------------------- B/C</span>
+<span class="linenos" aria-hidden="true">185</span> <span class="n">COSTS</span> <span class="o">=</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">186</span>     <span class="c1"># (stage, 秒)：来源标注在正文；ASR/原生 stage 无实测，按标注的假设值</span>
+<span class="linenos" aria-hidden="true">187</span>     <span class="s2">"asr_encode"</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.030</span><span class="p">,</span> <span class="s2">"假设：ASR encoder 未实测（4.9 B/C 被权重键前缀阻塞）"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">188</span>     <span class="s2">"thinker_prefill"</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.0338</span><span class="p">,</span> <span class="s2">"实测：4.8 vLLM 单图首 token 33.8 ms"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">189</span>     <span class="s2">"thinker_decode_step"</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.0121</span><span class="p">,</span> <span class="s2">"实测：4.8 vLLM 单图重复 12.1 ms（首 token）"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">190</span>     <span class="s2">"talker_frame"</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.080</span><span class="p">,</span> <span class="s2">"定义：码帧 80 ms（4.10 实测帧长）；生成速度未实测"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">191</span>     <span class="s2">"code2wav_frame"</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.005</span><span class="p">,</span> <span class="s2">"假设：Code2Wav 每帧解码 5 ms"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">192</span>     <span class="s2">"play_frame"</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.080</span><span class="p">,</span> <span class="s2">"定义：播放一帧 80 ms"</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">193</span> <span class="p">}</span>
+<span class="linenos" aria-hidden="true">194</span> 
+<span class="linenos" aria-hidden="true">195</span> 
+<span class="linenos" aria-hidden="true">196</span> <span class="k">def</span><span class="w"> </span><span class="nf">simulate</span><span class="p">(</span><span class="n">queue_bound</span><span class="p">,</span> <span class="n">consumer_delay</span><span class="p">,</span> <span class="n">interrupt_at</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">n_frames</span><span class="o">=</span><span class="mi">40</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">197</span>              <span class="n">epoch_cancel</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">tick</span><span class="o">=</span><span class="mf">0.001</span><span class="p">,</span> <span class="n">start_delay</span><span class="o">=</span><span class="mf">0.0</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">198</span> <span class="w">    </span><span class="sd">"""时间步进模拟：生成与播放同时推进（队列上限/消费延迟/打断都在同一个时间轴）。</span>
+<span class="linenos" aria-hidden="true">199</span> 
+<span class="linenos" aria-hidden="true">200</span> <span class="sd">    生成一帧耗 talker_frame + code2wav_frame（默认 85 ms），播放一帧占 80 ms；</span>
+<span class="linenos" aria-hidden="true">201</span> <span class="sd">    消费者延迟额外加到每一帧的播放上（模拟慢消费者/网络回压）。</span>
+<span class="linenos" aria-hidden="true">202</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true">203</span>     <span class="n">gen_per_frame</span> <span class="o">=</span> <span class="n">COSTS</span><span class="p">[</span><span class="s2">"talker_frame"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">COSTS</span><span class="p">[</span><span class="s2">"code2wav_frame"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">204</span>     <span class="n">play_per_frame</span> <span class="o">=</span> <span class="n">COSTS</span><span class="p">[</span><span class="s2">"play_frame"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">consumer_delay</span>
+<span class="linenos" aria-hidden="true">205</span>     <span class="n">q</span> <span class="o">=</span> <span class="n">collections</span><span class="o">.</span><span class="n">deque</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">206</span>     <span class="n">epoch</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true">207</span>     <span class="n">played</span><span class="p">,</span> <span class="n">dropped_stale</span><span class="p">,</span> <span class="n">dropped_full</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true">208</span>     <span class="n">underruns</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true">209</span>     <span class="n">first_playable</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">210</span>     <span class="n">produced</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true">211</span>     <span class="n">t</span> <span class="o">=</span> <span class="mf">0.0</span>
+<span class="linenos" aria-hidden="true">212</span>     <span class="n">next_gen</span> <span class="o">=</span> <span class="n">start_delay</span>              <span class="c1"># 首帧生成开始（可模拟 Thinker 前置）</span>
+<span class="linenos" aria-hidden="true">213</span>     <span class="n">next_play</span> <span class="o">=</span> <span class="kc">None</span>                    <span class="c1"># 播放第一次可开始的时刻</span>
+<span class="linenos" aria-hidden="true">214</span>     <span class="n">interrupted</span> <span class="o">=</span> <span class="kc">False</span>
+<span class="linenos" aria-hidden="true">215</span>     <span class="n">t_end</span> <span class="o">=</span> <span class="n">start_delay</span> <span class="o">+</span> <span class="n">gen_per_frame</span> <span class="o">*</span> <span class="n">n_frames</span> <span class="o">+</span> <span class="n">play_per_frame</span> <span class="o">*</span> <span class="n">n_frames</span> <span class="o">+</span> <span class="mf">1.0</span>
+<span class="linenos" aria-hidden="true">216</span>     <span class="k">while</span> <span class="n">t</span> <span class="o">&lt;=</span> <span class="n">t_end</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">217</span>         <span class="k">if</span> <span class="n">interrupt_at</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">interrupted</span> <span class="ow">and</span> <span class="n">produced</span> <span class="o">&gt;=</span> <span class="n">interrupt_at</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">218</span>             <span class="n">stale</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">q</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">219</span>             <span class="n">q</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">220</span>             <span class="n">dropped_stale</span> <span class="o">+=</span> <span class="n">stale</span>
+<span class="linenos" aria-hidden="true">221</span>             <span class="n">epoch</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">222</span>             <span class="n">interrupted</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="linenos" aria-hidden="true">223</span>         <span class="k">if</span> <span class="n">produced</span> <span class="o">&lt;</span> <span class="n">n_frames</span> <span class="ow">and</span> <span class="n">t</span> <span class="o">&gt;=</span> <span class="n">next_gen</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">224</span>             <span class="k">if</span> <span class="n">queue_bound</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">queue_bound</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">225</span>                 <span class="n">dropped_full</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">226</span>             <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">227</span>                 <span class="n">q</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">produced</span><span class="p">,</span> <span class="n">epoch</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">228</span>             <span class="n">produced</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">229</span>             <span class="n">next_gen</span> <span class="o">=</span> <span class="n">t</span> <span class="o">+</span> <span class="n">gen_per_frame</span>
+<span class="linenos" aria-hidden="true">230</span>         <span class="k">if</span> <span class="n">q</span> <span class="ow">and</span> <span class="n">next_play</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">231</span>             <span class="n">next_play</span> <span class="o">=</span> <span class="n">t</span>
+<span class="linenos" aria-hidden="true">232</span>         <span class="k">if</span> <span class="n">next_play</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">t</span> <span class="o">&gt;=</span> <span class="n">next_play</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">233</span>             <span class="k">if</span> <span class="n">q</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">234</span>                 <span class="n">f</span><span class="p">,</span> <span class="n">e</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">235</span>                 <span class="k">if</span> <span class="n">epoch_cancel</span> <span class="ow">and</span> <span class="n">e</span> <span class="o">!=</span> <span class="n">epoch</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">236</span>                     <span class="n">dropped_stale</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">237</span>                 <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">238</span>                     <span class="k">if</span> <span class="n">first_playable</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">239</span>                         <span class="n">first_playable</span> <span class="o">=</span> <span class="n">t</span>
+<span class="linenos" aria-hidden="true">240</span>                     <span class="n">played</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">241</span>             <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">242</span>                 <span class="k">if</span> <span class="n">produced</span> <span class="o">&lt;</span> <span class="n">n_frames</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">243</span>                     <span class="n">underruns</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">244</span>             <span class="n">next_play</span> <span class="o">=</span> <span class="n">t</span> <span class="o">+</span> <span class="n">play_per_frame</span>
+<span class="linenos" aria-hidden="true">245</span>         <span class="n">t</span> <span class="o">+=</span> <span class="n">tick</span>
+<span class="linenos" aria-hidden="true">246</span>     <span class="k">return</span> <span class="p">{</span><span class="s2">"queue_bound"</span><span class="p">:</span> <span class="n">queue_bound</span><span class="p">,</span> <span class="s2">"consumer_delay"</span><span class="p">:</span> <span class="n">consumer_delay</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">247</span>             <span class="s2">"n_frames"</span><span class="p">:</span> <span class="n">n_frames</span><span class="p">,</span> <span class="s2">"played"</span><span class="p">:</span> <span class="n">played</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">248</span>             <span class="s2">"dropped_stale"</span><span class="p">:</span> <span class="n">dropped_stale</span><span class="p">,</span> <span class="s2">"dropped_full"</span><span class="p">:</span> <span class="n">dropped_full</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">249</span>             <span class="s2">"underruns"</span><span class="p">:</span> <span class="n">underruns</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">250</span>             <span class="s2">"first_playable_s"</span><span class="p">:</span> <span class="n">first_playable</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">251</span>             <span class="s2">"gen_total_s"</span><span class="p">:</span> <span class="n">gen_per_frame</span> <span class="o">*</span> <span class="n">n_frames</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">252</span>             <span class="s2">"audio_s"</span><span class="p">:</span> <span class="n">n_frames</span> <span class="o">*</span> <span class="n">COSTS</span><span class="p">[</span><span class="s2">"play_frame"</span><span class="p">][</span><span class="mi">0</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">253</span>             <span class="s2">"rtf_gen"</span><span class="p">:</span> <span class="n">gen_per_frame</span> <span class="o">/</span> <span class="n">COSTS</span><span class="p">[</span><span class="s2">"play_frame"</span><span class="p">][</span><span class="mi">0</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">254</span>             <span class="s2">"interrupt"</span><span class="p">:</span> <span class="n">interrupt_at</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">255</span> 
+<span class="linenos" aria-hidden="true">256</span> 
+<span class="linenos" aria-hidden="true">257</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_B</span><span class="p">(</span><span class="n">args</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">258</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[B] 跨阶段队列与背压（stage 成本驱动的会话模拟）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">259</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  stage 成本表（来源标注）："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">260</span>     <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">src</span><span class="p">)</span> <span class="ow">in</span> <span class="n">COSTS</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">261</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    </span><span class="si">{</span><span class="n">k</span><span class="si">:</span><span class="s2">&lt;20</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">v</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">7.1f</span><span class="si">}</span><span class="s2"> ms   </span><span class="si">{</span><span class="n">src</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">262</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">263</span>     <span class="k">for</span> <span class="n">bound</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">264</span>         <span class="k">for</span> <span class="n">delay</span> <span class="ow">in</span> <span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.1</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">265</span>             <span class="n">r</span> <span class="o">=</span> <span class="n">simulate</span><span class="p">(</span><span class="n">bound</span><span class="p">,</span> <span class="n">delay</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">266</span>             <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">r</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">267</span>             <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  队列</span><span class="si">{</span><span class="s1">'无界'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">bound</span><span class="w"> </span><span class="ow">is</span><span class="w"> </span><span class="kc">None</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="sa">f</span><span class="s1">'≤</span><span class="si">{</span><span class="n">bound</span><span class="si">}</span><span class="s1">'</span><span class="si">:</span><span class="s2">&lt;4</span><span class="si">}</span><span class="s2"> 消费延迟 </span><span class="si">{</span><span class="n">delay</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">5.0f</span><span class="si">}</span><span class="s2"> ms → "</span>
+<span class="linenos" aria-hidden="true">268</span>                   <span class="sa">f</span><span class="s2">"播放 </span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'played'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;2</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'n_frames'</span><span class="p">]</span><span class="si">}</span><span class="s2"> 帧  首可播放 "</span>
+<span class="linenos" aria-hidden="true">269</span>                   <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">(</span><span class="n">r</span><span class="p">[</span><span class="s1">'first_playable_s'</span><span class="p">]</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="o">*</span><span class="mf">1e3</span><span class="si">:</span><span class="s2">7.1f</span><span class="si">}</span><span class="s2"> ms  underrun "</span>
+<span class="linenos" aria-hidden="true">270</span>                   <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'underruns'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;2</span><span class="si">}</span><span class="s2">  丢(满) </span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'dropped_full'</span><span class="p">]</span><span class="si">:</span><span class="s2">&gt;2</span><span class="si">}</span><span class="s2">  "</span>
+<span class="linenos" aria-hidden="true">271</span>                   <span class="sa">f</span><span class="s2">"生成 RTF </span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'rtf_gen'</span><span class="p">]</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">272</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  读法：队列上限越小、消费者越慢，越早出现「丢弃/underrun」；"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">273</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  生成 RTF&gt;1 时无论队列多大都会 underrun（生成跟不上播放）。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">274</span>     <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"B"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"costs"</span><span class="p">:</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">COSTS</span><span class="o">.</span><span class="n">items</span><span class="p">()},</span>
+<span class="linenos" aria-hidden="true">275</span>                     <span class="s2">"cost_sources"</span><span class="p">:</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">COSTS</span><span class="o">.</span><span class="n">items</span><span class="p">()},</span>
+<span class="linenos" aria-hidden="true">276</span>                     <span class="s2">"rows"</span><span class="p">:</span> <span class="n">rows</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">277</span>     <span class="k">return</span> <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"B"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">278</span> 
+<span class="linenos" aria-hidden="true">279</span> 
+<span class="linenos" aria-hidden="true">280</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_C</span><span class="p">(</span><span class="n">args</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">281</span>     <span class="n">title</span><span class="p">(</span><span class="s2">"[C] 打断：四个位置 × session epoch"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">282</span>     <span class="n">rows</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">283</span>     <span class="k">for</span> <span class="n">point</span><span class="p">,</span> <span class="n">frame</span> <span class="ow">in</span> <span class="p">((</span><span class="s2">"Thinker（生成中）"</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="p">(</span><span class="s2">"Talker（第 5 帧）"</span><span class="p">,</span> <span class="mi">5</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">284</span>                          <span class="p">(</span><span class="s2">"Code2Wav（第 12 帧）"</span><span class="p">,</span> <span class="mi">12</span><span class="p">),</span> <span class="p">(</span><span class="s2">"播放（第 20 帧）"</span><span class="p">,</span> <span class="mi">20</span><span class="p">)):</span>
+<span class="linenos" aria-hidden="true">285</span>         <span class="n">r</span> <span class="o">=</span> <span class="n">simulate</span><span class="p">(</span><span class="n">queue_bound</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span> <span class="n">consumer_delay</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">interrupt_at</span><span class="o">=</span><span class="n">frame</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">286</span>         <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"point"</span><span class="p">:</span> <span class="n">point</span><span class="p">,</span> <span class="s2">"frame"</span><span class="p">:</span> <span class="n">frame</span><span class="p">,</span> <span class="o">**</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">r</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span>
+<span class="linenos" aria-hidden="true">287</span>                      <span class="p">(</span><span class="s2">"played"</span><span class="p">,</span> <span class="s2">"dropped_stale"</span><span class="p">,</span> <span class="s2">"dropped_full"</span><span class="p">,</span> <span class="s2">"underruns"</span><span class="p">)}})</span>
+<span class="linenos" aria-hidden="true">288</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  在 </span><span class="si">{</span><span class="n">point</span><span class="si">:</span><span class="s2">&lt;18</span><span class="si">}</span><span class="s2"> 打断：旧 epoch 丢弃 </span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'dropped_stale'</span><span class="p">]</span><span class="si">}</span><span class="s2"> 帧，"</span>
+<span class="linenos" aria-hidden="true">289</span>               <span class="sa">f</span><span class="s2">"播放 </span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'played'</span><span class="p">]</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'n_frames'</span><span class="p">]</span><span class="si">}</span><span class="s2"> 帧，"</span>
+<span class="linenos" aria-hidden="true">290</span>               <span class="sa">f</span><span class="s2">"underrun </span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">'underruns'</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">291</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"C2 在途帧：epoch 校验的真正作用"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">292</span>     <span class="k">def</span><span class="w"> </span><span class="nf">inflight</span><span class="p">(</span><span class="n">n_inflight</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">epoch_cancel</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">293</span> <span class="w">        </span><span class="sd">"""打断后，已经在 codec/传输/播放缓冲里的旧 epoch 帧仍会到达。"""</span>
+<span class="linenos" aria-hidden="true">294</span>         <span class="n">q</span> <span class="o">=</span> <span class="n">collections</span><span class="o">.</span><span class="n">deque</span><span class="p">((</span><span class="n">i</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_inflight</span><span class="p">))</span>   <span class="c1"># 旧 epoch 在途</span>
+<span class="linenos" aria-hidden="true">295</span>         <span class="n">epoch</span> <span class="o">=</span> <span class="mi">1</span>                                                  <span class="c1"># 已打断</span>
+<span class="linenos" aria-hidden="true">296</span>         <span class="n">played</span><span class="p">,</span> <span class="n">dropped</span> <span class="o">=</span> <span class="p">[],</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true">297</span>         <span class="k">while</span> <span class="n">q</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">298</span>             <span class="n">f</span><span class="p">,</span> <span class="n">e</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">299</span>             <span class="k">if</span> <span class="n">epoch_cancel</span> <span class="ow">and</span> <span class="n">e</span> <span class="o">!=</span> <span class="n">epoch</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">300</span>                 <span class="n">dropped</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="linenos" aria-hidden="true">301</span>             <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">302</span>                 <span class="n">played</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">303</span>         <span class="k">return</span> <span class="n">played</span><span class="p">,</span> <span class="n">dropped</span>
+<span class="linenos" aria-hidden="true">304</span>     <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">8</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">305</span>         <span class="n">pl_e</span><span class="p">,</span> <span class="n">dr_e</span> <span class="o">=</span> <span class="n">inflight</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">306</span>         <span class="n">pl_n</span><span class="p">,</span> <span class="n">dr_n</span> <span class="o">=</span> <span class="n">inflight</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">307</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  在途 </span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2"> 帧：有 epoch 校验 → 播放 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">pl_e</span><span class="p">)</span><span class="si">}</span><span class="s2"> 帧（丢弃 </span><span class="si">{</span><span class="n">dr_e</span><span class="si">}</span><span class="s2">）；"</span>
+<span class="linenos" aria-hidden="true">308</span>               <span class="sa">f</span><span class="s2">"无校验 → 播放 </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">pl_n</span><span class="p">)</span><span class="si">}</span><span class="s2"> 帧（丢弃 </span><span class="si">{</span><span class="n">dr_n</span><span class="si">}</span><span class="s2">）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">309</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  → 队列清空只能拦住「已排队」的帧；**在途帧**必须靠 epoch 校验拦住，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">310</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    否则打断后用户会听到旧响应（本章的 counterexample）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">311</span>     <span class="n">rows</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"inflight_demo"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"with_epoch"</span><span class="p">:</span> <span class="n">inflight</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="kc">True</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">312</span>                                    <span class="s2">"without_epoch"</span><span class="p">:</span> <span class="n">inflight</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="kc">False</span><span class="p">)}})</span>
+<span class="linenos" aria-hidden="true">313</span>     <span class="n">sub</span><span class="p">(</span><span class="s2">"C3 打断后的资源与下一请求"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">314</span>     <span class="n">stale</span> <span class="o">=</span> <span class="mi">30</span>
+<span class="linenos" aria-hidden="true">315</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  打断时队列里有 </span><span class="si">{</span><span class="n">stale</span><span class="si">}</span><span class="s2"> 帧 → epoch 递增后全部作废（dropped_stale 计入）"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">316</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  → 旧 epoch 的帧不会进入播放；同会话下一请求从新 epoch 重新开始"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">317</span>     <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"C"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"interrupts"</span><span class="p">:</span> <span class="n">rows</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">318</span>                     <span class="s2">"no_epoch_control"</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos" aria-hidden="true">319</span>                         <span class="s2">"talker5"</span><span class="p">:</span> <span class="n">simulate</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="n">epoch_cancel</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+<span class="linenos" aria-hidden="true">320</span>                         <span class="s2">"play20"</span><span class="p">:</span> <span class="n">simulate</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">,</span> <span class="mi">20</span><span class="p">,</span> <span class="n">epoch_cancel</span><span class="o">=</span><span class="kc">False</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true">321</span>                     <span class="s2">"after_interrupt"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"cleared_frames"</span><span class="p">:</span> <span class="mi">30</span><span class="p">,</span> <span class="s2">"note"</span><span class="p">:</span> <span class="s2">"epoch 递增后旧包全部作废，新请求从新 epoch 开始"</span><span class="p">}}</span>
+<span class="linenos" aria-hidden="true">322</span>     <span class="k">return</span> <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"C"</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">323</span> 
+<span class="linenos" aria-hidden="true">324</span> 
+<span class="linenos" aria-hidden="true">325</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">326</span>     <span class="n">ap</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">327</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--outdir"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">expanduser</span><span class="p">(</span><span class="s2">"~/l411_out"</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">328</span>     <span class="n">ap</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">"--sections"</span><span class="p">,</span> <span class="n">nargs</span><span class="o">=</span><span class="s2">"*"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="p">[</span><span class="s2">"A"</span><span class="p">,</span> <span class="s2">"B"</span><span class="p">,</span> <span class="s2">"C"</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">329</span>     <span class="n">args</span> <span class="o">=</span> <span class="n">ap</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">330</span>     <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">outdir</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">331</span>     <span class="n">SUMMARY</span><span class="p">[</span><span class="s2">"env"</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"python"</span><span class="p">:</span> <span class="n">sys</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">split</span><span class="p">()[</span><span class="mi">0</span><span class="p">]}</span>
+<span class="linenos" aria-hidden="true">332</span>     <span class="n">want</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">args</span><span class="o">.</span><span class="n">sections</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">333</span>     <span class="k">if</span> <span class="s2">"A"</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">334</span>         <span class="n">section_A</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">335</span>     <span class="k">if</span> <span class="s2">"B"</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">336</span>         <span class="n">section_B</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">337</span>     <span class="k">if</span> <span class="s2">"C"</span> <span class="ow">in</span> <span class="n">want</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">338</span>         <span class="n">section_C</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">339</span>     <span class="n">path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">outdir</span><span class="p">,</span> <span class="s2">"omni_session_runtime.json"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">340</span>     <span class="n">prev</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">))</span> <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">path</span><span class="p">)</span> <span class="k">else</span> <span class="p">{}</span>
+<span class="linenos" aria-hidden="true">341</span>     <span class="n">prev</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">SUMMARY</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">342</span>     <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"w"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">343</span>         <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="nb">str</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">344</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">已写出 </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">345</span>     <span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">346</span> 
+<span class="linenos" aria-hidden="true">347</span> 
+<span class="linenos" aria-hidden="true">348</span> <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">349</span>     <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L4/omni_session_runtime.py 全文（349 行）</code><a href="../code/labs/L4/omni_session_runtime.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h3 id="_7">消融建议</h3>
+<table>
+<thead>
+<tr>
+<th>改什么</th>
+<th>先预测，再验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 段把 Thinker 换成 fp8</td>
+<td>每卡权重与余量各是多少？KV 要不要也换？</td>
+</tr>
+<tr>
+<td>A 段把 TP 从 2 改成 4</td>
+<td>每卡权重降到多少？通信开销会怎么变（6.2）？</td>
+</tr>
+<tr>
+<td>B 段把 talker 生成速度改成 60 ms/帧（RTF&lt;1）</td>
+<td>underrun 消失吗？队列还需要多大？</td>
+</tr>
+<tr>
+<td>B 段把消费者延迟改成 20 ms</td>
+<td>有界队列还丢帧吗？</td>
+</tr>
+<tr>
+<td>C 段把 epoch 校验只放在播放端（不在 codec 端）</td>
+<td>在途帧会被拦住吗？成本差在哪？</td>
+</tr>
+<tr>
+<td>C 段在打断后立刻重发同一请求</td>
+<td>新 epoch 的帧号与旧的是否混淆？</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_8">原始现场</h2>
+<details>
+<summary>① 三阶段容量与部署预算</summary>
+<div class="highlight"><pre><span></span><code>  thinker（文本 MoE + audio + vision）              31.263 B 参数  bf16   58.23 GiB
+  talker（文本塔 + 16 码本头 + code predictor）          0.369 B 参数  bf16    0.69 GiB
+  code2wav（DiT + 码本 + 上采样）                       0.128 B 参数  bf16    0.24 GiB
+  合计                                            31.760 B 参数  bf16   59.16 GiB
+  index 记录：28010 个张量，total_size 65.68 GiB（= 35.26 B 参数 @2 字节）
+  解析模型 / index 之比：0.901
+
+  Thinker 每 token 激活：8/128 专家 → 3.030 B（占总参数 9.5%）
+  GPU0-1（Thinker TP=2）   权重  29.12 GiB + 8k KV  0.75 GiB =  29.87 GiB（余量 2.13 GiB）
+  GPU2（Talker）           权重   0.69 GiB + 8k KV  0.00 GiB =   0.69 GiB（余量 31.31 GiB）
+  GPU3（Code2Wav）         权重   0.24 GiB + 8k KV  0.00 GiB =   0.24 GiB（余量 31.76 GiB）
+  Thinker 单 token KV 字节 = 2 × 48 层 × 4 KV 头 × 128 × 2 = 196608 B
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：31.76B 总量 vs 3.03B 激活；Thinker TP=2 只剩 2.13 GiB 余量；Talker/Code2Wav 各占一卡却只用了不到 1 GiB。</p>
+<p><strong>下一步观察</strong>：把 vision encoder 也放到独立卡上（三段流水线），Thinker 的每卡权重降到多少？</p>
+<p>采集命令：<code>python labs/L4/omni_session_runtime.py</code>
+完整输出：<code>results/crater/4.11/20260913-omni/run.log</code></p>
+</details>
+<details>
+<summary>② 队列背压扫描</summary>
+<div class="highlight"><pre><span></span><code>  队列无界   消费延迟     0 ms → 播放 40/40 帧  首可播放 0.0 ms  underrun  3  丢(满)  0
+  队列无界   消费延迟   500 ms → 播放 40/40 帧  首可播放 0.0 ms  underrun  0  丢(满)  0
+  队列≤1   消费延迟   100 ms → 播放 20/40 帧  首可播放 0.0 ms  underrun  0  丢(满) 20
+  队列≤1   消费延迟   500 ms → 播放  7/40 帧  首可播放 0.0 ms  underrun  0  丢(满) 33
+  队列≤4   消费延迟   500 ms → 播放 10/40 帧  首可播放 0.0 ms  underrun  0  丢(满) 30
+  队列≤8   消费延迟   500 ms → 播放 14/40 帧  首可播放 0.0 ms  underrun  0  丢(满) 26
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：生成 RTF 1.06 → 无界队列也会在启动期 underrun；有界队列在慢消费者下把过载转成丢弃；队列越大丢得越少。</p>
+<p><strong>下一步观察</strong>：把 talker 每帧改成 75 ms（RTF&lt;1），无界队列的 underrun 会归零吗？</p>
+<p>采集命令：<code>python labs/L4/omni_session_runtime.py</code>
+完整输出：<code>results/crater/4.11/20260913-omni/run.log</code></p>
+</details>
+<details>
+<summary>③ 打断与在途帧反例</summary>
+<div class="highlight"><pre><span></span><code>  在 Thinker（生成中）       打断：旧 epoch 丢弃 0 帧，播放 40/40 帧
+  在 Talker（第 5 帧）      打断：旧 epoch 丢弃 1 帧，播放 39/40 帧
+  在 Code2Wav（第 12 帧）   打断：旧 epoch 丢弃 1 帧，播放 39/40 帧
+  在 播放（第 20 帧）         打断：旧 epoch 丢弃 1 帧，播放 39/40 帧
+
+  在途 1 帧：有 epoch 校验 → 播放 0 帧（丢弃 1）；无校验 → 播放 1 帧
+  在途 3 帧：有 epoch 校验 → 播放 0 帧（丢弃 3）；无校验 → 播放 3 帧
+  在途 8 帧：有 epoch 校验 → 播放 0 帧（丢弃 8）；无校验 → 播放 8 帧
+</code></pre></div>
+
+<p><strong>该看哪些字段</strong>：清空队列只拦住 1 帧（已排队的那一帧）；<strong>在途帧没有 epoch 校验时会全部播放</strong>——用户打断后听到旧响应。</p>
+<p><strong>下一步观察</strong>：把 epoch 校验只加在播放端（不加在 codec 端），在途帧会被拦住吗？计算资源呢？</p>
+<p>采集命令：<code>python labs/L4/omni_session_runtime.py</code>
+完整输出：<code>results/crater/4.11/20260913-omni/run.log</code></p>
+</details>
+<hr />
+<h2 id="_9">前沿</h2>
+<p><strong>原生 Omni 的工程难点已经从"模型能不能做"转到"阶段之间怎么背压"。</strong> 本章的容量账显示：Thinker 占 98.4% 的权重（31.26/31.76 B），而 Talker + Code2Wav 合计 0.50 B 却决定了<strong>首可播放</strong>。这意味着部署方案不能按参数量分配卡（否则 Talker/Code2Wav 各占一整卡是浪费），而要按<strong>延迟链路</strong>分配——三段独立阶段、跨阶段队列、以及能被 epoch 作废的传输协议。</p>
+<p><strong>打断协议正在成为多模态会话的第一类需求。</strong> 本章的在途帧反例说明：<strong>只清空队列是无效的</strong>。完整协议需要三件事一起做——取消计算、作废在途包（epoch/session 版本）、清空播放缓冲并记账。这与 5.8 的失败路径是同一条主线：<strong>一个 stage 成功不代表全链路成功</strong>，而"停止"也必须是一条能被验证的完整路径。</p>
+<p><strong>共享时间轴是音画能力的配置级前提。</strong> <code>position_id_per_seconds: 13</code> 与 <code>seconds_per_chunk: 2</code> 说明音频与视频位置共用一套时间刻度；<code>accept_hidden_layer: 24</code> 说明 Talker 直接吃 Thinker 的中间层 hidden。<strong>这两条把"原生 Omni"与"ASR→VLM→TTS 级联"区分开</strong>：级联方案里每一段都有自己独立的时间基准与输出契约，把它们接起来需要额外的对齐层；而原生方案在配置里就把时间轴与层间接口固定了。</p>
+<hr />
+<h2 id="_10">陷阱</h2>
+<ol>
+<li><strong>"30B-A3B"里的 3B 是算力口径</strong>：显存必须放下 31.76 B（59.16 GiB bf16）。</li>
+<li><strong>bf16 + TP=2 只剩 2.13 GiB 余量</strong>（29.87 / 32 GiB），激活峰值还没算。</li>
+<li><strong>Talker/Code2Wav 各占一整卡是延迟需要，不是容量需要</strong>（0.69 / 0.24 GiB）。</li>
+<li><strong>生成 RTF &gt; 1 时，任何队列大小都无法避免断流</strong>（本章 85 ms 生成 vs 80 ms 播放）。</li>
+<li><strong>有界队列把过载变成丢弃</strong>：队列≤1 + 500 ms 消费延迟只播 7/40 帧，丢弃是可听断裂。</li>
+<li><strong>首可播放 ≠ 首响应</strong>：模拟里首可播放恒为 0，真实系统要加上解码与缓冲填充。</li>
+<li><strong>清空队列拦不住在途帧</strong>：无 epoch 校验时，1/3/8 帧在途旧音频会全部播放（打断失败）。</li>
+<li><strong>打断要在四个位置都能发起</strong>（Thinker/Talker/Code2Wav/播放），并且都要释放资源。</li>
+<li><strong>解析模型的参数账只覆盖 index 的 90.1%</strong>：绝对数字以 index 为准。</li>
+<li><strong><code>accept_hidden_layer: 24</code> 是流水线切分点</strong>：跨阶段传的是中间层 hidden，不是 logits。</li>
+<li><strong><code>num_semantic_quantizers: 1</code></strong>：语义码本（4096）与声学码本（2048）大小不同，生成侧要分开处理。</li>
+<li><strong>本章的 B/C 是成本驱动的模拟</strong>（ASR 30 ms 与 Code2Wav 5 ms 是假设值；原生推理未运行）；<strong>B（音画片段）、E（运行时矩阵）、F/G/H（训练与 RL）未执行</strong>，不能把本章的机制结论当作原生实测。</li>
+</ol>
+<hr />
+<h2 id="_11">自测题</h2>
+<details>
+<summary>1. 计划里的部署是 Thinker TP=2、Talker 一卡、Code2Wav 一卡，各卡余量多少？哪里最紧？</summary>
+<p>按本章的解析账（bf16，8k 上下文）：</p>
+<table>
+<thead>
+<tr>
+<th>卡</th>
+<th style="text-align: right;">权重</th>
+<th style="text-align: right;">KV</th>
+<th style="text-align: right;">合计</th>
+<th style="text-align: right;">32 GB 余量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Thinker TP=2（每卡）</td>
+<td style="text-align: right;">29.12 GiB</td>
+<td style="text-align: right;">0.75 GiB</td>
+<td style="text-align: right;">29.87 GiB</td>
+<td style="text-align: right;"><strong>2.13 GiB</strong></td>
+</tr>
+<tr>
+<td>Talker</td>
+<td style="text-align: right;">0.69 GiB</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.69 GiB</td>
+<td style="text-align: right;">31.31 GiB</td>
+</tr>
+<tr>
+<td>Code2Wav</td>
+<td style="text-align: right;">0.24 GiB</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.24 GiB</td>
+<td style="text-align: right;">31.76 GiB</td>
+</tr>
+</tbody>
+</table>
+<p><strong>最紧的是 Thinker 的两张卡</strong>：只剩 2.13 GiB。而激活峰值、NCCL 通信缓冲、Code2Wav 的中间张量都还没计入。所以这个配置在临界线上；可行的缓解是 fp8（每卡 14.56 GiB，余量 16.69 GiB，但要注意 KV 与激活的精度）、或把 vision/audio encoder 也切出去。</p>
+<p>反过来说，Talker 与 Code2Wav 各占一整卡是<strong>延迟设计</strong>：它们串在生成链路上，不能被 Thinker 的 batching 阻塞。</p>
+</details>
+<details>
+<summary>2. 为什么"每 token 只激活 3B"不能用来估显存？</summary>
+<p>因为 MoE 的稀疏性只作用于<strong>计算与带宽</strong>，不作用于<strong>驻留</strong>：所有 128 个专家的权重都必须在显存里，router 才知道该走哪几个。</p>
+<p>本章实测：Thinker 每 token 激活 8/128 专家 = 3.030 B（9.5%），但权重总量 31.263 B（58.23 GiB bf16）。<strong>如果按 3B 估容量（约 6 GiB），实际需要 58 GiB —— 差近 10 倍。</strong></p>
+<p>正确的两个口径：</p>
+<ul>
+<li><strong>容量</strong>（显存/部署）用<strong>总参数</strong>（31.76 B / 59.16 GiB）；</li>
+<li><strong>性能</strong>（算力/带宽/延迟）用<strong>激活参数</strong>（3.03 B）。</li>
+</ul>
+<p>4.4 的 MoE 章节给出过同一条结论的另一个侧面：decode 32 个 token 就碰到 58.4/64 的专家、读掉 93% 的专家权重——<strong>稀疏的是算力，不是流量</strong>。</p>
+</details>
+<details>
+<summary>3. 打断时清空队列为什么不够？需要哪三件事？</summary>
+<p>因为音频帧在"生成完成"和"播放出来"之间还有两段路：codec 输出缓冲与网络/播放缓冲。<strong>打断时这些在途帧已经离开队列了</strong>，清空队列对它们无效。本章的反例：</p>
+<div class="highlight"><pre><span></span><code>在途 1/3/8 帧：无 epoch 校验 → 播放 1/3/8 帧（旧音频全部放出来）
+             有 epoch 校验 → 播放 0 帧
+</code></pre></div>
+
+<p>完整协议要三件事一起做：</p>
+<ol>
+<li><strong>取消计算</strong>：停止 Thinker/Talker/Code2Wav 的当前步，释放 KV 与中间张量（否则后台还在烧算力）；</li>
+<li><strong>作废在途包</strong>：给每个 chunk 带 epoch（session 版本），接收端丢弃不匹配的包；</li>
+<li><strong>清空播放缓冲并记账</strong>：记录"当前 epoch 播放到哪一帧"，避免新响应的帧与旧帧交错。</li>
+</ol>
+<p>验收判据（计划里的要求）：<strong>打断至静音的时间</strong>、<strong>旧响应不得重新播放</strong>、<strong>资源被回收</strong>、<strong>同会话下一请求正常</strong>。本章只验证了第 2 条的机制（epoch 丢弃）与第 3 条的队列语义，<strong>没有测打断至静音的真实时间，也没有做真实的资源回收观测</strong>。</p>
+</details>
+<details>
+<summary>4. 生成 RTF = 1.06 意味着什么？加队列能解决吗？</summary>
+<p>RTF &gt; 1 意味着<strong>生成一帧音频所需的时间比播放一帧的时间长</strong>（本章：85 ms 生成 vs 80 ms 播放）。</p>
+<p>后果：<strong>播放端迟早会耗尽缓冲</strong>。加队列只能把断流推迟（缓冲越多，撑得越久），不能消除；而且缓冲越大，首可播放越晚（用户等待更久）。</p>
+<p>本章的模拟给出这个结构：</p>
+<ul>
+<li>无界队列 + 快消费者：40/40 帧都播了，但启动期有 3 次 underrun（缓冲一直很薄）；</li>
+<li>有界队列 + 慢消费者：变成丢弃（≤1 + 500 ms 只播 7/40）。</li>
+</ul>
+<p>真正的解法只有三条：<strong>加快生成</strong>（更小的 talker/更快的解码）、<strong>降低播放速率需求</strong>（更高的压缩率或更低的采样率）、或<strong>改变交互形式</strong>（不要实时流式，改为"生成完再播"）。这正是 TTS 服务里"首包/首可播放/RTF"必须一起报的原因。</p>
+</details>
+<details>
+<summary>5. `accept_hidden_layer: 24` 与 `position_id_per_seconds: 13` 各说明了什么？</summary>
+<p><strong><code>accept_hidden_layer: 24</code>（Thinker 48 层的一半）</strong>：Talker 不是吃 Thinker 的输出 logits，而是直接取第 24 层的 hidden 作为条件。含义：</p>
+<ul>
+<li><strong>跨阶段传的是中间层表示</strong>，所以流水线可以在第 24 层切分（Thinker 的前半算完就能喂 Talker）；</li>
+<li>Talker 的输入维度必须与 Thinker 第 24 层的 hidden 对齐（都是 2048）——这是配置级的接口契约；</li>
+<li>这也解释了为什么"原生 Omni"不等于"ASR + LLM + TTS 级联"：级联传递的是<strong>文本</strong>（离散符号），原生传递的是<strong>hidden</strong>（连续表示），后者能保留韵律与副语言信息。</li>
+</ul>
+<p><strong><code>position_id_per_seconds: 13</code> 与 <code>seconds_per_chunk: 2</code></strong>：位置编号按每秒 13 推进、chunk 为 2 秒。音频与视频如果用同一套时间刻度，就能在同一个位置空间里对齐——<strong>这是"音画共享时间轴"的配置依据</strong>（4.7 的 MRoPE 是文本/图像/视频三轴，这里是时间轴的统一刻度）。</p>
+</details>
+<details markup="1">
+<summary>6. 本章哪些数字可以直接用于容量规划，哪些不能？</summary>
+
+**可以直接用（真实 config 与 index 的算术）**：
+
+- 分阶段参数量与字节（Thinker 31.26 B / Talker 0.37 B / Code2Wav 0.13 B；合计 31.76 B = 59.16 GiB bf16）；
+- index 的权威总量（28,010 张量 / 65.68 GiB = 35.26 B @2 字节）；
+- KV 账：196,608 B/token → 8k 单会话 1.50 GiB；
+- 部署余量：Thinker TP=2 每卡 29.87 GiB（余量 2.13 GiB），fp8 每卡 14.56 GiB。
+
+**不能直接用**：
+
+- B/C 的绝对时间（ASR 30 ms、Code2Wav 5 ms 是假设值；Talker 生成速度未实测）；
+- 真实音质、可懂度、音画一致性（原生推理未运行）；
+- 两运行时的调度差异（vLLM-Omni / SGLang-Omni 本机都没有）；
+- 训练与 RL 相关的一切（F/G/H 未执行）。
+
+**判据**：本章给出的是"**能不能装下**"与"**协议是否自洽**"两个问题的答案；"**跑起来多快、听起来怎样**"需要 6.2 的 TP 基础与 vLLM-Omni/SGLang-Omni，属于下一阶段的工作。
+
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L4/4.10-speech-generation.html">&#8592; 4.10 语音生成：声学 token、codec 与流式播放</a><a class="nav-next" href="../L5/5.1-prefill-decode.html">5.1 prefill 与 decode 的系统性质 &#8594;</a></nav>
+</main>
+</body>
+</html>

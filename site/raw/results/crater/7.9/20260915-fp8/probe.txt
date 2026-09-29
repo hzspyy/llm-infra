@@ -1,0 +1,56 @@
+torch 2.13.0+cu130 | NVIDIA GeForce RTX 5090 D | sm_120
+
+==============================================================================
+A TF32：FP32 存储，三种 matmul 精度模式
+==============================================================================
+  precision=highest  输出 dtype=torch.float32 SQNR= 131.52 dB  最大绝对误差=5.781e-05
+  precision=high     输出 dtype=torch.float32 SQNR=  70.63 dB  最大绝对误差=4.579e-02
+  precision=medium   输出 dtype=torch.float32 SQNR=  70.63 dB  最大绝对误差=4.579e-02
+  BF16 输入对照         输出 dtype=torch.bfloat16 SQNR=  50.82 dB
+  三种模式的张量都以 FP32 存储；改变的是乘法输入被截到多少位尾数。
+
+==============================================================================
+B FP8 scaled_mm：tensorwise 与 rowwise
+==============================================================================
+  TensorWise fast_accum=False → 28.5
+  TensorWise fast_accum=True  → 28.5
+  RowWise                     → SQNR=28.46 dB
+
+  故意违反约束，保留真实报错：
+    K=1000 不是 16 的倍数         ValueError: Expected trailing dimension of mat1 to be divisible by 16 but got mat1 shape: (512x1000).
+    rowwise + mat_b 行主序      RuntimeError: Expected b.stride(0) == 1 to be true, but got false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)
+    tensorwise + mat_b 行主序   通过
+    output_dtype=float64     RuntimeError: CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor()
+
+==============================================================================
+C 块缩放：BlockWise1x32（MXFP8）与 BlockWise1x16（NVFP4）
+==============================================================================
+  MXFP8 NO_SWIZZLE         → ValueError: scale_a must be swizzled to SWIZZLE_32_4_4 format
+  MXFP8 SWIZZLE_32_4_4     → SQNR=27.61 dB
+  NVFP4 SWIZZLE_32_4_4  → SQNR=17.42 dB
+  块 scale 必须按 cuBLAS 的 32×4×4 布局重排；直接传扁平 scale 会被拒绝或算错。
+
+==============================================================================
+D 计时：同一个 GEMM 的四条路径，以及量化本身的代价
+==============================================================================
+
+  M=N=K=1024
+    BF16 mm                   0.0146 ms       146.8 TFLOP/s
+    FP8 tensorwise            0.0076 ms       281.1 TFLOP/s
+    FP8 rowwise               0.0108 ms       198.9 TFLOP/s
+    量化 A 一次(rowwise)          0.0403 ms
+
+  M=N=K=4096
+    BF16 mm                   0.6262 ms       219.5 TFLOP/s
+    FP8 tensorwise            0.2591 ms       530.5 TFLOP/s
+    FP8 rowwise               0.3374 ms       407.3 TFLOP/s
+    量化 A 一次(rowwise)          0.1782 ms
+
+  量化一行是未融合的 eager 实现：amax、log2、floor、乘法、cast 各一次 kernel，
+  小尺寸下几乎全是启动开销，所以 1024 这一档它比整个 FP8 GEMM 还贵。
+  上游把 torch.compile 列为 float8 训练的前提，正是要把这几次 cast 融进相邻算子。
+  训练每步对 input/weight/grad_output 都要量化，而且前向与反向的归约维不同，
+  同一个张量常常要量化两次；GEMM 越小这笔固定开销占比越高，
+  上游按 (K,N) 大小自动跳过小 linear 就是这个原因。
+
+结构化结果写入 runs/7.9/20260915-fp8/fp8_gemm_probe.json

@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.5 监督微调与偏好优化：SFT、LoRA/QLoRA、DPO</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">7.5</div>
+  <div class="sidebar-title">监督微调与偏好优化：SFT、LoRA/QLoRA、DPO</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型：训练方法和更新参数是两条轴</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#sft">SFT 的监督位置</a></li>
+<li><a href="#lora">LoRA 的低秩更新与第一次梯度</a></li>
+<li><a href="#dpo-log-ratio">DPO：序列 log-ratio 与偏好梯度</a></li>
+<li><a href="#reference">长度风险需要连同 reference 分析</a></li>
+<li><a href="#apo-zero-apo-down">APO-zero 与 APO-down</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析</a><ul>
+<li><a href="#peft">PEFT：初始化、旁路与合并状态</a></li>
+<li><a href="#trl-loss_type-apo">TRL：按 loss_type 选择 APO</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#round-trip">工程实现：小目标与 round-trip</a></li>
+<li><a href="#sft-75-i">完整教学项目：SFT 与独立评测（7.5-I）</a><ul>
+<li><a href="#_6">学习曲线与独立评测</a></li>
+<li><a href="#_7">遗忘</a></li>
+<li><a href="#_8">验收结论</a></li>
+<li><a href="#_9">导出与部署</a></li>
+</ul>
+</li>
+<li><a href="#75-j">完整教学项目：后训练分支（7.5-J）</a><ul>
+<li><a href="#lora_1">LoRA 领域适配</a></li>
+<li><a href="#dpo">DPO 偏好优化</a></li>
+<li><a href="#_10">成本、产物与命令</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab</a></li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答的三个问题</a></li>
+<li><a href="#_2">心智模型：训练方法和更新参数是两条轴</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#sft">SFT 的监督位置</a></li>
+<li><a href="#lora">LoRA 的低秩更新与第一次梯度</a></li>
+<li><a href="#dpo-log-ratio">DPO：序列 log-ratio 与偏好梯度</a></li>
+<li><a href="#reference">长度风险需要连同 reference 分析</a></li>
+<li><a href="#apo-zero-apo-down">APO-zero 与 APO-down</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析</a><ul>
+<li><a href="#peft">PEFT：初始化、旁路与合并状态</a></li>
+<li><a href="#trl-loss_type-apo">TRL：按 loss_type 选择 APO</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#round-trip">工程实现：小目标与 round-trip</a></li>
+<li><a href="#sft-75-i">完整教学项目：SFT 与独立评测（7.5-I）</a><ul>
+<li><a href="#_6">学习曲线与独立评测</a></li>
+<li><a href="#_7">遗忘</a></li>
+<li><a href="#_8">验收结论</a></li>
+<li><a href="#_9">导出与部署</a></li>
+</ul>
+</li>
+<li><a href="#75-j">完整教学项目：后训练分支（7.5-J）</a><ul>
+<li><a href="#lora_1">LoRA 领域适配</a></li>
+<li><a href="#dpo">DPO 偏好优化</a></li>
+<li><a href="#_10">成本、产物与命令</a></li>
+</ul>
+</li>
+<li><a href="#lab">动手 lab</a></li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L7 · 训练与后训练基础设施</div>
+  <div class="mod-id">7.5</div>
+  <h1>监督微调与偏好优化：SFT、LoRA/QLoRA、DPO</h1>
+  <p class="lede">从数据和 mask 到全参/LoRA/QLoRA、SFT 与 DPO/APO，再到参数组、精度、恢复、adapter 导出与多模态适配。</p>
+  
+</header><article class="prose"><h2 id="_1">本章回答的三个问题</h2>
+<ol>
+<li>SFT 的回答 mask、shift 和 padding 怎样决定真正的监督？</li>
+<li>LoRA 更新哪些参数，保存、加载和合并需要保持哪些不变量？</li>
+<li>DPO 和 APO 的 reference、长度与目标公式分别意味着什么？</li>
+</ol>
+<h2 id="_2">心智模型：训练方法和更新参数是两条轴</h2>
+<p>SFT、偏好优化定义数据与目标，full fine-tuning、LoRA/QLoRA 定义更新对象和参数表示。LoRA 可以用于不同目标，SFT 也不必局限于语言模型。阶段接续还要区分初始化权重、训练恢复和推理导出。</p>
+<div class="diagram-scroll" role="region" aria-label="机制图，可横向滚动" tabindex="0" style="--diagram-min-width:750px">
+
+
+<svg viewBox="0 0 750 205" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="监督目标和更新参数分别选择，产物依赖 base 和配置">
+<rect width="750" height="205" rx="12" fill="#f1f5f9"/>
+<g font-family="system-ui,sans-serif" fill="#0f172a" text-anchor="middle">
+<rect x="20" y="25" width="205" height="66" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="122" y="52" font-size="17">数据与目标</text><text x="122" y="78" font-size="14">SFT CE / DPO / APO</text>
+<rect x="275" y="25" width="200" height="66" rx="8" fill="#dcfce7" stroke="#15803d"/><text x="375" y="52" font-size="17">可训练参数</text><text x="375" y="78" font-size="14">全参 / A、B / 额外模块</text>
+<rect x="525" y="25" width="205" height="66" rx="8" fill="#ede9fe" stroke="#7c3aed"/><text x="627" y="52" font-size="17">adapter / 合并权重</text><text x="627" y="78" font-size="14">base、模板、词表、scale</text>
+<text x="250" y="65" font-size="25">→</text><text x="500" y="65" font-size="25">→</text>
+<rect x="90" y="128" width="570" height="48" rx="8" fill="#e2e8f0" stroke="#64748b"/><text x="375" y="158" font-size="15">先验证 loss/梯度/一次更新，再核对保存 → 加载 → 合并</text></g></svg>
+
+
+</div>
+
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="sft">SFT 的监督位置</h3>
+<p>设 prompt 与 response 拼成 token 序列。若配方只监督回答，则 label 中 prompt 和 padding 为 -100，回答与真实 EOS 保留 token ID。标准 causal shift 使用 <code>logits[:, :-1]</code> 预测 <code>labels[:, 1:]</code>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>L</mi><mo>&#x0003D;</mo><mo>&#x02212;</mo><mfrac><mrow><msub><mo>&#x02211;</mo><mrow><mi>b</mi><mo>&#x0002C;</mo><mi>t</mi></mrow></msub><msub><mi>m</mi><mrow><mi>b</mi><mo>&#x0002C;</mo><mi>t</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></msub><mi>log</mi><msub><mi>p</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00028;</mo><msub><mi>x</mi><mrow><mi>b</mi><mo>&#x0002C;</mo><mi>t</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></msub><mo>&#x02223;</mo><msub><mi>x</mi><mrow><mi>b</mi><mo>&#x0002C;</mo><mo>&#x02264;</mo><mi>t</mi></mrow></msub><mo stretchy="false">&#x00029;</mo></mrow><mrow><msub><mo>&#x02211;</mo><mrow><mi>b</mi><mo>&#x0002C;</mo><mi>t</mi></mrow></msub><msub><mi>m</mi><mrow><mi>b</mi><mo>&#x0002C;</mo><mi>t</mi><mo>&#x0002B;</mo><mn>1</mn></mrow></msub></mrow></mfrac><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>最后一个 prompt 位置的 logit 会预测第一个回答 token，因而可能有梯度；prompt embedding 也会通过上下文影响回答。屏蔽 prompt labels 不等于冻结 prompt 表征。多轮 SFT 可以监督多个 assistant turn，也可以只监督选定回答，取决于数据目标。</p>
+<p>当 pad token ID 等于 EOS，不能直接把所有 <code>ids==eos_id</code> 的 label 设为 -100；应以真实长度/attention mask 区分结束符和补齐位置。回答截空时，应在归约与 optimizer 前统一处理空监督，而不是对空集合取 mean。packing 还要分别隔离 attention 和跨文档 shift target，见 <a href="7.8-training-data-engineering.html">7.8</a>。</p>
+<h3 id="lora">LoRA 的低秩更新与第一次梯度</h3>
+<p>对 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>W</mi><mn>0</mn></msub><mo>&#x02208;</mo><msup><mi mathvariant="double-struck">R</mi><mrow><msub><mi>d</mi><mi>o</mi></msub><mo>&#x000D7;</mo><msub><mi>d</mi><mi>i</mi></msub></mrow></msup></mrow></math></span>：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>W</mi><mo>&#x0003D;</mo><msub><mi>W</mi><mn>0</mn></msub><mo>&#x0002B;</mo><mi>s</mi><mi>B</mi><mi>A</mi><mo>&#x0002C;</mo><mspace width="1em" /><mi>A</mi><mo>&#x02208;</mo><msup><mi mathvariant="double-struck">R</mi><mrow><mi>r</mi><mo>&#x000D7;</mo><msub><mi>d</mi><mi>i</mi></msub></mrow></msup><mo>&#x0002C;</mo><mtext>&#x000A0;</mtext><mi>B</mi><mo>&#x02208;</mo><msup><mi mathvariant="double-struck">R</mi><mrow><msub><mi>d</mi><mi>o</mi></msub><mo>&#x000D7;</mo><mi>r</mi></mrow></msup><mo>&#x0002C;</mo><mspace width="1em" /><mi>s</mi><mo>&#x0003D;</mo><mi>&#x003B1;</mi><mo>&#x0002F;</mo><mi>r</mi><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>冻结 base，只优化 A/B 时，参数量为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>r</mi><mo stretchy="false">&#x00028;</mo><msub><mi>d</mi><mi>i</mi></msub><mo>&#x0002B;</mo><msub><mi>d</mi><mi>o</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></math></span>。普通 Linear LoRA 的常见初始化是 A 随机、B=0，使初始增量为零。此时第一轮数据梯度对 A 为零，对 B 可以非零；A 有 <code>.grad</code> tensor 不等于数值非零。后续 B 非零后，两者都可以获得梯度。</p>
+<p>零增量初始化是一种选择，不是所有 adapter 初始化算法的普遍要求。<code>alpha/r</code> 是标准缩放，也有 <code>alpha/sqrt(r)</code> 等变体；改变 r 后是否调整学习率需按 recipe 验证，不能由公式保证。</p>
+<p>部署可保留旁路，也可合并为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>W</mi><mrow><mi>m</mi><mi>e</mi><mi>r</mi><mi>g</mi><mi>e</mi><mi>d</mi></mrow></msub><mo>&#x0003D;</mo><msub><mi>W</mi><mn>0</mn></msub><mo>&#x0002B;</mo><mi>s</mi><mi>B</mi><mi>A</mi></mrow></math></span>。合并后必须禁用/移除旁路，否则增量被加两次。浮点求和次序变化会带来舍入差，量化 base 的反量化/重量化还有额外误差。adapter checkpoint 通常需要匹配 base、target_modules、rank/alpha、模板和可能的额外模块；它不是包含 optimizer/RNG 的完整 resume checkpoint。</p>
+<h3 id="dpo-log-ratio">DPO：序列 log-ratio 与偏好梯度</h3>
+<p>设 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x02113;</mi><mi>w</mi></msub><mo>&#x0003D;</mo><mi>log</mi><msub><mi>&#x003C0;</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00028;</mo><msub><mi>y</mi><mi>w</mi></msub><mo stretchy="false">&#x0007C;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>、<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x02113;</mi><mi>l</mi></msub><mo>&#x0003D;</mo><mi>log</mi><msub><mi>&#x003C0;</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00028;</mo><msub><mi>y</mi><mi>l</mi></msub><mo stretchy="false">&#x0007C;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>，冻结 reference 的值为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msubsup><mi>&#x02113;</mi><mi>w</mi><mrow><mi>r</mi><mi>e</mi><mi>f</mi></mrow></msubsup><mo>&#x0002C;</mo><msubsup><mi>&#x02113;</mi><mi>l</mi><mrow><mi>r</mi><mi>e</mi><mi>f</mi></mrow></msubsup></mrow></math></span>，令：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>a</mi><mo>&#x0003D;</mo><mi>&#x003B2;</mi><mo stretchy="false">&#x00028;</mo><msub><mi>&#x02113;</mi><mi>w</mi></msub><mo>&#x02212;</mo><msubsup><mi>&#x02113;</mi><mi>w</mi><mrow><mi>r</mi><mi>e</mi><mi>f</mi></mrow></msubsup><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="1em" /><mi>b</mi><mo>&#x0003D;</mo><mi>&#x003B2;</mi><mo stretchy="false">&#x00028;</mo><msub><mi>&#x02113;</mi><mi>l</mi></msub><mo>&#x02212;</mo><msubsup><mi>&#x02113;</mi><mi>l</mi><mrow><mi>r</mi><mi>e</mi><mi>f</mi></mrow></msubsup><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="1em" /><msub><mi>L</mi><mrow><mi>D</mi><mi>P</mi><mi>O</mi></mrow></msub><mo>&#x0003D;</mo><mo>&#x02212;</mo><mi>log</mi><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo>&#x02212;</mo><mi>b</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>Bradley–Terry 模型比较奖励差；在 KL 正则目标 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>E</mi><mo stretchy="false">[</mo><mi>r</mi><mo stretchy="false">]</mo><mo>&#x02212;</mo><mi>&#x003B2;</mi><mi>K</mi><mi>L</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C0;</mi><mi>&#x02016;</mi><msub><mi>&#x003C0;</mi><mrow><mi>r</mi><mi>e</mi><mi>f</mi></mrow></msub><mo stretchy="false">&#x00029;</mo></mrow></math></span> 下，奖励可用 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B2;</mi><mi>log</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C0;</mi><mo>&#x0002F;</mo><msub><mi>&#x003C0;</mi><mrow><mi>r</mi><mi>e</mi><mi>f</mi></mrow></msub><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mi>&#x003B2;</mi><mi>log</mi><mi>Z</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span> 重参数化，Z 在 chosen/rejected 差值中消去。DPO 不需要单独训练一个 reward model 来计算这个偏好目标。</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mfrac><mrow><mo>&#x02202;</mo><mi>L</mi></mrow><mrow><mo>&#x02202;</mo><msub><mi>&#x02113;</mi><mi>w</mi></msub></mrow></mfrac><mo>&#x0003D;</mo><mo>&#x02212;</mo><mi>&#x003B2;</mi><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>b</mi><mo>&#x02212;</mo><mi>a</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="2em" /><mfrac><mrow><mo>&#x02202;</mo><mi>L</mi></mrow><mrow><mo>&#x02202;</mo><msub><mi>&#x02113;</mi><mi>l</mi></msub></mrow></mfrac><mo>&#x0003D;</mo><mo>&#x0002B;</mo><mi>&#x003B2;</mi><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>b</mi><mo>&#x02212;</mo><mi>a</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>这是把两个 sequence logprob 视为坐标时的梯度；实际参数共享与其它样本会共同决定更新，不能保证每一步所有 chosen 概率都上升。β 同时进入分类 margin；固定 log-ratio 下的极限梯度不等于完整训练中的必然漂移规律。</p>
+<h3 id="reference">长度风险需要连同 reference 分析</h3>
+<p>标准 DPO 通常使用回答 token 的 sequence logprob 和。若 policy=reference，50 token 与 5 token 的两项 log-ratio 都为零，loss=log 2；长度本身没有产生非零隐式奖励差。偏好数据、逐 token 偏差累积、截断、模板与归约仍可能导致长度相关行为，需要受控验证。</p>
+<p>把 sequence sum 改为 length mean 会改变目标，不是普适修复。reference 必须保持固定监督语义；若直接用同一个可微 policy logprob 同时充当 reference，差值恒等于零，参数梯度会抵消。独立但未冻结的 reference 是另一种问题，不能据这个 alias 反例推断其必然立即坍缩。</p>
+<h3 id="apo-zero-apo-down">APO-zero 与 APO-down</h3>
+<p>固定 TRL 的两个 APO 分支使用上述 a、b：</p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>L</mi><mrow><mi>z</mi><mi>e</mi><mi>r</mi><mi>o</mi></mrow></msub><mo>&#x0003D;</mo><mn>1</mn><mo>&#x02212;</mo><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>b</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo></mrow></math></div></p>
+<p><div class="math-block"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>L</mi><mrow><mi>d</mi><mi>o</mi><mi>w</mi><mi>n</mi></mrow></msub><mo>&#x0003D;</mo><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mn>1</mn><mo>&#x02212;</mo><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo>&#x02212;</mo><mi>b</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math></div></p>
+<p>令 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>s</mi><mi>&#x02032;</mi></msup><mo stretchy="false">&#x00028;</mo><mi>u</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>u</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><mi>&#x003C3;</mi><mo stretchy="false">&#x00028;</mo><mi>u</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00029;</mo></mrow></math></span>，则 APO-zero 对 chosen/rejected logprob 的梯度为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mi>&#x003B2;</mi><msup><mi>s</mi><mi>&#x02032;</mi></msup><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mo>&#x0002B;</mo><mi>&#x003B2;</mi><msup><mi>s</mi><mi>&#x02032;</mi></msup><mo stretchy="false">&#x00028;</mo><mi>b</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>；APO-down 为 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003B2;</mi><mo stretchy="false">[</mo><msup><mi>s</mi><mi>&#x02032;</mi></msup><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo stretchy="false">&#x00029;</mo><mo>&#x02212;</mo><msup><mi>s</mi><mi>&#x02032;</mi></msup><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo>&#x02212;</mo><mi>b</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">]</mo><mo>&#x0002C;</mo><mo>&#x0002B;</mo><mi>&#x003B2;</mi><msup><mi>s</mi><mi>&#x02032;</mi></msup><mo stretchy="false">&#x00028;</mo><mi>a</mi><mo>&#x02212;</mo><mi>b</mi><mo stretchy="false">&#x00029;</mo></mrow></math></span>。APO-down 的 chosen 总导数包含两项，不能仅看第一项判断每次更新方向。</p>
+<p>这里没有统一的序列长度除法或 SimPO 式 target margin。APO 选择不同的 anchoring 行为，不由此保证消除所有长度偏置。<a href="../raw/results/local/7.3/20260914-review-fixes/source/handbook/recipes/smollm3/dpo/apo.yaml">SmolLM3 固定 APO YAML</a>使用 <code>apo_zero</code>、β=.05、LR=1e-6、max_length=24576，并从 <code>it-SFT</code> 接续；完整阶段配方见 <a href="7.3-training-frameworks.html">7.3</a>。</p>
+<h2 id="_4">工程实现：源码解析</h2>
+<h3 id="peft">PEFT：初始化、旁路与合并状态</h3>
+<p>PEFT 固定 <code>0e8d0ae8</code> 的 <code>src/peft/tuners/lora/layer.py:332 reset_lora_parameters</code> 为普通 Linear 默认 A 做 Kaiming uniform，或选择 Gaussian；B 置零。其它初始化分支需分别核对。</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">332</span>     <span class="k">def</span><span class="w"> </span><span class="nf">reset_lora_parameters</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">adapter_name</span><span class="p">,</span> <span class="n">init_lora_weights</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">333</span>         <span class="k">if</span> <span class="n">init_lora_weights</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">False</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">334</span>             <span class="k">if</span> <span class="n">adapter_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">335</span>                 <span class="k">if</span> <span class="n">init_lora_weights</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">336</span>                     <span class="c1"># initialize A the same way as the default for nn.Linear and B to zero</span>
+<span class="linenos" aria-hidden="true">337</span>                     <span class="c1"># https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124</span>
+<span class="linenos" aria-hidden="true">338</span>                     <span class="n">nn</span><span class="o">.</span><span class="n">init</span><span class="o">.</span><span class="n">kaiming_uniform_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="p">[</span><span class="n">adapter_name</span><span class="p">]</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="n">a</span><span class="o">=</span><span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="mi">5</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">339</span>                 <span class="k">elif</span> <span class="n">init_lora_weights</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="o">==</span> <span class="s2">"gaussian"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">340</span>                     <span class="n">nn</span><span class="o">.</span><span class="n">init</span><span class="o">.</span><span class="n">normal_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="p">[</span><span class="n">adapter_name</span><span class="p">]</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="n">std</span><span class="o">=</span><span class="mi">1</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">r</span><span class="p">[</span><span class="n">adapter_name</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">341</span>                 <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">342</span>                     <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown initialization </span><span class="si">{</span><span class="n">init_lora_weights</span><span class="si">=}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">343</span>                 <span class="n">nn</span><span class="o">.</span><span class="n">init</span><span class="o">.</span><span class="n">zeros_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span><span class="p">[</span><span class="n">adapter_name</span><span class="p">]</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">344</span>                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_bias</span><span class="p">[</span><span class="n">adapter_name</span><span class="p">]:</span>
+<span class="linenos" aria-hidden="true">345</span>                     <span class="n">nn</span><span class="o">.</span><span class="n">init</span><span class="o">.</span><span class="n">zeros_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span><span class="p">[</span><span class="n">adapter_name</span><span class="p">]</span><span class="o">.</span><span class="n">bias</span><span class="p">)</span>
+</pre></div>
+<div class="srcref"><code>results/local/7.5/20260914-review-fixes/peft-source/src/peft/tuners/lora/layer.py 第 332–345 行</code><a href="../code/results/local/7.5/20260914-review-fixes/peft-source/src/peft/tuners/lora/layer.py.html#results-local-7-5-20260914-review-fixes-peft-source-src-peft-tuners-lora-layer-py-L-332">在完整文件中打开 &rarr;</a></div></div>
+<p><code>Linear.forward:1074</code> 根据 disabled、merged、active adapters 等状态选择路径，普通旁路的计算是：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">1087</span>         <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">1088</span>             <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">base_layer</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">1089</span>             <span class="n">torch_result_dtype</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">dtype</span>
+<span class="linenos" aria-hidden="true">1090</span> 
+<span class="linenos" aria-hidden="true">1091</span>             <span class="n">lora_A_keys</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">1092</span>             <span class="k">for</span> <span class="n">active_adapter</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">active_adapters</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">1093</span>                 <span class="k">if</span> <span class="n">active_adapter</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">lora_A_keys</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">1094</span>                     <span class="k">continue</span>
+<span class="linenos" aria-hidden="true">1095</span> 
+<span class="linenos" aria-hidden="true">1096</span>                 <span class="n">lora_A</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="p">[</span><span class="n">active_adapter</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">1097</span>                 <span class="n">lora_B</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span><span class="p">[</span><span class="n">active_adapter</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">1098</span>                 <span class="n">dropout</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_dropout</span><span class="p">[</span><span class="n">active_adapter</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">1099</span>                 <span class="n">scaling</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">scaling</span><span class="p">[</span><span class="n">active_adapter</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">1100</span>                 <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cast_input_dtype</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">lora_A</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">1101</span>                 <span class="k">if</span> <span class="n">active_adapter</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_variant</span><span class="p">:</span>  <span class="c1"># vanilla LoRA</span>
+<span class="linenos" aria-hidden="true">1102</span>                     <span class="n">result</span> <span class="o">=</span> <span class="n">result</span> <span class="o">+</span> <span class="n">lora_B</span><span class="p">(</span><span class="n">lora_A</span><span class="p">(</span><span class="n">dropout</span><span class="p">(</span><span class="n">x</span><span class="p">)))</span> <span class="o">*</span> <span class="n">scaling</span>
+<span class="linenos" aria-hidden="true">1103</span>                 <span class="k">else</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">1104</span>                     <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_variant</span><span class="p">[</span><span class="n">active_adapter</span><span class="p">]</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span>
+<span class="linenos" aria-hidden="true">1105</span>                         <span class="bp">self</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">1106</span>                         <span class="n">active_adapter</span><span class="o">=</span><span class="n">active_adapter</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">1107</span>                         <span class="n">x</span><span class="o">=</span><span class="n">x</span><span class="p">,</span>
+</pre></div>
+<div class="srcref"><code>results/local/7.5/20260914-review-fixes/peft-source/src/peft/tuners/lora/layer.py 第 1087–1107 行</code><a href="../code/results/local/7.5/20260914-review-fixes/peft-source/src/peft/tuners/lora/layer.py.html#results-local-7-5-20260914-review-fixes-peft-source-src-peft-tuners-lora-layer-py-L-1087">在完整文件中打开 &rarr;</a></div></div>
+<p><code>merge:952</code> 管理合并状态并更新 base。完整来源见<a href="../raw/results/local/7.5/20260914-review-fixes/peft-source/manifest.json">源码清单</a>。本章本地运行的是独立 Linear 参照，没有调用 PEFT 或 QLoRA kernel。</p>
+<h3 id="trl-loss_type-apo">TRL：按 loss_type 选择 APO</h3>
+<p>固定 TRL <code>cd2c5287</code> 的 <code>dpo_trainer.py:1552</code> 给出两条公式的真实分支：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">1552</span>             <span class="k">elif</span> <span class="n">loss_type</span> <span class="o">==</span> <span class="s2">"apo_zero"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">1553</span>                 <span class="c1"># Eqn (7) of the APO paper (https://huggingface.co/papers/2408.06266)</span>
+<span class="linenos" aria-hidden="true">1554</span>                 <span class="c1"># Use this loss when you believe the chosen outputs are better than your model's default output</span>
+<span class="linenos" aria-hidden="true">1555</span>                 <span class="c1"># Increase chosen likelihood and decrease rejected likelihood</span>
+<span class="linenos" aria-hidden="true">1556</span>                 <span class="n">losses_chosen</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">beta</span> <span class="o">*</span> <span class="n">chosen_logratios</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">1557</span>                 <span class="n">losses_rejected</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">beta</span> <span class="o">*</span> <span class="n">rejected_logratios</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">1558</span>                 <span class="n">per_sequence_loss</span> <span class="o">=</span> <span class="n">losses_chosen</span> <span class="o">+</span> <span class="n">losses_rejected</span>
+<span class="linenos" aria-hidden="true">1559</span> 
+<span class="linenos" aria-hidden="true">1560</span>             <span class="k">elif</span> <span class="n">loss_type</span> <span class="o">==</span> <span class="s2">"apo_down"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">1561</span>                 <span class="c1"># Eqn (8) of the APO paper (https://huggingface.co/papers/2408.06266)</span>
+<span class="linenos" aria-hidden="true">1562</span>                 <span class="c1"># Use this loss when you believe the chosen outputs are worse than your model's default output.</span>
+<span class="linenos" aria-hidden="true">1563</span>                 <span class="c1"># Decrease chosen likelihood and decrease rejected likelihood more</span>
+<span class="linenos" aria-hidden="true">1564</span>                 <span class="n">losses_chosen</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">beta</span> <span class="o">*</span> <span class="n">chosen_logratios</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">1565</span>                 <span class="n">losses_rejected</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">beta</span> <span class="o">*</span> <span class="p">(</span><span class="n">chosen_logratios</span> <span class="o">-</span> <span class="n">rejected_logratios</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">1566</span>                 <span class="n">per_sequence_loss</span> <span class="o">=</span> <span class="n">losses_chosen</span> <span class="o">+</span> <span class="n">losses_rejected</span>
+</pre></div>
+<div class="srcref"><code>results/local/review/20260914-chapters-continuation/source/huggingface__trl__trl__trainer__dpo_trainer.py 第 1552–1567 行</code><a href="../code/results/local/review/20260914-chapters-continuation/source/huggingface__trl__trl__trainer__dpo_trainer.py.html#results-local-review-20260914-chapters-continuation-source-huggingface__trl__trl__trainer__dpo_trainer-py-L-1552">在完整文件中打开 &rarr;</a></div></div>
+<p>因此用 DPO/IPO/APO/SimPO 的名称互相代替公式，会改变 reference、长度和 margin 的语义。数据模板、截断与有效位置还需在 Trainer 的 forward/归约路径分别检查。</p>
+<h3 id="_5">设计取舍</h3>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>更新对象</th>
+<th>主要额外成本</th>
+<th>导出依赖</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>full fine-tuning</td>
+<td>选定全参数</td>
+<td>参数梯度与 optimizer 状态</td>
+<td>完整模型与配置</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>低秩 A/B，可能有额外模块</td>
+<td>旁路计算与 adapter 状态；冻结 base 仍参与输入梯度</td>
+<td>base、adapter 或合并权重</td>
+</tr>
+<tr>
+<td>QLoRA</td>
+<td>低秩参数，base 低位宽冻结</td>
+<td>反量化、量化元数据和计算 dtype</td>
+<td>匹配量化 base 与 adapter</td>
+</tr>
+<tr>
+<td>QAT/QAD</td>
+<td>按 recipe 更新参数/量化器</td>
+<td>fake quant 或实际量化路径、教师等</td>
+<td>scale、量化配置与目标 loader</td>
+</tr>
+</tbody>
+</table>
+<p>容量和速度必须按 dtype、模块形状和实际执行测量。full fine-tuning 未必总比 LoRA 快，低位宽 base 也不自动获得低位宽反向 GEMM；优化器状态不是一律额外 12 字节/参数，见 <a href="7.9-optimizer-mixed-precision.html">7.9</a>。</p>
+<h2 id="round-trip">工程实现：小目标与 round-trip</h2>
+<p><code>sft_adapter_contract.py</code> 在合成 <code>[2,5,8]</code> logits 上逐 token 手算 CE，与 PyTorch CE 及梯度对拍；真正 EOS 保留，padding 屏蔽。LoRA 用 16→32 Linear、rank=2/4、FP64、seed=0/1/2，每例一次更新，保存 A/B 和 base hash 到学习盘临时文件，再加载并合并到一个没有旁路的 Linear。</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">16</span> <span class="k">class</span><span class="w"> </span><span class="nc">SimpleLoRALinear</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">17</span>     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">in_features</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span> <span class="n">out_features</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span> <span class="n">r</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">lora_alpha</span><span class="o">=</span><span class="mf">8.</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">18</span>         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">19</span>         <span class="bp">self</span><span class="o">.</span><span class="n">r</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">alpha</span> <span class="o">=</span> <span class="n">r</span><span class="p">,</span> <span class="n">lora_alpha</span>
+<span class="linenos" aria-hidden="true">20</span>         <span class="bp">self</span><span class="o">.</span><span class="n">scaling</span> <span class="o">=</span> <span class="n">lora_alpha</span> <span class="o">/</span> <span class="n">r</span>
+<span class="linenos" aria-hidden="true">21</span>         <span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">out_features</span><span class="p">,</span> <span class="n">in_features</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span> <span class="o">*</span> <span class="mf">.02</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">22</span>                                    <span class="n">requires_grad</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">23</span>         <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">in_features</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span> <span class="o">*</span> <span class="mf">.02</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">24</span>         <span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">out_features</span><span class="p">,</span> <span class="n">r</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">25</span> 
+<span class="linenos" aria-hidden="true">26</span>     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">27</span>         <span class="k">return</span> <span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span> <span class="o">+</span> <span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">scaling</span>
+<span class="linenos" aria-hidden="true">28</span> 
+<span class="linenos" aria-hidden="true">29</span>     <span class="k">def</span><span class="w"> </span><span class="nf">merged</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">30</span>         <span class="c1"># Return a separate plain Linear, so the adapter is not applied twice.</span>
+<span class="linenos" aria-hidden="true">31</span>         <span class="n">layer</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span><span class="o">.</span><span class="n">double</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">32</span>         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">33</span>             <span class="n">layer</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">scaling</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">34</span>         <span class="k">return</span> <span class="n">layer</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/sft_adapter_contract.py 第 16–36 行</code><a href="../code/labs/L7/sft_adapter_contract.py.html#labs-L7-sft_adapter_contract-py-L-16">在完整文件中打开 &rarr;</a></div></div>
+<p><code>preference_loss_reference.py</code> 用稳定 softplus 实现 DPO，解析检查 DPO/APO 的 logprob 梯度；长度、反向配对、reference alias 和数值偏移是独立反例。</p>
+<details class="fold srcfold"><summary>labs/L7/preference_loss_reference.py 全文（167 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""偏好优化的目标与梯度：DPO、APO-zero 与它们的边界。</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">四段：</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">  A 序列 logprob  在固定的小词表上手算 chosen/rejected 的序列对数概率</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="sd">  B DPO           从 Bradley–Terry 推到 DPO 的 loss 与解析梯度，与 autograd 对拍</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="sd">  C APO-zero      SmolLM3 用的那个变体与 DPO 的差别</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="sd">  D 反例          长度归一化、配对错位、reference 跟着更新、模板不一致</span>
+<span class="linenos" aria-hidden="true">  9</span> 
+<span class="linenos" aria-hidden="true"> 10</span> <span class="sd">全部 FP64，无外部依赖。</span>
+<span class="linenos" aria-hidden="true"> 11</span> 
+<span class="linenos" aria-hidden="true"> 12</span> <span class="sd">Usage:</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="sd">    python labs/L7/preference_loss_reference.py &gt; "$RUN_DIR/preference.txt"</span>
+<span class="linenos" aria-hidden="true"> 14</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true"> 15</span> <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+<span class="linenos" aria-hidden="true"> 16</span> 
+<span class="linenos" aria-hidden="true"> 17</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos" aria-hidden="true"> 18</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+<span class="linenos" aria-hidden="true"> 19</span> 
+<span class="linenos" aria-hidden="true"> 20</span> <span class="n">VOCAB</span><span class="p">,</span> <span class="n">SEQ</span> <span class="o">=</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">5</span>
+<span class="linenos" aria-hidden="true"> 21</span> <span class="n">BETA</span> <span class="o">=</span> <span class="mf">0.05</span>                      <span class="c1"># SmolLM3 的 APO 配方用的 beta</span>
+<span class="linenos" aria-hidden="true"> 22</span> <span class="n">torch</span><span class="o">.</span><span class="n">set_default_dtype</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 23</span> 
+<span class="linenos" aria-hidden="true"> 24</span> 
+<span class="linenos" aria-hidden="true"> 25</span> <span class="k">def</span><span class="w"> </span><span class="nf">head</span><span class="p">(</span><span class="n">title</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 26</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="si">{</span><span class="s1">'='</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">78</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">title</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="s1">'='</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">78</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 27</span> 
+<span class="linenos" aria-hidden="true"> 28</span> 
+<span class="linenos" aria-hidden="true"> 29</span> <span class="k">def</span><span class="w"> </span><span class="nf">seq_logprob</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 30</span>                 <span class="n">mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 31</span> <span class="w">    </span><span class="sd">"""Σ_t log p(y_t | y_&lt;t)，只统计 mask 为真的位置（即回答部分）。"""</span>
+<span class="linenos" aria-hidden="true"> 32</span>     <span class="n">logp</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 33</span>     <span class="n">picked</span> <span class="o">=</span> <span class="n">logp</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">tokens</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 34</span>     <span class="k">return</span> <span class="p">(</span><span class="n">picked</span> <span class="o">*</span> <span class="n">mask</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 35</span> 
+<span class="linenos" aria-hidden="true"> 36</span> 
+<span class="linenos" aria-hidden="true"> 37</span> <span class="k">def</span><span class="w"> </span><span class="nf">make_case</span><span class="p">(</span><span class="n">seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 38</span>     <span class="n">gen</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">()</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 39</span>     <span class="n">policy</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">SEQ</span><span class="p">,</span> <span class="n">VOCAB</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 40</span>     <span class="n">ref</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">SEQ</span><span class="p">,</span> <span class="n">VOCAB</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 41</span>     <span class="n">tokens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">VOCAB</span><span class="p">,</span> <span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">SEQ</span><span class="p">),</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 42</span>     <span class="n">mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">SEQ</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 43</span>     <span class="n">mask</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">:]</span> <span class="o">=</span> <span class="mf">1.0</span>            <span class="c1"># chosen 的回答从第 3 个位置开始</span>
+<span class="linenos" aria-hidden="true"> 44</span>     <span class="n">mask</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">:</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="mf">1.0</span>           <span class="c1"># rejected 的回答更短</span>
+<span class="linenos" aria-hidden="true"> 45</span>     <span class="k">return</span> <span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span>
+<span class="linenos" aria-hidden="true"> 46</span> 
+<span class="linenos" aria-hidden="true"> 47</span> 
+<span class="linenos" aria-hidden="true"> 48</span> <span class="c1"># ------------------------------------------------------------------ A</span>
+<span class="linenos" aria-hidden="true"> 49</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_a</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 50</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"A 序列 logprob：只统计回答部分"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 51</span>     <span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span> <span class="o">=</span> <span class="n">make_case</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 52</span>     <span class="n">lp</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 53</span>     <span class="n">lp_ref</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 54</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  chosen 回答长度 </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">mask</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="si">}</span><span class="s2">，rejected 回答长度 </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">mask</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 55</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  policy  logπ(chosen)=</span><span class="si">{</span><span class="n">lp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">:</span><span class="s2">.8f</span><span class="si">}</span><span class="s2">  logπ(rejected)=</span><span class="si">{</span><span class="n">lp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">:</span><span class="s2">.8f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 56</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  ref     logπ(chosen)=</span><span class="si">{</span><span class="n">lp_ref</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">:</span><span class="s2">.8f</span><span class="si">}</span><span class="s2">  logπ(rejected)=</span><span class="si">{</span><span class="n">lp_ref</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">:</span><span class="s2">.8f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 57</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  log-ratio：chosen </span><span class="si">{</span><span class="n">lp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">lp_ref</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">:</span><span class="s2">+.8f</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos" aria-hidden="true"> 58</span>           <span class="sa">f</span><span class="s2">"rejected </span><span class="si">{</span><span class="n">lp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">lp_ref</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">:</span><span class="s2">+.8f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 59</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  两条序列的 prompt 部分必须完全相同且都不计入 logprob；"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 60</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  否则比较的是两个不同问题上的概率，差值没有意义。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 61</span>     <span class="k">return</span> <span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span>
+<span class="linenos" aria-hidden="true"> 62</span> 
+<span class="linenos" aria-hidden="true"> 63</span> 
+<span class="linenos" aria-hidden="true"> 64</span> <span class="c1"># ------------------------------------------------------------------ B</span>
+<span class="linenos" aria-hidden="true"> 65</span> <span class="k">def</span><span class="w"> </span><span class="nf">dpo_loss</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">beta</span><span class="o">=</span><span class="n">BETA</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 66</span>     <span class="n">lp</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 67</span>     <span class="n">lp_ref</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 68</span>     <span class="n">delta</span> <span class="o">=</span> <span class="p">(</span><span class="n">lp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp_ref</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">-</span> <span class="p">(</span><span class="n">lp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp_ref</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 69</span>     <span class="k">return</span> <span class="o">-</span><span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">beta</span> <span class="o">*</span> <span class="n">delta</span><span class="p">),</span> <span class="n">delta</span>
+<span class="linenos" aria-hidden="true"> 70</span> 
+<span class="linenos" aria-hidden="true"> 71</span> 
+<span class="linenos" aria-hidden="true"> 72</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_b</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 73</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"B DPO：Bradley–Terry 给出的目标与它的梯度"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 74</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  Bradley–Terry：P(y_w ≻ y_l) = σ(r(y_w) − r(y_l))"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 75</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  DPO 把隐式奖励取成 r(y) = β·log[π(y)/π_ref(y)]，于是"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 76</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    L = −log σ(β·Δ)，Δ = [logπ(y_w)−logπ_ref(y_w)] − [logπ(y_l)−logπ_ref(y_l)]"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 77</span>     <span class="n">loss</span><span class="p">,</span> <span class="n">delta</span> <span class="o">=</span> <span class="n">dpo_loss</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 78</span>     <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 79</span>     <span class="n">grad_auto</span> <span class="o">=</span> <span class="n">policy</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 80</span>     <span class="n">policy</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true"> 81</span> 
+<span class="linenos" aria-hidden="true"> 82</span>     <span class="c1"># 解析梯度：dL/dΔ = −β·σ(−βΔ)</span>
+<span class="linenos" aria-hidden="true"> 83</span>     <span class="n">coef</span> <span class="o">=</span> <span class="o">-</span><span class="n">BETA</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="o">-</span><span class="n">BETA</span> <span class="o">*</span> <span class="n">delta</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 84</span>     <span class="n">policy2</span> <span class="o">=</span> <span class="n">policy</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 85</span>     <span class="n">lp</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">policy2</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 86</span>     <span class="p">(</span><span class="n">lp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 87</span>     <span class="n">grad_manual</span> <span class="o">=</span> <span class="n">coef</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span> <span class="o">*</span> <span class="n">policy2</span><span class="o">.</span><span class="n">grad</span>
+<span class="linenos" aria-hidden="true"> 88</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  Δ=</span><span class="si">{</span><span class="n">delta</span><span class="si">:</span><span class="s2">.8f</span><span class="si">}</span><span class="s2">  loss=</span><span class="si">{</span><span class="n">loss</span><span class="si">:</span><span class="s2">.8f</span><span class="si">}</span><span class="s2">  σ(βΔ)=</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="n">BETA</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">delta</span><span class="p">)</span><span class="si">:</span><span class="s2">.8f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 89</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  解析系数 dL/dΔ = −β·σ(−βΔ) = </span><span class="si">{</span><span class="n">coef</span><span class="si">:</span><span class="s2">.8f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 90</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  与 autograd 的梯度最大差 </span><span class="si">{</span><span class="nb">float</span><span class="p">((</span><span class="n">grad_auto</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">grad_manual</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">())</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 91</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  梯度的方向：把 chosen 的 logprob 推高、rejected 的推低，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 92</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  权重 σ(−βΔ)=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="o">-</span><span class="n">BETA</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">delta</span><span class="p">))</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2"> 在模型已经分得很开时趋近 0，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 93</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  所以 DPO 会自动忽略已经学会的样本——这也是它对标注噪声敏感的原因。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 94</span> 
+<span class="linenos" aria-hidden="true"> 95</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  β 的作用："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 96</span>     <span class="k">for</span> <span class="n">beta</span> <span class="ow">in</span> <span class="p">(</span><span class="mf">0.01</span><span class="p">,</span> <span class="mf">0.05</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 97</span>         <span class="n">p</span> <span class="o">=</span> <span class="n">policy</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 98</span>         <span class="n">l</span><span class="p">,</span> <span class="n">d</span> <span class="o">=</span> <span class="n">dpo_loss</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">beta</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 99</span>         <span class="n">l</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">100</span>         <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    β=</span><span class="si">{</span><span class="n">beta</span><span class="si">:</span><span class="s2">&lt;5</span><span class="si">}</span><span class="s2"> loss=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">l</span><span class="p">)</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">  梯度范数=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">norm</span><span class="p">())</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">101</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  β 越大越贴近 reference，越小越放任 policy 偏离——它不是学习率。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">102</span> 
+<span class="linenos" aria-hidden="true">103</span> 
+<span class="linenos" aria-hidden="true">104</span> <span class="c1"># ------------------------------------------------------------------ C</span>
+<span class="linenos" aria-hidden="true">105</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_c</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">106</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"C APO-zero：SmolLM3 的 DPO 配方用的是它"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">107</span>     <span class="n">lp</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">policy</span><span class="o">.</span><span class="n">detach</span><span class="p">(),</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">108</span>     <span class="n">lp_ref</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">109</span>     <span class="n">d_w</span> <span class="o">=</span> <span class="n">lp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp_ref</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">110</span>     <span class="n">d_l</span> <span class="o">=</span> <span class="n">lp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp_ref</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">111</span>     <span class="n">dpo</span> <span class="o">=</span> <span class="o">-</span><span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">BETA</span> <span class="o">*</span> <span class="p">(</span><span class="n">d_w</span> <span class="o">-</span> <span class="n">d_l</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">112</span>     <span class="n">apo_zero</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">BETA</span> <span class="o">*</span> <span class="n">d_w</span><span class="p">)</span> <span class="o">+</span> <span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="o">-</span><span class="n">BETA</span> <span class="o">*</span> <span class="n">d_l</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true">113</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  DPO 只约束两者之差；APO-zero 把两项拆开："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">114</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"    L_APO0 = −log σ(β·Δ_w) − log σ(−β·Δ_l)"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">115</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    Δ_w=</span><span class="si">{</span><span class="n">d_w</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">  Δ_l=</span><span class="si">{</span><span class="n">d_l</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">116</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"    DPO loss=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">dpo</span><span class="p">)</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">   APO-zero loss=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">apo_zero</span><span class="p">)</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">117</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  含义不同：DPO 允许两者一起下降只要差值拉大；"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">118</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  APO-zero 明确要求 chosen 的概率相对 reference 上升、rejected 下降。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">119</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  SmolLM3 的 apo.yaml 写的是 loss_type: apo_zero、beta: 0.05；"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">120</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"  换 loss_type 等于换优化目标，不是换一个超参。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">121</span> 
+<span class="linenos" aria-hidden="true">122</span> 
+<span class="linenos" aria-hidden="true">123</span> <span class="c1"># ------------------------------------------------------------------ D</span>
+<span class="linenos" aria-hidden="true">124</span> <span class="k">def</span><span class="w"> </span><span class="nf">section_d</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">125</span>     <span class="n">head</span><span class="p">(</span><span class="s2">"D 四个反例"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">126</span>     <span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span> <span class="o">=</span> <span class="n">make_case</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">127</span> 
+<span class="linenos" aria-hidden="true">128</span>     <span class="n">loss_plain</span><span class="p">,</span> <span class="n">delta_plain</span> <span class="o">=</span> <span class="n">dpo_loss</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">129</span>     <span class="n">len_w</span><span class="p">,</span> <span class="n">len_l</span> <span class="o">=</span> <span class="n">mask</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">sum</span><span class="p">(),</span> <span class="n">mask</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">130</span>     <span class="n">lp</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">131</span>     <span class="n">lp_ref</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">132</span>     <span class="n">delta_norm</span> <span class="o">=</span> <span class="p">((</span><span class="n">lp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp_ref</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">/</span> <span class="n">len_w</span><span class="p">)</span> <span class="o">-</span> <span class="p">((</span><span class="n">lp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp_ref</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span> <span class="o">/</span> <span class="n">len_l</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">133</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  1) 长度归一化：chosen </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">len_w</span><span class="p">)</span><span class="si">}</span><span class="s2"> token、rejected </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">len_l</span><span class="p">)</span><span class="si">}</span><span class="s2"> token"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">134</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"     不归一化 Δ=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">delta_plain</span><span class="p">)</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">；按长度归一化 Δ=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">delta_norm</span><span class="p">)</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">135</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"     两者符号可以相反。序列 logprob 随长度单调下降，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">136</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"     长度不等的偏好对里，不归一化的 DPO 天然偏向短回答。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">137</span> 
+<span class="linenos" aria-hidden="true">138</span>     <span class="n">swapped_mask</span> <span class="o">=</span> <span class="n">mask</span><span class="o">.</span><span class="n">flip</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">139</span>     <span class="n">loss_swap</span><span class="p">,</span> <span class="n">delta_swap</span> <span class="o">=</span> <span class="n">dpo_loss</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">swapped_mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">140</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  2) 配对错位（把 chosen 的 mask 用到 rejected 上）："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">141</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"     Δ 从 </span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">delta_plain</span><span class="p">)</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2"> 变成 </span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">delta_swap</span><span class="p">)</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos" aria-hidden="true">142</span>           <span class="sa">f</span><span class="s2">"loss 从 </span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">loss_plain</span><span class="p">)</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2"> 变成 </span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">loss_swap</span><span class="p">)</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">143</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"     它不会报错，只是把优化方向反过来。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">144</span> 
+<span class="linenos" aria-hidden="true">145</span>     <span class="n">ref_follow</span> <span class="o">=</span> <span class="n">policy</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">146</span>     <span class="n">lp</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">policy</span><span class="o">.</span><span class="n">detach</span><span class="p">(),</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">147</span>     <span class="n">lp_ref2</span> <span class="o">=</span> <span class="n">seq_logprob</span><span class="p">(</span><span class="n">ref_follow</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">148</span>     <span class="n">delta_follow</span> <span class="o">=</span> <span class="p">(</span><span class="n">lp</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp_ref2</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">-</span> <span class="p">(</span><span class="n">lp</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="n">lp_ref2</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">149</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  3) reference 跟着 policy 一起更新：Δ=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">delta_follow</span><span class="p">)</span><span class="si">:</span><span class="s2">.1e</span><span class="si">}</span><span class="s2">，"</span>
+<span class="linenos" aria-hidden="true">150</span>           <span class="sa">f</span><span class="s2">"loss=</span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="o">-</span><span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">BETA</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">delta_follow</span><span class="p">))</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">=−log σ(0)"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">151</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"     两个 log-ratio 恒为零，梯度也恒为零：reference 必须冻结。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">152</span> 
+<span class="linenos" aria-hidden="true">153</span>     <span class="n">shifted</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">154</span>     <span class="n">shifted</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">shifted</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">]</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">VOCAB</span>      <span class="c1"># 模板差一个 token</span>
+<span class="linenos" aria-hidden="true">155</span>     <span class="n">_</span><span class="p">,</span> <span class="n">delta_tpl</span> <span class="o">=</span> <span class="n">dpo_loss</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">shifted</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">156</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">  4) 两侧模板不一致（rejected 多一个特殊 token）："</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">157</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"     Δ 从 </span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">delta_plain</span><span class="p">)</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2"> 变成 </span><span class="si">{</span><span class="nb">float</span><span class="p">(</span><span class="n">delta_tpl</span><span class="p">)</span><span class="si">:</span><span class="s2">+.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">158</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"     偏好数据必须用与训练完全相同的 chat template 渲染，"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">159</span>     <span class="nb">print</span><span class="p">(</span><span class="s2">"     否则差值里混进了模板差异，而不是回答质量差异。"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">160</span> 
+<span class="linenos" aria-hidden="true">161</span> 
+<span class="linenos" aria-hidden="true">162</span> <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">163</span>     <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"torch </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2"> | CPU | FP64 | beta=</span><span class="si">{</span><span class="n">BETA</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">164</span>     <span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span> <span class="o">=</span> <span class="n">section_a</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true">165</span>     <span class="n">section_b</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">166</span>     <span class="n">section_c</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">167</span>     <span class="n">section_d</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/preference_loss_reference.py 全文（167 行）</code><a href="../code/labs/L7/preference_loss_reference.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h2 id="sft-75-i">完整教学项目：SFT 与独立评测（7.5-I）</h2>
+<p>I 任务把 7.1-F 的预训练权重接上一次真正的 SFT，并用与预训练隔离的数据做独立评测。数据来自 <a href="7.8-training-data-engineering.html">7.8</a> 的 <code>data-sft</code>：8,000 条训练会话（3,231,598 个回答 token）、621 条验证、592 条测试，监督只落在 assistant 段，模板在数据准备阶段就确定化。</p>
+<p>训练入口 <code>labs/L7/teaching_sft.py</code> 与上游 <code>train_full_sft.py</code> 对齐的部分：lr <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>5</mn></mrow></msup></mrow></math></span>、BF16 autocast + FP32 master、clip 1.0、assistant 段 label 规则；本项目增加的是验证曲线、梯度记录、best 选择与导出。协议：micro-batch 8、累积 2（16 条/step）、900 步（约 1.8 个 epoch）、每 150 步在 621 条验证集上评一次。</p>
+<p>loss 用<strong>有效回答 token 加权</strong>：每个 batch 返回 CE 的 sum 与有效 token 数，累计后再相除。这样长短样本、最后一个不满 batch 都不会改变分母——按样本平均会把 500 token 的长回答和 3 token 的短回答等权，两者对不同 task 的贡献完全不同。</p>
+<h3 id="_6">学习曲线与独立评测</h3>
+<table>
+<thead>
+<tr>
+<th>step</th>
+<th style="text-align: right;">150</th>
+<th style="text-align: right;">300</th>
+<th style="text-align: right;">450</th>
+<th style="text-align: right;">600</th>
+<th style="text-align: right;">750</th>
+<th style="text-align: right;">900</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>val CE（回答 token 加权）</td>
+<td style="text-align: right;">2.4131</td>
+<td style="text-align: right;">2.3496</td>
+<td style="text-align: right;">2.3218</td>
+<td style="text-align: right;">2.3087</td>
+<td style="text-align: right;">2.3024</td>
+<td style="text-align: right;"><strong>2.2991</strong></td>
+</tr>
+</tbody>
+</table>
+<p>验证 loss 到 900 步仍在下降，没有回升，所以 best 与 last 都是第 900 步。同一个评测协议（固定题号、贪心、两个生成长度上限）跑预训练 base 与 SFT 权重：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">base（7.1-F 第 6000 步）</th>
+<th style="text-align: right;">SFT（第 900 步）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SFT test CE（回答 token 加权）</td>
+<td style="text-align: right;">2.7891</td>
+<td style="text-align: right;"><strong>2.2851</strong></td>
+</tr>
+<tr>
+<td>char-F1，生成上限 128 token / 200 题</td>
+<td style="text-align: right;">0.1723</td>
+<td style="text-align: right;"><strong>0.2647</strong></td>
+</tr>
+<tr>
+<td>char-F1，生成上限 384 token / 100 题</td>
+<td style="text-align: right;">0.1345</td>
+<td style="text-align: right;"><strong>0.2999</strong></td>
+</tr>
+<tr>
+<td>exact match</td>
+<td style="text-align: right;">0/200、0/100</td>
+<td style="text-align: right;">0/200、0/100</td>
+</tr>
+<tr>
+<td>生成里出现 <code>&lt;think&gt;</code></td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">0.50（参考 0.30）</td>
+</tr>
+<tr>
+<td>生成里出现 <code>&lt;tool_call&gt;</code></td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">0.02（参考 0.14）</td>
+</tr>
+<tr>
+<td>平均生成长度（字符，@384）</td>
+<td style="text-align: right;">802</td>
+<td style="text-align: right;">535（参考 664）</td>
+</tr>
+</tbody>
+</table>
+<p>四条判读：</p>
+<p><strong>CE 与 F1 都指向同一方向。</strong> test CE 降 0.504 nats，留出 char-F1 在公平协议下从 0.1345 升到 0.2999（相对 +123%）。这是"SFT 确实改变了任务行为"的证据。</p>
+<p><strong>exact match 是 0，而且这个判据在本协议下不可达。</strong> 测试集参考答案的监督 token 数 p50 = 433、p90 = 638、均值 407，第一轮评测把生成上限设成 128 token，结构上不可能逐字匹配。把上限提到 384 后仍然 0，因为参考答案是数百 token 的开放式文字，"逐字相同"本身就不是合适的判据。<strong>这是协议缺陷，不是模型结论</strong>：先定义可判定的指标再跑评测，比事后解释 0 分更重要。第一轮的 128 token 数字保留在原始现场里，不覆盖。</p>
+<p><strong>格式子技能只学到了一半。</strong> SFT 让 <code>&lt;think&gt;</code> 结构从 0% 出现升到 50%（参考 30%，属于过度生成），但 <code>&lt;tool_call&gt;</code> 只做到 2%（参考 14%）——工具调用需要精确的 JSON 结构与参数，8000 条样本、1.8 个 epoch 不足以稳定学到。<strong>结构 token 比内容 token 更容易被 SFT 捕捉</strong>，这条差异只有在分开统计时才看得见。</p>
+<p><strong>生成上限改变 F1 的方向。</strong> base 在 128 上限下 F1 反而更高（0.1723 对 0.1345），因为它本来就啰嗦，放开长度后多余内容拉低精确率；SFT 放开长度则从 0.2647 升到 0.2999。同一个指标在不同生成长度下可以给出不同的排序，所以 F1 必须与生成协议一起报。</p>
+<h3 id="_7">遗忘</h3>
+<p>同一个 SFT 权重回到预训练留出集上：</p>
+<table>
+<thead>
+<tr>
+<th>数据</th>
+<th style="text-align: right;">base</th>
+<th style="text-align: right;">SFT</th>
+<th style="text-align: right;">变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>预训练 val CE</td>
+<td style="text-align: right;">2.2889</td>
+<td style="text-align: right;">2.3959</td>
+<td style="text-align: right;">+0.107</td>
+</tr>
+<tr>
+<td>预训练 test CE</td>
+<td style="text-align: right;">2.3294</td>
+<td style="text-align: right;">2.4471</td>
+<td style="text-align: right;">+0.118</td>
+</tr>
+</tbody>
+</table>
+<p>SFT 让语言建模能力退化了约 0.11 nats。这个量级不大，但它是真实存在的——<strong>只看 SFT 任务指标会漏掉这部分代价</strong>。要说清是否"灾难性遗忘"需要更长的训练和更广的评测，本项目只报这一组数字。</p>
+<h3 id="_8">验收结论</h3>
+<p>协议在训练前声明：CE 必须下降；留出 char-F1 相对 base 至少提升 20%；tool-call 任务按"参考里有 tool_call 的样本中生成也出现 tool_call"的比例判定，目标 ≥ 0.5；exact match 不作主判据。结果是：CE 通过（−0.504），char-F1 通过（+123%），tool-call 未通过（0.02 对参考 0.14），遗忘已量化（+0.11 nats）。<strong>未通过的项按计划保留，不用训练 loss 或单条样例替代。</strong></p>
+<h3 id="_9">导出与部署</h3>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>labs/L7/run_teaching_lm.sh<span class="w"> </span>sft<span class="w">      </span><span class="c1"># 900 步</span>
+bash<span class="w"> </span>labs/L7/run_teaching_lm.sh<span class="w"> </span>eval-sft
+bash<span class="w"> </span>labs/L7/run_teaching_lm.sh<span class="w"> </span><span class="nb">export</span><span class="w">   </span><span class="c1"># -&gt; $SRC/out/full_sft_768.pth</span>
+<span class="nb">cd</span><span class="w"> </span>/scratch/learn/opt/src/minimind<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>python<span class="w"> </span>eval_llm.py<span class="w"> </span>--weight<span class="w"> </span>full_sft<span class="w"> </span>--hidden_size<span class="w"> </span><span class="m">768</span>
+</code></pre></div>
+
+<p>导出产物是 FP16、91 个张量、137,684,407 B 的裸权重，能直接被上游 <code>init_model</code> 加载；训练态 checkpoint（optimizer/RNG/游标）不随导出走。这一区分与 <a href="7.4-data-ckpt-fault.html">7.4</a> 的产物表一致。</p>
+<h2 id="75-j">完整教学项目：后训练分支（7.5-J）</h2>
+<p>两个分支从同一个 SFT 起点（7.5-I 第 900 步的 <code>best.pt</code>）出发，各自在 4 GPU 小时预算内连续训练到预先声明的停止条件，并且都与原 SFT 起点比较。训练的循环是 <code>labs/L7/teaching_lora.py</code> 与 <code>labs/L7/teaching_dpo.py</code>：模型、注入方式、数据装载和损失都复用上游 MiniMind 实现，本项目补充逐步记录、held-out 曲线、步级 checkpoint、续训与导出。DPO 在启动时把本脚本的 <code>logits_to_log_probs</code>/<code>dpo_loss</code> 与上游 <code>trainer/train_dpo.py</code> 的同名函数在固定随机 batch 上对拍，logprob 最大差与 loss 差均为 0，不一致就直接退出。</p>
+<h3 id="lora_1">LoRA 领域适配</h3>
+<p>数据来自 <a href="7.8-training-data-engineering.html">7.8</a> 的工具子集：任一会话轮带 <code>tool_calls</code>、或 system 消息带 <code>tools</code> 的样本进入候选，再按内容哈希切分，得到 7,925/978/1,097 条 train/val/test。这个子集的一个结构事实决定后面所有判据：<strong>92.3% 的测试样本在对话中某处出现 <code>tool_calls</code>，但没有一条出现在最后一轮</strong>——末轮全都是普通 content。也就是说，同一个测试集可以问两个不同的问题："给定需要动手的上下文，会不会发起工具调用"和"给定工具结果，末轮会不会按参考格式直接作答"。</p>
+<p>协议：rank 16 注入所有方阵 Linear，共 16 个模块、32 个张量、393,216 个可训练参数，占全模型 64.31M 的 0.61%；AdamW 只拿 LoRA 参数，lr <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>4</mn></mrow></msup></mrow></math></span> 余弦退到 10%，micro-batch 32，1,000 步（约 4 个 epoch），BF16，clip 1.0。运行 138.5 s、消费 3.63M 回答 token、峰值 8,780 MiB、约 0.10 s/step，占分支预算的 0.96%。</p>
+<table>
+<thead>
+<tr>
+<th>step</th>
+<th style="text-align: right;">250</th>
+<th style="text-align: right;">500</th>
+<th style="text-align: right;">750</th>
+<th style="text-align: right;">1000</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>验证 loss（回答 token 加权）</td>
+<td style="text-align: right;">1.0893</td>
+<td style="text-align: right;">1.0146</td>
+<td style="text-align: right;">0.9844</td>
+<td style="text-align: right;"><strong>0.9770</strong></td>
+</tr>
+</tbody>
+</table>
+<p>best 与 last 都是第 1000 步。用同一评测协议在同一批 120 条留出题上比较三臂，全参对照用上游 <code>train_full_sft.py</code> 在<strong>同一份数据、同样 1,000 步</strong>上继续训练（lr 取上游默认 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>5</mn></mrow></msup></mrow></math></span>，这是"等数据等步数"而不是"等超参"）：</p>
+<table>
+<thead>
+<tr>
+<th>臂</th>
+<th style="text-align: right;">可训练参数</th>
+<th style="text-align: right;">SFT test CE</th>
+<th style="text-align: right;">预训练 val CE</th>
+<th style="text-align: right;">工具调用：函数名命中</th>
+<th style="text-align: right;">末轮 char-F1</th>
+<th style="text-align: right;">末轮误发 <code>&lt;tool_call&gt;</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SFT 起点</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">2.2851</td>
+<td style="text-align: right;">2.3959</td>
+<td style="text-align: right;">0.0667</td>
+<td style="text-align: right;">0.3745</td>
+<td style="text-align: right;">0.1667</td>
+</tr>
+<tr>
+<td>LoRA rank 16</td>
+<td style="text-align: right;">0.393M（0.61%）</td>
+<td style="text-align: right;">2.3266</td>
+<td style="text-align: right;">2.4146</td>
+<td style="text-align: right;"><strong>0.8917</strong></td>
+<td style="text-align: right;">0.6452</td>
+<td style="text-align: right;">0.0500</td>
+</tr>
+<tr>
+<td>全参对照</td>
+<td style="text-align: right;">63.91M</td>
+<td style="text-align: right;">2.3024</td>
+<td style="text-align: right;">2.4140</td>
+<td style="text-align: right;">0.7667</td>
+<td style="text-align: right;"><strong>0.7146</strong></td>
+<td style="text-align: right;">0.0667</td>
+</tr>
+</tbody>
+</table>
+<p>四条判读：</p>
+<p><strong>判据必须先与参考的监督语义对齐，否则同一个数字可以读出相反结论。</strong> 末轮参考全是 content，所以"生成里出现 <code>&lt;tool_call&gt;</code>"在这个切法下衡量的是<strong>格式漂移</strong>，越低越贴近参考；把切点移到首个带 <code>tool_calls</code> 的 assistant 轮之前，同一批题才在问工具调用能力。两个切法的结论完全相反：按末轮口径，适配后从 0.1667 掉到 0.0500，看起来像能力退化；按工具调用切法，函数名命中从 0.0667 升到 0.8917。协议写错一步，方向就会反过来——这与 7.5-I 里 exact match 在 384 token 上限下不可达是同一类问题。</p>
+<p><strong>0.61% 的参数拿到了结构行为的大部分收益。</strong> LoRA 的函数名命中 0.8917 高于全参的 0.7667，而两者的内容 F1 排序相反（0.6452 对 0.7146）。结构 token 是离散的格式决定，内容质量是连续分布拟合，两个目标对"更新容量"的需求不同。差异的机制本轮没有定位：要区分需要扫 rank 与步数，本轮只取了一个主配置。</p>
+<p><strong>"只更新少量参数"不等于"遗忘更少"。</strong> 预训练 val CE 两臂几乎相同（+0.019 对 +0.018），但留出 SFT 分布上 LoRA 退化更多（2.3266 对 2.3024）。冻结 base 保证的是原始权重不被改写，不保证输出分布不被推向新数据。</p>
+<p><strong>合并是近似。</strong> 16 个模块的 <code>B@A</code> 并入权重后与旁路推理的 logits 最大差 0.219、均值 0.0158（BF16 下"两次 matmul"与"一次 matmul"的差别）。合并前后逐位相同不成立，部署前要按容差检查，这与 <a href="../L5/5.10-lora-multitenant.html">5.10</a> 的服务侧结论一致。</p>
+<h3 id="dpo">DPO 偏好优化</h3>
+<p>偏好数据来自上游公开的 <code>dpo.jsonl</code>：扫描 17,166 对，丢掉 39 对命中有限粗筛词表的样本（规则与命中数写进 manifest），reservoir 采样后按内容哈希切成 8,000/477/458 对。协议：beta 0.15、lr <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>4</mn><mo>&#x000D7;</mo><msup><mn>10</mn><mrow><mo>&#x02212;</mo><mn>8</mn></mrow></msup></mrow></math></span> 余弦退到 10%、micro-batch 4（一个 batch 实为 8 条序列，前一半 chosen 后一半 rejected）、max_len 1024、2,000 步（1 个 epoch），reference 固定为 SFT 起点。运行 121 s、消费 5.32M 偏好 token、峰值 5,523 MiB、约 0.052 s/step，占分支预算的 0.84%。</p>
+<p>运行内部的 held-out margin 在 128 条验证对上逐步上升，没有出现回升：</p>
+<table>
+<thead>
+<tr>
+<th>step</th>
+<th style="text-align: right;">250</th>
+<th style="text-align: right;">500</th>
+<th style="text-align: right;">750</th>
+<th style="text-align: right;">1000</th>
+<th style="text-align: right;">1250</th>
+<th style="text-align: right;">1500</th>
+<th style="text-align: right;">1750</th>
+<th style="text-align: right;">2000</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>margin 均值</td>
+<td style="text-align: right;">−0.0861</td>
+<td style="text-align: right;">−0.0311</td>
+<td style="text-align: right;">−0.0294</td>
+<td style="text-align: right;">0.0014</td>
+<td style="text-align: right;">0.0244</td>
+<td style="text-align: right;">0.0471</td>
+<td style="text-align: right;">0.0696</td>
+<td style="text-align: right;"><strong>0.1100</strong></td>
+</tr>
+<tr>
+<td>正 margin 比例</td>
+<td style="text-align: right;">0.445</td>
+<td style="text-align: right;">0.500</td>
+<td style="text-align: right;">0.461</td>
+<td style="text-align: right;">0.539</td>
+<td style="text-align: right;">0.594</td>
+<td style="text-align: right;">0.547</td>
+<td style="text-align: right;">0.539</td>
+<td style="text-align: right;">0.578</td>
+</tr>
+</tbody>
+</table>
+<p>best 与 last 都是第 2000 步。换到 300 条测试对上独立复算，并同时记录偏好与任务两个轴：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">SFT 起点</th>
+<th style="text-align: right;">DPO（第 2000 步）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>策略 log-ratio 均值</td>
+<td style="text-align: right;">−47.3189</td>
+<td style="text-align: right;">−47.0523</td>
+</tr>
+<tr>
+<td>margin 均值（相对起点）</td>
+<td style="text-align: right;">0.0000（同权重的自检）</td>
+<td style="text-align: right;"><strong>+0.2666</strong></td>
+</tr>
+<tr>
+<td>正 margin 比例</td>
+<td style="text-align: right;">0.0000</td>
+<td style="text-align: right;">0.6367</td>
+</tr>
+<tr>
+<td>预训练 val CE</td>
+<td style="text-align: right;">2.3959</td>
+<td style="text-align: right;">2.3966</td>
+</tr>
+<tr>
+<td>SFT test CE</td>
+<td style="text-align: right;">2.2851</td>
+<td style="text-align: right;">2.2851</td>
+</tr>
+<tr>
+<td>留出生成 char-F1（384 token 上限）</td>
+<td style="text-align: right;">0.2647</td>
+<td style="text-align: right;">0.2706</td>
+</tr>
+</tbody>
+</table>
+<p><strong>偏好 margin 上升没有转成可测的任务质量。</strong> 每对平均 +0.2666 nats 的偏好改善在同一批题上只带来 +0.006 的 char-F1，通用能力与 SFT 分布上的 CE 都没有可辨变化（+0.0007 nats 的预训练 CE 差落在噪声内）。按计划这属于"训练偏好准确率不等于全部收益"的保留项：DPO 确实改变了偏好方向，但没有证据说明它改变了这批开放式问答的可用性。</p>
+<p><strong>评测节奏会扰动训练流。</strong> DPO 数据集的 <code>__getitem__</code> 用全局 Python RNG 决定是否去掉空 think 块，而 held-out margin 评测会取用该数据集，于是 <code>--eval-every</code> 的取值改变了后续 batch 的模板随机性。同一配置、只改评测间隔的两次运行因此给出不同的 margin 曲线。这是 <a href="7.8-training-data-engineering.html">7.8</a>"固定 seed 不保证可复现"的一个具体形态：随机性不只来自初始化和采样，也来自数据管道被读取的次数。</p>
+<h3 id="_10">成本、产物与命令</h3>
+<table>
+<thead>
+<tr>
+<th>分支</th>
+<th style="text-align: right;">墙钟</th>
+<th style="text-align: right;">GPU 小时</th>
+<th style="text-align: right;">预算占比</th>
+<th>可部署产物</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LoRA</td>
+<td style="text-align: right;">138.5 s</td>
+<td style="text-align: right;">0.0385</td>
+<td style="text-align: right;">0.96%</td>
+<td>adapter 795,153 B（32 张量）+ 合并权重 137,684,310 B</td>
+</tr>
+<tr>
+<td>DPO</td>
+<td style="text-align: right;">121.0 s</td>
+<td style="text-align: right;">0.0336</td>
+<td style="text-align: right;">0.84%</td>
+<td>裸 FP16 权重 137,677,807 B（91 张量）</td>
+</tr>
+</tbody>
+</table>
+<p>两个分支都远低于 4 GPU 小时的规划上限，所以本轮没有触发"缩小规模"的分支；预算的约束力体现在这两条曲线都很短，超过 1,000/2,000 步的效果没有测量。训练态 checkpoint（optimizer/scaler/RNG）与可部署权重分开保存，<code>best.pth</code> 按各分支的留出判据选择，本轮两者都落在最后一步。</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">RUN</span><span class="o">=</span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/teaching-lm"</span>
+bash<span class="w"> </span>labs/L7/run_teaching_posttrain.sh<span class="w"> </span>data
+bash<span class="w"> </span>labs/L7/run_teaching_posttrain.sh<span class="w"> </span>lora-pilot<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>bash<span class="w"> </span>labs/L7/run_teaching_posttrain.sh<span class="w"> </span>lora
+bash<span class="w"> </span>labs/L7/run_teaching_posttrain.sh<span class="w"> </span>lora-full-ft<span class="w">     </span><span class="c1"># 等数据等步数的全参对照</span>
+bash<span class="w"> </span>labs/L7/run_teaching_posttrain.sh<span class="w"> </span>dpo-pilot<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>bash<span class="w"> </span>labs/L7/run_teaching_posttrain.sh<span class="w"> </span>dpo
+bash<span class="w"> </span>labs/L7/run_teaching_posttrain.sh<span class="w"> </span><span class="nb">eval</span><span class="w">             </span><span class="c1"># 三臂 + 两个切法的工具调用判据</span>
+</code></pre></div>
+
+<h2 id="lab">动手 lab</h2>
+<p><code>$RUN_DIR</code> 是学习盘新实验父目录，TMPDIR 与 Python 环境见 <code>ENVIRONMENTS.md</code>。</p>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L7/sft_adapter_contract.py<span class="w"> </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/sft-lora"</span>
+python<span class="w"> </span>labs/L7/preference_loss_reference.py<span class="w"> </span>--outdir<span class="w"> </span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/preference"</span>
+</code></pre></div>
+
+<p>真实 SFT 与独立评测走教学项目入口（需要 7.1-F 的预训练权重与 7.8-I 的 SFT 数据）：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">RUN</span><span class="o">=</span><span class="s2">"</span><span class="nv">$RUN_DIR</span><span class="s2">/teaching-lm"</span>
+bash<span class="w"> </span>labs/L7/run_teaching_lm.sh<span class="w"> </span>sft
+bash<span class="w"> </span>labs/L7/run_teaching_lm.sh<span class="w"> </span>eval-sft
+bash<span class="w"> </span>labs/L7/run_teaching_lm.sh<span class="w"> </span><span class="nb">export</span>
+</code></pre></div>
+
+<p>三组 SFT 有效 target 都为 5；把所有 ID=EOS 的位置屏蔽后只剩 3，展示真实 EOS 被误删。六组 LoRA 初始增量为零、base 更新差为零、A 第一轮梯度为零而 B 非零；保存加载的输出一致，合并输出最大误差为 8.33e-17（阈值 1e-12）。</p>
+<p>固定 DPO 例 loss=.64439666，两个 logprob 梯度为 ±.04750208，解析差为 0。policy/reference 相同但长度为 50/5 时 loss=.69314718，冻结 reference 下梯度为 [-.05,.05]；若 reference 与同一可微图 alias，梯度为 [0,0]。反向配对把原 chosen 的梯度从 -.05 改为 +.05。这些是梯度契约，不是回答质量或长度坍塌实验。</p>
+<p>按 SmolLM3 YAML 的七个线性矩阵形状、36 层计算，r=8/16/32 的 adapter 数量为 15,114,240 / 30,228,480 / 60,456,960。这是指定 target 集合的公式预测，没有加载 3B 模型，也不包含 embedding adapter 或 modules_to_save。</p>
+<h2 id="_11">原始现场</h2>
+<ul>
+<li><a href="../raw/results/local/7.5/20260914-review-fixes/sft-lora/sft_lora_contract_report.json">SFT masks、六组保存/加载/合并与参数数目公式</a>。</li>
+<li><a href="../raw/results/local/7.5/20260914-review-fixes/preference-v2/preference_loss_report.json">DPO/APO 梯度及数值反例</a>。</li>
+<li><a href="../raw/results/local/7.5/20260914-review-fixes/peft-source/manifest.json">PEFT 固定源码清单</a>。</li>
+<li>教学 SFT：<a href="../raw/results/crater/7.5/20260922-teaching-sft/sft/run.json">训练 run.json</a>、<a href="../raw/results/crater/7.5/20260922-teaching-sft/sft/metrics.jsonl">验证曲线记录</a></li>
+<li>独立评测：<a href="../raw/results/crater/7.5/20260922-teaching-sft/eval-base/eval.json">base 在留出集上</a>、<a href="../raw/results/crater/7.5/20260922-teaching-sft/eval-sft-best/eval.json">SFT 在留出集上</a>、<a href="../raw/results/crater/7.5/20260922-teaching-sft/eval-long-sft/generations.jsonl">公平长度下的留出生成</a></li>
+<li>数据与监督核对：<a href="../raw/results/crater/7.8/20260922-teaching-data/data-sft/manifest.json">会话数据 manifest</a>（<a href="../raw/results/crater/7.8/20260922-teaching-data/data-sft/preview.jsonl">逐 token 预览</a>）</li>
+<li>后训练数据产品：<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/data-lora-manifest.json">LoRA 子集 manifest</a>、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/data-dpo-manifest.json">偏好对 manifest（含粗筛规则与命中数）</a></li>
+<li>后训练训练记录：<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/lora/run.json">LoRA run.json</a>（<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/lora/metrics.jsonl">逐步曲线</a>）、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/dpo/run.json">DPO run.json</a>（<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/dpo/metrics.jsonl">逐步曲线</a>）、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/lora-full-ft.log">等步数全参对照日志</a></li>
+<li>后训练评测：<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/base-on-lora/eval.json">SFT 起点</a>、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/lora/eval.json">LoRA</a>（<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/lora/lora_generations.jsonl">末轮生成</a>、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/lora/toolcall_generations.jsonl">工具调用切点生成</a>）、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/full-ft-on-lora/eval.json">全参对照</a>、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/base-on-dpo/eval.json">DPO 偏好自检</a>、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/dpo/eval.json">DPO 偏好</a>（<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/dpo/dpo_pairs.jsonl">逐对 margin</a>）、<a href="../raw/results/crater/7.5/20260922-teaching-posttrain/eval/dpo-task/eval.json">DPO 任务质量</a></li>
+</ul>
+<details class="fold srcfold"><summary>labs/L7/sft_adapter_contract.py 全文（138 行）</summary><div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">  1</span> <span class="ch">#!/usr/bin/env python3</span>
+<span class="linenos" aria-hidden="true">  2</span> <span class="sd">"""CPU SFT mask and one-layer LoRA update/save/load/merge contracts.</span>
+<span class="linenos" aria-hidden="true">  3</span> 
+<span class="linenos" aria-hidden="true">  4</span> <span class="sd">Synthetic inputs only. This is not a TRL/PEFT training or QLoRA kernel run.</span>
+<span class="linenos" aria-hidden="true">  5</span> <span class="sd">"""</span>
+<span class="linenos" aria-hidden="true">  6</span> <span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+<span class="linenos" aria-hidden="true">  7</span> <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="linenos" aria-hidden="true">  8</span> <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="linenos" aria-hidden="true">  9</span> <span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
+<span class="linenos" aria-hidden="true"> 10</span> 
+<span class="linenos" aria-hidden="true"> 11</span> <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="linenos" aria-hidden="true"> 12</span> <span class="kn">from</span><span class="w"> </span><span class="nn">torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">nn</span>
+<span class="linenos" aria-hidden="true"> 13</span> <span class="kn">from</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="kn">import</span> <span class="n">functional</span> <span class="k">as</span> <span class="n">F</span>
+<span class="linenos" aria-hidden="true"> 14</span> 
+<span class="linenos" aria-hidden="true"> 15</span> 
+<span class="linenos" aria-hidden="true"> 16</span> <span class="k">class</span><span class="w"> </span><span class="nc">SimpleLoRALinear</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 17</span>     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">in_features</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span> <span class="n">out_features</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span> <span class="n">r</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">lora_alpha</span><span class="o">=</span><span class="mf">8.</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 18</span>         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 19</span>         <span class="bp">self</span><span class="o">.</span><span class="n">r</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">alpha</span> <span class="o">=</span> <span class="n">r</span><span class="p">,</span> <span class="n">lora_alpha</span>
+<span class="linenos" aria-hidden="true"> 20</span>         <span class="bp">self</span><span class="o">.</span><span class="n">scaling</span> <span class="o">=</span> <span class="n">lora_alpha</span> <span class="o">/</span> <span class="n">r</span>
+<span class="linenos" aria-hidden="true"> 21</span>         <span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">out_features</span><span class="p">,</span> <span class="n">in_features</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span> <span class="o">*</span> <span class="mf">.02</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 22</span>                                    <span class="n">requires_grad</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 23</span>         <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">in_features</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span> <span class="o">*</span> <span class="mf">.02</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 24</span>         <span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">out_features</span><span class="p">,</span> <span class="n">r</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">))</span>
+<span class="linenos" aria-hidden="true"> 25</span> 
+<span class="linenos" aria-hidden="true"> 26</span>     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 27</span>         <span class="k">return</span> <span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span> <span class="o">+</span> <span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">scaling</span>
+<span class="linenos" aria-hidden="true"> 28</span> 
+<span class="linenos" aria-hidden="true"> 29</span>     <span class="k">def</span><span class="w"> </span><span class="nf">merged</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 30</span>         <span class="c1"># Return a separate plain Linear, so the adapter is not applied twice.</span>
+<span class="linenos" aria-hidden="true"> 31</span>         <span class="n">layer</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span><span class="o">.</span><span class="n">double</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 32</span>         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 33</span>             <span class="n">layer</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">scaling</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 34</span>         <span class="k">return</span> <span class="n">layer</span>
+<span class="linenos" aria-hidden="true"> 35</span> 
+<span class="linenos" aria-hidden="true"> 36</span> 
+<span class="linenos" aria-hidden="true"> 37</span> <span class="k">def</span><span class="w"> </span><span class="nf">verify_sft_masks</span><span class="p">(</span><span class="n">seed</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 38</span>     <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 39</span>     <span class="c1"># EOS and padding share ID 2. Valid lengths, rather than token equality, distinguish them.</span>
+<span class="linenos" aria-hidden="true"> 40</span>     <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="mi">2</span><span class="p">]])</span>
+<span class="linenos" aria-hidden="true"> 41</span>     <span class="n">attention</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">]],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 42</span>     <span class="n">response</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">]],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 43</span>     <span class="n">labels</span> <span class="o">=</span> <span class="n">ids</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="o">~</span><span class="p">(</span><span class="n">attention</span> <span class="o">&amp;</span> <span class="n">response</span><span class="p">),</span> <span class="o">-</span><span class="mi">100</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 44</span>     <span class="n">logits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 45</span>     <span class="n">shifted</span> <span class="o">=</span> <span class="n">labels</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">:]</span>
+<span class="linenos" aria-hidden="true"> 46</span>     <span class="n">valid</span> <span class="o">=</span> <span class="n">shifted</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">100</span>
+<span class="linenos" aria-hidden="true"> 47</span>     <span class="n">loss</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">cross_entropy</span><span class="p">(</span><span class="n">logits</span><span class="p">[:,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">8</span><span class="p">),</span> <span class="n">shifted</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">),</span> <span class="n">reduction</span><span class="o">=</span><span class="s1">'sum'</span><span class="p">)</span> <span class="o">/</span> <span class="n">valid</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 48</span>     <span class="n">logp</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 49</span>     <span class="n">manual</span> <span class="o">=</span> <span class="o">-</span><span class="n">logp</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">shifted</span><span class="o">.</span><span class="n">clamp_min</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="n">valid</span><span class="p">]</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">/</span> <span class="n">valid</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 50</span>     <span class="n">official_grad</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="n">logits</span><span class="p">,</span> <span class="n">retain_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 51</span>     <span class="n">manual_grad</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">manual</span><span class="p">,</span> <span class="n">logits</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 52</span>     <span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="n">manual</span><span class="p">,</span> <span class="n">rtol</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">atol</span><span class="o">=</span><span class="mf">1e-12</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 53</span>     <span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">official_grad</span><span class="p">,</span> <span class="n">manual_grad</span><span class="p">,</span> <span class="n">rtol</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">atol</span><span class="o">=</span><span class="mf">1e-12</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 54</span>     <span class="k">assert</span> <span class="n">official_grad</span><span class="p">[:,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="o">~</span><span class="n">valid</span><span class="p">]</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true"> 55</span>     <span class="k">assert</span> <span class="nb">int</span><span class="p">((</span><span class="n">labels</span> <span class="o">==</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span> <span class="o">==</span> <span class="mi">2</span>  <span class="c1"># two genuine EOS targets</span>
+<span class="linenos" aria-hidden="true"> 56</span>     <span class="n">bad</span> <span class="o">=</span> <span class="n">labels</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">ids</span> <span class="o">==</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">100</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 57</span>     <span class="k">assert</span> <span class="nb">int</span><span class="p">((</span><span class="n">bad</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">:]</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">100</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span> <span class="o">==</span> <span class="mi">3</span>
+<span class="linenos" aria-hidden="true"> 58</span>     <span class="c1"># Truncating before the first answer yields an empty supervised set; reject before reducing.</span>
+<span class="linenos" aria-hidden="true"> 59</span>     <span class="n">empty</span> <span class="o">=</span> <span class="n">labels</span><span class="p">[:,</span> <span class="p">:</span><span class="mi">2</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 60</span>     <span class="k">assert</span> <span class="ow">not</span> <span class="p">(</span><span class="n">empty</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">:]</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">100</span><span class="p">)</span><span class="o">.</span><span class="n">any</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 61</span>     <span class="k">return</span> <span class="p">{</span><span class="s1">'seed'</span><span class="p">:</span><span class="n">seed</span><span class="p">,</span><span class="s1">'input_ids'</span><span class="p">:</span><span class="n">ids</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span><span class="s1">'attention_mask'</span><span class="p">:</span><span class="n">attention</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true"> 62</span>             <span class="s1">'response_mask'</span><span class="p">:</span><span class="n">response</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span><span class="s1">'labels'</span><span class="p">:</span><span class="n">labels</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span><span class="s1">'valid_targets'</span><span class="p">:</span><span class="nb">int</span><span class="p">(</span><span class="n">valid</span><span class="o">.</span><span class="n">sum</span><span class="p">()),</span>
+<span class="linenos" aria-hidden="true"> 63</span>             <span class="s1">'loss'</span><span class="p">:</span><span class="n">loss</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span><span class="s1">'gradient_max_error'</span><span class="p">:(</span><span class="n">official_grad</span><span class="o">-</span><span class="n">manual_grad</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true"> 64</span>             <span class="s1">'wrong_eos_mask_valid_targets'</span><span class="p">:</span><span class="nb">int</span><span class="p">((</span><span class="n">bad</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">:]</span><span class="o">!=-</span><span class="mi">100</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()),</span>
+<span class="linenos" aria-hidden="true"> 65</span>             <span class="s1">'empty_answer_action'</span><span class="p">:</span><span class="s1">'reject before loss/optimizer'</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 66</span>             <span class="s1">'scope'</span><span class="p">:</span><span class="s1">'independent logits CE reference; no TRL or causal-attention model executed'</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true"> 67</span> 
+<span class="linenos" aria-hidden="true"> 68</span> 
+<span class="linenos" aria-hidden="true"> 69</span> <span class="k">def</span><span class="w"> </span><span class="nf">verify_lora</span><span class="p">(</span><span class="n">seed</span><span class="p">,</span> <span class="n">rank</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 70</span>     <span class="n">torch</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 71</span>     <span class="n">model</span> <span class="o">=</span> <span class="n">SimpleLoRALinear</span><span class="p">(</span><span class="n">r</span><span class="o">=</span><span class="n">rank</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 72</span>     <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span><span class="mi">16</span><span class="p">,</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 73</span>     <span class="n">target</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span><span class="mi">32</span><span class="p">,</span><span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 74</span>     <span class="n">initial_base</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 75</span>     <span class="n">initial_diff</span> <span class="o">=</span> <span class="p">(</span><span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">-</span><span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">,</span><span class="n">model</span><span class="o">.</span><span class="n">weight</span><span class="p">))</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 76</span>     <span class="k">assert</span> <span class="n">initial_diff</span> <span class="o">==</span> <span class="mi">0</span>
+<span class="linenos" aria-hidden="true"> 77</span>     <span class="n">optimizer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">([</span><span class="n">model</span><span class="o">.</span><span class="n">lora_A</span><span class="p">,</span><span class="n">model</span><span class="o">.</span><span class="n">lora_B</span><span class="p">],</span> <span class="n">lr</span><span class="o">=</span><span class="mf">.01</span><span class="p">,</span> <span class="n">weight_decay</span><span class="o">=</span><span class="mf">0.</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 78</span>     <span class="n">F</span><span class="o">.</span><span class="n">mse_loss</span><span class="p">(</span><span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">),</span><span class="n">target</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 79</span>     <span class="n">grad_a</span><span class="p">,</span><span class="n">grad_b</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">lora_A</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span> <span class="n">model</span><span class="o">.</span><span class="n">lora_B</span><span class="o">.</span><span class="n">grad</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 80</span>     <span class="k">assert</span> <span class="n">grad_a</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">grad_b</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">model</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">grad</span> <span class="ow">is</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true"> 81</span>     <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 82</span>     <span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span><span class="n">initial_base</span><span class="p">,</span><span class="n">rtol</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span><span class="n">atol</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 83</span>     <span class="n">expected</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 84</span>     <span class="n">base_hash</span> <span class="o">=</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">sha256</span><span class="p">(</span><span class="n">initial_base</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">tobytes</span><span class="p">())</span><span class="o">.</span><span class="n">hexdigest</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 85</span>     <span class="k">with</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">TemporaryDirectory</span><span class="p">(</span><span class="n">prefix</span><span class="o">=</span><span class="s1">'adapter-contract-'</span><span class="p">,</span><span class="nb">dir</span><span class="o">=</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s1">'TMPDIR'</span><span class="p">])</span> <span class="k">as</span> <span class="n">directory</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true"> 86</span>         <span class="n">checkpoint</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">directory</span><span class="p">)</span><span class="o">/</span><span class="s1">'adapter.pt'</span>
+<span class="linenos" aria-hidden="true"> 87</span>         <span class="n">torch</span><span class="o">.</span><span class="n">save</span><span class="p">({</span><span class="s1">'r'</span><span class="p">:</span><span class="n">rank</span><span class="p">,</span><span class="s1">'alpha'</span><span class="p">:</span><span class="n">model</span><span class="o">.</span><span class="n">alpha</span><span class="p">,</span><span class="s1">'base_sha256'</span><span class="p">:</span><span class="n">base_hash</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true"> 88</span>                     <span class="s1">'A'</span><span class="p">:</span><span class="n">model</span><span class="o">.</span><span class="n">lora_A</span><span class="o">.</span><span class="n">detach</span><span class="p">(),</span><span class="s1">'B'</span><span class="p">:</span><span class="n">model</span><span class="o">.</span><span class="n">lora_B</span><span class="o">.</span><span class="n">detach</span><span class="p">()},</span><span class="n">checkpoint</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 89</span>         <span class="n">payload</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">checkpoint</span><span class="p">,</span><span class="n">weights_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 90</span>         <span class="n">restored</span> <span class="o">=</span> <span class="n">SimpleLoRALinear</span><span class="p">(</span><span class="n">r</span><span class="o">=</span><span class="n">payload</span><span class="p">[</span><span class="s1">'r'</span><span class="p">],</span><span class="n">lora_alpha</span><span class="o">=</span><span class="n">payload</span><span class="p">[</span><span class="s1">'alpha'</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 91</span>         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true"> 92</span>             <span class="n">restored</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">initial_base</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 93</span>             <span class="n">restored</span><span class="o">.</span><span class="n">lora_A</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">payload</span><span class="p">[</span><span class="s1">'A'</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 94</span>             <span class="n">restored</span><span class="o">.</span><span class="n">lora_B</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">payload</span><span class="p">[</span><span class="s1">'B'</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true"> 95</span>         <span class="k">assert</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">sha256</span><span class="p">(</span><span class="n">restored</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">tobytes</span><span class="p">())</span><span class="o">.</span><span class="n">hexdigest</span><span class="p">()</span><span class="o">==</span><span class="n">payload</span><span class="p">[</span><span class="s1">'base_sha256'</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true"> 96</span>         <span class="n">reloaded_output</span> <span class="o">=</span> <span class="n">restored</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 97</span>         <span class="n">merged_output</span> <span class="o">=</span> <span class="n">restored</span><span class="o">.</span><span class="n">merged</span><span class="p">()(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+<span class="linenos" aria-hidden="true"> 98</span>         <span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">reloaded_output</span><span class="p">,</span><span class="n">expected</span><span class="p">,</span><span class="n">rtol</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span><span class="n">atol</span><span class="o">=</span><span class="mf">1e-12</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 99</span>         <span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span><span class="n">merged_output</span><span class="p">,</span><span class="n">expected</span><span class="p">,</span><span class="n">rtol</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span><span class="n">atol</span><span class="o">=</span><span class="mf">1e-12</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">100</span>         <span class="n">checkpoint_bytes</span> <span class="o">=</span> <span class="n">checkpoint</span><span class="o">.</span><span class="n">stat</span><span class="p">()</span><span class="o">.</span><span class="n">st_size</span>
+<span class="linenos" aria-hidden="true">101</span>     <span class="k">return</span> <span class="p">{</span><span class="s1">'seed'</span><span class="p">:</span><span class="n">seed</span><span class="p">,</span><span class="s1">'rank'</span><span class="p">:</span><span class="n">rank</span><span class="p">,</span><span class="s1">'alpha'</span><span class="p">:</span><span class="n">model</span><span class="o">.</span><span class="n">alpha</span><span class="p">,</span><span class="s1">'initial_output_error'</span><span class="p">:</span><span class="n">initial_diff</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">102</span>             <span class="s1">'base_max_change'</span><span class="p">:(</span><span class="n">model</span><span class="o">.</span><span class="n">weight</span><span class="o">-</span><span class="n">initial_base</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true">103</span>             <span class="s1">'first_gradient_norms'</span><span class="p">:{</span><span class="s1">'A'</span><span class="p">:</span><span class="n">grad_a</span><span class="p">,</span><span class="s1">'B'</span><span class="p">:</span><span class="n">grad_b</span><span class="p">},</span>
+<span class="linenos" aria-hidden="true">104</span>             <span class="s1">'adapter_parameter_count'</span><span class="p">:</span><span class="n">model</span><span class="o">.</span><span class="n">lora_A</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span><span class="o">+</span><span class="n">model</span><span class="o">.</span><span class="n">lora_B</span><span class="o">.</span><span class="n">numel</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true">105</span>             <span class="s1">'adapter_optimizer_state_dtypes'</span><span class="p">:</span><span class="nb">sorted</span><span class="p">({</span><span class="nb">str</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">optimizer</span><span class="o">.</span><span class="n">state</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">s</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">t</span><span class="p">)}),</span>
+<span class="linenos" aria-hidden="true">106</span>             <span class="s1">'reload_max_error'</span><span class="p">:(</span><span class="n">reloaded_output</span><span class="o">-</span><span class="n">expected</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true">107</span>             <span class="s1">'merge_max_error'</span><span class="p">:(</span><span class="n">merged_output</span><span class="o">-</span><span class="n">expected</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+<span class="linenos" aria-hidden="true">108</span>             <span class="s1">'checkpoint_bytes'</span><span class="p">:</span><span class="n">checkpoint_bytes</span><span class="p">,</span><span class="s1">'base_sha256'</span><span class="p">:</span><span class="n">base_hash</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">109</span>             <span class="s1">'expected_output'</span><span class="p">:</span><span class="n">expected</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span><span class="s1">'updates'</span><span class="p">:</span><span class="mi">1</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">110</span> 
+<span class="linenos" aria-hidden="true">111</span> 
+<span class="linenos" aria-hidden="true">112</span> <span class="k">def</span><span class="w"> </span><span class="nf">adapter_count_example</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">113</span>     <span class="c1"># Dimensions from the pinned SmolLM3 YAML. Counts are arithmetic, not a loaded-model census.</span>
+<span class="linenos" aria-hidden="true">114</span>     <span class="n">shapes</span><span class="o">=</span><span class="p">{</span><span class="s1">'q_proj'</span><span class="p">:[</span><span class="mi">2048</span><span class="p">,</span><span class="mi">2048</span><span class="p">],</span><span class="s1">'k_proj'</span><span class="p">:[</span><span class="mi">512</span><span class="p">,</span><span class="mi">2048</span><span class="p">],</span><span class="s1">'v_proj'</span><span class="p">:[</span><span class="mi">512</span><span class="p">,</span><span class="mi">2048</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">115</span>             <span class="s1">'o_proj'</span><span class="p">:[</span><span class="mi">2048</span><span class="p">,</span><span class="mi">2048</span><span class="p">],</span><span class="s1">'gate_proj'</span><span class="p">:[</span><span class="mi">11008</span><span class="p">,</span><span class="mi">2048</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">116</span>             <span class="s1">'up_proj'</span><span class="p">:[</span><span class="mi">11008</span><span class="p">,</span><span class="mi">2048</span><span class="p">],</span><span class="s1">'down_proj'</span><span class="p">:[</span><span class="mi">2048</span><span class="p">,</span><span class="mi">11008</span><span class="p">]}</span>
+<span class="linenos" aria-hidden="true">117</span>     <span class="k">return</span> <span class="p">{</span><span class="s1">'source_kind'</span><span class="p">:</span><span class="s1">'formula_prediction'</span><span class="p">,</span><span class="s1">'layers'</span><span class="p">:</span><span class="mi">36</span><span class="p">,</span><span class="s1">'linear_shapes_out_in'</span><span class="p">:</span><span class="n">shapes</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">118</span>             <span class="s1">'counts'</span><span class="p">:{</span><span class="nb">str</span><span class="p">(</span><span class="n">r</span><span class="p">):</span><span class="mi">36</span><span class="o">*</span><span class="nb">sum</span><span class="p">(</span><span class="n">r</span><span class="o">*</span><span class="p">(</span><span class="n">m</span><span class="o">+</span><span class="n">n</span><span class="p">)</span> <span class="k">for</span> <span class="n">m</span><span class="p">,</span><span class="n">n</span> <span class="ow">in</span> <span class="n">shapes</span><span class="o">.</span><span class="n">values</span><span class="p">())</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">8</span><span class="p">,</span><span class="mi">16</span><span class="p">,</span><span class="mi">32</span><span class="p">)},</span>
+<span class="linenos" aria-hidden="true">119</span>             <span class="s1">'assumptions'</span><span class="p">:</span><span class="s1">'adapters on all seven listed matrices in every layer; no embedding adapter, bias or modules_to_save'</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">120</span>             <span class="s1">'memory_rule'</span><span class="p">:</span><span class="s1">'state bytes use actual adapter parameter/gradient/m/v dtypes; activation and base storage are separate'</span><span class="p">}</span>
+<span class="linenos" aria-hidden="true">121</span> 
+<span class="linenos" aria-hidden="true">122</span> 
+<span class="linenos" aria-hidden="true">123</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos" aria-hidden="true">124</span>     <span class="kn">from</span><span class="w"> </span><span class="nn">_evidence</span><span class="w"> </span><span class="kn">import</span> <span class="n">new_output</span><span class="p">,</span><span class="n">write_result</span>
+<span class="linenos" aria-hidden="true">125</span>     <span class="n">torch</span><span class="o">.</span><span class="n">set_num_threads</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">126</span>     <span class="n">out</span><span class="o">=</span><span class="n">new_output</span><span class="p">(</span><span class="s1">'Synthetic SFT mask and one-layer LoRA round-trip'</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">127</span>     <span class="n">result</span><span class="o">=</span><span class="p">{</span><span class="s1">'sft_masks'</span><span class="p">:[</span><span class="n">verify_sft_masks</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span> <span class="k">for</span> <span class="n">seed</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">)],</span>
+<span class="linenos" aria-hidden="true">128</span>             <span class="s1">'lora_round_trip'</span><span class="p">:[</span><span class="n">verify_lora</span><span class="p">(</span><span class="n">seed</span><span class="p">,</span><span class="n">rank</span><span class="p">)</span> <span class="k">for</span> <span class="n">seed</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">)</span> <span class="k">for</span> <span class="n">rank</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="mi">4</span><span class="p">)],</span>
+<span class="linenos" aria-hidden="true">129</span>             <span class="s1">'adapter_count_formula'</span><span class="p">:</span><span class="n">adapter_count_example</span><span class="p">()}</span>
+<span class="linenos" aria-hidden="true">130</span>     <span class="n">write_result</span><span class="p">(</span><span class="n">out</span><span class="p">,</span><span class="s1">'sft_lora_contract_report.json'</span><span class="p">,</span><span class="n">result</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">131</span>                  <span class="p">{</span><span class="s1">'device'</span><span class="p">:</span><span class="s1">'CPU'</span><span class="p">,</span><span class="s1">'dtype'</span><span class="p">:</span><span class="s1">'float64'</span><span class="p">,</span><span class="s1">'seeds'</span><span class="p">:[</span><span class="mi">0</span><span class="p">,</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">],</span><span class="s1">'lora_ranks'</span><span class="p">:[</span><span class="mi">2</span><span class="p">,</span><span class="mi">4</span><span class="p">],</span>
+<span class="linenos" aria-hidden="true">132</span>                   <span class="s1">'updates_per_lora_case'</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="s1">'source_data'</span><span class="p">:</span><span class="s1">'synthetic tensors'</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">133</span>                   <span class="s1">'reference'</span><span class="p">:</span><span class="s1">'PyTorch CE and one plain Linear after merge'</span><span class="p">,</span>
+<span class="linenos" aria-hidden="true">134</span>                   <span class="s1">'TRL_PEFT_QLoRA_execution'</span><span class="p">:</span><span class="kc">False</span><span class="p">,</span><span class="s1">'quality_measured'</span><span class="p">:</span><span class="kc">False</span><span class="p">},[</span><span class="vm">__file__</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">135</span> 
+<span class="linenos" aria-hidden="true">136</span> 
+<span class="linenos" aria-hidden="true">137</span> <span class="k">if</span> <span class="vm">__name__</span><span class="o">==</span><span class="s1">'__main__'</span><span class="p">:</span>
+<span class="linenos" aria-hidden="true">138</span>     <span class="n">main</span><span class="p">()</span>
+</pre></div>
+<div class="srcref"><code>labs/L7/sft_adapter_contract.py 全文（138 行）</code><a href="../code/labs/L7/sft_adapter_contract.py.html">在完整文件中打开 &rarr;</a></div></div></details>
+<h2 id="_12">前沿</h2>
+<p>多 adapter 服务把匹配同一 base 的增量共享加载，真实路由、合并、量化和输出验证见 <a href="../L5/5.10-lora-multitenant.html">5.10</a>。QAT/QAD、视觉/语音/动作模型的 adapter target 和训练目标分别核对。当前小例未完成公开 16 样本与 TRL SFTTrainer 的逐 token 对拍，也未运行 bitsandbytes QLoRA；这些不因 PyTorch CE 或 Linear round-trip 通过而成为已验证能力。</p>
+<h2 id="_13">陷阱</h2>
+<p><code>target_modules</code> 与 <code>modules_to_save</code> 分别决定低秩注入和额外完整模块的保存，不能只按 adapter 文件大小估算训练容量。模板/词表不匹配会改变 logprob 的语义，影响幅度要实际测量。adapter 保存后要检查 base 身份和 rank/alpha，合并后要移除旁路；冻结 base 也不等于前向无需保存任何反向所需值。</p>
+<h2 id="_14">自测题</h2>
+<ol>
+<li>普通 LoRA 的 B=0 时，A 有 <code>.grad</code> 是否说明第一步 A 获得非零数据梯度？</li>
+</ol>
+<details class="fold">
+<summary>展开</summary>
+<p>不是。对 A 的链式导数含 B，因此第一步数据梯度为零；B 可以有非零梯度。优化器 decay/动量的作用还要另看。</p>
+</details>
+<ol start="2">
+<li>50 token 的回答概率比 5 token 的低，是否足以证明 DPO 必然偏短？</li>
+</ol>
+<details class="fold">
+<summary>展开</summary>
+<p>不足。DPO 比较 policy/reference 的 log-ratio。两者相同则两条 log-ratio 都是零；长度影响需要连同 reference、数据与归约分析。</p>
+</details>
+<ol start="3">
+<li>APO-zero 是否等于 DPO 加长度归一化和 target margin？</li>
+</ol>
+<details class="fold">
+<summary>展开</summary>
+<p>不是。固定实现为 1-sigmoid(a)+sigmoid(b)，APO-down 为 sigmoid(a)+1-sigmoid(a-b)。应使用对应公式与 recipe，不能按名称推断优化行为。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L7/7.4-data-ckpt-fault.html">&#8592; 7.4 数据、checkpoint 与容错</a><a class="nav-next" href="../L7/7.6-rl-infra-rollout.html">7.6 RL infra：rollout、policy 版本与权重同步 &#8594;</a></nav>
+</main>
+</body>
+</html>

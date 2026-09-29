@@ -1,0 +1,68 @@
+== 1. 手写 CUDA（同一份源码，dtype 与 tile 是模板参数）==
+=== NVIDIA GeForce RTX 5090 D  SM=170  GEMM 4096x4096x4096 = 137.4 GFLOP
+    对照上限：bf16/fp16 tensor core 纯发射 251.9 TFLOPS（L1.2 实测）
+
+    变体（同一份源码，只改模板参数） 最短ms 中位ms    TFLOPS 占峰值  寄存器 线程   smem B block/SM  相对RMS/最大绝对差
+    fp16 tile 128x128x64（受控 tile）     0.784    0.786     175.2     69.6%    126    256    35840        2  0.00e+00/0.00e+00  NaN残留 0 不同元素 0
+    fp16 tile 128x128x32（2.4 的 v6 配置）    0.888    0.890     154.8     61.4%     96    256    18944        2  0.00e+00/0.00e+00  NaN残留 0 不同元素 0
+    bf16 tile 128x128x64（受控 tile）     0.810    0.812     169.8     67.4%    128    256    35840        2  0.00e+00/0.00e+00  NaN残留 0 不同元素 0
+    --  cuBLAS fp16（参照）               0.635        -     216.3     85.9%
+    --  cuBLAS bf16（参照）               0.631        -     217.7     86.4%
+
+== 2. Triton / TileLang（受控 tile、各自 tile、布局改动、融合）==
+=== NVIDIA GeForce RTX 5090 D  GEMM 4096x4096x4096 fp16→fp32 = 137.4 GFLOP
+    受控 tile 128×128×64；各自 tile 128×256×64；参照为 FP64 matmul
+
+2026-09-13 18:15:19  [TileLang:tilelang.cache.kernel_cache:WARNING] (kernel_cache.py:357): Found kernel 'kernel' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.
+    实现        变体                             tile             冷编译s     二次调用s     稳态ms   TFLOPS     占峰值    寄存器    溢出    smem    PTX行       相对误差
+    Triton    受控 tile                        128x128x64       0.21    0.0008    0.726    189.4   75.2%    166     0   65536    1235   4.87e-06
+    Triton    各自 tile                        128x256x64       0.00    0.0008    0.781    176.0   69.9%    228     0   98304    1821   4.87e-06
+    Triton    受控 tile + B 转置（布局改动）           128x128x64       0.00    0.0007    0.718    191.5   76.0%    154     0   65536    1203   4.87e-06
+    Triton    受控 tile + bias&ReLU（融合）        128x128x64       0.00    0.0007    0.708    194.2   77.1%    158     0   65536    1412   4.87e-06
+    TileLang  受控 tile                        128x128x64       0.01    0.0009    0.679    202.5   80.4%   None  None    None    None   4.87e-06
+    TileLang  各自 tile（= 可用最宽，见失败用例）          128x128x64       0.01    0.0007    0.679    202.4   80.3%   None  None    None    None   4.87e-06
+    TileLang  受控 tile + B 转置（布局改动）           128x128x64       0.01    0.0008    0.680    202.2   80.3%   None  None    None    None   4.87e-06
+    TileLang  受控 tile + bias&ReLU（融合）        128x128x64       0.01    0.0008    0.680    202.2   80.3%   None  None    None    None   4.87e-06
+
+    == 失败用例（原文）==
+    [Triton BK=128, num_stages=8（共享内存超限）] OutOfResources: out of resource: shared memory, Required: 458752, Hardware limit: 101376. Reducing block sizes or `num_stages` may help.
+    [TileLang BM=96（非 2 的幂 tile）] 通过
+    [TileLang 128×256×64, stages=3（共享内存）] InternalError: Failed to set the allowed dynamic shared memory size to 147456
+    [Triton N-major B 的 stride 顺序写反（静默错误）] 相对 RMS = 1.41e+00（编译通过、计时正常，只有对拍才暴露）
+
+JSON -> /scratch/learn/work/out/2.5/controlled-tile/dsl_controlled_tile.json
+
+== 3. CuTe-DSL（CUTLASS 官方 sm_120 例程，tile 128×128×64）==
+CUTLASS commit: 147295a3d4b75f3aeff247c25b8927cea9a7006a
+-- 冷编译（空 cache，--skip_ref_check --iterations 1）--
+Execution time: 1331.2000036239624 microseconds per iteration
+冷编译 + 1 次运行: 1.95 s
+-- 缓存命中（复用 cache，同样只跑 1 次）--
+Execution time: 1325.600028038025 microseconds per iteration
+缓存命中 + 1 次运行: 1.97 s
+
+-- 受控 tile 的正确性与稳态（含参照检查）--
+Tile Shape: (128, 128, 64)
+Execution time: 651.6736030578613 microseconds per iteration
+PASS
+
+-- 同 tile 下的布局改动：B 改成 N-major 存放（例程自带开关）--
+Tile Shape: (128, 128, 64)
+Execution time: 651.6736030578613 microseconds per iteration
+PASS
+
+-- 例程拒绝的输入：tile 与 mnk 不整除（原文）--
+Reference checking ...
+Execution time: 755.9360265731812 microseconds per iteration
+PASS
+
+== 4. ptxas 资源账（手写 CUDA 的三个实例）==
+ptxas info    : Function properties for _Z9gemm_wmmaI13__nv_bfloat16Li128ELi128ELi64ELi64ELi32ELi8EEvPKT_S3_Pf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers, 35840 bytes smem
+ptxas info    : Function properties for _Z9gemm_wmmaI6__halfLi128ELi128ELi32ELi64ELi32ELi8EEvPKT_S3_Pf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 18944 bytes smem
+ptxas info    : Function properties for _Z9gemm_wmmaI6__halfLi128ELi128ELi64ELi64ELi32ELi8EEvPKT_S3_Pf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 126 registers, used 1 barriers, 35840 bytes smem

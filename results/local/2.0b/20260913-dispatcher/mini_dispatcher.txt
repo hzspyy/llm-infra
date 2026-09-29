@@ -1,0 +1,87 @@
+torch 2.14.0  device=cpu
+========================================================================================
+[mini] 位图 + 排除集 + redispatch
+========================================================================================
+场景                                             分发顺序
+----------------------------------------------------------------------------------------
+
+  CPU, no_grad
+      [kernel] CPU: x @ w.T + b
+
+  CPU + Autograd
+      [AutogradCPU] 建 LinearBackward0 并保存输入
+      [kernel] CPU: x @ w.T + b
+      [AutogradCPU] 挂上 grad_fn
+
+  CPU + Autograd + Autocast（真实顺序：Autocast 先）
+      [AutocastCPU] 把 torch.float32 输入转成 bfloat16
+      [AutogradCPU] 建 LinearBackward0 并保存输入
+      [kernel] CPU: x @ w.T + b
+      [AutogradCPU] 挂上 grad_fn
+      [AutocastCPU] 结果转回 float32
+
+  CPU + Autograd + ADInplaceOrView（ADInplaceOrView 在 Autograd 之下）
+      [AutogradCPU] 建 LinearBackward0 并保存输入
+      [ADInplaceOrView] bump 版本计数 / 建 view meta
+      [kernel] CPU: x @ w.T + b
+      [AutogradCPU] 挂上 grad_fn
+
+  CPU + CUDA 同时出现（后端键二选一）
+      [kernel] CUDA: cuBLAS gemm + epilogue
+
+  CPU + 前端 fallthrough
+      [FuncTorchDynamicLayerFrontMode] fallthrough
+      [kernel] CPU: x @ w.T + b
+
+场景                                             分发顺序
+----------------------------------------------------------------------------------------
+CPU, no_grad                                   CPU   输出(2, 5)
+CPU + Autograd                                 AutogradCPU -> CPU   输出(2, 5)
+CPU + Autograd + Autocast（真实顺序：Autocast 先）     AutocastCPU -> AutogradCPU -> CPU   输出(2, 5)
+CPU + Autograd + ADInplaceOrView（ADInplaceOrView 在 Autograd 之下） AutogradCPU -> ADInplaceOrView -> CPU   输出(2, 5)
+CPU + CUDA 同时出现（后端键二选一）                        CUDA   输出(2, 5)
+CPU + 前端 fallthrough                           FuncTorchDynamicLayerFrontMode -> CPU   输出(2, 5)
+
+读法：`AutocastCPU` 排在 `AutogradCPU` 之前，所以它先改输入、再让
+autograd 看到转换后的张量 —— 与 DispatchKey.h:332 的注释一致。
+`ADInplaceOrView` 排在 Autograd 之下，所以它最后才补版本计数。
+
+========================================================================================
+[mini] 反例：redispatch 时不排除自己的键
+========================================================================================
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      [AutogradCPU] 直接重新分发，没有把自己放进排除集
+      RuntimeError: aten::linear: 分发深度超过 12；AutogradCPU 实现 redispatch 时没有排除自己的键
+
+真实框架的同一实验（用 torch.library 注册一个重入自己的 CPU kernel）：
+      RecursionError: maximum recursion depth exceeded
+
+========================================================================================
+[对照] 真实框架里的同一套机制
+========================================================================================
+线程局部排除集：
+  普通上下文   DispatchKeySet(AutocastCPU, AutocastMTIA, AutocastMAIA, AutocastXPU, AutocastIPU, AutocastHPU, AutocastXLA, AutocastMPS, AutocastCUDA, AutocastPrivateUse1)
+  no_grad      DispatchKeySet(AutocastCPU, AutocastMTIA, AutocastMAIA, AutocastXPU, AutocastIPU, AutocastHPU, AutocastXLA, AutocastMPS, AutocastCUDA, AutocastPrivateUse1)
+  autocast     DispatchKeySet(AutocastMTIA, AutocastMAIA, AutocastXPU, AutocastIPU, AutocastHPU, AutocastXLA, AutocastMPS, AutocastCUDA, AutocastPrivateUse1)
+  no_grad 不改变排除集（它翻的是 GradMode 布尔）；
+  autocast 会把 AutocastCPU 从默认排除集里拿掉。
+
+autocast 下面的保存值 dtype（用 saved_tensors_hooks 抓）：
+  y.dtype = torch.bfloat16  grad_fn = MmBackward0
+  反向保存的张量（dtype, shape）：[('torch.bfloat16', (4, 4)), ('torch.bfloat16', (4, 4))]
+  x.grad.dtype = torch.float32
+  保存下来的是 post-autocast 类型（bfloat16），与源码注释一致；
+  叶子的梯度仍按叶子 dtype 累积。
+
+autocast 下 F.linear 在 aten 层的算子序列：
+  ['aten._to_copy.default', 'aten._to_copy.default', 'aten.t.default', 'aten.mm.default']

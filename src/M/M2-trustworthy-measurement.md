@@ -1,6 +1,5 @@
 ---
 machine: 本地；计时与计数器按实际权限分开
-measured: 2026-09-12
 deps: 0.2（资源账本）
 ---
 
@@ -88,7 +87,7 @@ $$T_{submit}=h_1-h_0,\quad T_{complete}=h_2-h_0,\quad T_{event}=e_1-e_0.$$
 
 ## 工程实现：CUDA Event 的真实边界
 
-本批源码取自实际运行的 PyTorch `2.13.0+cu130`，构建提交 `cf30153c4c131c8164ee7798e5022d810682e2cb`。安装源码 `torch/cuda/streams.py:199` 的 `Event.record` 默认选当前 stream；`:234` 的 `elapsed_time` 返回毫秒；`:245` 的 `synchronize` 等待事件捕获的工作完成并阻塞主机。
+本批源码取自实际运行的 **PyTorch 2.13.0（cu130）**。安装源码 `torch/cuda/streams.py:199` 的 `Event.record` 默认选当前 stream；`:234` 的 `elapsed_time` 返回毫秒；`:245` 的 `synchronize` 等待事件捕获的工作完成并阻塞主机。
 
 {{srcfold:results/crater/M2/20260913-protocol-a/torch_cuda_streams.py:199-258}}
 

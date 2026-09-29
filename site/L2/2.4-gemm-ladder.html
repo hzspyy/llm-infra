@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2.4 优化阶梯 II：逐步实现 GEMM</title>
-<link rel="stylesheet" href="../assets/style.css?v=a74f4b2b">
-<link rel="stylesheet" href="../assets/code.css?v=a74f4b2b">
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
 
 </head>
 <body>
@@ -33,7 +33,20 @@
 <li><a href="#3-llm-gemm">3. LLM 里的 GEMM 形状很特殊</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#_4">工程实现 · 自己写一遍</a><ul>
+<li><a href="#qwen3-17bcublas-bf16">真实模型的形状扫描（Qwen3-1.7B，cuBLAS bf16 对照）</a></li>
+</ul>
+</li>
+<li><a href="#sm_100-tmem-sm_120">工程实现 · 两条路径：sm_100 的 TMEM 与 sm_120 的寄存器</a><ul>
+<li><a href="#1">1. 分界线画在指令上</a></li>
+<li><a href="#2">2. 源码里的门控与容量</a></li>
+<li><a href="#3-tile">3. 同一块 tile 的两套账</a></li>
+<li><a href="#4-sm_120-tile-spill">4. sm_120 实测：tile 一变大，寄存器就 spill</a></li>
+<li><a href="#5-persistent-tile">5. persistent 调度：把 tile 的领取方式当作独立变量</a></li>
+<li><a href="#6-warp-specialization-clc">6. warp specialization 与 CLC</a></li>
+<li><a href="#7">7. 接入下游章节的接口</a></li>
+</ul>
+</li>
 <li><a href="#lab">动手 lab</a><ul>
 <li><a href="#_5">消融建议</a></li>
 </ul>
@@ -66,7 +79,20 @@
 <li><a href="#3-llm-gemm">3. LLM 里的 GEMM 形状很特殊</a></li>
 </ul>
 </li>
-<li><a href="#_4">工程实现 · 自己写一遍</a></li>
+<li><a href="#_4">工程实现 · 自己写一遍</a><ul>
+<li><a href="#qwen3-17bcublas-bf16">真实模型的形状扫描（Qwen3-1.7B，cuBLAS bf16 对照）</a></li>
+</ul>
+</li>
+<li><a href="#sm_100-tmem-sm_120">工程实现 · 两条路径：sm_100 的 TMEM 与 sm_120 的寄存器</a><ul>
+<li><a href="#1">1. 分界线画在指令上</a></li>
+<li><a href="#2">2. 源码里的门控与容量</a></li>
+<li><a href="#3-tile">3. 同一块 tile 的两套账</a></li>
+<li><a href="#4-sm_120-tile-spill">4. sm_120 实测：tile 一变大，寄存器就 spill</a></li>
+<li><a href="#5-persistent-tile">5. persistent 调度：把 tile 的领取方式当作独立变量</a></li>
+<li><a href="#6-warp-specialization-clc">6. warp specialization 与 CLC</a></li>
+<li><a href="#7">7. 接入下游章节的接口</a></li>
+</ul>
+</li>
 <li><a href="#lab">动手 lab</a><ul>
 <li><a href="#_5">消融建议</a></li>
 </ul>
@@ -91,7 +117,7 @@
 <ol>
 <li>GEMM 从 naive 推到接近硬件上限，<strong>每一步各贡献多少倍</strong>？哪一步最关键？</li>
 <li>为什么"加共享内存分块"这个教科书第一优化，在本机只带来 <strong>1.2 倍</strong>？</li>
-<li>我手写的 tensor core GEMM 只有 cuBLAS 的 41%。<strong>差距在哪一件事上</strong>？</li>
+<li>基础手写 Tensor Core GEMM 只有 cuBLAS 的 41%。<strong>差距在哪一件事上</strong>？</li>
 </ol>
 <p>通用矩阵乘法（GEMM）是深度学习大模型计算中占据最高算力比重的核心算子。对于矩阵乘 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi><mo>&#x0003D;</mo><mi>A</mi><mo>&#x000D7;</mo><mi>B</mi></mrow></math></span>，优化的本质是在有限的片上高速缓存（SRAM/寄存器）容量内，追求数据复用率与计算强度的最大化。本章从最基础的朴素实现出发，同步展开 CUDA Core（fp32）与 Tensor Core（bf16）两条演化阶梯，实测分块编排、寄存器外积累加、共享内存避免 bank 冲突等核心优化手段的真实收益，彻底打通算子优化的思维脉络。</p>
 <hr />
@@ -221,7 +247,7 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 但只有 tensor core 峰值的 35.4%，也只有 cuBLAS bf16（218.6）的 <strong>41%</strong>。</p>
 <p>差距在哪？先看<strong>共享内存的布局</strong>：</p>
 <div class="highlight"><pre><span></span><code><span class="n">__shared__</span><span class="w"> </span><span class="n">__nv_bfloat16</span><span class="w"> </span><span class="n">sA</span><span class="p">[</span><span class="n">BM</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">BK</span><span class="p">],</span><span class="w"> </span><span class="n">sB</span><span class="p">[</span><span class="n">BK</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">BN</span><span class="p">];</span><span class="w">   </span><span class="c1">// BK=32, BN=128</span>
-<span class="n">wmma</span><span class="o">::</span><span class="n">load_matrix_sync</span><span class="p">(</span><span class="n">fa</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sA</span><span class="p">[(</span><span class="n">wRow</span><span class="o">*</span><span class="n">WM</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="o">*</span><span class="mi">16</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">BK</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">k</span><span class="p">],</span><span class="w"> </span><span class="n">BK</span><span class="p">);</span><span class="w">   </span><span class="c1">// 行距 = 32</span>
+<span class="n">nvcuda</span><span class="o">::</span><span class="n">wmma</span><span class="o">::</span><span class="n">load_matrix_sync</span><span class="p">(</span><span class="n">fa</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sA</span><span class="p">[(</span><span class="n">wRow</span><span class="o">*</span><span class="n">WM</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="o">*</span><span class="mi">16</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">BK</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">k</span><span class="p">],</span><span class="w"> </span><span class="n">BK</span><span class="p">);</span><span class="w">   </span><span class="c1">// 行距 = 32</span>
 </code></pre></div>
 
 <p>行距是 <strong>32 个 bf16 = 64 字节 = 16 个 bank</strong>。
@@ -231,9 +257,11 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 <p>解法是 <strong>padding</strong>：把行距改成非 2 的幂：</p>
 <div class="highlight"><pre><span></span><code><span class="k">constexpr</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">LDA</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BK</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">PAD</span><span class="p">,</span><span class="w"> </span><span class="n">LDB</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BN</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">PAD</span><span class="p">;</span><span class="w">        </span><span class="c1">// PAD = 8</span>
 <span class="n">__shared__</span><span class="w"> </span><span class="n">__nv_bfloat16</span><span class="w"> </span><span class="n">sA</span><span class="p">[</span><span class="n">BM</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">LDA</span><span class="p">],</span><span class="w"> </span><span class="n">sB</span><span class="p">[</span><span class="n">BK</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">LDB</span><span class="p">];</span>
-<span class="n">wmma</span><span class="o">::</span><span class="n">load_matrix_sync</span><span class="p">(</span><span class="n">fa</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sA</span><span class="p">[(</span><span class="n">wRow</span><span class="o">*</span><span class="n">WM</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="o">*</span><span class="mi">16</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">LDA</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">k</span><span class="p">],</span><span class="w"> </span><span class="n">LDA</span><span class="p">);</span>
+<span class="n">nvcuda</span><span class="o">::</span><span class="n">wmma</span><span class="o">::</span><span class="n">load_matrix_sync</span><span class="p">(</span><span class="n">fa</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sA</span><span class="p">[(</span><span class="n">wRow</span><span class="o">*</span><span class="n">WM</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="o">*</span><span class="mi">16</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">LDA</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">k</span><span class="p">],</span><span class="w"> </span><span class="n">LDA</span><span class="p">);</span>
 </code></pre></div>
 
+<p>CUDA 13 起 CCCL 只保留 <code>nvcuda::wmma</code> 这一个名字，不再提供顶层的
+<code>wmma</code> 别名；两种拼写在旧工具链上等价，本章的 lab 统一用前者。</p>
 <p>行距变成 40 个 bf16 = 80 字节 = 20 个 bank。相邻行的起始 bank 依次错开，
 冲突被打散。</p>
 <p>实测：<strong>89.2 → 144.9 TFLOPS，1.62 倍。</strong> 达到峰值的 57.5%、cuBLAS 的 66%。</p>
@@ -317,10 +345,10 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 </code></pre></div>
 
 <ul>
-<li><code>128x64_64</code> = block tile M×N，BK=64 —— 对照我们的 128×128×32</li>
+<li><code>128x64_64</code> = block tile M×N，BK=64 —— 对照自写实现的 128×128×32</li>
 <li><code>x3</code> = <strong>3 段软件流水</strong>（本章版本没有双缓冲）</li>
-<li><code>align8</code> = 按 8 个元素（16 字节）对齐，可用 <code>LDG.128</code> —— 我们的 v6 也做了</li>
-<li><code>s16816</code> = <code>m16n8k16</code> —— 和我们的 WMMA 底层是同一条指令</li>
+<li><code>align8</code> = 按 8 个元素（16 字节）对齐，可用 <code>LDG.128</code> —— 自写实现 v6 同样应用了该优化</li>
+<li><code>s16816</code> = <code>m16n8k16</code> —— 与自写 WMMA 底层属于同一条指令</li>
 </ul>
 <p>三段流水是可见的实现差异之一。要量化它对性能差距的贡献，仍需控制 tile、布局等变量做对照。</p>
 <h3 id="2-tile-128128">2. 为什么 tile 是 128×128 而不是别的</h3>
@@ -414,6 +442,472 @@ GEMM 是 compute-bound，靠 ILP 而不是占用率。</p>
 <p>改成相对 RMS 误差 <span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo fence="false" stretchy="false">&#x02016;</mo><mi>g</mi><mi>o</mi><mi>t</mi><mo>&#x02212;</mo><mi>r</mi><mi>e</mi><mi>f</mi><mo fence="false" stretchy="false">&#x02016;</mo><mo>&#x0002F;</mo><mo fence="false" stretchy="false">&#x02016;</mo><mi>r</mi><mi>e</mi><mi>f</mi><mo fence="false" stretchy="false">&#x02016;</mo></mrow></math></span> 后是 1.19e-06 —— 正常的 fp32 舍入。</p>
 <p><strong>误差度量选错会让你去追一个不存在的 bug。</strong></p>
 <hr />
+<h3 id="qwen3-17bcublas-bf16">真实模型的形状扫描（Qwen3-1.7B，cuBLAS bf16 对照）</h3>
+<p>把 tile 层面的结论放到模型自己的维度上：维度直接取自
+<code>Qwen/Qwen3-1.7B</code> 的 <code>config.json</code>（hidden=2048、intermediate=6144、
+16 个 Q 头 / 8 个 KV 头、head_dim=128，文件 SHA256 前 16 位 <code>1ddb5b89ebc90dcb</code>），
+跑 cuBLAS 作为"这条阶梯的终点参照"（<code>labs/L2/gemm_shapes.py</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th style="text-align: right;">M</th>
+<th style="text-align: right;">K</th>
+<th style="text-align: right;">N</th>
+<th style="text-align: right;">驻留 TFLOPS</th>
+<th style="text-align: right;">轮转权重 TFLOPS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>q_proj</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">0.8</td>
+<td style="text-align: right;">—（权重 8 MB 常驻 L2）</td>
+</tr>
+<tr>
+<td>q_proj</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">5.4</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>q_proj</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">73.8</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>q_proj</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">159.8</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>q_proj</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">174.3</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>down_proj</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">6144</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2.5</td>
+<td style="text-align: right;"><strong>1.3</strong></td>
+</tr>
+<tr>
+<td>down_proj</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">6144</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">12.1</td>
+<td style="text-align: right;"><strong>9.6</strong></td>
+</tr>
+<tr>
+<td>down_proj</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">6144</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">141.3</td>
+<td style="text-align: right;"><strong>130.8</strong></td>
+</tr>
+<tr>
+<td>down_proj</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">6144</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">179.1</td>
+<td style="text-align: right;">174.3</td>
+</tr>
+<tr>
+<td>down_proj</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">6144</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">204.6</td>
+<td style="text-align: right;">204.0</td>
+</tr>
+<tr>
+<td>gate_up_proj</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">12288</td>
+<td style="text-align: right;">219.4</td>
+<td style="text-align: right;">219.0</td>
+</tr>
+<tr>
+<td>4096 方阵</td>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">220.5</td>
+<td style="text-align: right;">219.9</td>
+</tr>
+</tbody>
+</table>
+<p>三条结论：</p>
+<ol>
+<li><strong>M 小于 128 时 GEMM 根本不在算力区间。</strong> M=1 的 q_proj 只有 0.8 TFLOPS，
+   是 251.9 TFLOPS 上限的 0.3% —— decode 的 GEMM 是"小矩阵 × 大权重"，
+   tensor core 利用率极低，这正是 0.2 里"算力利用率不到 6%"的 GEMM 侧证据。
+   M 从 128 涨到 2048，同一形状的 TFLOPS 翻 2.4 倍（73.8 → 174.3）。</li>
+<li><strong>权重轮转只在 M 小的时候咬人。</strong> 用 8 份权重（总字节远超 96 MB L2）
+   逼权重每次从 DRAM 读：down_proj 在 M=1 时从 2.5 掉到 1.3 TFLOPS（−48%）、
+   M=8 时 12.1→9.6（−21%），而 M≥512 几乎不变。原因很直接：
+   M 越大，一次权重读取被摊到越多的输出行上。</li>
+<li><strong>最大形状离上限还有 13%。</strong> gate_up_proj 与 4096 方阵都在 219–220 TFLOPS，
+   对照 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a> 的 bf16 上限 251.9 —— 剩下的差距是 epilogue、尾块与调度，
+   与 2.5 里 cuBLAS/Helion/Triton 的排名是同一件事的两面。</li>
+</ol>
+<p>本节只给 cuBLAS 这一端；手写 CUDA 阶梯与 CuTe 的对应点见前几节，
+两边使用同一组形状与同一份 fp16/BF16 输入约定。</p>
+<hr />
+<h2 id="sm_100-tmem-sm_120">工程实现 · 两条路径：sm_100 的 TMEM 与 sm_120 的寄存器</h2>
+<p>前面的 tile 预算归到三个约束：共享内存、寄存器、累加器。这三条在
+<strong>数据中心 Blackwell（sm_100）</strong>和 <strong>GeForce Blackwell（sm_120，本机 5090 D）</strong>
+上不是同一组。sm_100 把累加器搬出寄存器档案，放进一块专用内存 <strong>TMEM</strong>
+（Tensor Memory），用 <code>tcgen05.mma</code> 计算；sm_120 没有 TMEM，累加器仍在寄存器里，
+用 <code>mma.sync</code> 计算。同一块 tile，两条路径的账完全不同 ——
+这解释了为什么"把数据中心的 GEMM kernel 搬到 5090 上跑"不成立。</p>
+<h3 id="1">1. 分界线画在指令上</h3>
+<p>把同一批 PTX 片段交给 ptxas 的四个 target 编译（<code>labs/L2/arch_gate.py</code>，
+只调 ptxas，不占 GPU），接受与否就是两条路径的边界：</p>
+<table>
+<thead>
+<tr>
+<th>指令</th>
+<th>sm_90a</th>
+<th>sm_100a</th>
+<th>sm_120</th>
+<th>sm_120a</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cp.async.bulk.tensor.2d</code>（TMA 搬运）</td>
+<td>接受</td>
+<td>接受</td>
+<td>接受</td>
+<td>接受</td>
+</tr>
+<tr>
+<td><code>tcgen05.alloc</code>（申请 TMEM）</td>
+<td>拒绝</td>
+<td><strong>接受</strong></td>
+<td>拒绝</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>tcgen05.mma.cta_group::1</code></td>
+<td>拒绝</td>
+<td><strong>接受</strong></td>
+<td>拒绝</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>tcgen05.mma.cta_group::2</code>（2-CTA）</td>
+<td>拒绝</td>
+<td><strong>接受</strong></td>
+<td>拒绝</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>tcgen05.ld.sync.aligned.32x32b</code>（读 TMEM）</td>
+<td>拒绝</td>
+<td><strong>接受</strong></td>
+<td>拒绝</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>mma.sync.…kind::f8f6f4.m16n8k32</code></td>
+<td>拒绝</td>
+<td>接受</td>
+<td>拒绝</td>
+<td><strong>接受</strong></td>
+</tr>
+<tr>
+<td><code>mma.sync.m16n8k16.bf16</code></td>
+<td>接受</td>
+<td>接受</td>
+<td>接受</td>
+<td>接受</td>
+</tr>
+<tr>
+<td><code>wgmma.mma_async.m64n16k16</code></td>
+<td><strong>接受</strong></td>
+<td>拒绝</td>
+<td>拒绝</td>
+<td>拒绝</td>
+</tr>
+</tbody>
+</table>
+<p>三条结论：</p>
+<ol>
+<li><strong>TMA 是两条路径共有的</strong>，从 sm_90 起就有。所以"用 TMA 搬数据"不是
+   Blackwell 的特征，不能拿它区分这两条路。</li>
+<li><strong>tcgen05 / TMEM / 2-CTA 只属于 sm_100 家族。</strong> sm_120 与 sm_120a 都报
+   <code>Instruction 'tcgen05.mma' not supported on .target 'sm_120a'</code>（原文见原始现场）。</li>
+<li><strong>Hopper 的 <code>wgmma</code> 在两边都没有了</strong>：sm_100 换成 tcgen05，sm_120 回到
+   <code>mma.sync</code>。四个 target 都接受的 <code>mma.sync.m16n8k16.bf16</code>
+   就是 sm_120 上可用的那条路。</li>
+</ol>
+<p><code>kind::f8f6f4</code>（低位宽格式的 <code>mma.sync</code>）需要 <code>a</code> 后缀目标，
+即 <code>-arch=sm_120a</code>；目标是 sm_120 时它同样被拒绝。
+这解释了 <a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a> 在 cuBLAS fp8 kernel 里看到的 <code>QMMA.SF</code>/<code>OMMA.SF</code>：
+那是 sm_120a 目标下生成的低位宽指令族。</p>
+<h3 id="2">2. 源码里的门控与容量</h3>
+<p>固定 commit 的 CUTLASS（<code>147295a3</code>）把这件事直接写进宏：</p>
+<ul>
+<li><code>include/cute/arch/config.hpp:140-143</code>：<code>CUTE_ARCH_TCGEN05_TMEM_ENABLED</code>
+  只在 <code>SM100A/SM101A/SM103A/SM107A</code> 的列表里，<strong>sm_120 家族不在列表</strong>。
+  <code>CUTE_ARCH_TMA_SM90_ENABLED</code> 的列表（第 56-63 行）则包含 sm_120A/121A。</li>
+<li><code>include/cute/arch/config.hpp:158-163</code>：sm_120 家族拿到的是
+  <code>CUTE_ARCH_MMA_SM120_ENABLED</code> 与 <code>CUTE_ARCH_TMA_SM120_ENABLED</code>；
+  第 165-176 行再按 nvcc 版本打开 <code>CUTE_ARCH_F8F6F4_MMA_ENABLED</code>。</li>
+<li><code>include/cutlass/arch/config.h:158-162</code>：<code>CUTLASS_ARCH_MMA_SM120_ENABLED</code>
+  来自 <code>__CUDA_ARCH__ == 1200</code>，<code>CUTLASS_ARCH_MMA_SM120A_ENABLED</code> 来自
+  <code>__CUDA_ARCH_FEAT_SM120_ALL</code> —— 后者正是 <code>-arch=sm_120a</code> 才会定义的宏。</li>
+<li><strong>累加器的位置写在类型里。</strong> <code>include/cute/arch/mma_sm120.hpp</code> 的每个特化都有
+  <code>using CRegisters = float[4]</code>（寄存器）；<code>include/cute/arch/mma_sm100_umma.hpp</code>
+  的每个 tcgen05 变体把目标写成 TMEM 地址，例如第 576 行
+  <code>tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, {...}, p;</code>。</li>
+<li><strong>容量写在常量里。</strong> <code>include/cute/arch/tmem_capacity_sm100.hpp:37-46</code>：
+  TMEM 是 128 行 × 512 列 × 32 bit = 256 KB/SM，取值条件是
+  <code>__CUDA_ARCH__ &gt;= 1000 &amp;&amp; __CUDA_ARCH__ &lt; 1200</code>，
+  否则 <code>TargetTmemCapacityColumns = 0</code>。<strong>在 sm_120 上编译时这个常量就是 0</strong>，
+  不是"支持但没用"，而是这条路径不存在。</li>
+</ul>
+<h3 id="3-tile">3. 同一块 tile 的两套账</h3>
+<p><code>labs/L2/tmem_budget.py</code> 把两边的预算写成算式（常量来自上面的源码，
+数字是推导值，不是测量值）：</p>
+<table>
+<thead>
+<tr>
+<th>tile</th>
+<th style="text-align: right;">TMEM 路径：占用列 / 512</th>
+<th style="text-align: right;">可同时驻留的 CTA</th>
+<th style="text-align: right;">寄存器路径（256 线程）：累加器/线程</th>
+<th style="text-align: right;">可驻留 block/SM（仅算累加器）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>128×64</td>
+<td style="text-align: right;">64（12.5%）</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">8</td>
+</tr>
+<tr>
+<td>128×128</td>
+<td style="text-align: right;">128（25.0%）</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr>
+<td>128×256</td>
+<td style="text-align: right;">256（50.0%）</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr>
+<td>128×512</td>
+<td style="text-align: right;">512（100.0%）</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">256 → <strong>必然 spill</strong></td>
+<td style="text-align: right;">1</td>
+</tr>
+</tbody>
+</table>
+<p>两条路径的总容量恰好都是 256 KB/SM（TMEM 128×512×32 bit；寄存器档案 64K×32 bit），
+但<strong>花法完全不同</strong>：</p>
+<ul>
+<li>TMEM 路径里，累加器不占寄存器，寄存器只需要放 A/B 片段和地址；
+  tile 的 M 维被固定为 ≤ 128（tcgen05 的 M 映射到 TMEM 的 128 行），
+  N 维每加一列就多占一列 TMEM。这也是为什么 sm_100 的 tile 可以开到
+  128×256，而同样形状在 sm_120 上会让累加器挤爆寄存器。</li>
+<li>寄存器路径里，累加器是每线程私有的：<code>TM×TN/线程数</code> 直接吃 255 个寄存器的硬上限。
+  tile 一大，要么 spill，要么降低每 SM 的驻留 block 数。</li>
+</ul>
+<p><strong>2-CTA（<code>cta_group::2</code>）解决的是另一件事</strong>：两个 CTA 各自待在一个 SM 上，
+共用一条 MMA 指令，A 操作数由硬件在 cluster 内广播，累加器按行分到两个 SM 的 TMEM。
+它让"每个 CTA 只存一半的行"变成合法，从而在同样的 TMEM 容量下把 tile 的 M 维翻倍 ——
+这是 sm_120 上完全没有的能力。</p>
+<h3 id="4-sm_120-tile-spill">4. sm_120 实测：tile 一变大，寄存器就 spill</h3>
+<p>CUTLASS 官方为 GeForce 提供的 CuTe-DSL GEMM 例程
+（<code>examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py</code>，
+TMA 多级流水 + persistent tile scheduler + <code>mma.sync</code>）在 4096³ fp16 上换三个 tile：</p>
+<table>
+<thead>
+<tr>
+<th>tile</th>
+<th style="text-align: right;">耗时 µs</th>
+<th style="text-align: right;">TFLOPS</th>
+<th style="text-align: right;">占 251.9 峰值</th>
+<th style="text-align: right;">寄存器/线程</th>
+<th style="text-align: right;">stack</th>
+<th style="text-align: right;">总指令</th>
+<th style="text-align: right;">HMMA</th>
+<th style="text-align: right;">LDL+STL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>64×64×64</td>
+<td style="text-align: right;">638.2</td>
+<td style="text-align: right;">215.4</td>
+<td style="text-align: right;">85.5%</td>
+<td style="text-align: right;">90</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">600</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>128×128×64</td>
+<td style="text-align: right;">649.4</td>
+<td style="text-align: right;">211.6</td>
+<td style="text-align: right;">84.0%</td>
+<td style="text-align: right;">209</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">1184</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>128×256×64</td>
+<td style="text-align: right;">3077.7</td>
+<td style="text-align: right;">44.7</td>
+<td style="text-align: right;">17.7%</td>
+<td style="text-align: right;">255（上限）</td>
+<td style="text-align: right;">1552 B</td>
+<td style="text-align: right;">4288</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">1411</td>
+</tr>
+</tbody>
+</table>
+<p>64×64 与 128×128 两个 tile 都在 85% 峰值、<strong>没有一条本地访存指令</strong>；
+128×256 的 tile 把寄存器顶到 255 的上限、留下 1552 字节栈帧，
+4288 条指令里有 1411 条（33%）是 <code>LDL</code>/<code>STL</code> —— 累加器被挤出寄存器档案，
+性能掉到 44.7 TFLOPS。同一份 kernel 代码，只改 tile。</p>
+<p>对照 cuBLAS bf16（本章实测 219.0 TFLOPS）：<strong>在 sm_120 上，tile 是否落在
+寄存器预算内，比任何指令级优化都重要</strong>。这就是"数据中心 kernel 不能直接搬"
+的具体含义 —— 它假定的累加器位置在 sm_120 上不存在。</p>
+<h3 id="5-persistent-tile">5. persistent 调度：把 tile 的领取方式当作独立变量</h3>
+<p>sm_100 的 CUTLASS kernel 普遍用 persistent 调度：只发射常驻 block 数，
+每个 block 循环领取 tile。<code>labs/L2/persistent_gemm.cu</code> 用同一个 <code>gemm_body</code>
+（bf16 WMMA、tile 128×128×32、256 线程、每 SM 驻留 2 个 block）把两件事分开测：
+tile 遍历顺序（沿 M 还是沿 N 连续）与调度方式（静态 grid 还是软件领块）。</p>
+<table>
+<thead>
+<tr>
+<th>变体</th>
+<th style="text-align: right;">最短 ms</th>
+<th style="text-align: right;">TFLOPS</th>
+<th style="text-align: right;">占峰值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>静态 grid=1024，沿 N 连续</td>
+<td style="text-align: right;">0.940</td>
+<td style="text-align: right;">146.2</td>
+<td style="text-align: right;">58.0%</td>
+</tr>
+<tr>
+<td>静态 grid=1024，沿 M 连续</td>
+<td style="text-align: right;">0.959</td>
+<td style="text-align: right;">143.3</td>
+<td style="text-align: right;">56.9%</td>
+</tr>
+<tr>
+<td>persistent，grid=1×SM（170）</td>
+<td style="text-align: right;">1.485</td>
+<td style="text-align: right;">92.6</td>
+<td style="text-align: right;">36.7%</td>
+</tr>
+<tr>
+<td><strong>persistent，grid=2×SM（340，正好填满常驻槽位）</strong></td>
+<td style="text-align: right;"><strong>0.865</strong></td>
+<td style="text-align: right;"><strong>158.8</strong></td>
+<td style="text-align: right;"><strong>63.0%</strong></td>
+</tr>
+<tr>
+<td>persistent，grid=4×SM（680）</td>
+<td style="text-align: right;">0.950</td>
+<td style="text-align: right;">144.6</td>
+<td style="text-align: right;">57.4%</td>
+</tr>
+<tr>
+<td>persistent，grid=1024</td>
+<td style="text-align: right;">0.908</td>
+<td style="text-align: right;">151.3</td>
+<td style="text-align: right;">60.1%</td>
+</tr>
+<tr>
+<td>cuBLAS bf16 GemmEx</td>
+<td style="text-align: right;">0.632</td>
+<td style="text-align: right;">217.4</td>
+<td style="text-align: right;">86.3%</td>
+</tr>
+</tbody>
+</table>
+<p>三点：</p>
+<ol>
+<li><strong>persistent 的收益有条件</strong>：grid 正好等于常驻槽位（170 SM × 2 block = 340）
+   时最快，比静态 grid 快 9%；只发一半（1×SM）就掉到 36.7% —— 软件领块不会
+   帮你把闲置的 SM 填满，硬件调度才会。超过常驻槽位后又回到静态 grid 的水平。</li>
+<li><strong>遍历顺序影响很小</strong>（146.2 vs 143.3，约 2%），因为 M=N=K 时两个方向
+   复用的 panel 大小相同。形状不方时这个差会放大，它是 stream-K 之类
+   调度要处理的问题。</li>
+<li><strong>换调度方式只值 9%，换 tile 值 5 倍</strong>（上表 215.4 → 44.7）。
+   先让 tile 落在预算内，再谈调度。</li>
+</ol>
+<h3 id="6-warp-specialization-clc">6. warp specialization 与 CLC</h3>
+<p>sm_100 的 kernel 把 warp 按职责分组：<code>include/cutlass/gemm/kernel/
+sm100_gemm_tma_warpspecialized.hpp:234</code> 定义 <code>enum class WarpCategory</code>，
+取值包括 <code>Sched / MainloopLoad / MMA / EpilogueLoad / Epilogue</code>（第 440-462 行），
+每组拿到不同的寄存器预算和不同的流水角色。tile 调度也不是软件算的：
+<code>include/cutlass/gemm/kernel/sm100_tile_scheduler.hpp</code> 的
+<code>PersistentTileSchedulerSm100</code> 用 <strong>CLC</strong>（cluster launch control，
+<code>CLCResponse</code> 在第 74 行、<code>issue_clc_query</code> 在第 394 行）向硬件要下一块 tile ——
+persistent 调度的负载均衡交给硬件做。</p>
+<p>sm_120 的 CUTLASS kernel 也有 warp specialization，但角色划分不同
+（<code>sm120_gemm_tma_warpspecialized_cooperative_asymmetric_dma.hpp:360/365</code>
+是 <code>WarpGroupRole</code> 与 <code>ProducerWarpRole</code>），调度回到 sm_90 的静态 persistent
+scheduler。<strong>两边的 kernel 结构相似，可用的原语不同。</strong></p>
+<h3 id="7">7. 接入下游章节的接口</h3>
+<p>把 GEMM 换实现时，这三条接口约束决定了能不能直接替换：</p>
+<ul>
+<li><strong>tile 形状</strong>：sm_100 上 M 受 TMEM 的 128 行约束（1-CTA），N 受列数预算约束；
+  sm_120 上 M/N 受每线程累加器数约束。同一个 tile 参数在两边不等价。</li>
+<li><strong>累加器类型与 epilogue</strong>：sm_100 的 epilogue 要从 TMEM 读（<code>tcgen05.ld</code>），
+  sm_120 直接从寄存器读。3.2 的 FlashAttention、4.3 的量化 GEMM、4.4 的
+  grouped GEMM 都要按目标架构选各自的 epilogue。</li>
+<li><strong>调度</strong>：CLC 与软件 round-robin 都能做 persistent，但"向硬件要 tile"
+  需要 cluster 支持，sm_120 上不可用。</li>
+</ul>
+<div class="admonition warning">
+<p class="admonition-title">本节的边界</p>
+<p><code>tcgen05</code> 一侧只有源码事实与资源模型：本机没有 sm_100 硬件，
+<strong>所有 tcgen05/TMEM/2-CTA 的性能数字都未实测</strong>，标为未验证。
+sm_120 一侧的数字全部来自上面的实测工件。</p>
+</div>
 <h2 id="lab">动手 lab</h2>
 <div class="highlight"><pre><span></span><code><span class="nv">C</span><span class="o">=</span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import nvidia,os;print(os.path.dirname(nvidia.__file__))"</span><span class="k">)</span>/cu13
 nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-arch<span class="o">=</span>sm_120<span class="w"> </span>-I<span class="nv">$C</span>/include<span class="w"> </span>-L<span class="nv">$C</span>/lib<span class="w"> </span>-lcublas<span class="w"> </span><span class="se">\</span>
@@ -421,10 +915,30 @@ nvcc<span class="w"> </span>-O3<span class="w"> </span>-std<span class="o">=</sp
 <span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span><span class="nv">$C</span>/lib<span class="w"> </span>./gemm_ladder
 
 <span class="c1"># 看每个版本的寄存器/smem 用量</span>
-nvcc<span class="w"> </span>...<span class="w"> </span>-c<span class="w"> </span>labs/L2/gemm_ladder.cu<span class="w"> </span>-o<span class="w"> </span>/tmp/gl.o<span class="w"> </span>-Xptxas<span class="w"> </span>-v<span class="w"> </span><span class="m">2</span>&gt;/tmp/gl.log
-python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp/gl.log
+nvcc<span class="w"> </span>...<span class="w"> </span>-c<span class="w"> </span>labs/L2/gemm_ladder.cu<span class="w"> </span>-o<span class="w"> </span>out/2.4/gl.o<span class="w"> </span>-Xptxas<span class="w"> </span>-v<span class="w"> </span><span class="m">2</span>&gt;out/2.4/gl.log
+python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>out/2.4/gl.log
+
+<span class="c1"># 两条路径的指令门控（只调 ptxas，不需要 GPU）</span>
+python<span class="w"> </span>labs/L2/arch_gate.py<span class="w"> </span>--ptxas<span class="w"> </span><span class="nv">$C</span>/bin/ptxas<span class="w"> </span>--out-dir<span class="w"> </span>out/2.4/arch-gate
+
+<span class="c1"># persistent 调度与 tile 遍历顺序（同一份 gemm_body，只改映射）</span>
+bash<span class="w"> </span>labs/L2/run_persistent_gemm.sh<span class="w"> </span>out/2.4/persistent
+
+<span class="c1"># sm_120 上的 CUTLASS CuTe-DSL GEMM（TMA + persistent + mma.sync），</span>
+<span class="c1"># 同时 dump clean MLIR / PTX / cubin 并做 SASS 普查</span>
+<span class="nv">CUTLASS_SRC</span><span class="o">=</span>&lt;cutlass<span class="w"> </span>源码树&gt;<span class="w"> </span>bash<span class="w"> </span>labs/L2/run_dsl_sm120_gemm.sh<span class="w"> </span>out/2.4/dsl-sm120
+
+<span class="c1"># 两条路径的累加器预算（纯算术，来自源码常量）</span>
+python<span class="w"> </span>labs/L2/tmem_budget.py<span class="w"> </span>--out<span class="w"> </span>out/2.4/model/tmem_budget.json
+
+<span class="c1"># 对任意 cubin 做 SASS 指令普查与资源用量</span>
+python<span class="w"> </span>labs/L2/sass_census.py<span class="w"> </span>&lt;某个<span class="w"> </span>cubin&gt;
 </code></pre></div>
 
+<p>CuTe-DSL 需要两个环境变量：<code>CUTE_DSL_DUMP_DIR</code> 指定落盘目录、
+<code>CUTE_DSL_KEEP=ir,ptx,cubin</code> 选择保留哪些中间产物；
+<code>CUDA_TOOLKIT_PATH</code> 必须指向 CUDA 安装根，否则 libNVVM 找不到后端。
+默认生成的目标是 <code>sm_120a</code>。</p>
 <h3 id="_5">消融建议</h3>
 <table>
 <thead>
@@ -457,6 +971,22 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 <tr>
 <td>把 K 从 4096 改成 128</td>
 <td>主循环只有 4 次迭代，启动与收尾开销占比激增</td>
+</tr>
+<tr>
+<td><code>arch_gate.py</code> 里加一条 <code>tcgen05.mma.cta_group::1</code>，target 换成 sm_120a</td>
+<td>ptxas 报 <code>not supported on .target 'sm_120a'</code> —— 亲手确认 TMEM 路径不存在</td>
+</tr>
+<tr>
+<td>DSL 例程的 <code>--tile_shape_mnk</code> 从 64,64,64 改成 128,256,64</td>
+<td>TFLOPS 从 215 掉到 45，<code>sass_census.py</code> 看到 <code>LDL</code>/<code>STL</code> 出现</td>
+</tr>
+<tr>
+<td><code>persistent_gemm.cu</code> 里把 persistent 的 grid 从 2×SM 改成 1×SM</td>
+<td>性能掉到 36.7% —— 软件领块填不满闲置的 SM</td>
+</tr>
+<tr>
+<td>把 <code>tmem_budget.py</code> 的 tile 改成 128×512</td>
+<td>TMEM 占满 512 列，只能驻留 1 个 CTA；寄存器路径则需要 256 个累加器/线程</td>
 </tr>
 </tbody>
 </table>
@@ -552,6 +1082,136 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 <p><strong>教训：验证数值 kernel 时，误差度量要匹配问题的数值性质。</strong>
 逐元素相对误差只适用于结果远离 0 的情况。</p>
 </details>
+<details>
+<summary>⑤ 两条路径的指令门控（ptxas 原文）</summary>
+<p><code>labs/L2/arch_gate.py</code> 的输出矩阵（每个 target 独立调用一次 ptxas：</p>
+<div class="highlight"><pre><span></span><code>instruction                     sm_90a   sm_100a    sm_120   sm_120a
+tma_bulk_tensor_2d                  OK        OK        OK        OK
+tcgen05_alloc                   REJECT        OK    REJECT    REJECT
+tcgen05_mma_cta_group1          REJECT        OK    REJECT    REJECT
+tcgen05_mma_cta_group2          REJECT        OK    REJECT    REJECT
+tcgen05_ld_32x32b               REJECT        OK    REJECT    REJECT
+mma_sync_f8f6f4_f32             REJECT        OK    REJECT        OK
+mma_sync_bf16_m16n8k16              OK        OK        OK        OK
+wgmma_m64n16k16                     OK    REJECT    REJECT    REJECT
+</code></pre></div>
+
+<p>拒绝原文（sm_120a 三例）：</p>
+<div class="highlight"><pre><span></span><code>tcgen05_alloc           error : Instruction 'tcgen05.alloc' not supported on .target 'sm_120a'
+tcgen05_mma_cta_group1  error : Instruction 'tcgen05.mma' not supported on .target 'sm_120a'
+tcgen05_ld_32x32b       error : Feature '.32x32b' not supported on .target 'sm_120a'
+mma_sync_f8f6f4_f32 (sm_120)  error : Feature '.kind::f8f6f4' not supported on .target 'sm_120'
+</code></pre></div>
+
+<p>工件：<code>results/crater/2.4/20260913-sm120-paths/arch-gate/</code>（含每条片段被接受时留下的 cubin 与
+<code>arch_gate.json</code>，逐条记 ptxas 退出码与 PTX 哈希）。</p>
+</details>
+<details>
+<summary>⑥ persistent 调度与遍历顺序的完整输出</summary>
+<div class="highlight"><pre><span></span><code>=== NVIDIA GeForce RTX 5090 D  SM=170  GEMM 4096x4096x4096 = 137.4 GFLOP
+    tile 128x128x32  WM×WN=64×32  256 线程  寄存器 98/线程  smem 18944 B  驻留 2 block/SM
+    ⇒ 常驻槽位 340，tile 总数 1024（3.01 波）；预热 10 次，5 轮交错 × 20 次计时
+
+    写回检查（persist grid=2×SM）：NaN 预填 16777216 个，跑完残留 0 个
+
+    变体                                       最短ms 中位ms   TFLOPS 占峰值 相对RMS/最大绝对差
+    static   grid=1024 沿 N 连续（TN_FAST）    0.940    0.942    146.2    58.0%   0.00e+00 / 0.00e+00
+    static   grid=1024 沿 M 连续（TM_FAST）    0.959    0.960    143.3    56.9%   0.00e+00 / 0.00e+00
+    persist  grid=170 沿 N 连续（1×SM）       1.485    1.485     92.6    36.7%   0.00e+00 / 0.00e+00
+    persist  grid=340 沿 N 连续（2×SM）       0.865    0.866    158.8    63.0%   0.00e+00 / 0.00e+00
+    persist  grid=680 沿 N 连续（4×SM）       0.950    0.952    144.6    57.4%   0.00e+00 / 0.00e+00
+    persist  grid=1024 沿 N 连续（6×SM）      0.908    0.909    151.3    60.1%   0.00e+00 / 0.00e+00
+    persist  grid=340 沿 M 连续（2×SM）       0.879    0.880    156.3    62.0%   0.00e+00 / 0.00e+00
+    persist  grid=1024 沿 M 连续（6×SM）      0.917    0.917    150.0    59.6%   0.00e+00 / 0.00e+00
+    --  cuBLAS bf16 GemmEx（参照）              0.632    0.633    217.4    86.3%   0.00e+00 / 0.00e+00
+
+    只改每线程累加器规模（其余不变），观察 sm_120 的寄存器路径：
+      WM×WN   线程数 寄存器/线程 累加器/线程 驻留block 稳态TFLOPS
+      32×32        512           66           32          1        112.6
+      64×32        256           98           64          2        159.0
+      64×64        128          168          128          3        127.4
+</code></pre></div>
+
+<p>「NaN 预填」那一行是写回检查：把 <code>dC</code> 全部填成 NaN 再跑一次 kernel，
+确认没有 NaN 残留。否则"误差恰好为 0"可能只是比较了两个都没被写过的缓冲区。</p>
+<p>对照 6.4 的 fp16 命名：<code>WM×WN=64×64</code> 用 128 线程时累加器 128 个/线程、
+寄存器 168 个，驻留 3 个 block；<code>32×32</code> 的累加器只有 32 个但需要 512 线程，
+寄存器总量把驻留压到 1 个 block —— <strong>寄存器路径上，tile 形状与线程数是同一个预算的两面。</strong></p>
+<p>工件：<code>results/crater/2.4/20260913-sm120-paths/persistent/</code>
+（<code>persistent_gemm.txt</code> 与 <code>-Xptxas -v</code> 的 <code>ptxas_resources.txt</code>）。</p>
+</details>
+<details>
+<summary>⑦ sm_120 上 CUTLASS CuTe-DSL GEMM 的 tile 扫描、SASS 普查与 MLIR</summary>
+<div class="highlight"><pre><span></span><code>CUTLASS commit: 147295a3d4b75f3aeff247c25b8927cea9a7006a
+=== tile 64,64,64 ===
+Tile Shape: (64, 64, 64)
+Execution time: 638.156795501709 microseconds per iteration
+PASS
+=== tile 128,128,64 ===
+Execution time: 649.4207859039307 microseconds per iteration
+PASS
+=== tile 128,256,64 ===
+Execution time: 3077.734375 microseconds per iteration
+PASS
+
+== sm_120a cubin 的指令族合计与资源用量 ==
+tile_64_64_64    600 条指令   UTMA   9   HMMA  64   LDSM  32   STSM   4   REG:90  STACK:0
+tile_128_128_64 1184 条指令   UTMA  23   HMMA 256   LDSM  64   STSM  16   REG:209 STACK:0
+tile_128_256_64 4288 条指令   UTMA  41   HMMA 512   LDSM  96   STSM  32   REG:255 STACK:1552
+                             LDL 806   STL 605
+
+== PTX 里 TMA 与 mma.sync 的条数 ==
+tile_64_64_64    cp.async.bulk    9   mma.sync.m16n8k16   64   ldmatrix  32
+tile_128_128_64  cp.async.bulk   29   mma.sync.m16n8k16  256   ldmatrix  64
+tile_128_256_64  cp.async.bulk   55   mma.sync.m16n8k16  512   ldmatrix  96
+
+== PTX 片段：TMA 3-D tile 装载（128×256×64）==
+4002: cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group.L2::cache_hint
+      [%rd26, {%r10, %r11, %r3872}], [%r959+50176], %rd27;
+4003: cp.async.bulk.commit_group;
+
+== SASS 片段：TMA 装载与 HMMA（128×256×64）==
+        /*2f00*/                   HMMA.16816.F32 R4, R220, R236, R4 ;
+        /*2f10*/                   HMMA.16816.F32 R8, R220, R238, R8 ;
+        /*2fe0*/                   HMMA.16816.F32 R12, R220, R244, R12 ;
+
+== SASS 片段：同一 kernel 的本地访存（spill）==
+        /*05e0*/                   STL.64 [R1+0x358], R4 ;
+        /*0610*/                   STL.64 [R1+0x350], R2 ;
+
+== clean MLIR 片段：原子类型与寄存器上限声明 ==
+  200:        nvvm.setmaxregister  increase 232
+  297:        cute.gemm(%arg6, %rmem, %slice_613, %slice_614, %rmem)
+              : (!mma_f16_f16_f32_16x8x16, !memref_rmem_f32, ..., !memref_rmem_f32)
+</code></pre></div>
+
+<p>三处可对照的地方：</p>
+<ol>
+<li><strong>PTX 与 SASS 的 HMMA 条数一一对应</strong>（64↔64、256↔256、512↔512）：
+   这条路上 <code>mma.sync</code> 没有再被展开或合并，PTX 里数出来的就是最终发射的。</li>
+<li><strong>累加器住在寄存器里</strong>：MLIR 的原子类型是 <code>mma_f16_f16_f32_16x8x16</code>，
+   目标操作数是 <code>!memref_rmem_f32</code>（register memory），没有一处 <code>tmem</code>。</li>
+<li><strong>TMA 指令在 SASS 里叫 <code>UTMALDG</code> / <code>UTMASTG</code></strong>（tensor memory accelerator），
+   它们是两条路径共有的部分。</li>
+</ol>
+<p>工件：<code>results/crater/2.4/20260913-sm120-paths/dsl-sm120/</code>
+（<code>dsl_sm120.txt</code>、<code>sass_census.txt</code>、<code>artifacts_excerpt.txt</code>；
+完整 cubin/PTX/MLIR 约 1.6 MB，按大体积产物规则留在运行机上，不入库）。</p>
+</details>
+<details>
+<summary>⑧ gemm_ladder 在新工具链下的复跑</summary>
+<p>CUDA 13 起 CCCL 去掉了顶层 <code>wmma</code> 别名，lab 改用 <code>nvcuda::wmma</code> 后在同一台
+5090 D 上复跑（同一份 <code>labs/L2/gemm_ladder.cu</code>）：</p>
+<div class="highlight"><pre><span></span><code>    v0  18.032 ms   7.6 TFLOPS      v2  2.936 ms  46.8 TFLOPS
+    v1  15.041 ms   9.1 TFLOPS      v3  2.597 ms  52.9 TFLOPS
+    cuBLAS SGEMM  1.990 ms  69.1 TFLOPS
+    v5  1.538 ms  89.4 TFLOPS        v6  0.942 ms 145.8 TFLOPS
+    cuBLAS bf16   0.628 ms 218.9 TFLOPS
+</code></pre></div>
+
+<p>与正文表格的差异在 1% 以内（v6 145.8 vs 144.9），阶梯的每一步结论不变。
+工件：<code>results/crater/2.4/20260913-sm120-paths/gemm_ladder_rerun.txt</code>。</p>
+</details>
 <hr />
 <h2 id="_7">前沿</h2>
 <table>
@@ -568,7 +1228,11 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 </tr>
 <tr>
 <td><strong>warp specialization</strong></td>
-<td>一部分 warp 专职搬数据（producer），一部分专职算（consumer），用 named barrier 协调。Hopper/Blackwell 上高性能 GEMM 的标准结构</td>
+<td>一部分 warp 专职搬数据（producer），一部分专职算（consumer），用 named barrier 协调。sm_100 上按 <code>WarpCategory</code>（Sched/MainloopLoad/MMA/EpilogueLoad/Epilogue）分组，sm_120 上按 <code>WarpGroupRole</code>/<code>ProducerWarpRole</code> 分组</td>
+</tr>
+<tr>
+<td><strong>TMEM 累加器与 CLC</strong></td>
+<td>sm_100 把累加器搬进 TMEM（128 行 × 512 列 × 32 bit），并用 cluster launch control 向硬件要下一块 tile。两条路径的分界与预算见本章最后一节；sm_100 一侧只有源码与容量模型<span class="unverified">未实测</span></td>
 </tr>
 <tr>
 <td><strong>XOR swizzle</strong></td>
@@ -587,8 +1251,8 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 <td>DeepSeek 为 MoE 的分组 GEMM 写的专用库，用 JIT + 极简代码达到超过 cuBLAS 的性能（<a class="xref" href="../L4/4.4-moe.html" title="MoE：稀疏激活的系统代价">L4.4</a>）</td>
 </tr>
 <tr>
-<td><strong><code>kind::mxf8f6f4</code> 指令族</strong></td>
-<td><a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a> 留下的开放问题。cuBLAS fp8 达到 1501 FLOP/clk/SM 而 <code>m16n8k32</code> 上限只有 1022 —— 本章仍未测<span class="unverified">未实测</span></td>
+<td><strong><code>kind::f8f6f4</code> 低位宽指令族</strong></td>
+<td>需要 <code>sm_120a</code> 目标（本章实测门控）。cuBLAS fp8 达到 1501 FLOP/clk/SM 而 <code>m16n8k32</code> 上限只有 1022，<a class="xref" href="../L1/1.2-tensor-core-lineage.html" title="Tensor Core 的指令演进与架构差异">L1.2</a> 留下的这个开放问题仍<span class="unverified">未实测</span></td>
 </tr>
 </tbody>
 </table>
@@ -605,8 +1269,24 @@ python<span class="w"> </span>labs/L2/parse_ptxas.py<span class="w"> </span>/tmp
 让你去追不存在的 bug。用相对 RMS。</p>
 <p><strong>6. 把 M=1 的 decode 当 GEMM 优化。</strong> 那是 GEMV，是 memory-bound 问题，
 本章的所有手段都不适用。</p>
-<p><strong>7. 拿"纯计算峰值"当 GEMM 的分母。</strong> 本章的 116 TFLOPS 来自 <a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 的纯 FMA 循环，
-不搬数据。cuBLAS SGEMM 也只到它的 59.6% —— 说明真实 GEMM 的可达上限更低。</p>
+<p><strong>7. 拿"纯计算峰值"当 GEMM 的分母。</strong> 116 TFLOPS 来自 <a class="xref" href="../L2/2.1-cuda-execution-model.html" title="CUDA 执行模型与 CUDA Graph">L2.1</a> 的纯 FMA 循环，
+不搬数据。cuBLAS SGEMM 也只到它的 59.6% —— 真实 GEMM 的可达上限更低。</p>
+<p><strong>8. 把数据中心的 Blackwell 教程直接当 5090 的代码用。</strong>
+sm_100 的 <code>tcgen05</code>/TMEM/2-CTA 在 sm_120 上被 ptxas 拒绝（原始现场⑤），
+两边的累加器根本不在同一个地方。<strong>先看 ptxas 接受哪条指令，再决定移植哪份 kernel。</strong></p>
+<p><strong>9. 调 tile 只看吞吐，不看寄存器与栈帧。</strong> 本章实测同一份 kernel 换 tile：
+64×64 用 90 个寄存器、零本地访存、215.4 TFLOPS；128×256 顶到 255 个寄存器、
+1552 B 栈帧、33% 的指令是 <code>LDL</code>/<code>STL</code>，掉到 44.7 TFLOPS。
+改 tile 前后都要用 <code>-Xptxas -v</code> 或 SASS 普查确认没有 spill。</p>
+<p><strong>10. 以为 persistent 调度本身能提升性能。</strong>
+grid 只有常驻槽位的一半时实测只有 36.7% —— 软件领块不会把闲置的 SM 填满。
+persistent 的收益来自"grid 正好等于常驻槽位"时省下的发射与收尾开销（本章 9%），
+不是来自"persistent"这个词。</p>
+<p><strong>11. 把 <code>kind::f8f6f4</code> 当成"sm_120 就能用"。</strong>
+它要求 <code>-arch=sm_120a</code>；目标是 sm_120 时 ptxas 报
+<code>Feature '.kind::f8f6f4' not supported on .target 'sm_120'</code>。</p>
+<p><strong>12. 用输出相同反推实现相同。</strong> v6 与 cuBLAS bf16 在这组输入上逐位相同，
+但这是输入与分块顺序共同决定的，不是"两者实现一致"的证明。</p>
 <hr />
 <h2 id="_9">自测题</h2>
 <details>
@@ -742,6 +1422,52 @@ cuBLAS 检测到 M 很小，切换到了专门的 GEMV kernel。</p>
 - 提高数值精度（fp32 累加已经是标配，再往上代价很大）</p>
 <p><strong>本章的实测给了这个问题一个具体的锚点</strong>：
 分块一致时可以做到逐位相同，所以这是<strong>工程可解</strong>的，不是物理限制。</p>
+</details>
+<details>
+<summary>6. sm_120 上把 tile 从 64×64 提到 128×256，为什么性能掉到 1/5？</summary>
+<p>因为<strong>累加器住在寄存器里，而寄存器档案没有变大</strong>。</p>
+<p>128×256 的 fp32 累加器按线程切分后，一旦超过每线程 255 个寄存器的硬上限，
+编译器只能把累加器的一部分写到本地内存（栈帧）。实测：寄存器顶到 255、
+栈帧 1552 字节、4288 条 SASS 里 1411 条（33%）是 <code>LDL</code>/<code>STL</code>，
+TFLOPS 从 215.4 掉到 44.7。</p>
+<p>同样的 tile 在 sm_100 上是合法的：累加器放在 TMEM（128 行 × 512 列 × 32 bit），
+128×256 的 fp32 累加器占 256 列（一半容量），<strong>不占寄存器</strong>。
+两个架构的总容量都是 256 KB/SM，但一个按"列"分配给 tile，
+另一个按"每线程私有"分配 —— 这就是同一份 kernel 换架构后行为不同的根源。</p>
+<p>补测条件：本机没有 sm_100 硬件，TMEM 一侧只有源码与容量模型（未实测）。</p>
+</details>
+<details>
+<summary>7. 为什么 persistent 调度在 grid=2×SM 时最快，在 grid=1×SM 时最慢？</summary>
+<p>因为<strong>常驻槽位是 2 个 block/SM</strong>（寄存器 98/线程、smem 18944 B 的实测占用率）。
+<span class="math-inline"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>170</mn><mo>&#x000D7;</mo><mn>2</mn><mo>&#x0003D;</mo><mn>340</mn></mrow></math></span> 个 block 正好把所有槽位填满，每个 block 领到约 3 个 tile，
+省掉了 block 的发射与收尾，实测 158.8 TFLOPS，比静态 grid 高 9%。</p>
+<p>grid = 170 时只填了一半槽位，SM 上有一半时间没有常驻 block 在跑 ——
+<strong>软件 round-robin 不会把闲置的 SM 用起来</strong>，硬件调度才会。掉到 92.6 TFLOPS。
+grid 超过 340 后（680、1024）收益消失，回到静态 grid 的水平。</p>
+<p>结论：persistent 是一个"让 grid 等于常驻容量"的技巧，
+前提是先知道自己的 kernel 能驻留几个 block（占用率），而不是先写 persistent 再说。</p>
+</details>
+<details>
+<summary>8. TMA 是不是 Blackwell 的特征？tcgen05 呢？</summary>
+<p>TMA（<code>cp.async.bulk.tensor</code>）<strong>不是</strong>：从 sm_90a 起就有，
+sm_90a/sm_100a/sm_120/sm_120a 四个 target 都接受（原始现场⑤）。
+CUTLASS 的 <code>config.hpp</code> 把它同时挂在 sm_90、sm_100、sm_120 三条分支上。</p>
+<p>tcgen05（含 <code>tcgen05.alloc</code>、<code>tcgen05.mma</code>、<code>tcgen05.ld</code>）<strong>是</strong> sm_100 家族独有：
+sm_120 与 sm_120a 都被 ptxas 拒绝，CUTLASS 的
+<code>CUTE_ARCH_TCGEN05_TMEM_ENABLED</code> 也只列了 <code>SM100A/SM101A/SM103A/SM107A</code>。</p>
+<p>所以"数据中心 kernel 搬到 5090"的障碍不是搬运指令，而是<strong>累加器住在哪里</strong>。</p>
+</details>
+<details>
+<summary>9. 一个 GEMM kernel 从 sm_100 移植到 sm_120，最少要改哪三处？</summary>
+<ol>
+<li><strong>MMA 指令与累加器位置</strong>：<code>tcgen05.mma</code> + TMEM 累加器 → <code>mma.sync</code> + 寄存器累加器
+   （bf16/fp16 用 <code>m16n8k16</code>，低位宽格式用 <code>kind::f8f6f4</code> 且需要 <code>sm_120a</code> 目标）。</li>
+<li><strong>tile 形状</strong>：sm_100 上 M ≤ 128 由 TMEM 行数决定、N 由列预算决定；
+   sm_120 上 tile 大小由"每线程累加器数 ≤ 255"决定（实测 128×256 就会 spill）。</li>
+<li><strong>epilogue 与调度</strong>：sm_100 从 TMEM 读结果（<code>tcgen05.ld</code>），并可用 CLC
+   向硬件要下一块 tile；sm_120 直接从寄存器读，调度退回软件 persistent 或静态 grid。</li>
+</ol>
+<p>TMA 与多级流水这两部分可以基本照搬 —— 它们是两条路径共有的。</p>
 </details></article><nav class="pagenav"><a class="nav-prev" href="../L2/2.3-memory-bound-ladder.html">&#8592; 2.3 优化阶梯 I：memory-bound 算子</a><a class="nav-next" href="../L2/2.5-kernel-dsl-shootout.html">2.5 CUDA 与 kernel DSL 对比 &#8594;</a></nav>
 </main>
 </body>

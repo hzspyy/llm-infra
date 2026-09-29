@@ -252,16 +252,193 @@ def section_E():
     print("  单次调用的对比会低估它在服务里的价值。5.2/5.3 会在真实引擎里看。")
 
 
+# ---------------------------------------------------------------- F
+def splitk_decode(q, K, V, nsplit, valid_len=None, dtype=torch.float64):
+    """split-K decode：把 KV 切段，各段算局部 m/l/O，再用合并公式归并。
+
+    q: [B,Hq,1,D]，K/V: [B,Hkv,S,D]，valid_len: [B] 或 None（有效长度掩码）。
+    返回 (O, grid, workspace_bytes, parts)。
+    """
+    q = q.to(dtype)
+    K = K.to(dtype)
+    V = V.to(dtype)
+    B, Hq, _, D = q.shape
+    Hkv = K.shape[1]
+    S = K.shape[-2]
+    g = Hq // Hkv
+    scale = D ** -0.5
+    chunk = (S + nsplit - 1) // nsplit
+    parts = []
+    for s0 in range(0, S, chunk):
+        s1 = min(S, s0 + chunk)
+        Kb = K[:, :, s0:s1].repeat_interleave(g, dim=1)
+        Vb = V[:, :, s0:s1].repeat_interleave(g, dim=1)
+        sc = (q @ Kb.transpose(-1, -2)) * scale            # [B,Hq,1,c]
+        if valid_len is not None:
+            idx = torch.arange(s0, s1, device=q.device).view(1, 1, 1, -1)
+            ok = idx < valid_len.to(q.device).view(-1, 1, 1, 1)
+            sc = sc.masked_fill(~ok, float("-inf"))
+        m = sc.amax(dim=-1)                                # [B,Hq,1]
+        p = torch.nan_to_num(torch.exp(sc - m.unsqueeze(-1)), nan=0.0)
+        l = p.sum(dim=-1)
+        acc = p @ Vb
+        parts.append({"m": m, "l": l, "acc": acc})
+    ms = torch.stack([p["m"] for p in parts])
+    m = ms.amax(dim=0)
+    l = torch.zeros_like(m)
+    acc = torch.zeros_like(parts[0]["acc"])
+    for p in parts:
+        w = torch.nan_to_num(torch.exp(p["m"] - m), nan=0.0)
+        l = l + p["l"] * w
+        acc = acc + p["acc"] * w.unsqueeze(-1)
+    O = torch.where((l > 0).unsqueeze(-1),
+                    acc / l.clamp(min=1e-30).unsqueeze(-1),
+                    torch.zeros_like(acc))
+    grid = (B * Hq * len(parts),)
+    ws = len(parts) * (2 * B * Hq * 4 + B * Hq * D * 4)
+    return O, grid, ws, parts
+
+
+def section_F(h):
+    title("[F] split-K：局部 m/l/O 与归并，grid 与 workspace")
+
+    print("  decode 时 Q 只有一行，并行单元只有 B·Hq。split-K 把 KV 再切 NSPLIT 段：")
+    print("      每段独立算 (m, l, O)，再用 3.1 的合并公式归并")
+    print("      grid = B·Hq·NSPLIT，workspace = NSPLIT×(m+l+O) 的 fp32 部分状态")
+    print()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    B, Hq, Hkv, S, D = 1, 16, 2, 4096, 128
+    q = torch.randn(B, Hq, 1, D, device=device, dtype=torch.float64)
+    K = torch.randn(B, Hkv, S, D, device=device, dtype=torch.float64)
+    V = torch.randn(B, Hkv, S, D, device=device, dtype=torch.float64)
+    ref, _, _, _ = splitk_decode(q, K, V, 1, dtype=torch.float64)
+    print(f"  B={B} Hq={Hq} Hkv={Hkv} S={S} D={D}（FP64 参照）")
+    print(f"  {'NSPLIT':>7} {'grid':>10} {'workspace KB':>13} "
+          f"{'max|err| vs 1 段':>17}")
+    for ns in [1, 2, 4, 8, 16, 32]:
+        O, grid, ws, parts = splitk_decode(q, K, V, ns, dtype=torch.float64)
+        err = (O - ref).abs().max().item()
+        h.case(id=f"F_nsplit{ns}", nsplit=ns, grid=grid[0], workspace_bytes=ws,
+               max_err=err, S=S, Hq=16, Hkv=2, D=128, dtype="float64")
+        print(f"  {ns:>7} {grid[0]:>10} {ws / 1024:>13.1f} {err:>17.3e}")
+    print("\n  切段数不改变语义：误差在 FP64 机器精度量级（1e-16）。")
+
+    sub("边界：S = page−1 / page / page+1，以及有效长度掩码")
+    print("  要求：改变 NSPLIT 不改变**有效序列边界与 mask** 的处理。")
+    for page in [16, 32, 64]:
+        for S2 in [page - 1, page, page + 1]:
+            q2 = torch.randn(B, Hq, 1, D, device=device, dtype=torch.float64)
+            K2 = torch.randn(B, Hkv, S2, D, device=device, dtype=torch.float64)
+            V2 = torch.randn(B, Hkv, S2, D, device=device, dtype=torch.float64)
+            r1, _, _, _ = splitk_decode(q2, K2, V2, 1, dtype=torch.float64)
+            errs = []
+            for ns in [2, 3, 8, 16]:
+                O2, _, _, _ = splitk_decode(q2, K2, V2, ns, dtype=torch.float64)
+                errs.append((O2 - r1).abs().max().item())
+            print(f"  page={page:>3} S={S2:>3}: NSPLIT∈{{2,3,8,16}} 最大差 "
+                  f"{max(errs):.3e}")
+        # 掩码：只允许前 100 个 key 可见（模拟变长请求）
+        S3 = page + 5
+        q3 = torch.randn(B, Hq, 1, D, device=device, dtype=torch.float64)
+        K3 = torch.randn(B, Hkv, S3, D, device=device, dtype=torch.float64)
+        V3 = torch.randn(B, Hkv, S3, D, device=device, dtype=torch.float64)
+        vl = torch.tensor([100], device=device)
+        r_m, _, _, _ = splitk_decode(q3, K3, V3, 1, valid_len=vl,
+                                     dtype=torch.float64)
+        e_m = max((splitk_decode(q3, K3, V3, ns, valid_len=vl,
+                                 dtype=torch.float64)[0] - r_m).abs().max().item()
+                  for ns in [1, 2, 4, 8])
+        print(f"  page={page:>3} 有效长度 100（S={S3}）: 切段最大差 {e_m:.3e}")
+
+    sub("workspace 与真实 kernel 的对应")
+    print("  上面的 workspace 是 NSPLIT×(m,l,O) 的 fp32 部分状态；")
+    print("  真实 FlashDecoding 多一个 combine kernel 做同样的归并（3.2-B 的")
+    print("  fa_loop_variants.py 里也有一份 Triton 实现）。")
+    print("  按带宽算：S=65536、Hkv=8、D=128、B=1 时 KV = 256 MiB，")
+    kv = 2 * 1 * 8 * 65536 * 128 * 2
+    print(f"  只读一遍需要 {kv / (PEAK_BW * 1e9) * 1e3:.4f} ms（按 {PEAK_BW} GB/s），")
+    print(f"  也就是 {kv / (PEAK_BW * 1e9) * 1e6:.1f} µs —— 这是单步 decode 的下限。")
+
+
+# ---------------------------------------------------------------- G
+def section_G(h):
+    title("[G] 扫描：heads / KV heads / batch / 上下文与成本模型")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("  同一输入下改一个维度，记录时间、有效带宽、峰值临时显存。")
+    print(f"  {'Hq':>4} {'Hkv':>4} {'B':>3} {'S':>7} {'KV MB':>9} {'在 L2?':>7} "
+          f"{'ms':>9} {'GB/s':>9} {'占峰值':>8} {'峰值 MB':>9}")
+    rows = []
+    for (Hq, Hkv, B, S) in [(32, 32, 1, 8192), (32, 8, 1, 8192), (32, 4, 1, 8192),
+                            (32, 1, 1, 8192), (16, 8, 1, 8192), (16, 8, 4, 8192),
+                            (16, 8, 1, 32768), (16, 8, 1, 131072),
+                            (8, 8, 1, 131072), (16, 8, 32, 8192)]:
+        D = 128
+        try:
+            q = torch.randn(B, Hq, 1, D, device=device, dtype=torch.bfloat16)
+            k = torch.randn(B, Hkv, S, D, device=device, dtype=torch.bfloat16)
+            v = torch.randn(B, Hkv, S, D, device=device, dtype=torch.bfloat16)
+        except torch.cuda.OutOfMemoryError:
+            print(f"  {Hq:>4} {Hkv:>4} {B:>3} {S:>7}  显存不足")
+            torch.cuda.empty_cache()
+            continue
+        kv = 2 * B * Hkv * S * D * 2
+        peak_mb = None
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        t = timeit(lambda: F.scaled_dot_product_attention(q, k, v, enable_gqa=True))
+        peak_mb = (torch.cuda.max_memory_allocated() - base) / MB
+        gbs = kv / t / 1e6
+        in_l2 = "是" if kv / MB <= L2_MB else "否"
+        print(f"  {Hq:>4} {Hkv:>4} {B:>3} {S:>7} {kv / MB:>7.1f} {in_l2:>7} "
+              f"{t:>9.4f} {gbs:>9.1f} {gbs / PEAK_BW:>7.1%} {peak_mb:>8.1f}")
+        rows.append((Hq, Hkv, B, S, kv, t, gbs, peak_mb))
+        h.case(id=f"G_Hq{Hq}_Hkv{Hkv}_B{B}_S{S}", Hq=Hq, Hkv=Hkv, B=B, S=S,
+               kv_bytes=kv, ms=t, gbs=gbs, pct_peak=gbs / PEAK_BW,
+               peak_mb=peak_mb, dtype="bfloat16")
+        del q, k, v
+        torch.cuda.empty_cache()
+
+    sub("成本模型：分页 / 连续 / MLA 的每 token 字节")
+    print("  decode 每步的字节 ≈ KV 字节（只读），时间 ≈ 字节 ÷ 带宽。")
+    print(f"  {'配置':>34} {'每 token 每层字节':>18} {'相对 MHA':>10}")
+    D = 128
+    for name, per in [("MHA  Hkv=Hq=32", 2 * 32 * D * 2),
+                      ("GQA  Hkv=8（4:1）", 2 * 8 * D * 2),
+                      ("MQA  Hkv=1", 2 * 1 * D * 2),
+                      ("MLA  rank=512+rope64（H=16）", (512 + 64) * 2)]:
+        print(f"  {name:>34} {per:>18} {per / (2 * 32 * D * 2):>9.2f}×")
+    print("\n  分页与连续布局的**字节数相同**，差别只在寻址：")
+    print("  分页多一次 block table 查表（表本身很小），连续布局要按最大长度预留。")
+    print("  所以'分页比连续读得多'不成立；代价在碎片与表长（3.3-B 有实测）。")
+
+
 SECTIONS = {"A": section_A, "B": section_B, "C": section_C,
-            "D": section_D, "E": section_E}
+            "D": section_D, "E": section_E, "F": section_F, "G": section_G}
 
 if __name__ == "__main__":
+    import os
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _harness import Harness
+
     want = [s.upper() for s in sys.argv[1:]] or list(SECTIONS)
     p = torch.cuda.get_device_properties(0)
     print(f"torch {torch.__version__}  {p.name}  SM {p.multi_processor_count}")
     print(f"参照：只读 {PEAK_BW} / copy {PEAK_COPY} GB/s, bf16 {PEAK_TF} TFLOP/s "
           f"(L1.1/L1.2 实测)  L2 {L2_MB:.0f} MiB")
+    h = Harness("3.3-A-D", "3.3", out=os.environ.get("L3_OUT"),
+                backend="torch split-K 参照 + SDPA decode",
+                notes="F 节是 split-K 的语义参照，非融合 kernel 性能")
     for s in want:
-        SECTIONS[s]()
+        if s in ("F", "G"):
+            SECTIONS[s](h)
+        else:
+            SECTIONS[s]()
+    h.finish({"verdict": "split-K 的 grid/workspace 与归并语义可检查；"
+                         "扫描给出 heads/KV heads/batch/上下文的成本曲线。",
+              "peak_bw_gbs": PEAK_BW})
     sys.stdout.flush()
     os._exit(0)

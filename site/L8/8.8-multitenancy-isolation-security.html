@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.8 多租户、隔离与安全</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">8.8</div>
+  <div class="sidebar-title">多租户、隔离与安全</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：租户身份要出现在四个地方</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 缓存身份的四个字段</a></li>
+<li><a href="#2">2. 共享算力下的干扰</a></li>
+<li><a href="#3">3. 取消、崩溃与重启之后的归属</a></li>
+<li><a href="#4">4. 隔离机制的能力边界</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析</a><ul>
+<li><a href="#vllm-0290lora">vLLM 0.29.0：LoRA 名字进哈希，权重版本不进</a></li>
+<li><a href="#vllm-0290adapter">vLLM 0.29.0：adapter 的加载、卸载与就地更新</a></li>
+<li><a href="#lmcache-adapter">LMCache：键里没有 adapter 字段，但有标签</a></li>
+<li><a href="#mooncake">Mooncake：把租户配额做成账户</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#a-cpu">A. 身份与归属（CPU）</a></li>
+<li><a href="#b-adapter-revision">B. adapter revision 与缓存身份（引擎）</a></li>
+<li><a href="#c-vs">C. 共享实例 vs 进程隔离（引擎）</a></li>
+<li><a href="#d">D. 隔离机制的条件核对</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：租户身份要出现在四个地方</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1">1. 缓存身份的四个字段</a></li>
+<li><a href="#2">2. 共享算力下的干扰</a></li>
+<li><a href="#3">3. 取消、崩溃与重启之后的归属</a></li>
+<li><a href="#4">4. 隔离机制的能力边界</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析</a><ul>
+<li><a href="#vllm-0290lora">vLLM 0.29.0：LoRA 名字进哈希，权重版本不进</a></li>
+<li><a href="#vllm-0290adapter">vLLM 0.29.0：adapter 的加载、卸载与就地更新</a></li>
+<li><a href="#lmcache-adapter">LMCache：键里没有 adapter 字段，但有标签</a></li>
+<li><a href="#mooncake">Mooncake：把租户配额做成账户</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#a-cpu">A. 身份与归属（CPU）</a></li>
+<li><a href="#b-adapter-revision">B. adapter revision 与缓存身份（引擎）</a></li>
+<li><a href="#c-vs">C. 共享实例 vs 进程隔离（引擎）</a></li>
+<li><a href="#d">D. 隔离机制的条件核对</a></li>
+</ul>
+</li>
+<li><a href="#_6">原始现场</a></li>
+<li><a href="#_7">前沿</a></li>
+<li><a href="#_8">陷阱</a></li>
+<li><a href="#_9">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L8 · 集群、生产与前沿</div>
+  <div class="mod-id">8.8</div>
+  <h1>多租户、隔离与安全</h1>
+  <p class="lede">围绕租户身份、缓存边界、配额、优先级与抢占分析共享 GPU 服务，测相互干扰、资源回收和隔离成本；安全结论限定于实际执行边界。</p>
+  <div class="chips"><span class="chip">实测机器 crater（RTX 5090 32 GB）· Qwen3-4B + trl-lib/Qwen3-4B-LoRA · vLLM 0.29.0 · LMCache commit 0d18736 · Mooncake commit 6cc1a10</span><span class="chip">前置 5.3（adapter 与多路复用）· 5.8（失败路径与抢占）· 8.2（编排与就绪）· 8.6（KV 身份与层级）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><strong>租户身份如何贯穿缓存和 adapter？</strong> 请求上的租户、会话与 adapter revision 必须在<strong>缓存键、调度配额和执行归属</strong>三处都出现。本章实测的一件事是：vLLM 0.29.0 的前缀缓存把 LoRA 的<strong>名字</strong>进哈希（<code>_gen_lora_extra_hash_keys</code> 只返回 <code>lora_request.lora_name</code>），因此同一个名字下就地换权重，缓存身份不变。</li>
+<li><strong>共享资源怎样造成干扰？</strong> 在同一个引擎里，两类请求进来之后共享同一份算力：模拟里把总速率固定后按在途请求数均分，租户 A 的 p50 从独跑时的 0.107 s 涨到 1.5–2.8 s；把 B 的份额从 0 加到 1.0，A 的 p99 在 4.69 s 与 39.7–67.4 s 之间摆动。A 的并发上限（配额）只把 p50 从 2.76 s 压到 2.47 s，<strong>配额并不改变"进来之后按份共享"这一事实</strong>。</li>
+<li><strong>隔离机制各自提供哪些边界？</strong> 应用层配额限制的是"谁进来"，进程隔离限制的是"谁和谁共享同一份状态"。本章在引擎侧对比了共享单实例与两租户各自一个实例的部署，并核对 MIG/MPS 在本机的可用性：MIG 两台机器都没有可切分设备，MPS 在共享机器上未启用，因此这两条路径只记录机制与条件。</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的边界</p>
+<p>多租户的<strong>真实系统</strong>实验集中在单机单卡、两个合成租户与一个公开 LoRA adapter 上。MIG/MPS 不做实验（硬件与权限不支持，且不修改共享机器）；Kubernetes 的租户边界（NetworkPolicy、ResourceQuota、RBAC）不在本机范围内，只在 8.2 的字段映射基础上说明职责分工。所有输入都是合成 token 与合成租户，没有使用真实用户数据。</p>
+</div>
+<hr />
+<h2 id="_2">心智模型：租户身份要出现在四个地方</h2>
+<figure>
+
+
+<svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="租户身份在请求路径上的四个注入点">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="20" font-size="13" font-weight="600">一次租户请求经过的四个身份注入点</text>
+
+    <rect x="16" y="40" width="150" height="56" rx="5" fill="#61afef" opacity="0.18"/>
+    <text x="26" y="60" font-size="11" font-weight="600">① 请求头/参数</text>
+    <text x="26" y="78" font-size="10">tenant · session · adapter</text>
+    <text x="26" y="92" font-size="10">cache_salt · 幂等键</text>
+
+    <rect x="180" y="40" width="150" height="56" rx="5" fill="#e5c07b" opacity="0.22"/>
+    <text x="190" y="60" font-size="11" font-weight="600">② 调度与配额</text>
+    <text x="190" y="78" font-size="10">并发上限 · 令牌桶</text>
+    <text x="190" y="92" font-size="10">优先级 · 抢占</text>
+
+    <rect x="344" y="40" width="180" height="56" rx="5" fill="#98c379" opacity="0.20"/>
+    <text x="354" y="60" font-size="11" font-weight="600">③ 缓存键</text>
+    <text x="354" y="78" font-size="10">prefix 哈希 + extra_keys</text>
+    <text x="354" y="92" font-size="10">LoRA 名 · cache_salt · 多模态</text>
+
+    <rect x="538" y="40" width="204" height="56" rx="5" fill="#e06c75" opacity="0.18"/>
+    <text x="548" y="60" font-size="11" font-weight="600">④ 执行与资源归属</text>
+    <text x="548" y="78" font-size="10">adapter 槽位 · KV 块 · 请求记账</text>
+    <text x="548" y="92" font-size="10">取消 · 抢占 · 回收</text>
+
+    <rect x="16" y="116" width="726" height="88" rx="5" fill="none" stroke="currentColor" stroke-width="1"/>
+    <text x="28" y="136" font-size="11.5" font-weight="600">缺一处就会出现一类错误</text>
+    <text x="28" y="156" font-size="10.5">缺 ①：无法区分租户，配额与取消都落到错误的请求上</text>
+    <text x="28" y="173" font-size="10.5">缺 ③：同名 adapter 的不同 revision 互相命中对方算出的 KV（本次已复现）</text>
+    <text x="28" y="190" font-size="10.5">缺 ④：被抢占/取消的请求不归还 KV 与槽位，长时间运行后资源泄漏到别人的账上</text>
+
+    <rect x="16" y="216" width="356" height="96" rx="5" fill="#61afef" opacity="0.10"/>
+    <text x="28" y="236" font-size="11.5" font-weight="600">进程隔离提供的边界</text>
+    <text x="28" y="255" font-size="10.5">权重、KV、adapter、队列、崩溃域各自独立</text>
+    <text x="28" y="272" font-size="10.5">代价：副本数 × 显存、扩容变慢、空闲成本</text>
+    <text x="28" y="289" font-size="10.5">仍共享：GPU 带宽、显存容量、功耗与温度</text>
+
+    <rect x="386" y="216" width="356" height="96" rx="5" fill="#e06c75" opacity="0.10"/>
+    <text x="398" y="236" font-size="11.5" font-weight="600">应用配额提供的边界</text>
+    <text x="398" y="255" font-size="10.5">限制进入量与在途数，不改共享算力的分配</text>
+    <text x="398" y="272" font-size="10.5">超载时表现为拒绝或排队，不表现为隔离</text>
+    <text x="398" y="289" font-size="10.5">提示词约束既不限制资源也不限制数据可见性</text>
+  </g>
+</svg>
+
+
+<figcaption>多租户的正确性由四处身份共同保证；任何一处缺失都会以"别人的状态被复用"的形式暴露出来。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1">1. 缓存身份的四个字段</h3>
+<p>把缓存键拆成"逻辑身份"和"必须校验的物理身份"两半（8.6 已展开），多租户在逻辑身份上多出两个字段：</p>
+<div class="highlight"><pre><span></span><code>key = H(tenant ‖ adapter_revision ‖ prefix_hash)
+</code></pre></div>
+
+<p><code>tenant</code> 决定"同一段文本属于谁"，<code>adapter_revision</code> 决定"用哪份权重算出来的"。本次把这两个字段分别从键里去掉，直接观察后果：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align: right;">A0（tenant A, rev-a）</th>
+<th style="text-align: right;">B0（tenant B, rev-b1）</th>
+<th style="text-align: right;">B1（tenant B, rev-b2）</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正确键（tenant + revision）</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td>三次都是 miss，各算各的</td>
+</tr>
+<tr>
+<td>去掉 adapter revision</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;"><strong>2048</strong></td>
+<td>B1 拿到 B0 的 2048 token KV</td>
+</tr>
+<tr>
+<td>去掉 tenant</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td>B0/B1 仍按 revision 分开</td>
+</tr>
+<tr>
+<td>两个都去掉</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;"><strong>2048</strong></td>
+<td style="text-align: right;"><strong>2048</strong></td>
+<td>B0 拿到 A0 的 KV，B1 也拿到</td>
+</tr>
+</tbody>
+</table>
+<p>三种配置下 KV 块的归属账都是闭合的（驻留块 + 空闲块 = 容量），差异只体现在<strong>谁能命中谁的块</strong>：正确配置下三条缓存条目各自只有一个租户与一个 revision；去掉 revision 后其中一条记录里出现 <code>revisions_seen = {rev-b1, rev-b2}</code>；两个都去掉时出现 <code>tenants_seen = {A, B}</code> 与三个 revision 混在一条记录上。这说明"命中"本身不是正确性证据，<strong>归属审计</strong>才是。</p>
+<h3 id="2">2. 共享算力下的干扰</h3>
+<p>只要两个租户进入同一个引擎的同一批，它们的请求就共享同一份算力。把引擎建模成"总算力固定、按在途请求数均分"（processor sharing），并用同一份到达清单跑四个策略：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th style="text-align: right;">B 的份额</th>
+<th style="text-align: right;">A 的 p50</th>
+<th style="text-align: right;">A 的 p95</th>
+<th style="text-align: right;">A 的 p99</th>
+<th style="text-align: right;">B 的 p99</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>独跑（份额 0）</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.107 s</td>
+<td style="text-align: right;">0.213 s</td>
+<td style="text-align: right;">4.69 s</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>共享（无配额）</td>
+<td style="text-align: right;">0.5</td>
+<td style="text-align: right;">2.76 s</td>
+<td style="text-align: right;">2.76 s</td>
+<td style="text-align: right;">67.43 s</td>
+<td style="text-align: right;">157.4 s</td>
+</tr>
+<tr>
+<td>共享（无配额）</td>
+<td style="text-align: right;">1.0</td>
+<td style="text-align: right;">1.46 s</td>
+<td style="text-align: right;">1.46 s</td>
+<td style="text-align: right;">39.71 s</td>
+<td style="text-align: right;">549.7 s</td>
+</tr>
+<tr>
+<td>配额（A≤8、B≤16）</td>
+<td style="text-align: right;">0.5</td>
+<td style="text-align: right;">2.47 s</td>
+<td style="text-align: right;">2.48 s</td>
+<td style="text-align: right;">61.53 s</td>
+<td style="text-align: right;">157.4 s</td>
+</tr>
+<tr>
+<td>配额</td>
+<td style="text-align: right;">1.0</td>
+<td style="text-align: right;">1.46 s</td>
+<td style="text-align: right;">1.46 s</td>
+<td style="text-align: right;">39.71 s</td>
+<td style="text-align: right;">549.7 s</td>
+</tr>
+<tr>
+<td>配额 + 优先级排序</td>
+<td style="text-align: right;">0.5</td>
+<td style="text-align: right;">2.47 s</td>
+<td style="text-align: right;">2.48 s</td>
+<td style="text-align: right;">61.53 s</td>
+<td style="text-align: right;">157.4 s</td>
+</tr>
+</tbody>
+</table>
+<p>表中的份额 0.5 与 1.0 两行对应的到达清单不同（B 的请求数分别是 20 与 40，长 prompt 比例 0.34 与 1.0），因此<strong>跨行比较的是"有 B 与没有 B"和"换策略"，不是份额的单调性</strong>。两个必须说清的事实：</p>
+<ul>
+<li><strong>A 的尾延迟被 B 拉长一个量级以上</strong>：份额 0.5 时 A 的 p50 从 0.107 s 涨到 2.76 s，p99 从 4.69 s 涨到 67.4 s。这不是"平均吞吐下降"，而是"交互请求排在长请求后面"。</li>
+<li><strong>配额与优先级排序只挪动了很小一部分</strong>：配额把 p50 从 2.76 s 压到 2.47 s（−10.5%），优先级排序没有再改；原因是它限制的是"同时进来多少"，而进来之后每个请求拿到的份额仍由在途总数决定。要在共享引擎里真正保护交互流量，需要的是<strong>给它保留算力</strong>（例如把长请求的 prefill 分块、或按 token 预算分批），而不是只加并发上限。这一结论与 8.4 的准入实验一致：准入决定谁进来，配额决定进来多少，二者都不等于隔离。</li>
+</ul>
+<h3 id="3">3. 取消、崩溃与重启之后的归属</h3>
+<p>多租户下最容易被忽略的是"失败路径也要按租户记账"。模拟里逐项检查：</p>
+<ul>
+<li><strong>跨租户取消</strong>：取消租户 B 的一个在跑请求后，B 的条目被移除、它占的 4 个块归还；同一时刻租户 A 的空闲块数、token 用量与完成数都不变（<code>tenant_a_free_blocks_restored</code>、<code>tenant_a_used_tokens_unchanged</code>、<code>tenant_a_done_unchanged</code> 三项都为 true）。取消一个不存在的请求返回 <code>{"cancelled": false}</code>，不做任何清理。</li>
+<li><strong>引用计数</strong>：取回中取消把引用减回 0 再抛错；持引用期间不允许驱逐；<code>release</code> 次数多于 <code>get</code> 直接报错。审计在结束时检查每一条缓存记录的 <code>refs</code> 是否为 0，以及驻留块 + 空闲块是否等于容量。</li>
+<li><strong>重启与幂等</strong>：20 个请求完成后把"幂等键 → 结果"写成同一个提交记录；重启后重放同一批请求，20 个全部按记录返回（<code>replayed = 20</code>、<code>recomputed = 0</code>），提交记录数不变（<code>no_duplicate_results = true</code>）。这回答的是"重试不会重复计费、不会重复执行"。</li>
+</ul>
+<h3 id="4">4. 隔离机制的能力边界</h3>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>提供什么</th>
+<th>不提供什么</th>
+<th>本机状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>应用层配额（并发/令牌桶）</td>
+<td>限制某租户的进入量与在途数</td>
+<td>不改算力分配；超载时是拒绝不是隔离</td>
+<td>可用，见 8.4-D</td>
+</tr>
+<tr>
+<td>独立进程 + 独立引擎</td>
+<td>权重、KV、adapter、队列、崩溃域各自独立</td>
+<td>仍共享 GPU 带宽、显存容量、功耗与温度</td>
+<td>可用，见第 3 节实测</td>
+</tr>
+<tr>
+<td>MPS</td>
+<td>同一 GPU 上的进程级并发（按 SM/显存配额）</td>
+<td>不提供故障隔离；配置需改共享机器</td>
+<td>未启用（共享机器，不改驱动配置）</td>
+</tr>
+<tr>
+<td>MIG</td>
+<td>硬件切分的独立 GPU 实例（显存/计算/带宽隔离）</td>
+<td>需要设备支持与管理员权限</td>
+<td>不可用（两台机器 <code>nvidia-smi mig -lgip</code> 均报无可切分设备）</td>
+</tr>
+<tr>
+<td>提示词/模板约束</td>
+<td>约束模型的输出形态</td>
+<td>既不限制资源，也不限制数据可见性</td>
+<td>不属于隔离机制</td>
+</tr>
+</tbody>
+</table>
+<p>后三行是<strong>机制与条件</strong>的记录，不是实测；把它们写成"已支持"会把配置开关当成硬件能力。</p>
+<hr />
+<h2 id="_4">工程实现：源码解析</h2>
+<h3 id="vllm-0290lora">vLLM 0.29.0：LoRA 名字进哈希，权重版本不进</h3>
+<p>前缀缓存的块哈希是 <code>H(parent_hash, token_ids, extra_keys)</code>（<code>vllm/v1/core/kv_cache_utils.py:621</code> 的 <code>hash_block_tokens</code>）。<code>extra_keys</code> 由 <code>generate_block_hash_extra_keys</code>（<code>:583</code>）拼装，来源有四类：</p>
+<div class="highlight"><pre><span></span><code><span class="n">extra_keys</span> <span class="o">=</span> <span class="n">lora_extra_keys</span> <span class="o">+</span> <span class="n">mm_extra_keys</span> <span class="o">+</span> <span class="n">cache_salt_keys</span> <span class="o">+</span> <span class="n">prompt_embeds_keys</span>
+</code></pre></div>
+
+<p>其中 LoRA 那一项的实现是（<code>:542</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_gen_lora_extra_hash_keys</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">Request</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">request</span><span class="o">.</span><span class="n">lora_request</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">[]</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">request</span><span class="o">.</span><span class="n">lora_request</span><span class="o">.</span><span class="n">lora_name</span><span class="p">]</span>
+</code></pre></div>
+
+<p><strong>只有名字。</strong> 适配器的权重版本、<code>lora_int_id</code> 都不参与哈希。这带来一个可验证的推论：如果同一个名字下的权重被换掉，而该前缀的 KV 还在缓存里，下一次请求会命中<strong>上一版权重算出来的 KV</strong>。第 3 节用 <code>/v1/load_lora_adapter</code> 的 <code>load_inplace</code> 与 <code>cache_salt</code> 直接检验了这条推论。</p>
+<p>另两类 extra key 对多租户有直接作用：<code>cache_salt</code> 在块 0 上进入哈希（<code>:604</code>），等于给同一段文本提供"强制不同缓存身份"的开关；多模态特征的 identifier 也进哈希，避免不同图像/音频复用同一段文本的 KV。<code>cache_salt</code> 在 OpenAI 兼容接口上暴露（<code>entrypoints/openai/completion/protocol.py:198</code>）。</p>
+<h3 id="vllm-0290adapter">vLLM 0.29.0：adapter 的加载、卸载与就地更新</h3>
+<ul>
+<li>运行时增删 adapter 由环境变量 <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> 门控（<code>entrypoints/serve/lora/api_router.py:25</code>）；打开后才有 <code>POST /v1/load_lora_adapter</code> 与 <code>POST /v1/unload_lora_adapter</code>。</li>
+<li><code>LoadLoRAAdapterRequest</code> 的字段是 <code>lora_name</code>、<code>lora_path</code>、<code>load_inplace</code>、<code>is_3d_lora_weight</code>。<code>load_inplace</code> 为真时不换名字、沿用同一个 <code>lora_int_id</code>（<code>entrypoints/openai/models/serving.py:179-188</code>），也就是说<strong>引擎内部认为这还是同一个 adapter</strong>；为假时同名会报错，要求的做法就是换名字（<code>:250-253</code>）。</li>
+<li>调度侧的租户相关开关是 <code>--scheduling-policy {fcfs,priority}</code>、<code>--enable-lora</code>、<code>--lora-modules</code>、<code>--max-loras</code>、<code>--max-cpu-loras</code>。它们控制的是"先服务谁"与"同时装载几个 adapter"，不改变缓存身份。</li>
+</ul>
+<p>把这两件事放在一起就能得到工程结论：<strong><code>load_inplace</code> 适合"同一份权重的热修补"，不适合"换一版 adapter"</strong>；换版本要么换名字（缓存身份随之改变），要么在换之前清理该前缀的缓存（例如 <code>POST /reset_prefix_cache</code>）。</p>
+<h3 id="lmcache-adapter">LMCache：键里没有 adapter 字段，但有标签</h3>
+<p>LMCache 的键是 <code>CacheEngineKey(model_name, world_size, worker_id, chunk_hash, dtype, tags)</code>（<code>lmcache/utils.py:389</code>），<code>__hash__</code>/<code>__eq__</code> 与 <code>to_string()</code>（<code>:438</code>）都只用这六个字段：<strong>模型名、并行度、worker id、块哈希、dtype、标签</strong>。它没有 adapter 字段；要区分 adapter，只能通过 <code>lmcache.tag.*</code> 形式的请求配置（<code>:399-411</code>），而 vLLM 侧这些标签来自请求的 <code>sampling_params.extra_args["kv_transfer_params"]</code> 中以 <code>lmcache.</code> 开头的项（<code>vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py:102</code>）。</p>
+<p>这意味着：<strong>多租户的隔离程度取决于调用方有没有把租户与 adapter 版本传进去</strong>。默认配置下不同租户请求同一段文本会落到同一个键上——共享缓存本身不一定错（如果权重的确相同），但它把"身份是否正确"的责任交给了上层。</p>
+<h3 id="mooncake">Mooncake：把租户配额做成账户</h3>
+<p>Mooncake 的存储侧把租户配额做成显式对象（<code>mooncake-store/include/tenant_quota.h</code>）：<code>TenantQuotaSnapshot</code>（快照）、<code>TenantQuotaError</code> 与 <code>TenantQuotaChargeFailure</code>（计费失败的两种返回）、<code>TenantQuotaAccount</code>（单租户账户）与 <code>TenantQuotaTable</code>（账户表，<code>TenantQuotaAccount</code> 是它的友元）。这与 8.6 里 Mooncake 的 NVMe 对象身份、冲突策略是一套设计的两面：<strong>身份决定"这份数据是谁的"，配额决定"谁还能再写多少"</strong>。相比之下，本章模拟里的租户预算就是这张账户表的最小版本。</p>
+<h3 id="_5">设计取舍</h3>
+<ol>
+<li><strong>缓存键放不放进 tenant。</strong> 放进键会降低命中率（同一段公共前缀在不同租户间无法共享），不放则要求租户之间本来就可以共享这份 KV。判断依据是数据边界而不是性能：跨租户共享系统提示的 KV 通常是安全的，共享含私有上下文的 KV 不是。本次模拟把两种情况都实现了，并把"谁能命中谁"作为审计项输出。</li>
+<li><strong>配额放在准入还是放在调度。</strong> 准入实现简单、可复算，但它只能拒绝；调度侧（优先级、抢占）能改变顺序，代价是被抢占的请求要重算。本次两种都测了，结论是"顺序改变不等于算力保留"。</li>
+<li><strong>隔离用进程还是用设备。</strong> 进程隔离用显存换边界，MIG 用硬件换边界。前者随时可用、代价可算（副本数 × 权重），后者依赖设备与权限，本章本机不可用。</li>
+<li><strong><code>load_inplace</code> 还是换名字。</strong> 就地更新省一次加载、保住缓存身份（对同一份权重有利），但它也让缓存无法察觉权重变化；换名字会丢掉该 adapter 的全部缓存。<strong>正确性优先时选换名字或显式清缓存。</strong></li>
+</ol>
+<hr />
+<h2 id="mini">工程实现：mini 实现</h2>
+<p><code>labs/L8/tenant_scheduler.py</code> 是一个确定性的多租户调度与状态归属模拟，四个可检查的设计点：</p>
+<ol>
+<li><strong>身份</strong>：<code>cache_key(r)</code> 由 <code>tenant</code>、<code>adapter_revision</code> 与 <code>prefix_hash(prefix)</code> 拼成；两个 <code>--ignore-*</code> 开关分别把对应字段去掉，用来复现跨租户/跨版本命中。</li>
+<li><strong>预算</strong>：每个租户有 <code>token_budget</code>、<code>max_concurrency</code>、<code>max_adapters</code>；准入返回 <code>(bool, reason)</code>，拒绝原因逐条记入事件流。</li>
+<li><strong>抢占</strong>：<code>preempt_for</code> 只抢优先级数值更大（更低）的租户，被抢请求立即释放 KV 块、归还引用，记一次 <code>preempt</code>，不计入完成。</li>
+<li><strong>持久状态</strong>：完成时把 <code>idem_key → 结果</code> 写成同一条提交记录；<code>replay()</code> 只按快照恢复，已提交的直接返回。</li>
+</ol>
+<p>审计函数 <code>audit()</code> 在结束时检查三件事：每条缓存记录的 <code>refs</code> 是否为 0；是否出现 <code>tenants_seen</code> 多于一个（未开启 <code>--ignore-tenant</code> 时）；驻留块 + 空闲块是否等于容量。第 1 节的四组身份实验结果就是这四条的组合。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="a-cpu">A. 身份与归属（CPU）</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L8/tenant_scheduler.py<span class="w"> </span>--out<span class="w"> </span>&lt;out&gt;/scheduler
+</code></pre></div>
+
+<p>输出里三个字段最值得看：<code>identity_probe</code>（四组配置下 B0/B1 的 <code>cached_tokens</code>）、<code>cases[*].audit.issues</code>（应为空）、<code>restart_replay</code>（<code>replayed</code> 与 <code>committed_after</code>）。消融建议：把 <code>--kv-blocks</code> 从 1200 降到 300，观察容量压力下 <code>quota</code> 与 <code>quota_no_preempt</code> 的差别；把 <code>--seed</code> 换几个值，检查审计项是否始终为空。</p>
+<h3 id="b-adapter-revision">B. adapter revision 与缓存身份（引擎）</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L8/tenant_interference.py<span class="w"> </span>identity<span class="w"> </span>--out-dir<span class="w"> </span>&lt;out&gt;/identity<span class="w"> </span>--prompt-len<span class="w"> </span><span class="m">2048</span>
+</code></pre></div>
+
+<p>流程是：同一段 2048 token 前缀在 adapter <code>rev</code>（revA 权重）上建立缓存 → <code>POST /v1/load_lora_adapter {"load_inplace": true}</code> 就地把权重换成 revB → 分别用<strong>同一个 <code>cache_salt</code></strong>（可能命中旧 KV）与<strong>新的 <code>cache_salt</code></strong>（必然重算）请求同一段前缀，比较首个 token 的 top-5 logprob。revB 是把公开 adapter 的 <code>lora_B</code> 取负得到的合成权重，只用于让两份 revision 的函数确实不同。</p>
+<p>实测（Qwen3-4B + 该 adapter，2048 token 前缀，引擎就绪 42.0 s）：</p>
+<table>
+<thead>
+<tr>
+<th>请求</th>
+<th><code>cache_salt</code></th>
+<th>top-1 token</th>
+<th style="text-align: right;">top-5 里的前两位</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>revA 首算</td>
+<td>s1</td>
+<td><code>"\n"</code></td>
+<td style="text-align: right;"><code>"\n"</code> −4.566 / <code>" "</code> −4.816</td>
+</tr>
+<tr>
+<td>revA 再算（新 salt）</td>
+<td>s2</td>
+<td><code>"\n"</code></td>
+<td style="text-align: right;"><code>"\n"</code> −4.569 / <code>" "</code> −4.819</td>
+</tr>
+<tr>
+<td>revA 热缓存（第三次）</td>
+<td>s1</td>
+<td><code>"\n"</code></td>
+<td style="text-align: right;"><code>"\n"</code> −4.566（<code>prefix_cache_hits_total</code> 在 warm 阶段累计 4 064）</td>
+</tr>
+<tr>
+<td>就地换权重后，同一 salt</td>
+<td>s1</td>
+<td><code>"\n"</code></td>
+<td style="text-align: right;"><code>"\n"</code> −4.538 / <code>" "</code> −4.663</td>
+</tr>
+<tr>
+<td>换权重后，新 salt（真值）</td>
+<td>s3</td>
+<td><code>" "</code></td>
+<td style="text-align: right;"><code>" "</code> −3.912 / <code>"\n"</code> −4.225</td>
+</tr>
+<tr>
+<td>换名字重新加载 revB，同一 salt</td>
+<td>s1</td>
+<td><code>" "</code></td>
+<td style="text-align: right;"><code>" "</code> −3.917 / <code>"\n"</code> −4.292</td>
+</tr>
+</tbody>
+</table>
+<p>读法：</p>
+<ul>
+<li><strong>两份 revision 的函数确实不同</strong>：同一段前缀在 revB 上首 token 的 top-1 从 <code>"\n"</code> 变成 <code>" "</code>（logprob −3.912），两者不是同一个分布。</li>
+<li><strong>同名就地换权重后，缓存把旧 KV 用上了</strong>：<code>load_inplace</code> 返回 <code>Success: LoRA adapter 'rev' added successfully.</code>，随后用同一个 salt 请求同一段前缀，首 token 仍是 <code>"\n"</code>（−4.538），与真值 revB 的 <code>" "</code> 不同；分布相对 revA 略有移动（−4.566 → −4.538），因为最后一层之后的部分用了新权重，而前缀的 KV 来自旧权重。</li>
+<li><strong>换名字就恢复了正确性</strong>：把同一份 revB 权重以 <code>rev-next</code> 名字加载后，同一个 salt 的请求给出 <code>" "</code>（−3.917），与"新 salt 真值"一致。这与源码一致：哈希里的 LoRA 项只有名字。</li>
+</ul>
+<p>对照组的确定性也要交代：revA 的两次计算用了不同 <code>cache_salt</code>（都必然重算），首 token 与 logprob 在 −4.566/−4.569 上一致，说明"不同 salt 导致的重算"本身不改变结果，上面第三行的差别不是 salt 引入的。</p>
+<h3 id="c-vs">C. 共享实例 vs 进程隔离（引擎）</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L8/tenant_interference.py<span class="w"> </span>interference<span class="w"> </span>--out-dir<span class="w"> </span>&lt;out&gt;/interference
+</code></pre></div>
+
+<p>同一份到达清单跑两种部署：<code>shared</code> 是一个引擎同时服务两个租户（各挂一个 adapter），<code>isolated</code> 是两个引擎各服务一个租户。分租户记录 TTFT/TPOT/状态，并按 0.5 s 采样显卡的显存与利用率。<strong>消融建议</strong>：把 <code>--b-prompt-len</code> 从 6144 降到 2048（B 的 prefill 变短），观察 A 的 TTFT 尾部分位是否随之改善；把 <code>--interval-s</code> 从 1.0 调到 0.5（A 的到达率翻倍），看拒绝与排队是否先出现在 A 上。</p>
+<p>实测（Qwen3-4B + 两个 adapter，A：60 个 1024 token 前缀请求、每 1 s 一个；B：12 个 6144 token 前缀请求、每 1 s 一个；输出 32/64 token）：</p>
+<table>
+<thead>
+<tr>
+<th>部署</th>
+<th>引擎就绪</th>
+<th style="text-align: right;">峰值显存</th>
+<th>租户</th>
+<th style="text-align: right;">成功率</th>
+<th style="text-align: right;">TTFT p50</th>
+<th style="text-align: right;">TTFT p95</th>
+<th style="text-align: right;">TTFT p99</th>
+<th style="text-align: right;">TPOT p50</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>shared（一个引擎）</td>
+<td>30.0 s</td>
+<td style="text-align: right;">14 432 MiB</td>
+<td>A</td>
+<td style="text-align: right;">60/60</td>
+<td style="text-align: right;">17.1 ms</td>
+<td style="text-align: right;">26.7 ms</td>
+<td style="text-align: right;">79.6 ms</td>
+<td style="text-align: right;">7.4 ms</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td style="text-align: right;"></td>
+<td>B</td>
+<td style="text-align: right;">12/12</td>
+<td style="text-align: right;"><strong>273.6 ms</strong></td>
+<td style="text-align: right;">277.0 ms</td>
+<td style="text-align: right;">277.0 ms</td>
+<td style="text-align: right;">8.0 ms</td>
+</tr>
+<tr>
+<td>isolated（两个引擎）</td>
+<td>30.0 / 28.0 s</td>
+<td style="text-align: right;">22 439 MiB</td>
+<td>A</td>
+<td style="text-align: right;">60/60</td>
+<td style="text-align: right;">16.6 ms</td>
+<td style="text-align: right;">34.0 ms</td>
+<td style="text-align: right;">63.0 ms</td>
+<td style="text-align: right;">7.1 ms</td>
+</tr>
+<tr>
+<td></td>
+<td></td>
+<td style="text-align: right;"></td>
+<td>B</td>
+<td style="text-align: right;">12/12</td>
+<td style="text-align: right;"><strong>47.2 ms</strong></td>
+<td style="text-align: right;">103.6 ms</td>
+<td style="text-align: right;">103.6 ms</td>
+<td style="text-align: right;">11.6 ms</td>
+</tr>
+</tbody>
+</table>
+<p>读法：</p>
+<ul>
+<li><strong>隔离把长 prefill 租户的 TTFT 改善 5.8 倍</strong>（273.6 → 47.2 ms）。共享引擎里 B 的 6144 token prefill 最可能被分块并与 A 的解码步交错（本次没有关闭 chunked prefill，也没有记录分块次数，这一点是解释而非实测），TTFT 因此被拉长；独立引擎里它独占批次。代价是 B 的解码变慢：TPOT p50 从 8.0 ms 涨到 11.6 ms，因为它失去了与 A 的请求同批的机会。</li>
+<li><strong>交互租户本来就被缓存保护</strong>：A 的前缀被前缀缓存命中（共享引擎两侧合计 <code>prefix_cache_hits_total = 126 880 / 135 168</code> = 93.9%），prefill 本来就短，因此共享与隔离的 p50 只差 0.5 ms；隔离后 A 的 p99 从 79.6 ms 降到 63.0 ms，说明共享仍会给它带来约 17 ms 的尾部扰动。</li>
+<li><strong>隔离的代价写在显存上</strong>：共享 14 432 MiB、隔离 22 439 MiB（两块权重与两个 KV 池），多出来的 8.0 GiB 就是"边界"的价格；两块引擎并行启动用时 30.0 s，与单引擎相同（两个进程的初始化本来就可以并行）。</li>
+<li>这个结果修正了"隔离总是更好"的直觉：<strong>隔离改善的是被共享拖慢的那一类（长 prefill），损害的是本来受益于批处理的指标（解码吞吐）</strong>。选择哪一种取决于哪一类指标在你的 SLO 里更硬。</li>
+</ul>
+<h3 id="d">D. 隔离机制的条件核对</h3>
+<p>本机可以核对的只有"当前权限下不可用"这一事实：</p>
+<div class="highlight"><pre><span></span><code>nvidia-smi<span class="w"> </span>mig<span class="w"> </span>-lgip<span class="w">            </span><span class="c1"># 两机均返回 No MIG-supported devices found</span>
+nvidia-smi<span class="w"> </span>--query-gpu<span class="o">=</span>name,mig.mode.current<span class="w"> </span>--format<span class="o">=</span>csv
+</code></pre></div>
+
+<p>MPS 需要在共享机器上改驱动配置（<code>nvidia-cuda-mps-control</code>），本机不做；提示词约束与数据隔离的关系属于机制说明，不安排实验。</p>
+<hr />
+<h2 id="_6">原始现场</h2>
+<p>CPU 侧的身份、审计与重启结果：</p>
+<details class="fold">
+<summary>results/crater/8.8/20260921-tenant/scheduler/tenant_scheduler.json 身份探针、审计、取消与重启</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"identity_probe"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"correct"</span><span class="p">:</span><span class="w">          </span><span class="p">{</span><span class="nt">"per_request"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"B0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cached_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span><span class="w"> </span><span class="nt">"B1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cached_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">}},</span>
+<span class="w">                         </span><span class="nt">"entries"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">"owner"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"A"</span><span class="p">,</span><span class="w"> </span><span class="s2">"rev-a"</span><span class="p">],</span><span class="w"> </span><span class="nt">"tenants_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"A"</span><span class="p">],</span><span class="w"> </span><span class="nt">"revisions_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"rev-a"</span><span class="p">]},</span>
+<span class="w">                                     </span><span class="p">{</span><span class="nt">"owner"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"B"</span><span class="p">,</span><span class="w"> </span><span class="s2">"rev-b1"</span><span class="p">],</span><span class="w"> </span><span class="nt">"tenants_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"B"</span><span class="p">],</span><span class="w"> </span><span class="nt">"revisions_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"rev-b1"</span><span class="p">]},</span>
+<span class="w">                                     </span><span class="p">{</span><span class="nt">"owner"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"B"</span><span class="p">,</span><span class="w"> </span><span class="s2">"rev-b2"</span><span class="p">],</span><span class="w"> </span><span class="nt">"tenants_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"B"</span><span class="p">],</span><span class="w"> </span><span class="nt">"revisions_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"rev-b2"</span><span class="p">]}]},</span>
+<span class="w">    </span><span class="nt">"ignore_revision"</span><span class="p">:</span><span class="w">  </span><span class="p">{</span><span class="nt">"per_request"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"B0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cached_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span><span class="w"> </span><span class="nt">"B1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cached_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">}},</span>
+<span class="w">                         </span><span class="nt">"wrong_reuse_B1_after_revision_change"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">                         </span><span class="nt">"entries"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">"owner"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"B"</span><span class="p">,</span><span class="w"> </span><span class="s2">"rev-b1"</span><span class="p">],</span><span class="w"> </span><span class="nt">"revisions_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"rev-b1"</span><span class="p">,</span><span class="w"> </span><span class="s2">"rev-b2"</span><span class="p">]}]},</span>
+<span class="w">    </span><span class="nt">"ignore_tenant"</span><span class="p">:</span><span class="w">    </span><span class="p">{</span><span class="nt">"wrong_reuse_B0_across_tenant"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"ignore_both"</span><span class="p">:</span><span class="w">      </span><span class="p">{</span><span class="nt">"per_request"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"B0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cached_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">},</span><span class="w"> </span><span class="nt">"B1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cached_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">}},</span>
+<span class="w">                         </span><span class="nt">"wrong_reuse_B0_across_tenant"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">                         </span><span class="nt">"entries"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">"owner"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"A"</span><span class="p">,</span><span class="w"> </span><span class="s2">"rev-a"</span><span class="p">],</span><span class="w"> </span><span class="nt">"tenants_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"A"</span><span class="p">,</span><span class="w"> </span><span class="s2">"B"</span><span class="p">],</span>
+<span class="w">                                      </span><span class="nt">"revisions_seen"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"rev-a"</span><span class="p">,</span><span class="w"> </span><span class="s2">"rev-b1"</span><span class="p">,</span><span class="w"> </span><span class="s2">"rev-b2"</span><span class="p">]}]}</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"cancel"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cancel_result"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cancelled"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"tenant"</span><span class="p">:</span><span class="w"> </span><span class="s2">"B"</span><span class="p">},</span>
+<span class="w">             </span><span class="nt">"tenant_a_free_blocks_restored"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"tenant_a_used_tokens_unchanged"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">             </span><span class="nt">"tenant_a_done_unchanged"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"b_entry_removed"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">             </span><span class="nt">"cancel_unknown_req"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"cancelled"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">},</span><span class="w"> </span><span class="nt">"audit_after_cancel_issues"</span><span class="p">:</span><span class="w"> </span><span class="p">[]},</span>
+<span class="w">  </span><span class="nt">"restart_replay"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"committed_before"</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span><span class="w"> </span><span class="nt">"replayed"</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span><span class="w"> </span><span class="nt">"recomputed"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                     </span><span class="nt">"committed_after"</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span><span class="w"> </span><span class="nt">"no_duplicate_results"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"cases"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"quota"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"audit"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"issues"</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span><span class="w"> </span><span class="nt">"block_accounting_ok"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">}},</span>
+<span class="w">            </span><span class="nt">"quota_small_kv"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"per_tenant"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"B"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"done"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"rejected"</span><span class="p">:</span><span class="w"> </span><span class="mi">39</span><span class="p">}}}}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>压力扫描的完整表格（四策略 × 五份额）：</p>
+<details class="fold">
+<summary>results/crater/8.8/20260921-tenant/scheduler/tenant_scheduler.json 干扰与策略对照</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">"pressure_sweep"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"rows"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">  </span><span class="p">{</span><span class="nt">"policy"</span><span class="p">:</span><span class="w"> </span><span class="s2">"shared"</span><span class="p">,</span><span class="w"> </span><span class="nt">"b_share"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"A"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.1067</span><span class="p">,</span><span class="w"> </span><span class="nt">"p95"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2133</span><span class="p">,</span><span class="w"> </span><span class="nt">"p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.6933</span><span class="p">}},</span>
+<span class="w">  </span><span class="p">{</span><span class="nt">"policy"</span><span class="p">:</span><span class="w"> </span><span class="s2">"shared"</span><span class="p">,</span><span class="w"> </span><span class="nt">"b_share"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span><span class="w"> </span><span class="nt">"A"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.7642</span><span class="p">,</span><span class="w"> </span><span class="nt">"p95"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.7649</span><span class="p">,</span><span class="w"> </span><span class="nt">"p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">67.4302</span><span class="p">},</span>
+<span class="w">   </span><span class="nt">"B"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">157.4209</span><span class="p">}},</span>
+<span class="w">  </span><span class="p">{</span><span class="nt">"policy"</span><span class="p">:</span><span class="w"> </span><span class="s2">"shared"</span><span class="p">,</span><span class="w"> </span><span class="nt">"b_share"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"A"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.4613</span><span class="p">,</span><span class="w"> </span><span class="nt">"p95"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.4613</span><span class="p">,</span><span class="w"> </span><span class="nt">"p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">39.7057</span><span class="p">},</span>
+<span class="w">   </span><span class="nt">"B"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">549.6775</span><span class="p">}},</span>
+<span class="w">  </span><span class="p">{</span><span class="nt">"policy"</span><span class="p">:</span><span class="w"> </span><span class="s2">"quota"</span><span class="p">,</span><span class="w">  </span><span class="nt">"b_share"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span><span class="w"> </span><span class="nt">"A"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.4749</span><span class="p">,</span><span class="w"> </span><span class="nt">"p95"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.4753</span><span class="p">,</span><span class="w"> </span><span class="nt">"p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">61.5342</span><span class="p">}},</span>
+<span class="w">  </span><span class="p">{</span><span class="nt">"policy"</span><span class="p">:</span><span class="w"> </span><span class="s2">"priority"</span><span class="p">,</span><span class="w"> </span><span class="nt">"b_share"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span><span class="w"> </span><span class="nt">"A"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.4749</span><span class="p">,</span><span class="w"> </span><span class="nt">"p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">61.5342</span><span class="p">}},</span>
+<span class="w">  </span><span class="p">{</span><span class="nt">"policy"</span><span class="p">:</span><span class="w"> </span><span class="s2">"quota_no_preempt"</span><span class="p">,</span><span class="w"> </span><span class="nt">"b_share"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span><span class="w"> </span><span class="nt">"A"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.4749</span><span class="p">,</span><span class="w"> </span><span class="nt">"p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">61.5342</span><span class="p">}}]}}</span>
+</code></pre></div>
+
+</details>
+<p>引擎侧两段实验的原始结果（身份对照的 logprob、干扰对照的分租户统计）：</p>
+<details class="fold">
+<summary>results/crater/8.8/20260921-tenant/identity/identity.json adapter revision 与缓存身份</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"adapter_revA"</span><span class="p">:</span><span class="w"> </span><span class="s2">"…/adapter_revA（公开 adapter）"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"adapter_revB"</span><span class="p">:</span><span class="w"> </span><span class="s2">"…/adapter_revB（把 lora_B 取负的合成权重）"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">42.01</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"revA_salt_s1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"token"</span><span class="p">:</span><span class="w"> </span><span class="s2">"\n"</span><span class="p">,</span><span class="w"> </span><span class="nt">"top_logprobs"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"\n"</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.5656</span><span class="p">,</span><span class="w"> </span><span class="nt">" "</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.8156</span><span class="p">,</span><span class="w"> </span><span class="nt">"."</span><span class="p">:</span><span class="w"> </span><span class="mf">-6.0031</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"revA_salt_s2"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"token"</span><span class="p">:</span><span class="w"> </span><span class="s2">"\n"</span><span class="p">,</span><span class="w"> </span><span class="nt">"top_logprobs"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"\n"</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.5691</span><span class="p">,</span><span class="w"> </span><span class="nt">" "</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.8191</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"revA_deterministic_across_salts"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"prefix_cache_delta_warm"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">4064</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_cache_queries_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"load_inplace_response"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"raw"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Success: LoRA adapter 'rev' added successfully."</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"revB_same_salt_after_inplace"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"token"</span><span class="p">:</span><span class="w"> </span><span class="s2">"\n"</span><span class="p">,</span><span class="w"> </span><span class="nt">"top_logprobs"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"\n"</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.5384</span><span class="p">,</span><span class="w"> </span><span class="nt">" "</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.6634</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"revB_fresh_salt"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"token"</span><span class="p">:</span><span class="w"> </span><span class="s2">" "</span><span class="p">,</span><span class="w"> </span><span class="nt">"top_logprobs"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">" "</span><span class="p">:</span><span class="w"> </span><span class="mf">-3.9120</span><span class="p">,</span><span class="w"> </span><span class="nt">"\n"</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.2245</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"revisions_differ"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"stale_kv_reused"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"load_new_name_response"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"raw"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Success: LoRA adapter 'rev-next' added successfully."</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"revB_new_name_same_salt"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"token"</span><span class="p">:</span><span class="w"> </span><span class="s2">" "</span><span class="p">,</span><span class="w"> </span><span class="nt">"top_logprobs"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">" "</span><span class="p">:</span><span class="w"> </span><span class="mf">-3.9168</span><span class="p">,</span><span class="w"> </span><span class="nt">"\n"</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.2918</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"new_name_matches_fresh_revB"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<details class="fold">
+<summary>results/crater/8.8/20260921-tenant/interference/ 干扰对照（shared / isolated）</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"shared"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"servers"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">"port"</span><span class="p">:</span><span class="w"> </span><span class="mi">18088</span><span class="p">,</span><span class="w"> </span><span class="nt">"ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">30.01</span><span class="p">}],</span>
+<span class="w">             </span><span class="nt">"gpu_after"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"mem_used_mib"</span><span class="p">:</span><span class="w"> </span><span class="mi">14432</span><span class="p">,</span><span class="w"> </span><span class="nt">"mem_total_mib"</span><span class="p">:</span><span class="w"> </span><span class="mi">32607</span><span class="p">},</span>
+<span class="w">             </span><span class="nt">"tenant_A"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">60</span><span class="p">,</span><span class="w"> </span><span class="nt">"statuses"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"SUCCESS"</span><span class="p">:</span><span class="w"> </span><span class="mi">60</span><span class="p">},</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0171</span><span class="p">,</span>
+<span class="w">                          </span><span class="nt">"ttft_p95"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0267</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0796</span><span class="p">,</span><span class="w"> </span><span class="nt">"tpot_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0074</span><span class="p">},</span>
+<span class="w">             </span><span class="nt">"tenant_B"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span><span class="w"> </span><span class="nt">"statuses"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"SUCCESS"</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">},</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2736</span><span class="p">,</span>
+<span class="w">                          </span><span class="nt">"ttft_p95"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2770</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.2770</span><span class="p">,</span><span class="w"> </span><span class="nt">"tpot_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0080</span><span class="p">},</span>
+<span class="w">             </span><span class="nt">"metrics_delta"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">126880</span><span class="p">,</span>
+<span class="w">                               </span><span class="nt">"prefix_cache_queries_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">135168</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"isolated"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"servers"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">"ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">30.01</span><span class="p">},</span><span class="w"> </span><span class="p">{</span><span class="nt">"ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">28.01</span><span class="p">}],</span>
+<span class="w">               </span><span class="nt">"gpu_after"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"mem_used_mib"</span><span class="p">:</span><span class="w"> </span><span class="mi">22439</span><span class="p">,</span><span class="w"> </span><span class="nt">"mem_total_mib"</span><span class="p">:</span><span class="w"> </span><span class="mi">32607</span><span class="p">},</span>
+<span class="w">               </span><span class="nt">"tenant_A"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">60</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0166</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p95"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0340</span><span class="p">,</span>
+<span class="w">                            </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0630</span><span class="p">,</span><span class="w"> </span><span class="nt">"tpot_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0071</span><span class="p">,</span><span class="w"> </span><span class="nt">"tpot_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0158</span><span class="p">},</span>
+<span class="w">               </span><span class="nt">"tenant_B"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"n"</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0472</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p95"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.1036</span><span class="p">,</span>
+<span class="w">                            </span><span class="nt">"ttft_p99"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.1036</span><span class="p">,</span><span class="w"> </span><span class="nt">"tpot_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0116</span><span class="p">}}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<hr />
+<h2 id="_7">前沿</h2>
+<ol>
+<li><strong>把租户身份写进缓存键的显式开关。</strong> vLLM 的 <code>cache_salt</code> 在块 0 上进入哈希（<code>kv_cache_utils.py:604</code>），等于给"同一段文本、不同租户"提供了一个不改变模型行为的隔离旋钮；本次实验用它构造"必然重算"的对照。它的边界也很清楚：salt 相同的两次请求仍然共享，所以 salt 必须由可信侧生成（例如网关），不能来自客户端。</li>
+<li><strong>就地更新与缓存一致性。</strong> <code>load_inplace</code> 让 adapter 的权重可以在不换名字的情况下替换，但缓存哈希只看名字，因此引擎需要额外的失效动作。类似的"身份没变、内容变了"问题在 8.6 的 KV 存储层以另一个形式出现（对象身份与校验和），两章可以用同一组判据检查：<strong>内容版本是否进入了身份</strong>。</li>
+<li><strong>租户配额的存储侧表达。</strong> Mooncake 把配额做成 <code>TenantQuotaAccount</code> / <code>TenantQuotaTable</code> 与应用层令牌桶是同一件事的不同层：应用层配额限制"请求"，存储层配额限制"字节"。多租户服务通常两层都要有，否则一类租户可以通过长上下文把存储层写满。</li>
+<li><strong>进程隔离的成本结构。</strong> 进程隔离把边界做得最干净，代价是每个租户一份权重与一份 KV 池；8.5 的能量账与 8.7 的启动账可以直接相乘：每多一个常驻副本，就多一份空闲功耗与一次扩容滞后。</li>
+</ol>
+<hr />
+<h2 id="_8">陷阱</h2>
+<ol>
+<li><strong>把命中当正确。</strong> 缓存命中的前提是身份一致；本次在 <code>--ignore-revision</code> 下 B1 拿到了 2048 token 的"命中"，但那是别人的 KV。</li>
+<li><strong>把配额当隔离。</strong> 配额限制进入量，不改变共享算力的分配；实测里 A 的 p50 只从 2.76 s 降到 2.47 s。</li>
+<li><strong>提示词约束不是资源或数据隔离。</strong> 它约束输出形态，不限制其他租户看到什么、也不限制算力占用。</li>
+<li><strong>同名 adapter 就地换权重后继续用旧缓存。</strong> <code>load_inplace</code> 不换名字，前缀缓存的哈希只含名字；要么换名字，要么显式清缓存。</li>
+<li><strong>取消/抢占不记账。</strong> 失败路径必须归还 KV 块与 adapter 槽位，否则资源会静默地记在别的租户账上；本次审计把"引用为 0"与"块账闭合"作为退出条件。</li>
+<li><strong>把配置开关当硬件能力。</strong> <code>nvidia-smi</code> 里出现 MIG 字段不代表设备可切分；本机 <code>mig -lgip</code> 明确返回无可切分设备。</li>
+<li><strong>独立进程就等于不争用。</strong> 两个实例仍共享 GPU 带宽与显存容量，隔离的是状态与故障域，不是物理资源。</li>
+</ol>
+<hr />
+<h2 id="_9">自测题</h2>
+<details class="fold">
+<summary>1. 为什么&quot;同一段文本、不同租户&quot;是否应该共享 KV，取决于内容而不是性能？</summary>
+<p><strong>答案：</strong>
+KV 是这段文本在该模型/权重下的中间状态，本身不含额外的权限信息。如果这段文本是公共系统提示，两个租户共享它的 KV 不泄漏任何一方的东西；如果它包含某一租户的私有上下文，共享就等于把别人的上下文状态注入到自己的注意力里。所以判断依据是数据边界：能共享的前提是"这段内容对两边都可见"。工程上把 tenant 放进键是最保守的做法，代价是公共前缀的命中率下降。</p>
+</details>
+<details class="fold">
+<summary>2. 本次实验里 A 的 p50 从 0.107 s 涨到 2.76 s，为什么加上&quot;配额&quot;只降回 2.47 s？</summary>
+<p><strong>答案：</strong>
+因为配额限制的是"同一租户能有多少请求同时在里面"，而请求进来之后每个请求拿到的算力份额由<strong>在途总数</strong>决定。配额把 B 的并发限制在 16，但 A 自己的 8 个请求仍然和 B 的 16 个共享同一份总算力，所以 A 的每个请求还是被摊薄。要真正保护交互流量，需要给它的请求保留算力（例如限制长请求的 prefill 批量、按 token 预算分批），而不只是限制并发数。</p>
+</details>
+<details class="fold">
+<summary>3. 为什么&quot;就地换 adapter 权重&quot;之后，前缀缓存会给出上一版权重的 KV？</summary>
+<p><strong>答案：</strong>
+因为块哈希是 <code>H(parent_hash, token_ids, extra_keys)</code>，而 LoRA 那一项 extra key 只有 <code>lora_request.lora_name</code>（vLLM 0.29.0 的 <code>_gen_lora_extra_hash_keys</code>）。<code>load_inplace</code> 不换名字，哈希输入完全不变，前缀缓存自然认为这就是同一份 KV。要避免它，要么换 adapter 名字（哈希随之改变），要么在换权重前清理该前缀的缓存（如 <code>POST /reset_prefix_cache</code>），要么用不同的 <code>cache_salt</code> 把两版隔离。</p>
+</details>
+<details class="fold">
+<summary>4. 进程隔离解决了什么，又没有解决什么？</summary>
+<p><strong>答案：</strong>
+它让每个租户拥有独立的权重、KV 缓存、adapter 槽位、队列和崩溃域：一个实例 OOM 或崩溃不会带走另一个实例的请求，缓存身份也不会互相污染。它没有解决的是物理资源共享——两个实例仍共用同一张卡的带宽、显存容量和功耗预算，一个实例把带宽打满时另一个的 TPOT 一样会退化；代价则是每个租户多一份权重常驻显存和一次独立的启动/扩容滞后。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L8/8.7-cold-start-weight-distribution.html">&#8592; 8.7 冷启动与权重分发</a><a class="nav-next" href="../L9/9.1-agent-workload-shape.html">9.1 任务图、请求轨迹与 Agent 压测 &#8594;</a></nav>
+</main>
+</body>
+</html>

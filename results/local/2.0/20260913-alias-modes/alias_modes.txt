@@ -1,0 +1,84 @@
+torch 2.14.0  device=cpu  seed=0
+
+================================================================================================
+[C1] dispatcher 层：原地算子、函数式算子与 copy_
+================================================================================================
+eager
+  算子序列（! 标记原地算子）：aten.add.Tensor !aten.mul_.Tensor aten.t.default !aten.add_.Tensor !aten.add_.Tensor aten.sum.default
+  输出 42.0   x 之后 [11.0, 11.0]   x._version=1
+
+functionalize(remove='mutations')
+  算子序列（! 标记原地算子）：aten.add.Tensor aten.mul.Tensor aten.t.default aten.t.default aten.add.Tensor aten.t.default aten.t.default aten.add.Tensor aten.sum.default !aten.copy_.default
+  输出 42.0   x 之后 [11.0, 11.0]   x._version=1
+
+functionalize(remove='mutations_and_views')
+  算子序列（! 标记原地算子）：aten.add.Tensor aten.mul.Tensor aten.t_copy.default aten.t_copy.default aten.add.Tensor aten.t_copy.default aten.t_copy.default aten.add.Tensor aten.sum.default !aten.copy_.default
+  输出 42.0   x 之后 [11.0, 11.0]   x._version=1
+
+
+--- reshape / transpose 在两种 remove 下的差别 -------------------------------------------------
+  eager                                aten.view.default aten.t.default aten.sum.default   -> 6.0
+  functionalize('mutations')           aten.view.default aten.t.default aten.sum.default   -> 6.0
+  functionalize('mutations_and_views') aten.view_copy.default aten.t_copy.default aten.sum.default   -> 6.0
+
+================================================================================================
+[C2] 输入状态对拍：输出一样，输入和版本计数也未必一样
+================================================================================================
+eager 参照：输入前=[1.0, 1.0] 输出=42.0  x 之后=[11.0, 11.0] x._version=1
+
+模式                             输出   输入被改   x._version   与 eager 输出一致     与 eager 输入一致  
+--------------------------------------------------------------------------------------------
+eager                        42.0    是              1        是                是        
+functionalize('mutations')   42.0    是              1        是                是        
+compile(backend='eager')     42.0    是              1        是                是        
+compile(backend='aot_eager')   42.0    是              2        是                是        
+compile(backend='inductor')   42.0    是              1        是                是        
+
+--- 编译后的第二次调用：图复用与版本计数 ------------------------------------------------------------------
+  第一次 out=42.0 x._version=1
+  第二次 out=162.0 x._version=2  （每次调用都真的改了输入：+1）
+
+================================================================================================
+[C3] 失效反例：原地修改打断保存值，三条路径的处置不同
+================================================================================================
+模式                           前向     反向        输出   grad[0] 报错首行
+--------------------------------------------------------------------------------------------------------------
+eager                        OK    ERR      16.0  RuntimeError: one of the variables needed for gradient computation has bee
+functionalize('mutations')   OK     OK      16.0     8.000 
+compile(backend='eager')     OK    ERR      16.0  RuntimeError: one of the variables needed for gradient computation has bee
+compile(backend='aot_eager')  ERR     —      BackendCompilerFailed: backend='aot_eager' raised:
+compile(backend='inductor')  ERR     —      BackendCompilerFailed: backend='inductor' raised:
+
+--- compile 的报错把 autograd 错误包在编译器异常里 ----------------------------------------------------
+  backend='aot_eager' raised:
+  RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation: 
+  Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to
+  ...（共 3 行）
+
+--- 版本计数就是判定依据 --------------------------------------------------------------------------
+  构造后 y._version=0
+  原地改后 y._version=1（MulBackward 记的是 0）
+  报错原文：one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [4]], which is output 0 of Add, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+
+--- functionalize 把原地修改换成 copy_，保存值因此不再失效 -----------------------------------------------
+  算子序列：aten.mul.Tensor aten.mul.Tensor aten.add.Tensor aten.sum.default aten.ones_like.default aten.expand.default aten.mul.Tensor aten.mul.Tensor aten.add.Tensor aten.mul.Tensor aten.detach.default
+  输出 16.0  grad[0]=8.000  无报错
+  反向用的 y 仍是 2：dz/dx = 2 × 2y = 8.0，原地修改没有污染保存的 y
+
+================================================================================================
+[C4] 观察层次之三：图里留下的算子与运行时的真实拷贝
+================================================================================================
+  export clean          成功：def forward(self, x): add = torch.ops.aten.add.Tensor(x, 1); x = None sum_1 = torch.ops.aten.sum.default(add); add = None return (sum_1,)
+  export mutates_input  成功：def forward(self, x): add_ = torch.ops.aten.add_.Tensor(x, 1.0); x = None sum_1 = torch.ops.aten.sum.default(add_); add_ = None return (sum_1,)
+
+--- 编译触发时 TorchDispatchMode 记录到的是追踪期算子序列 ------------------------------------------------
+  （要看编译后的图本身用 2.6b/2.7 的 IR 与 AOT 工具，这里只看追踪期）
+  compile(eager    ) aten.add.Tensor aten.t.default !aten.add_.Tensor aten.sum.default -> 12.0
+  compile(aot_eager) aten.add.Tensor aten.t.default !aten.add_.Tensor aten.sum.default -> 12.0
+  compile(inductor ) aten.add.Tensor aten.t.default !aten.add_.Tensor aten.sum.default -> 12.0
+
+--- 导出图中的 view 与拷贝 ----------------------------------------------------------------------
+  def forward(self, x): reshape = torch.ops.aten.reshape.default(x, [3, 2]) sum_1 = torch.ops.aten.sum.default(reshape); reshape = None t = torch.ops.aten.t.default(x); x = None reshape_1 = torch.ops.aten.reshape.default(t, [-1]); t = None sum_2 = torch.ops.aten.sum.default(reshape_1); reshape_1 = Non
+  eager  x.reshape(3,2)      同 storage: True
+  eager  x.t().reshape(-1)   同 storage: False   <- 图里同样是 reshape，运行时却拷了
+  图只记录算子名，view 还是拷贝由运行时的 stride 决定。

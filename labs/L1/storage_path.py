@@ -47,30 +47,41 @@ def drop_file_cache(path: Path) -> bool:
 
 
 def cached_pages(path: Path) -> float:
-    """用 mincore 估算这个文件当前有多少比例在页缓存里。"""
+    """用 mincore 估算这个文件当前有多少比例在页缓存里。
+
+    为什么不用 Python 的 `mmap.mmap` + `from_buffer`：
+    只读映射不是可写缓冲区，`ctypes.c_char.from_buffer(mm)` 会直接抛异常，
+    于是 mincore 永远报"不可用"（本章陷阱 ⑦ 记的就是这个现象）。
+    正确做法是自己调 libc 的 mmap 拿地址，用完 munmap——
+    mincore 只要求映射存在，不要求可写。
+    """
     try:
         size = path.stat().st_size
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
-        finally:
-            os.close(fd)
         page = os.sysconf("SC_PAGE_SIZE")
         n = (size + page - 1) // page
-        vec = (ctypes.c_ubyte * n)()
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        # 必须声明 argtypes：否则指针会被当成 int 截断成 32 位（L1.4 踩过同类坑）
+        # 必须声明 argtypes：否则 64 位指针会被当成 int 截断（L1.4 踩过同类坑）
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        libc.munmap.restype = ctypes.c_int
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.mincore.restype = ctypes.c_int
         libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
                                  ctypes.POINTER(ctypes.c_ubyte)]
-        libc.mincore.restype = ctypes.c_int
-        addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-        rc = libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(size), vec)
-        if rc != 0:
-            mm.close()
+        PROT_READ, MAP_PRIVATE = 1, 2
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            addr = libc.mmap(None, ctypes.c_size_t(size), PROT_READ, MAP_PRIVATE, fd, 0)
+        finally:
+            os.close(fd)
+        if addr is None or addr == ctypes.c_void_p(-1).value:
             return -1.0
-        resident = sum(1 for v in vec if v & 1)
-        mm.close()
-        return resident / n
+        vec = (ctypes.c_ubyte * n)()
+        rc = libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(size), vec)
+        resident = sum(1 for v in vec if v & 1) if rc == 0 else -1
+        libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+        return resident / n if rc == 0 else -1.0
     except Exception:  # noqa: BLE001
         return -1.0
 
@@ -110,40 +121,158 @@ def fs_of(path: Path) -> str:
         return "?"
 
 
+def block_device_of(path: Path) -> str:
+    """这个文件落在哪个块设备上——介质信息要和带宽一起记。"""
+    try:
+        r = subprocess.run(["df", str(path)], capture_output=True, text=True,
+                           timeout=10).stdout.splitlines()
+        return r[-1].split()[0] if len(r) > 1 else "?"
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def proc_io() -> dict:
+    """本进程真正从块设备读了多少字节（/proc/self/io）。
+
+    `rchar` 包含缓存命中的读，`read_bytes` 只计真正下到块层的字节。
+    两者一起看才能区分「读了文件」和「真的碰了盘」。
+    """
+    out = {}
+    try:
+        for line in Path(f"/proc/{os.getpid()}/io").read_text().splitlines():
+            k, _, v = line.partition(":")
+            out[k.strip()] = int(v.strip())
+    except OSError:
+        pass
+    return out
+
+
+def page_faults() -> dict:
+    """软/硬缺页计数（/proc/self/stat 的 minflt / majflt）。"""
+    try:
+        fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(") ", 1)[1].split()
+        return {"minflt": int(fields[7]), "majflt": int(fields[9])}
+    except (OSError, IndexError):
+        return {}
+
+
+class Stage:
+    """一段计时的上下文：墙钟 + 缺页增量 + 进程 IO 增量。
+
+    把「这一段到底读了多少字节、触发多少缺页」和耗时一起记下来，
+    是区分 mmap 建视图 / 真正调页 / CPU 转换 / H2D 的唯一办法。
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        self.f0 = page_faults()
+        self.io0 = proc_io()
+        return self
+
+    def __exit__(self, *exc):
+        self.ms = (time.perf_counter() - self.t0) * 1e3
+        f1, io1 = page_faults(), proc_io()
+        self.minflt = f1.get("minflt", 0) - self.f0.get("minflt", 0)
+        self.majflt = f1.get("majflt", 0) - self.f0.get("majflt", 0)
+        self.rchar = io1.get("rchar", 0) - self.io0.get("rchar", 0)
+        self.read_bytes = io1.get("read_bytes", 0) - self.io0.get("read_bytes", 0)
+        return False
+
+    def as_dict(self) -> dict:
+        return {"ms": round(self.ms, 1), "minflt": self.minflt, "majflt": self.majflt,
+                "rchar_mib": round(self.rchar / 2**20, 1),
+                "read_bytes_mib": round(self.read_bytes / 2**20, 1)}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--work", default=None,
+                    help="把分片复制到这个目录下的独立文件再测；"
+                         "避免别的进程读同一个模型文件把页缓存弄热（冷态控制）")
+    ap.add_argument("--keep-copy", action="store_true")
     args = ap.parse_args()
 
     model = Path(args.model)
     shards = sorted(model.glob("*.safetensors"))
     if not shards:
         raise SystemExit(f"{model} 下没有 .safetensors")
-    shard = max(shards, key=lambda p: p.stat().st_size)
+    src = max(shards, key=lambda p: p.stat().st_size)
+
+    # 独立数据文件：冷态控制必须先排除「别人也在读同一份文件」。
+    # 复制是顺序读+写，之后所有实验都只碰这个私有副本。
+    shard = src
+    copy_ms = None
+    if args.work:
+        work = Path(args.work)
+        work.mkdir(parents=True, exist_ok=True)
+        shard = work / f"cold_{src.name}"
+        if not shard.exists() or shard.stat().st_size != src.stat().st_size:
+            t0 = time.perf_counter()
+            with open(src, "rb") as fi, open(shard, "wb") as fo:
+                while True:
+                    b = fi.read(8 << 20)
+                    if not b:
+                        break
+                    fo.write(b)
+            copy_ms = round((time.perf_counter() - t0) * 1e3, 1)
+            os.fsync(os.open(shard, os.O_RDONLY))
     size_gb = shard.stat().st_size / 1e9
 
     res = {
         "measured_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        "file": str(shard), "size_gb": round(size_gb, 2), "fs": fs_of(shard),
+        "source_file": str(src), "file": str(shard), "size_gb": round(size_gb, 2),
+        "fs": fs_of(shard), "block_device": block_device_of(shard),
+        "private_copy": bool(args.work), "private_copy_ms": copy_ms,
+        "media": {},
     }
     print(f"=== {shard.name}  {size_gb:.2f} GB")
-    print(f"    文件系统: {res['fs']}")
+    print(f"    文件系统: {res['fs']}   块设备: {res['block_device']}")
+    if copy_ms is not None:
+        print(f"    已复制到独立文件（{copy_ms} ms），后续冷热控制只针对它")
+    try:
+        st = os.statvfs(shard)
+        res["media"]["statvfs_bsize"] = st.f_bsize
+        res["media"]["free_gib"] = round(st.f_bavail * st.f_frsize / 2**30, 1)
+    except OSError:
+        pass
 
     # ---- A. 冷读 vs 热读 ----
     print("\n[A] 冷读（页缓存已逐出） vs 热读（命中页缓存）")
+    frac_before = cached_pages(shard)
     ok = drop_file_cache(shard)
     frac = cached_pages(shard)
-    print(f"    posix_fadvise(DONTNEED) {'成功' if ok else '失败'}；"
-          f"逐出后仍在缓存的比例 {frac:.1%}" if frac >= 0 else "    （mincore 不可用）")
-    cold = read_seq(shard)
-    warm = read_seq(shard)
+    if frac >= 0:
+        print(f"    mincore 逐出前驻留 {frac_before:.1%}  →  "
+              f"posix_fadvise(DONTNEED) {'成功' if ok else '失败'}  →  逐出后 {frac:.1%}")
+    else:
+        print(f"    （mincore 不可用，无法给出驻留比例；DONTNEED {'成功' if ok else '失败'}）")
+    if frac >= 0 and frac > 0.2:
+        print("    ⚠ 逐出后仍有 >20% 驻留：这不是干净的冷态，冷读数字只能当上界看")
+    with Stage("cold_read") as s_cold:
+        cold = read_seq(shard)
+    with Stage("warm_read") as s_warm:
+        warm = read_seq(shard)
     warm2 = read_seq(shard)
-    print(f"    冷读   {cold:7.2f} GB/s")
-    print(f"    热读   {warm:7.2f} GB/s   （第二次 {warm2:.2f}）")
+    print(f"    冷读   {cold:7.2f} GB/s   "
+          f"（进程 read_bytes 增量 {s_cold.read_bytes / 2**30:.2f} GiB，"
+          f"缺页 {s_cold.minflt}+{s_cold.majflt}）")
+    print(f"    热读   {warm:7.2f} GB/s   （第二次 {warm2:.2f}；"
+          f"read_bytes 增量 {s_warm.read_bytes / 2**30:.2f} GiB）")
     print(f"    页缓存带来 {warm/cold:.1f}× —— 这就是「第二次加载模型快得多」的原因")
-    res["A_cold_vs_warm"] = {"cold_gbps": round(cold, 2), "warm_gbps": round(warm, 2),
-                             "warm2_gbps": round(warm2, 2), "ratio": round(warm / cold, 2)}
+    res["A_cold_vs_warm"] = {
+        "cold_gbps": round(cold, 2), "warm_gbps": round(warm, 2),
+        "warm2_gbps": round(warm2, 2), "ratio": round(warm / cold, 2),
+        "mincore_resident_before": round(frac_before, 4),
+        "mincore_resident_after_fadvise": round(frac, 4),
+        "fadvise_ok": ok,
+        "cold_stage": s_cold.as_dict(), "warm_stage": s_warm.as_dict(),
+        "cold_evidence_ok": bool(frac >= 0 and frac <= 0.2),
+    }
 
     # ---- B. read() vs mmap ----
     print("\n[B] 读法对比（都在页缓存已热的前提下）")
@@ -165,49 +294,74 @@ def main() -> None:
     # 于是 H2D 只测出 6.7 GB/s（而 PCIe 5.0 是 47）。**两段时间串了台。**
     #
     # 正确做法：把三个阶段显式分开，中间用真实触碰强制页调入。
-    print("\n[C] 端到端：safetensors -> 主机内存 -> 显存（三段分开计时）")
+    print("\n[C] 端到端：safetensors -> 主机内存 -> 显存（每段单独计时 + 缺页/字节账）")
     import torch
     from safetensors import safe_open
 
     drop_file_cache(shard)
 
+    # C0: 只读文件头并解析 JSON（CPU 侧的解码，不碰张量数据）
+    with Stage("C0_header_decode") as s_c0:
+        with open(shard, "rb") as f:
+            n_hdr = int.from_bytes(f.read(8), "little")
+            header = json.loads(f.read(n_hdr))
+    hdr_tensors = {k: v for k, v in header.items() if k != "__metadata__"}
+
     # C1: 只建立 mmap 视图（不读数据）
-    t0 = time.perf_counter()
-    with safe_open(str(shard), framework="pt") as f:
-        keys = list(f.keys())
-        views = {k: f.get_tensor(k) for k in keys}
-    t_map = time.perf_counter() - t0
+    with Stage("C1_mmap_view") as s_c1:
+        with safe_open(str(shard), framework="pt") as f:
+            keys = list(f.keys())
+            views = {k: f.get_tensor(k) for k in keys}
 
     # C2: 强制把所有页真的读进主机内存（clone 会逐字节拷贝一遍）
-    t0 = time.perf_counter()
-    resident = {k: v.clone() for k, v in views.items()}
-    t_fault = time.perf_counter() - t0
+    with Stage("C2_fault_in") as s_c2:
+        resident = {k: v.clone() for k, v in views.items()}
     del views
+
+    # C2b: CPU 侧解码/转换——把 BF16 张量转成 FP16。
+    #      checkpoint 里存的精度和 kernel 想要的精度经常不同，这一步是纯 CPU 工作，
+    #      它的成本既不属于磁盘读，也不属于 H2D，必须单列。
+    with Stage("C2b_cpu_cast") as s_c2b:
+        cast = {k: (v.to(torch.float16) if v.dtype == torch.bfloat16 else v)
+                for k, v in resident.items()}
 
     # C3: 主机内存（已驻留） -> 显存
     torch.cuda.init(); torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    on_gpu = {k: v.to("cuda", non_blocking=False) for k, v in resident.items()}
-    torch.cuda.synchronize()
-    t_h2d = time.perf_counter() - t0
+    with Stage("C3_h2d_pageable") as s_c3:
+        on_gpu = {k: v.to("cuda", non_blocking=False) for k, v in cast.items()}
+        torch.cuda.synchronize()
     n_tensors = len(resident)
+    t_map, t_fault, t_h2d = s_c1.ms / 1e3, s_c2.ms / 1e3, s_c3.ms / 1e3
 
-    print(f"    张量数 {n_tensors}")
-    print(f"    C1 建立 mmap 视图     {t_map*1e3:8.1f} ms   "
-          f"（不读数据，所以'带宽'没有意义）")
-    print(f"    C2 强制读入主机内存   {t_fault*1e3:8.1f} ms  ({size_gb/t_fault:6.2f} GB/s)  ← 真正的磁盘/缓存读")
-    print(f"    C3 主机内存 -> 显存   {t_h2d*1e3:8.1f} ms  ({size_gb/t_h2d:6.2f} GB/s)")
-    print(f"    ⇒ 冷启动总计约 {(t_map+t_fault+t_h2d)*1e3:.0f} ms")
-    print(f"      磁盘/缓存占 {t_fault/(t_map+t_fault+t_h2d):.0%}，"
-          f"PCIe 占 {t_h2d/(t_map+t_fault+t_h2d):.0%}")
+    print(f"    张量数 {n_tensors}（文件头里 {len(hdr_tensors)} 项）")
+    print(f"    C0 读文件头 + JSON 解析 {s_c0.ms:8.1f} ms  "
+          f"（rchar {s_c0.rchar / 2**20:.1f} MiB，只读了头部）")
+    print(f"    C1 建立 mmap 视图     {s_c1.ms:8.1f} ms   "
+          f"（不读数据：rchar {s_c1.rchar / 2**20:.1f} MiB）")
+    print(f"    C2 强制读入主机内存   {s_c2.ms:8.1f} ms  ({size_gb/(s_c2.ms/1e3):6.2f} GB/s)  "
+          f"← 真正的磁盘/缓存读；缺页 {s_c2.minflt}+{s_c2.majflt}，"
+          f"read_bytes {s_c2.read_bytes / 2**20:.1f} MiB")
+    print(f"    C2b CPU 侧精度转换    {s_c2b.ms:8.1f} ms  "
+          f"（bf16→fp16，纯 CPU，缺页 {s_c2b.minflt}+{s_c2b.majflt}）")
+    print(f"    C3 主机内存 -> 显存   {s_c3.ms:8.1f} ms  ({size_gb/t_h2d:6.2f} GB/s)")
+    total = t_map + t_fault + t_h2d + s_c2b.ms / 1e3
+    print(f"    ⇒ 冷启动总计约 {total*1e3:.0f} ms")
+    print(f"      磁盘/缓存占 {t_fault/total:.0%}，CPU 转换占 {s_c2b.ms/1e3/total:.0%}，"
+          f"PCIe 占 {t_h2d/total:.0%}")
     print(f"    注意 C3 的 {size_gb/t_h2d:.1f} GB/s 远低于 L1.3 实测的 47 GB/s ——下面查原因。")
     res["C_end_to_end"] = {
         "n_tensors": n_tensors,
-        "mmap_view_ms": round(t_map * 1e3, 1),
-        "fault_in_ms": round(t_fault * 1e3, 1),
-        "fault_in_gbps": round(size_gb / t_fault, 2),
-        "h2d_ms": round(t_h2d * 1e3, 1),
-        "h2d_gbps": round(size_gb / t_h2d, 2),
+        "header_items": len(hdr_tensors),
+        "header_decode": s_c0.as_dict(),
+        "mmap_view_ms": round(s_c1.ms, 1),
+        "mmap_view": s_c1.as_dict(),
+        "fault_in_ms": round(s_c2.ms, 1),
+        "fault_in_gbps": round(size_gb / (s_c2.ms / 1e3), 2),
+        "fault_in": s_c2.as_dict(),
+        "cpu_cast": s_c2b.as_dict(),
+        "h2d_ms": round(s_c3.ms, 1),
+        "h2d_gbps": round(size_gb / (s_c3.ms / 1e3), 2),
+        "total_ms": round(total * 1e3, 1),
         "note": "get_tensor() 只建 mmap 视图；必须显式触碰才会真读磁盘"}
 
     # C4: 对照——把所有张量拼成一块大的再传，看固定开销的影响

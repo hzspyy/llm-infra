@@ -1,0 +1,88 @@
+
+==============================================================================
+[A] processor 配置、手写 resize/normalize/patchify 与对拍
+==============================================================================
+  图像 processor：patch 16、temporal 2、merge 2、mean [0.5, 0.5, 0.5]、std [0.5, 0.5, 0.5]
+  resize 边界（像素数）：最短边 65536、最长边 16777216  → 65536 = 256²，16777216 = 4096²
+  视频 processor：Qwen3VLVideoProcessor，边界 {'longest_edge': 25165824, 'shortest_edge': 4096}，patch/temporal/merge 同上
+  对齐因子 = patch × merge = 16 × 2 = 32
+
+--- A1 手写 smart_resize 与官方 resize 对照 --------------------------------------
+/scratch/learn/work/labs/L4/vision_preprocess.py:92: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:213.)
+  arr = torch.from_numpy(np.asarray(im)).float() / 255.0     # [H,W,3]
+  img01_ocr_320x240.png      [320, 240] → [320, 256]  grid [1, 16, 20]  token 80    patch 320×1536  mean|diff| 6.77e-03  max 1.86e+00
+  img02_count_320x240.png    [320, 240] → [320, 256]  grid [1, 16, 20]  token 80    patch 320×1536  mean|diff| 4.91e-02  max 1.75e+00
+  img03_time_320x240.png     [320, 240] → [320, 256]  grid [1, 16, 20]  token 80    patch 320×1536  mean|diff| 5.20e-02  max 1.86e+00
+  img04_ocr_640x480.png      [640, 480] → [640, 480]  grid [1, 30, 40]  token 300   patch 1200×1536  mean|diff| 1.76e-03  max 1.84e+00
+  img11_count_480x640.png    [480, 640] → [480, 640]  grid [1, 40, 30]  token 300   patch 1200×1536  mean|diff| 3.61e-02  max 1.58e+00
+  img12_time_480x640.png     [480, 640] → [480, 640]  grid [1, 40, 30]  token 300   patch 1200×1536  mean|diff| 3.98e-02  max 1.86e+00
+  12 张图逐元素对拍：全部为 0 = False
+  平均绝对差 5.71e-02（取值域 [-1,1]），超过 0.5 的元素占比最大 4.8824%
+  形状与几何完全一致（grid_thw 与 patch 数逐张相同），残差集中在高对比细笔画像素上；原因未定位，见本章“陷阱”
+  对照：把 patch 内顺序改成 (t,c,ph,pw)，平均绝对差最大 1.02e-01，是正确顺序的 1.8–66.7 倍 → 顺序判断是决定性的
+
+==============================================================================
+[B] 图像尺寸覆盖、视频采帧与非法边界
+==============================================================================
+
+--- B1 12 张图的尺寸、token 预算与 CPU 耗时 ------------------------------------------
+  img01_ocr_320x240.png        [320, 240] → grid [1, 16, 20]  token 80    CPU   2.50 ms  pixel   960.0 KiB
+  img02_count_320x240.png      [320, 240] → grid [1, 16, 20]  token 80    CPU   0.84 ms  pixel   960.0 KiB
+  img03_time_320x240.png       [320, 240] → grid [1, 16, 20]  token 80    CPU   2.70 ms  pixel   960.0 KiB
+  img04_ocr_640x480.png        [640, 480] → grid [1, 30, 40]  token 300   CPU   2.36 ms  pixel  3600.0 KiB
+  img05_count_640x480.png      [640, 480] → grid [1, 30, 40]  token 300   CPU   2.15 ms  pixel  3600.0 KiB
+  img06_time_640x480.png       [640, 480] → grid [1, 30, 40]  token 300   CPU   2.07 ms  pixel  3600.0 KiB
+  img07_ocr_1280x720.png       [1280, 720] → grid [1, 44, 80]  token 880   CPU   7.05 ms  pixel 10560.0 KiB
+  img08_count_1280x720.png     [1280, 720] → grid [1, 44, 80]  token 880   CPU   7.76 ms  pixel 10560.0 KiB
+  img09_time_1280x720.png      [1280, 720] → grid [1, 44, 80]  token 880   CPU   7.67 ms  pixel 10560.0 KiB
+  img10_ocr_480x640.png        [480, 640] → grid [1, 40, 30]  token 300   CPU   4.55 ms  pixel  3600.0 KiB
+  img11_count_480x640.png      [480, 640] → grid [1, 40, 30]  token 300   CPU   2.23 ms  pixel  3600.0 KiB
+  img12_time_480x640.png       [480, 640] → grid [1, 40, 30]  token 300   CPU   2.19 ms  pixel  3600.0 KiB
+  注意：文件大小、原始像素数与视觉 token 数是三个不同的量；上表给出的是 processor 输出的真实 token 数。
+
+--- B2 视频采帧：fps 与 num_frames ----------------------------------------------
+[transformers] Asked to sample `fps` frames per second but no video metadata was provided which is required when sampling with `fps`. Defaulting to `fps=24`. Please provide `video_metadata` for more accurate results.
+[transformers] Qwen3VL video processing does not apply the per-frame pixel cap the reference implementation (qwen-vl-utils) applies, so some videos cost far more tokens than they would there. In v5.22 the capped behavior will become the default and `cap_pixels_per_frame` will be removed. Pass `cap_pixels_per_frame=True` to adopt the reference behavior now, or `False` to keep the current behavior and silence this warning.
+  fps=1            取  2 帧  时间戳 [0.0, 1.0]
+  fps=2            取  4 帧  时间戳 [0.0, 0.5, 1.0, 1.5]
+  fps=4            取  8 帧  时间戳 [0.0, 0.25, 0.5, 0.75, 1.0, 1.25]...
+  num_frames=4     取  4 帧  时间戳 [0.0, 0.625, 1.25, 1.875]
+  num_frames=8     取  8 帧  时间戳 [0.0, 0.25, 0.5, 0.75, 1.125, 1.375]...
+  num_frames=16    取 16 帧  时间戳 [0.0, 0.125, 0.25, 0.375, 0.5, 0.625]...
+  官方 video_processor：grid_thw [2, 16, 20]，temporal_patch_size 2，grid_t×temporal = 4 帧
+
+--- B3 非法与边界输入 ------------------------------------------------------------
+  32×32 小图                     未报错 → 32×32 → grid [1, 16, 16]
+  5000×5000 大图                 未报错 → 5000×5000 → grid [1, 256, 256]，token 16384
+  fps=0                        ZeroDivisionError: division by zero
+  单帧视频                         ValueError: t:1 must be larger than temporal_factor:2
+  5 帧奇数长度                      未报错 → 5 帧（奇数，temporal=2）→ grid [2, 16, 20]，grid_t×temporal = 4 > 5 → 需要 padding/复制
+  RGBA 输入                      未报错 → RGBA 图 → grid [1, 14, 20]（自动转 RGB）
+
+==============================================================================
+[C] 视觉 token 预算：128 / 512 / 2048
+==============================================================================
+  预算换算：token 数 = (grid_t·grid_h·grid_w)/merge²，grid_h·grid_w = 像素面积/(patch²·temporal) → min_pixels ≈ token×32×32
+   budget    token 中位数     CPU 中位数 ms    pixel MiB 中位数
+      128          120           4.56            1.406
+      512          540           3.41            6.328
+     2048         2120           9.67           24.844
+  预算设置值与实际 token 数分别记录：面积夹取与 32 对齐会产生偏差。
+
+--- C1 Qwen3-VL 在三种预算下的实际作答 -----------------------------------------------
+Loading weights:   0%|          | 0/713 [00:00<?, ?it/s]Loading weights:   4%|▍         | 27/713 [00:00<00:02, 262.53it/s]Loading weights:  14%|█▍        | 100/713 [00:00<00:01, 533.30it/s]Loading weights:  24%|██▎       | 169/713 [00:00<00:00, 595.26it/s]Loading weights:  34%|███▎      | 240/713 [00:00<00:00, 634.83it/s]Loading weights:  44%|████▍     | 317/713 [00:00<00:00, 680.94it/s]Loading weights:  55%|█████▍    | 390/713 [00:00<00:00, 696.90it/s]Loading weights: 100%|██████████| 713/713 [00:00<00:00, 1051.51it/s]
+  budget=128   视觉 token 中位数 120   命中 7/12  生成耗时中位数 70 ms
+  budget=512   视觉 token 中位数 540   命中 12/12  生成耗时中位数 98 ms
+  budget=2048  视觉 token 中位数 2120  命中 12/12  生成耗时中位数 230 ms
+
+--- C2 Gemma3 processor 的结构对照 ---------------------------------------------
+  Gemma3 图像 processor 属性：{'do_pan_and_scan': None, 'pan_and_scan_min_crop_size': None, 'pan_and_scan_max_num_crops': None, 'size': 'SizeDict(height=224, width=224, longest_edge=None, shortest_edge=None, max_height=None, max_width=None, min_pixels=None, max_pixels=None)', 'do_resize': True, 'resample': <Resampling.BILINEAR: 2>, 'image_mean': '(0.5, 0.5, 0.5)', 'image_std': '(0.5, 0.5, 0.5)'}
+  img01_ocr_320x240.png        [1, 3, 224, 224] num_crops=1
+  img02_count_320x240.png      [1, 3, 224, 224] num_crops=1
+  img03_time_320x240.png       [1, 3, 224, 224] num_crops=1
+  img04_ocr_640x480.png        [1, 3, 224, 224] num_crops=1
+  Gemma3 用的是固定 896×896 分块 + 可选的 pan-and-scan（大图切成多块），
+  与 Qwen3-VL 的「按面积夹取 + 32 对齐 + merge 2×2」是两种结构。
+  Gemma3 processor 不可用：AttributeError: 'Gemma3ImageProcessor' object has no attribute 'patch_size'
+
+已写出 out/4.5/20260913-vlm/vision_preprocess.json

@@ -1,289 +1,72 @@
-# L7 训练部分模型选型记录
+# 训练材料与模型选型依据
 
-日期：2026-09-12
+本文件只记录模型和公开材料的选型依据；任务、依赖、交付与验收统一写入[已完成部分的修订计划](plans/completed.md)与[未完成部分的详细计划](plans/pending.md#training-workflow)。正文进度和实测证据以 [STATUS](../STATUS.md) 为准。
 
-## 选型决定
+## 模型与运行范围
 
-**主力模型：SmolLM3 3B** (HuggingFaceTB/SmolLM3-3B-Base)
+训练体系使用多个基础模型，不设覆盖全部模态的唯一语言模型基座。文本、视觉表示、ASR、codec/TTS、扩散/flow、视频/世界模型、Omni、VLA 分别学习自己的数据、目标、优化和导出流程；微调、蒸馏、QAT/QAD、RL 再与这些流程结合。
 
-## 理由
+- 数值和状态验证复用 TinyLM、线性/projector/flow 小例及已测 SmolLM2-360M。一次更新、短恢复和少量两 rank 检查用于回答确定的机制问题。
+- 文本、视觉适配和小型图像生成分别完成预算内的教学训练。文本从随机权重预训练到 SFT 和部署，LoRA/DPO/RL/蒸馏从共同起点分别开展；视觉适配明确复用的预训练模块，像素域图像生成具有独立基础目标。
+- Puro-2B 与 SmolLM3-3B-Base 用作真实规模配方、阶段权重、公开日志和系统设计参照，不要求重做其全量预训练。
+- 资料研读、本机机制小验证、本机完整教学项目与作者规模结果分别标注。FSDP2、DeepSpeed、Megatron、TorchTitan 均完成源码/状态/接口比较，实际教学项目只选择预算内适用路径。
 
-### 1. 前沿性与代表性
-- **2026年发布**，使用现代架构：RoPE、Grouped Query Attention、RMSNorm、SwiGLU
-- 支持长上下文（NoPE + YaRN 至 128k）
-- 比 GPT-2 (2019) 更能代表当前训练栈
+## 低资源项目与规模参照
 
-### 2. 完整透明度
-- ✅ 开源训练配置（nanotron YAML）
-- ✅ 11T tokens 完整训练数据配方
-- ✅ 论文详细记录（arxiv/2502.02737）
-- ✅ 多阶段训练策略、消融实验
-- ✅ 官方 checkpoint 可直接使用
+| 对象 | 教学用途与来源 | 选型与成本边界 |
+|---|---|---|
+| [MiniMind](https://github.com/jingyaogong/minimind) | 可读的模型、数据、预训练、SFT、LoRA、偏好/RL 与蒸馏实现；文本贯穿项目优先候选 | 当前主线约 64M，旧版本含 26M 配置；结构、tokenizer 和权重必须与选定版本对应。README 的“2 小时、3 元”注明为单张 3090 上 SFT 一轮，不能作为全部训练阶段预算 |
+| [MiniMind-V](https://github.com/jingyaogong/minimind-v) | 图像→视觉特征→projector→语言模型的对齐与联合适配 | 当前实现复用语言模型和冻结视觉编码器；所谓从零构建 VLM 不等于所有参数从随机初始化训练。全模型参数、可训练参数和显存分别计算；版本变更后重查冻结策略 |
+| [Diffusers 基础训练](https://huggingface.co/docs/diffusers/en/tutorials/basic_training) | 随机初始化 UNet、加噪目标、训练、保存和采样；使用小图像集与小网络 | 官方示例是流程来源，本课程缩小数据/分辨率/模型后自行测算成本。像素域主例不依赖预训练 VAE 或语言模型；flow 参照和扩展按 10.1 任务执行 |
+| [Puro-2B](https://arxiv.org/html/2608.27370) / [Puro-Megatron](https://github.com/thu-pacman/Puro-Megatron) | 消费级 GPU 上的规模预训练、FP8、MuonH、阶段数据与成本分析 | 报告的正式阶段用 24/96 张 RTX 5090，最佳模型约 22,514 活跃训练 GPU 小时、约 6,900 美元的归一化预训练计算成本；不含数据准备、后训练等全部研发支出，不能理解成单卡几小时项目 |
 
-### 3. 教学友好
-**不需要训练完整模型**：
-- 官方已训练好的 checkpoint 可加载验证
-- 用小数据集（1000-10000 样本）跑几个 step 验证机制
-- 可在几小时内完成训练步验证
-- 有多个训练阶段 checkpoint 可复用
+这些项目是实现载体，最终版本按目标、数据、可读性、显存和预算选择；替换时保持完整阶段及质量/恢复/部署验收。具体数据规模、运行上限、停止条件和责任章节统一见[贯穿任务](plans/pending.md#training-workflow)，本文件不另设执行计划。
 
-### 4. 可借用结论
-SmolLM2 论文（arxiv/2502.02737）提供：
-- 训练曲线与 loss 趋势
-- 数据混合比例的消融实验
-- 多阶段训练的性能对比
-- 不同优化器配置的影响
+## 文本案例的核实信息
 
-**我们专注于"怎么实现训练系统"，而非"训练出最好模型"**
+信息依据：[SmolLM2-360M config](https://huggingface.co/HuggingFaceTB/SmolLM2-360M/blob/main/config.json)、[SmolLM3-3B-Base config](https://huggingface.co/HuggingFaceTB/SmolLM3-3B-Base/blob/main/config.json)、[SmolLM3 官方介绍](https://huggingface.co/blog/smollm3)、[Nanotron 配置](https://github.com/huggingface/smollm/tree/main/text/pretraining/smollm3)。版本和用途必须与具体配置对应。
 
-### 5. 资源可行性
-- **3B 参数**：单卡可运行部分实验
-- **crater (RTX 5090 D, 32GB)**：可运行短时训练验证
-- **worldvln (5× L40S, 48GB/卡)**：可验证多卡并行
+| 项目 | SmolLM2-360M | SmolLM3-3B-Base |
+|---|---|---|
+| 层数 / hidden size | 32 / 960 | 36 / 2048 |
+| Query / KV heads | 15 / 5，GQA | 16 / 4，GQA |
+| intermediate size | 2560 | 11008 |
+| vocab size | 49152 | 128256 |
+| 位置与上下文配置 | RoPE，config max_position_embeddings=8192 | 每 4 层无 RoPE；Base config max_position_embeddings=65536、rope_theta=5000000、rope_scaling=null |
+| 本课程用途 | 复用既有训练步、累积、恢复和混合精度工件 | 研究真实架构、数据混合、多阶段训练、checkpoint、评测及部署产物 |
+| 可比边界 | 模型结构和工作集与 3B 不同 | 不能以小模型结果替代 3B 训练吞吐、显存峰值或收敛结论 |
 
-### 6. 官方训练配置（可直接复用）
-```yaml
-# 来自 huggingface/smollm text/pretraining/smollm3/stage1_8T.yaml
-model:
-  model_type: llama
-  num_hidden_layers: 32
-  num_attention_heads: 32
-  num_key_value_heads: 8  # GQA
-  hidden_size: 3072
-  intermediate_size: 8192
-  max_position_embeddings: 4096
+SmolLM3 于 2025 年发布。长上下文、YaRN 和 128k 能力需按 Base/Instruct 的实际 checkpoint/config 与官方说明分别分析，不能把宣传能力直接写成每份 config 的默认设置。
 
-optimizer:
-  learning_rate_scheduler:
-    learning_rate: 2e-4
-    lr_warmup_steps: 2000
-    lr_warmup_style: linear
-    lr_decay_style: cosine
-    min_decay_lr: 2e-5
-  
-  optimizer_factory:
-    name: adamW
-    adam_beta1: 0.9
-    adam_beta2: 0.95
-    adam_eps: 1e-8
-    weight_decay: 0.1
+官方 stage1 YAML 的结构字段是 36 层、hidden_size=2048、16 query/4 KV heads；学习率采用 warmup 后稳定、末段线性衰减的 WSD 配方。示例包含原训练的内部路径和恢复位置，学习时需要区分参数含义、公开可用数据与原环境地址；不将摘录改写成未经核实的“官方完整可运行配置”。
 
-tokens:
-  batch_accumulation_per_replica: 1
-  micro_batch_size: 8
-  sequence_length: 4096
-  train_steps: 4718000  # ~8T tokens
-```
+## 可借用的完整流程材料
 
-## 对比方案
+| 对象 | 可用材料 | 不能由这些材料推出的结论 |
+|---|---|---|
+| SmolLM3 | [预训练配置与日志入口](https://github.com/huggingface/smollm/blob/main/text/pretraining/README.md)、[mid/SFT/APO](https://github.com/huggingface/alignment-handbook/tree/main/recipes/smollm3)、[中间权重](https://huggingface.co/HuggingFaceTB/SmolLM3-3B-checkpoints)、[评测](https://github.com/huggingface/smollm/tree/main/text/evaluation/smollm3) | 中间 Transformers 权重不自动包含原训练 optimizer、RNG、数据游标；配置公开不代表所有内部数据路径可直接访问 |
+| Tülu 3 | [SFT/DPO/RLVR 的训练、数据与模型阶段](https://github.com/allenai/open-instruct/blob/main/docs/tulu3.md) | 作者的大规模结果不能作为本课程短小验证的质量结论 |
+| 视觉与 VLM | [OpenCLIP](https://github.com/mlfoundations/open_clip) 的视觉/图文基础训练；[Qwen3-VL](https://github.com/QwenLM/Qwen3-VL/tree/main/qwen-vl-finetune) 的适配 | OpenCLIP 配方不等于 Qwen 视觉塔原始训练；微调代码不等于完整预训练公开 |
+| ASR | [SpeechBrain](https://github.com/speechbrain/speechbrain/tree/develop/recipes/LibriSpeech/ASR/transformer) 基础训练；[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning) 微调 | 两种模型的 tokenizer、目标、采样率和流式支持不能相互套用 |
+| Codec 与 TTS | [DAC](https://github.com/descriptinc/descript-audio-codec)、[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS/tree/main/finetuning)、[F5-TTS](https://github.com/SWivid/F5-TTS/tree/main/src/f5_tts/train)、[ZipVoice](https://github.com/k2-fsa/ZipVoice) | 下游 TTS SFT 不等于训练 codec/vocoder；Qwen 单说话人示例不等于完整多说话人预训练 |
+| 草稿、量化与蒸馏 | [SpecForge](https://github.com/sgl-project/SpecForge)、[ModelOpt QAT/QAD](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_qat)、[TRL](https://github.com/huggingface/trl)、[LCM](https://github.com/huggingface/diffusers/tree/main/examples/consistency_distillation)、[DMD2](https://github.com/tianweiy/DMD2) | 不同 teacher 信号/学生目标不能统称同一种 KD；runtime checkpoint 不一定能直接服务 |
+| 图像、视频与世界模型 | [flow_matching](https://github.com/facebookresearch/flow_matching)、[DiffSynth Wan](https://github.com/modelscope/DiffSynth-Studio/tree/main/examples/wanvideo/model_training)、[Cosmos3-Edge SFT](https://github.com/NVIDIA/cosmos-framework/blob/2b6c9a7061ae78dc83e29a4910ec5f8c9fe4b6ce/docs/training.md) | Wan 微调实现和 Cosmos 生成分支 SFT 不证明原始全量预训练/所有蒸馏阶段均已公开 |
+| Omni / VLA | [Qwen3-Omni 报告](https://arxiv.org/html/2509.17765)、[ms-swift](https://github.com/modelscope/ms-swift/tree/main/examples/models/qwen3_omni)、[openpi DROID](https://github.com/Physical-Intelligence/openpi/blob/main/examples/droid/README_train.md) | 接受多模态输入不等于训练所有输出模块；离线动作训练不等于在线 RL 或真实闭环成功 |
+| 非文本 RL | [Flow-GRPO](https://github.com/yifan123/flow_grpo)、[DanceGRPO](https://github.com/XueZeyue/DanceGRPO)、[CosyVoice2 GRPO](https://github.com/FunAudioLLM/CosyVoice/tree/main/examples/grpo/cosyvoice2) | 连续转移/codec token 的概率和奖励不能直接套成文本 CE；参考流程不代表所有目标型号都有官方 RL 配方 |
 
-### 备选：TinyLlama 1.1B
-- **优势**：更小更快，8000+ GitHub stars，基于 lit-gpt
-- **劣势**：2024年发布，比 SmolLM3 旧一代
-- **用途**：如果 3B 资源受限，可降级到 1.1B
+## 训练状态与容量依据
 
-### 教学对照：GPT-2 124M (nanoGPT)
-- **保留价值**：作为"经典 baseline"
-- **使用场景**：
-  - 7.0 autograd：tiny model（已完成）
-  - 7.0b 对照：GPT-2 快速演示（1小时）
-  - 7.1-7.6：SmolLM3 真实系统实验
-- **形成梯度**：教学 toy → 经典 baseline → 前沿实践
+令参数量为 P，具体容量以实测 tensor/optimizer state dtype 为准：
 
-## 实施策略
+| 状态假设 | 不含激活、临时 buffer、通信与框架开销的字节 |
+|---|---:|
+| BF16 参数＋BF16 梯度＋FP32 Adam m/v，无额外 master | 2P＋2P＋8P＝12P |
+| 上述状态再保留 FP32 master weight | 16P |
+| FP32 参数＋FP32 梯度＋FP32 Adam m/v，autocast 计算 | 16P；低精度缓存另算 |
+| LoRA/冻结模块 | 分开计算冻结 base、可训练 adapter 的梯度/optimizer、需要保存的激活；不是按总参数统一乘一个系数 |
 
-### 不需要完整训练
+以 P≈3B 估算，12P 已约 36 GB，16P 约 48 GB，尚未计入激活和临时状态。GB 与 GiB 必须区分；不能据“BF16 权重约 6 GB”断言 3B AdamW 全参更新能装进 32 GB 显存。某些 PyTorch 模式下 optimizer 状态会跟随参数 dtype，是否保持 FP32 必须逐 recipe 核对。
 
-**原则：验证机制，不追求收敛**
+FSDP2 在单 rank 下没有跨 rank 分片收益；梯度累积和 activation checkpointing 不减少全部常驻训练状态。CPU/Gloo 的小通信参照只验证算法与协议，不能替代 GPU FSDP/NCCL 的支持性和性能证明。
 
-#### 1. 加载官方 checkpoint（7.0b/7.1）
-```python
-from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM3-3B-Base")
-```
-
-#### 2. 短时验证训练（几小时内）
-- 用 1000-10000 样本
-- 跑 10-100 个 step
-- 验证：loss 下降、梯度流、内存曲线、checkpoint 恢复
-- **不需要训练到任务质量指标**
-
-#### 3. 借用官方数据（7.2-7.6）
-- SmolLM2 论文有详细训练曲线、消融实验
-- 引用数据并注明来源
-- 我们专注"实现"，借用"结果"
-
-#### 4. 关键机制的 mini 实现
-- 梯度累积：自己写小例子对拍
-- 混合精度：验证 loss scaling
-- FSDP2 分片：两卡验证正确性
-- Checkpoint 恢复：实际测中断恢复
-
-## 各章节模型使用
-
-| 章节 | 模型 | 用途 | 训练范围 |
-|------|------|------|----------|
-| 7.0 autograd | 自写 tiny model | 机制演示 | 已完成，CPU |
-| 7.0b 完整训练步 | **SmolLM3 3B** | 真实数据、labels、loss、更新 | 10-100 steps，验证正确性 |
-| 7.1 训练循环系统 | **SmolLM3 3B** | 内存曲线、checkpointing | 短时运行，profiling |
-| 7.2 训练并行 | **SmolLM3 3B** | FSDP2 实测 | 两卡验证分片正确性 |
-| 7.3 训练框架 | nanotron vs FSDP2 vs DeepSpeed | 架构对比 | 源码解析 + 配置对照 |
-| 7.4 数据与恢复 | **SmolLM3 3B** | checkpoint、数据位置 | 中断恢复验证 |
-| 7.5 SFT/LoRA | **SmolLM3 3B** | 微调、adapter | SmolTalk 数据集 |
-| 7.6 RL infra | **SmolLM3 3B** | policy 版本、rollout | 借用 veRL 配置 |
-
-## 资源需求估算
-
-### 单卡验证（crater）
-```
-3B × 2 bytes (bf16) = 6 GB 权重
-+ ~4 GB 优化器状态（AdamW）
-+ ~2 GB 梯度
-+ ~8 GB 激活（batch=8, seq=4096, 估算）
--------------------------------------
-≈ 20 GB 峰值（32 GB 卡可运行）
-```
-
-### 多卡验证（worldvln）
-- FSDP2：两卡即可验证分片
-- 每卡显存需求降低到 ~12 GB
-- 5 卡可运行更大 batch 或更长序列
-
-## 数据集
-
-### Pretraining（7.0b-7.2）
-- **FineWeb-Edu**（HuggingFace）：高质量 web 文本
-- **小样本验证**：1000-10000 文档，tokenize 后 ~40M tokens
-- **不追求覆盖全部 11T tokens**
-
-### Instruction Tuning（7.5）
-- **SmolTalk**（官方数据集）：HuggingFaceTB/smoltalk
-- **DPO**：UltraFeedback（官方使用）
-
-### 快速实验数据
-- **OpenWebText**（小版本）：~8GB，可快速下载
-- **TinyStories**：极小数据集，纯语法验证
-
-## 环境准备
-
-### Nanotron 框架
-```bash
-# SmolLM3 使用的 branch
-git clone https://github.com/huggingface/nanotron.git
-cd nanotron
-git checkout smollm3
-pip install -e .
-```
-
-### Datatrove（数据处理）
-```bash
-git clone https://github.com/huggingface/datatrove.git
-cd datatrove
-git checkout nouamane/avoid-s3
-pip install -e .
-```
-
-### 依赖
-- PyTorch >= 2.1（FSDP2 需要）
-- transformers >= 4.40
-- datasets
-- accelerate
-
-## 验证计划
-
-### Phase 1：单机单卡（7.0b/7.1）
-- [ ] 加载 SmolLM3 checkpoint
-- [ ] 准备小数据集（~1000 样本）
-- [ ] 完整训练步：forward + backward + optimizer step
-- [ ] 验证 loss 下降
-- [ ] 梯度累积对拍
-- [ ] 混合精度验证
-- [ ] Activation checkpointing 内存对比
-- [ ] Checkpoint 保存与恢复
-
-### Phase 2：多卡并行（7.2）
-- [ ] FSDP2 两卡分片
-- [ ] 梯度与单卡对拍
-- [ ] 通信 trace
-- [ ] 内存曲线对比
-
-### Phase 3：框架对照（7.3）
-- [ ] Nanotron 配置解析
-- [ ] FSDP2 原生 API
-- [ ] DeepSpeed 配置映射
-- [ ] TorchTitan（如果时间允许）
-
-### Phase 4：数据与恢复（7.4）
-- [ ] DataLoader state_dict
-- [ ] 中断恢复验证
-- [ ] RNG 状态对齐
-
-### Phase 5：后训练（7.5/7.6）
-- [ ] SmolTalk SFT
-- [ ] LoRA adapter
-- [ ] DPO 损失计算
-- [ ] （7.6 的完整 RL 系统视资源而定）
-
-## 参考资料
-
-### 官方资源
-- Model: https://huggingface.co/HuggingFaceTB/SmolLM3-3B-Base
-- Paper: https://arxiv.org/abs/2502.02737
-- Code: https://github.com/huggingface/smollm
-- Training configs: https://github.com/huggingface/smollm/tree/main/text/pretraining/smollm3
-- Nanotron: https://github.com/huggingface/nanotron
-
-### 数据集
-- FineWeb-Edu: https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
-- SmolTalk: https://huggingface.co/datasets/HuggingFaceTB/smoltalk
-- FineMath: https://huggingface.co/datasets/HuggingFaceTB/finemath
-- Stack-Edu: （代码数据）
-
-## 与 GPT-2 的对比
-
-| 维度 | GPT-2 124M (2019) | SmolLM3 3B (2026) |
-|------|-------------------|-------------------|
-| 架构 | 绝对位置编码 | RoPE |
-| Attention | Multi-head | Grouped Query (32h/8kv) |
-| Normalization | LayerNorm | RMSNorm |
-| FFN | GELU | SwiGLU |
-| 训练数据 | WebText (~40GB) | 11T tokens (mixed) |
-| 上下文 | 1024 | 128k (with YaRN) |
-| 训练时间 | 数周（当时） | 24天×384 H100 |
-| 可复现性 | 1小时×单卡（nanoGPT） | 需要集群（但可借用结果）|
-
-**教学价值**：保留 GPT-2 作为"可以自己跑完"的 baseline，用 SmolLM3 展示"现代训练是怎么做的"。
-
-## 风险与备选
-
-### 风险
-1. **容量不足**：3B 可能超出单卡显存
-   - **缓解**：减小 batch size，使用梯度累积
-   - **备选**：SmolLM2-360M 或 TinyLlama 1.1B
-
-2. **多卡不可用**：worldvln 无法访问
-   - **缓解**：FSDP2 可以在单卡上演示（分片但不真正分布）
-   - **备选**：使用 Gloo backend 在本地多进程模拟
-
-3. **Nanotron 兼容性**：smollm3 branch 可能有依赖冲突
-   - **缓解**：使用 PyTorch FSDP2 原生 API
-   - **备选**：lit-gpt 的 TinyLlama 路线
-
-### 降级路径
-如果 SmolLM3 3B 资源受限：
-1. **SmolLM2-360M**：更小，1T tokens 训练
-2. **TinyLlama 1.1B**：中等大小，有完整 lit-gpt 实现
-3. **GPT-2 124M**：最小，nanoGPT 可直接运行
-
-**当前计划**：先尝试 SmolLM3 3B，遇到阻塞再降级。
-
-## 总结
-
-- ✅ **主力模型**：SmolLM3 3B
-- ✅ **策略**：验证机制，不追求训练完整模型
-- ✅ **资源**：crater 单卡 + worldvln 多卡
-- ✅ **数据**：小样本 + 借用官方结果
-- ✅ **对照**：保留 GPT-2 作为教学 baseline
-- ✅ **风险可控**：有明确降级路径
-
-**下一步**：开始实施 7.0b - 完整训练步
+混合精度的基础任务在 7.1；完整参数/计算/梯度/归约/optimizer 精度、GradScaler、FP8/MXFP8/NVFP4、缩放与数值诊断见 [7.9](plans/pending.md#c-7-9)。环境与存储遵循 [ENVIRONMENTS](../ENVIRONMENTS.md) 和[实验规范](experiment-guidelines.md)。

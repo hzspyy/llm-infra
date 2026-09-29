@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.6 KV 作为存储层级</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">8.6</div>
+  <div class="sidebar-title">KV 作为存储层级</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一份字节，三层状态</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-kv">1. KV 是字节级的复用对象</a></li>
+<li><a href="#2">2. 身份元组：键里放什么、放什么会出问题</a></li>
+<li><a href="#3">3. 引用、驱逐与取消：三层状态机的四个失败面</a></li>
+<li><a href="#4">4. 文件格式与重启恢复</a></li>
+<li><a href="#5">5. 取回与重算的交叉点</a></li>
+<li><a href="#6">6. 精确复用与近似保留的分界</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析</a><ul>
+<li><a href="#vllm-0290kv-offloading">vLLM 0.29.0：KV offloading 是一套独立的分层系统</a></li>
+<li><a href="#lmcache">LMCache：键更"逻辑"，层更"多样"</a></li>
+<li><a href="#mooncake-kv">Mooncake：把 KV 当分布式对象存</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#abcd">A/B/C/D 四段</a></li>
+<li><a href="#e-kv-offloading">E. 真实引擎的 KV offloading</a></li>
+<li><a href="#_6">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_7">原始现场</a></li>
+<li><a href="#_8">前沿</a></li>
+<li><a href="#_9">陷阱</a></li>
+<li><a href="#_10">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一份字节，三层状态</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-kv">1. KV 是字节级的复用对象</a></li>
+<li><a href="#2">2. 身份元组：键里放什么、放什么会出问题</a></li>
+<li><a href="#3">3. 引用、驱逐与取消：三层状态机的四个失败面</a></li>
+<li><a href="#4">4. 文件格式与重启恢复</a></li>
+<li><a href="#5">5. 取回与重算的交叉点</a></li>
+<li><a href="#6">6. 精确复用与近似保留的分界</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现：源码解析</a><ul>
+<li><a href="#vllm-0290kv-offloading">vLLM 0.29.0：KV offloading 是一套独立的分层系统</a></li>
+<li><a href="#lmcache">LMCache：键更"逻辑"，层更"多样"</a></li>
+<li><a href="#mooncake-kv">Mooncake：把 KV 当分布式对象存</a></li>
+<li><a href="#_5">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#mini">工程实现：mini 实现</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#abcd">A/B/C/D 四段</a></li>
+<li><a href="#e-kv-offloading">E. 真实引擎的 KV offloading</a></li>
+<li><a href="#_6">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_7">原始现场</a></li>
+<li><a href="#_8">前沿</a></li>
+<li><a href="#_9">陷阱</a></li>
+<li><a href="#_10">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L8 · 集群、生产与前沿</div>
+  <div class="mod-id">8.6</div>
+  <h1>KV 作为存储层级</h1>
+  <p class="lede">将 KV 组织为 GPU、CPU、SSD 与远端存储层级，比较取回和重算的交叉点；区分可重建的块驱逐与改变注意力输入的近似 token 保留/压缩。</p>
+  <div class="chips"><span class="chip">实测机器 crater（RTX 5090 32 GB）· Qwen3-1.7B bf16 · vLLM 0.29.0 · LMCache commit 0d18736 · Mooncake commit 6cc1a10</span><span class="chip">前置 5.2（分页与 block table）· 1.5（网络与存储）· 6.4（prefill–decode 分离的 KV 交接）· 8.3（请求事件口径）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<ol>
+<li><strong>GPU/CPU/存储层各持有什么状态？</strong> 三层持有的是同一份 KV 字节，但身份、引用与生命周期不同。Qwen3-1.7B 每 token 的 KV 是 <strong>114 688 B</strong>（28 层 × 2 × 8 KV head × 128 head dim × 2 B），2048 token 就是 224 MiB；取回一层与取回一层之上的存储，差别只在搬运路径与有没有人说得出"这份字节属于谁"。</li>
+<li><strong>取回与重算的交叉点在哪里？</strong> 在 224 MiB（2048 token）这一档，同机 NVMe 取回 0.0917 s、重新 prefill 0.3668 s；到 32 768 token（3.5 GiB）取回变成磁盘带宽问题。交叉点不是固定长度，而是"搬运带宽 vs prefill 算力"加上注册、等待与维护成本共同决定的一条曲线。</li>
+<li><strong>精确复用与近似保留怎样区分？</strong> 精确复用要求取回的 KV 与直接重算<strong>逐元素相等</strong>，本次三个层级全部 <code>max_abs_diff = 0</code>，续解码 8 个 token 逐位相同。近似保留（sink+window、heavy-hitter）改变的是注意力输入本身：在 NFCorpus 拼接的固定检索任务上，25% 预算只在 needle 落在窗口内时救回答案（平均 logprob −0.0817），其余格子从 −0.07 掉到 −4.4～−5.3；把保留下来的 KV 片段直接接起来则是另一种东西。</li>
+</ol>
+<div class="admonition note">
+<p class="admonition-title">本章的边界</p>
+<p>三层里的"存储层"在本次实验里是<strong>本机 NVMe 文件</strong>，不是跨实例对象存储；跨机取回需要 RDMA 与共享存储，本机没有 <code>/dev/infiniband</code>（1.5 的可用性判定），所以跨实例那一档只做机制与源码核对。引擎侧实测使用 vLLM 0.29.0 自带的 KV offloading 连接器；LMCache 与 Mooncake 只做到固定 commit 的源码剖析，未接入服务栈运行。</p>
+</div>
+<hr />
+<h2 id="_2">心智模型：一份字节，三层状态</h2>
+<figure>
+
+
+<svg viewBox="0 0 760 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="KV 的三层状态与身份校验">
+  <g font-size="11.5" fill="currentColor">
+    <text x="12" y="20" font-size="13" font-weight="600">同一份 KV 的三层位置与四类必须显式化的状态</text>
+
+    <rect x="16" y="36" width="220" height="66" rx="5" fill="#61afef" opacity="0.18"/>
+    <text x="26" y="56" font-size="11.5" font-weight="600">GPU（block 池）</text>
+    <text x="26" y="74" font-size="10.5">RESIDENT_GPU：无拷贝命中</text>
+    <text x="26" y="90" font-size="10.5">本次 2048 token：3.4×10⁻⁵ s</text>
+
+    <rect x="16" y="112" width="220" height="66" rx="5" fill="#e5c07b" opacity="0.22"/>
+    <text x="26" y="132" font-size="11.5" font-weight="600">CPU（pinned 内存）</text>
+    <text x="26" y="150" font-size="10.5">RESIDENT_CPU：H2D 拷回</text>
+    <text x="26" y="166" font-size="10.5">本次 2048 token：0.0053 s</text>
+
+    <rect x="16" y="188" width="220" height="80" rx="5" fill="#98c379" opacity="0.20"/>
+    <text x="26" y="208" font-size="11.5" font-weight="600">NVMe（文件）</text>
+    <text x="26" y="226" font-size="10.5">文件 = 每层 K/V 原始字节 + 尾部身份</text>
+    <text x="26" y="242" font-size="10.5">本次 2048 token：0.0917 s</text>
+    <text x="26" y="258" font-size="10.5">重启后只凭文件恢复身份</text>
+
+    <rect x="268" y="36" width="474" height="232" rx="5" fill="none" stroke="currentColor" stroke-width="1"/>
+    <text x="282" y="56" font-size="11.5" font-weight="600">取回时必须逐字段相等的身份元组</text>
+    <text x="282" y="76" font-size="10.5">model_revision · adapter_revision · dtype · layout · num_layers ·</text>
+    <text x="282" y="92" font-size="10.5">num_kv_heads · head_dim · token_len · quant</text>
+
+    <text x="282" y="118" font-size="11.5" font-weight="600">键只编码逻辑身份</text>
+    <text x="282" y="136" font-size="10.5">key = H(model_revision ‖ adapter_revision ‖ 前缀前 64 token)</text>
+    <text x="282" y="154" font-size="10.5">物理身份不进键：它变化时应当是"键命中但被拒"，不是静默 miss</text>
+
+    <text x="282" y="180" font-size="11.5" font-weight="600">引用与状态</text>
+    <text x="282" y="198" font-size="10.5">refcount &gt; 0 不可驱逐；传输中取消退回 REGISTERED 并归零引用</text>
+    <text x="282" y="214" font-size="10.5">REGISTERED → TRANSFERRING → RESIDENT_CPU → RESIDENT_GPU → EVICTING → EVICTED</text>
+
+    <rect x="282" y="228" width="446" height="30" rx="4" fill="#e06c75" opacity="0.15"/>
+    <text x="290" y="248" font-size="10.5">错误布局 / 旧 revision / 截断文件 / 引用下溢：四类都必须显式失败</text>
+
+    <rect x="16" y="282" width="726" height="46" rx="5" fill="none" stroke="#e06c75" stroke-width="1"/>
+    <text x="28" y="302" font-size="11" font-weight="600">近似的正确语义是"保留 token 与原始位置后重算"</text>
+    <text x="28" y="319" font-size="10.5">直接拼接保留位置的 KV 片段既不保证等价（位置编码/掩码不再自洽），也不能可靠地答对</text>
+  </g>
+</svg>
+
+
+<figcaption>三层存的是同一份字节；把"身份、引用、状态、失败"写成显式契约，才能判断一次命中是否可用。</figcaption>
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1-kv">1. KV 是字节级的复用对象</h3>
+<p>Qwen3-1.7B 的 KV 形状在实测里打印为每层 <code>(1, 8, seq, 128)</code>，bf16。按一个 token 算：</p>
+<div class="highlight"><pre><span></span><code>每 token 字节 = 2(K/V) × 28(层) × 8(KV head) × 128(head_dim) × 2(B/元素) = 114 688 B
+</code></pre></div>
+
+<p>这个数与 6.4 从服务端实测到的 114 688 B/token 相同，说明"层数 × KV 头 × head dim × 2"这条账在两端一致。它带来两个直接后果：</p>
+<ul>
+<li><strong>长度决定体积</strong>：128 / 2048 / 8192 / 32768 token 分别是 14.0 / 224.0 / 896.0 / 3584 MiB。三层里最贵的一层是磁盘：3.5 GiB 的写读在本机 NVMe 上就是秒级。</li>
+<li><strong>复用是字节搬运</strong>：取回不需要反量化、不需要重新计算，只需要把同一串字节放回 block 池。这决定了数值判据应当是<strong>精确相等</strong>而不是浮点容差——本次三个层级 <code>max_abs_diff = 0.0</code>。</li>
+</ul>
+<h3 id="2">2. 身份元组：键里放什么、放什么会出问题</h3>
+<p>缓存键只放<strong>逻辑身份</strong>（模型 revision、adapter revision、前缀 token），物理身份（dtype、layout、层数、KV 头数、head dim、长度、量化）不进键。这样做的理由是两者出错的表现不同：</p>
+<ul>
+<li>换了 adapter：这是<strong>另一份权重</strong>算出来的 KV，应该表现为 miss（换个键），不能命中别人的数据。本次 <code>adapter_revision = "lora-rev2"</code> 的查询返回 <code>None</code>。</li>
+<li>换了 dtype/layout/长度/量化：同一个键下配置漂移，如果表现为 miss 就被掩盖成"没缓存"，正确做法是<strong>键命中但显式拒绝</strong>。本次四类漂移全部抛 <code>KVIdentityError</code>：</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>注入的漂移</th>
+<th>拒绝信息（截断）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>layout <code>BHSD</code> → <code>BSHD</code></td>
+<td><code>layout: stored='BHSD' requested='BSHD'</code></td>
+</tr>
+<tr>
+<td>dtype <code>bfloat16</code> → <code>float16</code></td>
+<td><code>dtype: stored='bfloat16' requested='float16'</code></td>
+</tr>
+<tr>
+<td><code>token_len</code> 2048 → 2041</td>
+<td><code>token_len: stored=2048 requested=2041</code></td>
+</tr>
+<tr>
+<td><code>quant</code> <code>none</code> → <code>fp8</code></td>
+<td><code>quant: stored='none' requested='fp8'</code></td>
+</tr>
+</tbody>
+</table>
+<p>旧 revision 则表现为 miss：模型 revision 进键之后，盘上属于上一版模型的块根本不会被当前请求查到。</p>
+<h3 id="3">3. 引用、驱逐与取消：三层状态机的四个失败面</h3>
+<p>一份 KV 在"有人正在用它"和"没人用它"时的可驱逐性不同，取消、驱逐、下溢、重启四种情况下最容易出现半成品状态：</p>
+<ul>
+<li><strong>重复写入</strong>：同一前缀第二次 <code>put</code> 命中既有条目（<code>put_hit = 1</code>），不产生第二份字节。</li>
+<li><strong>取回中取消</strong>：取消标记置位后，<code>get</code> 抛 <code>KVStateError("取回被取消")</code>，<code>refcount</code> 回到 0，条目状态回到 <code>RESIDENT_CPU</code>；取消标记清除后同一条目可以正常取回且逐元素相等。</li>
+<li><strong>持引用时驱逐</strong>：持有一次引用时强制过期，条目状态仍是 <code>RESIDENT_CPU</code>，只记一次 <code>deferred_eviction</code>；引用归还后再扫描才变成 <code>EVICTED</code>，同时删掉盘上文件。</li>
+<li><strong>引用下溢</strong>：<code>release</code> 次数多于 <code>get</code> 直接报错（<code>release 次数多于 get (引用计数下溢)</code>），不允许静默把计数夹到 0。</li>
+<li><strong>驱逐后取回</strong>：返回 miss，不返回旧数据。</li>
+</ul>
+<p>这五条合起来回答一个常被跳过的问题：<strong>缓存里"有"这份数据，和"这份数据现在可用于这个请求"是两件事</strong>。前者是键的命中，后者要过身份、引用与状态三道检查。</p>
+<h3 id="4">4. 文件格式与重启恢复</h3>
+<p>盘上文件是"每层 K/V 原始字节 + 尾部身份元组"，格式如下：</p>
+<div class="highlight"><pre><span></span><code>[layer0.K][layer0.V][layer1.K][layer1.V]…[identity_json][json_len: 8 B]
+</code></pre></div>
+
+<p>长度写在最后 8 字节，重新打开时只需读尾部就能知道 JSON 从哪里开始，进而推出每层张量的形状。重启后的校验有三条：</p>
+<ol>
+<li>身份从文件还原（本次还原出的元组与写入时逐字段相同）；</li>
+<li>文件长度必须等于"身份推出的字节数 + 尾部长度"，否则拒绝登记；</li>
+<li>登记后按前缀重新计算键并取回，逐元素相等（<code>restart_get_exact = true</code>，耗时 0.0261 s）。</li>
+</ol>
+<p>三类损坏文件都会被拒绝且取回是 miss：截断到一半、尾部追加 4 KiB 垃圾、以及把尾部长度字节改成 <code>0xff</code>。这条设计对应一个常见误判——<strong>磁盘上存在数据不证明它属于当前请求</strong>。</p>
+<h3 id="5">5. 取回与重算的交叉点</h3>
+<p>比较的是同一件事的两种做法：把前缀 KV 从低层取回，或重新 prefill 这段前缀。四个长度上分别测写入、三级取回、重算与完整请求（取回/重算 + 解码 8 token）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">前缀长度</th>
+<th style="text-align: right;">KV</th>
+<th style="text-align: right;">写入（注册）</th>
+<th style="text-align: right;">取回 GPU</th>
+<th style="text-align: right;">取回 CPU</th>
+<th style="text-align: right;">取回 NVMe</th>
+<th style="text-align: right;">重算 prefill</th>
+<th style="text-align: right;">NVMe 取回 ÷ 重算</th>
+<th style="text-align: right;">完整请求：取回 + 解码</th>
+<th style="text-align: right;">完整请求：重算 + 解码</th>
+<th style="text-align: right;">峰值显存</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">14.0 MiB</td>
+<td style="text-align: right;">0.0077 s</td>
+<td style="text-align: right;">~0</td>
+<td style="text-align: right;">0.0006 s</td>
+<td style="text-align: right;">0.0050 s</td>
+<td style="text-align: right;">0.3329 s</td>
+<td style="text-align: right;">0.015</td>
+<td style="text-align: right;">0.0627 s</td>
+<td style="text-align: right;">0.4366 s</td>
+<td style="text-align: right;">3 365 MiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">2 048</td>
+<td style="text-align: right;">224.0 MiB</td>
+<td style="text-align: right;">0.1138 s</td>
+<td style="text-align: right;">~0</td>
+<td style="text-align: right;">0.0053 s</td>
+<td style="text-align: right;">0.0919 s</td>
+<td style="text-align: right;">0.3654 s</td>
+<td style="text-align: right;">0.25</td>
+<td style="text-align: right;">0.0666 s</td>
+<td style="text-align: right;">0.4711 s</td>
+<td style="text-align: right;">4 139 MiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">8 192</td>
+<td style="text-align: right;">896.0 MiB</td>
+<td style="text-align: right;">0.4223 s</td>
+<td style="text-align: right;">~0</td>
+<td style="text-align: right;">0.0244 s</td>
+<td style="text-align: right;">0.3684 s</td>
+<td style="text-align: right;">0.5258 s</td>
+<td style="text-align: right;">0.70</td>
+<td style="text-align: right;">0.0898 s</td>
+<td style="text-align: right;">0.6310 s</td>
+<td style="text-align: right;">6 616 MiB</td>
+</tr>
+<tr>
+<td style="text-align: right;">32 768</td>
+<td style="text-align: right;">3 584.0 MiB</td>
+<td style="text-align: right;">2.7530 s</td>
+<td style="text-align: right;">~0</td>
+<td style="text-align: right;">0.0976 s</td>
+<td style="text-align: right;">2.5022 s</td>
+<td style="text-align: right;">1.6369 s</td>
+<td style="text-align: right;"><strong>1.53</strong></td>
+<td style="text-align: right;">0.2042 s</td>
+<td style="text-align: right;">1.7868 s</td>
+<td style="text-align: right;">16 522 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>三点必须一起读：</p>
+<ul>
+<li><strong>GPU 那一级是"已经在显存里"的命中，没有拷贝</strong>，所以它的时间是 3×10⁻⁵ s 量级；把它与 NVMe 的 2.5 s 并列会误以为"缓存就是快"。</li>
+<li><strong>完整请求那一列用的是 CPU 一级的取回</strong>（<code>retrieve_cpu_s + 解码</code>），因为完整请求的对照口径是"同一次请求能不能省掉 prefill"。若换成 NVMe 一级，32 768 token 那一行的取回会变成 2.50 s，反而慢于重算的 1.64 s——见下面的交叉点。</li>
+<li><strong>NVMe 一级在 32 768 token 上比重算慢 1.53 倍</strong>。本机 <code>/scratch</code> 的顺序读写约 1.4–1.5 GB/s（3.76 GB 写 2.75 s、读 0.67 s），加上页表化 staging 的 H2D 1.83 s（≈2.0 GB/s），合计 2.50 s；同一段前缀重新 prefill 只要 1.64 s。<strong>交叉点在 8192 与 32768 之间</strong>（8192 上取回 0.3684 s 仍快于重算 0.5258 s）。</li>
+</ul>
+<p>这里还有一个次要但真实的差别值得指出：CPU 一级用 pinned 内存做 staging，32 768 token 的 H2D 是 0.0976 s（≈38 GB/s）；NVMe 一级在本实现里用普通页表化内存先接住读出来的字节，同一份数据 H2D 要 1.83 s（≈2.0 GB/s）。也就是说，<strong>低层的有效带宽不只由介质决定，还由 staging 缓冲是否 pinned 决定</strong>；vLLM 的磁盘后端为此专门分配对齐的 staging 缓冲并默认走 <code>O_DIRECT</code>。</p>
+<p>并发取回（CPU 一级，每个线程一份真实 H2D 副本）的实测是：1/8 并发的总耗时分别是 0.0034/0.0222 s（128）、0.0094/0.0693 s（2048）、0.0297/0.2402 s（8192），逐操作耗时随并发线性增长、聚合保持每秒百余次到几十次量级——本实现是 Python 循环里的逐层拷贝，没有把 H2D 并行起来。32 768 token 那一档的 8 并发需要 28 GiB 副本，超出 12 GiB 预算被显式跳过并记录，而不是让进程 OOM。</p>
+<p>交叉点要计入四段成本，缺一段就会高估收益：</p>
+<table>
+<thead>
+<tr>
+<th>成本段</th>
+<th>出现在哪里</th>
+<th>本次量级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>注册/写入</td>
+<td>第一次算完之后要把 KV 落到低层</td>
+<td>2048 token：CPU 暂存 0.0378 s + NVMe 写 0.0747 s</td>
+</tr>
+<tr>
+<td>传输</td>
+<td>取回时按层搬运</td>
+<td>CPU→GPU 0.0053 s；NVMe→GPU 0.0917 s（含读盘 0.0824 s）</td>
+</tr>
+<tr>
+<td>等待</td>
+<td>引擎必须等这一层搬运完成才能继续</td>
+<td>已含在上面的取回时间里（同步计时）</td>
+</tr>
+<tr>
+<td>维护</td>
+<td>过期扫描与逐出</td>
+<td>1/8/64 条目的扫描为 0.06–0.14 / 0.17–0.35 / 1.5–2.3 ms（四个长度各自一次，条目大小相同，差别来自机器负载）</td>
+</tr>
+</tbody>
+</table>
+<p>重算那一侧也不是免费的对照：prefill 的代价随长度增长但<strong>不严格线性</strong>——2048 token 0.3654 s、8192 token 0.5258 s、32768 token 1.6369 s，其中 128 token 那一档的 0.3329 s 主要被进程内第一次前向的固定开销占据，因此交叉点的读数应当只看 ≥2048 的三档。取回的代价是"体积 ÷ 搬运带宽"加固定开销，于是长度越长取回越占优、长度越短重算越占优。真正决定能不能用的是<strong>复用间隔</strong>：同一条前缀隔多久再来一次。实测把 <code>reuse gap</code> 分成 0/1/10/60 s 两档 TTL：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">前缀长度</th>
+<th style="text-align: right;">TTL</th>
+<th>gap = 0 s</th>
+<th>gap = 1 s</th>
+<th>gap = 10 s</th>
+<th>gap = 60 s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">2 048</td>
+<td style="text-align: right;">0（不驱逐）</td>
+<td>命中 0.0919 s</td>
+<td>命中 0.0919 s</td>
+<td>命中 0.0962 s</td>
+<td>命中 0.1010 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">2 048</td>
+<td style="text-align: right;">5 s</td>
+<td>命中 0.0931 s</td>
+<td>命中 0.0938 s</td>
+<td><strong>未命中</strong></td>
+<td><strong>未命中</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">8 192</td>
+<td style="text-align: right;">0（不驱逐）</td>
+<td>命中 0.3786 s</td>
+<td>命中 0.3816 s</td>
+<td>命中 0.3864 s</td>
+<td>命中 0.3832 s</td>
+</tr>
+<tr>
+<td style="text-align: right;">8 192</td>
+<td style="text-align: right;">5 s</td>
+<td>命中 0.3757 s</td>
+<td>命中 0.4053 s</td>
+<td><strong>未命中</strong></td>
+<td><strong>未命中</strong></td>
+</tr>
+</tbody>
+</table>
+<p>（表中是取回耗时；未命中那一格完整请求退回重算，2 048 token 是 0.4711 s、8 192 token 是 0.6310 s。）</p>
+<p>结果的含义很直接：TTL 大于复用间隔时，取回把完整请求时间从"重算 + 解码"降到"取回 + 解码"；TTL 小于间隔时缓存已经被逐出，请求退回重算，<strong>缓存的存在只值一次命中率，不改变这次请求的耗时</strong>。所以"命中率高"与"请求更快"之间隔着一个复用间隔分布。</p>
+<h3 id="6">6. 精确复用与近似保留的分界</h3>
+<p>三层存储做的是<strong>精确复用</strong>：取回的 KV 与直接算出来的 KV 逐元素相等，续解码逐 token 相同。近似方法（H2O 式的重击者保留、sink+window 式的滑窗保留）做的是<strong>改变注意力输入</strong>：丢掉一部分 token 的 KV，位置编码与掩码都要重新对齐，正确实现是"保留 token 与原始位置后重算"，不是"把剩下的 KV 片段接起来"。</p>
+<p>用 NFCorpus 文档拼出约 4100 token 的固定上下文，在 10%/50%/90% 位置插入同一个格式的取数 needle，比较完整上下文与两种保留策略（10%/25% 预算）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align: right;">needle@10%</th>
+<th style="text-align: right;">needle@50%</th>
+<th style="text-align: right;">needle@90%</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>完整上下文（参照）</td>
+<td style="text-align: right;">命中，logprob −0.1351</td>
+<td style="text-align: right;">命中，−0.0971</td>
+<td style="text-align: right;">命中，−0.0680</td>
+</tr>
+<tr>
+<td>sink+window @10%</td>
+<td style="text-align: right;">未命中，−4.6611</td>
+<td style="text-align: right;">未命中，−4.6952</td>
+<td style="text-align: right;">未命中，−4.6422</td>
+</tr>
+<tr>
+<td>sink+window @25%</td>
+<td style="text-align: right;">未命中，−4.4049</td>
+<td style="text-align: right;">未命中，−4.4085</td>
+<td style="text-align: right;"><strong>命中，−0.0817</strong></td>
+</tr>
+<tr>
+<td>heavy-hitter @10%</td>
+<td style="text-align: right;">未命中，−5.1410</td>
+<td style="text-align: right;">未命中，−5.1796</td>
+<td style="text-align: right;">未命中，−5.2274</td>
+</tr>
+<tr>
+<td>heavy-hitter @25%</td>
+<td style="text-align: right;">未命中，−5.2022</td>
+<td style="text-align: right;">未命中，−5.2273</td>
+<td style="text-align: right;">未命中，−5.2604</td>
+</tr>
+</tbody>
+</table>
+<p>三类观察：</p>
+<ul>
+<li><strong>保留位置不等于保留信息</strong>：需要的 token 落在被丢掉的区间时，答案不是"稍微差一点"而是整体垮掉——平均 logprob 从 −0.07 掉到 −4.4～−5.3，逐 token 贪心 6 个 token 一个都不对。</li>
+<li><strong>窗口策略只在 needle 落入窗口时有效</strong>：90% 位置在 25% 预算下正好落在滑窗内，恢复到 −0.0817；同一预算下 10%/50% 位置仍然全错。这解释了为什么"平均压缩比"不能预测任务质量，<strong>位置分布</strong>才是变量。</li>
+<li><strong>heavy-hitter 的代理指标不顶用</strong>：本实现用各层 K 的 L2 范数当"被关注程度"的廉价代理，四个格子全部失败。真实实现用累计注意力权重，代理与真实选择之间的差距正是质量差距。</li>
+</ul>
+<p>反例是把保留位置的 KV 片段直接接起来（不重算）：在 needle@90%/sink+window@25% 这一格它也能输出 needle（<code>ZQ790. The answer is: ZQ790. The answer is: …</code>），但输出是在复读；在 heavy-hitter@25% 的三格里它给出的是语料里无关的数字（<code>1234</code>、<code>7777</code>）。<strong>"答案串出现"是一个会被复读欺骗的判据</strong>，所以本实验同时记录 teacher-forcing 的平均 logprob 与逐 token 一致数，而不是只做字符串包含判断。</p>
+<hr />
+<h2 id="_4">工程实现：源码解析</h2>
+<h3 id="vllm-0290kv-offloading">vLLM 0.29.0：KV offloading 是一套独立的分层系统</h3>
+<p>vLLM 自己在 <code>vllm/v1/kv_offload/</code> 下实现了本章的机制，可以逐项对照：</p>
+<ul>
+<li><strong>键</strong>：<code>OffloadKey = block_hash + group_idx</code>（4 字节大端），见 <code>v1/kv_offload/base.py:29</code>。<code>block_hash</code> 来自 <code>v1/core/kv_cache_utils.py:621</code> 的 <code>hash_block_tokens</code>，即 <code>H(parent_hash, token_ids, extra_keys)</code>；<code>extra_keys</code> 由 <code>generate_block_hash_extra_keys</code>（同文件 <code>:583</code>）拼装：LoRA 名（<code>:542</code> 的 <code>_gen_lora_extra_hash_keys</code>）、多模态特征标识、<code>cache_salt</code>、prompt embeds。</li>
+<li><strong>存储介质与位置</strong>：<code>Medium</code> 只有两个值 <code>CPU</code> / <code>STORAGE</code>（<code>base.py:47</code>），<code>Locality</code> 有 <code>LOCAL</code> / <code>REMOTE</code>（<code>:54</code>）；<code>TierFilter</code> 允许按请求选择参与查询的层（<code>:74</code>）。这说明"层"在这个实现里是<strong>介质 × 位置</strong>的二维标签，而不是固定的三级。</li>
+<li><strong>查询结果不是一个布尔值</strong>：<code>LookupResult</code> 有 <code>MISS / HIT / HIT_PENDING / RETRY</code>（<code>:107</code>）。<code>HIT_PENDING</code> 的语义是"数据在，但还读不到"，<code>RETRY</code> 是"晚点再问"——异步搬运必须能被表达，否则调度器只能阻塞等待。</li>
+<li><strong>管理器接口即状态契约</strong>：<code>OffloadingManager.lookup</code> → <code>prepare_load</code>（被准备加载的块<strong>在 <code>complete_load</code> 之前禁止驱逐</strong>）→ <code>complete_load</code>；写侧 <code>prepare_store</code>（返回要存的块与因此被逐出的块）→ <code>complete_store(success)</code>，失败时未标记为已存的块会被移除（<code>base.py:223-320</code>）。</li>
+<li><strong>CPU 主层的参数</strong>：<code>cpu_bytes_to_use</code> 必填；<code>eviction_policy</code> 支持 <code>lru</code> / <code>arc</code>；<code>store_threshold</code> 表示"一个块要被提议多少次才有资格落层"，<code>&gt;=2</code> 时才开始过滤（<code>v1/kv_offload/cpu/spec.py:82-150</code>）。策略实现在 <code>cpu/policies/lru.py:12</code> 与 <code>arc.py:12</code>，接口含 <code>mark_evictable</code> / <code>mark_non_evictable</code>——也就是<strong>置顶</strong>。</li>
+<li><strong>次级层与晋升</strong>：<code>TieringOffloadingSpec</code> 的文档字符串给出配置形状（<code>cpu_bytes_to_use</code> + <code>secondary_tiers: [{type: fs|p2p|obj, …}]</code>，<code>v1/kv_offload/tiering/spec.py</code> 头部）。语义写在 <code>tiering/manager.py:12-18</code>：写入从主层<strong>级联</strong>到所有次级层；次级层的数据必须<strong>晋升</strong>到主层才能被加载，晋升期间 <code>lookup</code> 返回 <code>HIT_PENDING</code>；<code>TransferJob.is_promotion</code> 区分方向（<code>:201</code>）。</li>
+<li><strong>文件次级层</strong>：<code>tiering/fs/manager.py</code> 的文档字符串写明写入是"先写 <code>&lt;dest&gt;.tmp</code> 再 <code>os.replace</code>"（原子替换），读取用 <code>os.readv</code> 直接读进给定的 memoryview 切片，文件路径按 <code>_r&lt;rank&gt;/&lt;hhh&gt;/&lt;hh&gt;_g&lt;group&gt;/&lt;hash&gt;.bin</code> 分层，避免单目录扇出；跨进程共享的前提是块内容哈希在各实例上一致。</li>
+<li><strong>纯磁盘层的 I/O 细节</strong>：<code>v1/simple_kv_offload/disk_backend.py</code> 默认 <code>O_DIRECT</code>（<code>:32</code>）、staging 缓冲按对齐分配（<code>:36</code>）、"存第 N 个槽的同时读第 N−1 个槽"的交错双缓冲（<code>:54</code>），实际读写是 <code>os.pwritev</code> / <code>os.preadv</code>（<code>:252</code>、<code>:260</code>）。文件命名与并行布局由 <code>v1/kv_offload/file_mapper.py</code> 负责，落一份 <code>config.json</code> 记录布局。</li>
+</ul>
+<h3 id="lmcache">LMCache：键更"逻辑"，层更"多样"</h3>
+<p>LMCache 的键是 <code>CacheEngineKey</code>（<code>lmcache/utils.py:389</code>）：</p>
+<div class="highlight"><pre><span></span><code>model_name @ world_size @ worker_id @ chunk_hash @ dtype [@ tag%value …]
+</code></pre></div>
+
+<p>它带并行度（<code>world_size</code>、<code>worker_id</code>）与 <code>dtype</code>，并可携带 <code>lmcache.tag.*</code> 形式的标签；<code>to_string()</code>（<code>:438</code>）就是这个键的文本形式，本地磁盘层直接用它做文件名（<code>storage_backend/local_disk_backend.py:224</code>，后缀 <code>.pt</code>，逐块 torch 序列化）。chunk 哈希在 <code>v1/token_database.py</code> 里做链式：<code>_hash_tokens(tokens, prefix_hash, extra_keys)</code> 把"前缀哈希 + 本块 token + extra keys"一起喂给哈希函数（<code>:269</code>，<code>_canonicalize_hash_inputs</code> 在 <code>:250</code> 把 <code>None</code> 规范化成固定结构）。</p>
+<p>存储侧的分层表达比 vLLM 更宽：<code>v1/storage_backend/</code> 下并列 <code>local_cpu_backend.py</code>（pinned 热缓存 + <code>cache_policy</code>，策略目录含 <code>lru/lfu/fifo/mru</code>）、<code>local_disk_backend.py</code>、<code>remote_backend.py</code>、<code>gds_backend.py</code>、<code>nixl_storage_backend.py</code>、<code>p2p_backend.py</code>。取回接口带<strong>引用语义</strong>：<code>CacheEngine.lookup(..., pin=True, lookup_id=...)</code> 要求在置顶时给出 <code>lookup_id</code>，用完调 <code>lookup_unpin(lookup_id)</code>（<code>v1/cache_engine.py:1130</code>、<code>:1544</code>）。这与本章 mini store 的引用计数是同一件事的两个工程化版本。</p>
+<p>近似路线的实现在 <code>v1/compute/blend/blender.py:19</code> 的 <code>LMCBlender</code>：它把"上下文里非前缀部分的块"拼进注意力计算，并支持 sparse 开关——这正是"精确存储复用"之外的另一条路线，语义上是<strong>改变注意力输入</strong>，与取回不是一回事。</p>
+<h3 id="mooncake-kv">Mooncake：把 KV 当分布式对象存</h3>
+<p>Mooncake 的 TransferEngine 提供的是通用搬运原语：<code>registerLocalMemory</code> / <code>unregisterLocalMemory</code>（<code>mooncake-transfer-engine/include/transfer_engine.h:133</code>、<code>:146</code>）、<code>allocateBatchID</code> / <code>freeBatchID</code>（<code>:225</code>、<code>:227</code>）、<code>submitTransfer</code> / <code>submitTransferWithNotify</code>（<code>:148</code>、<code>:196</code>）、<code>getTransferStatus</code>（<code>:239</code>）。存储侧则把 KV 当作带身份与校验和的对象：<code>mooncake-store/include/nvme_kv_object_layout.h</code> 定义了 <code>NvmeKvPhysicalKey</code>、<code>NvmeKvStoredIdentityView</code>（逻辑键 + 解析出的物理键 + slot）、manifest 与 payload 校验和；<code>nvme_kv_key_conflict_policy.h</code> 把"同一物理键上已有对象"显式判成 <code>kNotFound / kSameObject / kDifferentObject</code> 三种情况，写入计划里带 <code>store_inline</code>、chunk 与 manifest 记录。<code>mooncake-store/include/tenant_quota.h</code> 则把租户配额做成一张账户表（<code>TenantQuotaAccount</code> / <code>TenantQuotaTable</code>，含快照与计费失败结构）——多租户的存储配额在 8.8 再展开。</p>
+<h3 id="_5">设计取舍</h3>
+<ol>
+<li><strong>键粗还是键细。</strong> 键里放逻辑身份、命中后再校物理身份，换来的是"配置漂移可被发现"；代价是每次命中都要付一次逐字段比较。反过来，把所有物理属性塞进键可以让漂移变成 miss，但会<strong>静默掩盖</strong>配置错误。</li>
+<li><strong>同步取回还是异步晋升。</strong> 同步取回实现简单，代价是请求必须等完搬运；异步晋升（vLLM 的 <code>HIT_PENDING</code>/<code>RETRY</code>）能让调度继续跑别的请求，代价是状态机多出"数据在但不可读"这一态，且要处理晋升失败。</li>
+<li><strong>写不写低层。</strong> 每次算完就级联写盘能让重启后的复用最大化，代价是写放大；<code>store_threshold</code> 这类"先用几次再落层"的策略就是在两者之间取平衡。</li>
+<li><strong>精确与近似不能合并成一条曲线。</strong> 精确复用的判据是逐元素相等，近似保留的判据是任务质量；把两者放进同一个"命中率"里，会让"丢掉一半 token 也算命中"。</li>
+</ol>
+<hr />
+<h2 id="mini">工程实现：mini 实现</h2>
+<p><code>labs/L8/tiered_kv_store.py</code> 把上面四类状态写成显式字段与断言：</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@dataclasses</span><span class="o">.</span><span class="n">dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">KVIdentity</span><span class="p">:</span>
+    <span class="n">model_revision</span><span class="p">:</span> <span class="nb">str</span><span class="p">;</span> <span class="n">adapter_revision</span><span class="p">:</span> <span class="nb">str</span><span class="p">;</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">;</span> <span class="n">layout</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">;</span> <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">;</span> <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">;</span> <span class="n">token_len</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">quant</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"none"</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_compatible</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">):</span>   <span class="c1"># 逐字段比较, 不一致抛 KVIdentityError</span>
+</code></pre></div>
+
+<p>三类关键实现：</p>
+<ol>
+<li><strong>键构造</strong>（<code>key_for</code>）：只哈希 <code>model_revision + adapter_revision + 前缀前 64 token</code>，因此物理漂移会落到"键命中"分支上被身份检查拦住。</li>
+<li><strong>取回</strong>（<code>get</code>）：先查状态与身份，再 <code>refcount += 1</code>；取消检查在引用增加之后做，取消时把引用减回去再抛错，保证不留悬挂引用。<code>force_tier</code> 参数让实验能分别量三层。</li>
+<li><strong>驱逐</strong>（<code>evict_expired</code>）：<code>ttl_s &lt;= 0</code> 表示不驱逐；<code>refcount &gt; 0</code> 只记 <code>deferred_eviction</code> 并跳过；真正驱逐时同时释放 CPU/GPU 副本并删除盘上文件，最后置 <code>EVICTED</code>。</li>
+</ol>
+<p><code>labs/L8/kv_retrieve_vs_recompute.py</code> 是四个子命令的驱动：<code>exact</code>（A 段）、<code>scan</code>（B 段）、<code>errors</code>（C 段）、<code>approx</code>（D 段）。它复用 8.3 的逐请求记录口径，自己只负责 KV 侧的对拍与计时。</p>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="abcd">A/B/C/D 四段</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 远程机器 (crater): 四段全部跑一遍</span>
+bash<span class="w"> </span>labs/L8/run_8_6.sh<span class="w"> </span>/scratch/learn/work/out/8.6
+<span class="c1"># 或分开跑</span>
+python<span class="w"> </span>labs/L8/kv_retrieve_vs_recompute.py<span class="w"> </span>exact<span class="w">  </span>--out-dir<span class="w"> </span>&lt;out&gt;/A<span class="w"> </span>--exact-len<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--decode-steps<span class="w"> </span><span class="m">8</span>
+python<span class="w"> </span>labs/L8/kv_retrieve_vs_recompute.py<span class="w"> </span>scan<span class="w">   </span>--out-dir<span class="w"> </span>&lt;out&gt;/B<span class="w"> </span>--lengths<span class="w"> </span><span class="m">128</span>,2048,8192,32768<span class="w"> </span><span class="se">\</span>
+<span class="w">       </span>--gaps<span class="w"> </span><span class="m">0</span>,1,10,60<span class="w"> </span>--ttls<span class="w"> </span><span class="m">0</span>,5<span class="w"> </span>--concurrency<span class="w"> </span><span class="m">1</span>,8<span class="w"> </span>--conc-budget-gib<span class="w"> </span><span class="m">12</span>
+python<span class="w"> </span>labs/L8/kv_retrieve_vs_recompute.py<span class="w"> </span>errors<span class="w"> </span>--out-dir<span class="w"> </span>&lt;out&gt;/C<span class="w"> </span>--err-len<span class="w"> </span><span class="m">512</span><span class="w"> </span>--ttl<span class="w"> </span><span class="m">0</span>.5
+python<span class="w"> </span>labs/L8/kv_retrieve_vs_recompute.py<span class="w"> </span>approx<span class="w"> </span>--out-dir<span class="w"> </span>&lt;out&gt;/D<span class="w"> </span>--ctx-len<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">       </span>--needle-positions<span class="w"> </span><span class="m">0</span>.1,0.5,0.9<span class="w"> </span>--budgets<span class="w"> </span><span class="m">0</span>.1,0.25<span class="w"> </span>--answer-steps<span class="w"> </span><span class="m">20</span>
+</code></pre></div>
+
+<p>A 段的判据是三条：三层取回逐元素相等（<code>max_abs_diff = 0</code>）、用取回的 KV 续解码 8 token 与重算逐位相同、四类物理漂移全部被拒。C 段的判据是五个失败面各自给出预期结果（取消抛错、持引用不驱逐、下溢报错、驱逐后 miss、重启后精确相等）。</p>
+<p><code>scan</code> 的消融建议：</p>
+<ul>
+<li><strong>换存储介质</strong>：把 <code>--out-dir</code> 放到 <code>/dev/shm</code> 下的目录，观察 NVMe 那一级的时间从 0.0917 s 变成多少，用来分离"读盘"与"H2D"两段。</li>
+<li><strong>改 TTL</strong>：<code>--ttls 0,5</code> 之间只差"复用间隔大于 TTL 时缓存已失效"，把 TTL 调到 30 s 可以看到 10 s 间隔那格从 miss 变 hit。</li>
+<li><strong>改并发预算</strong>：<code>--conc-budget-gib</code> 压低到 4，32768 token 那一档的 8 并发会被跳过并记录原因，而不是 OOM。</li>
+<li><strong>换量化</strong>：把 K/V 换到 fp8 存盘（改 <code>write_entry_file</code> 的 dtype 与身份里的 <code>quant</code>），可以观察"体积减半但身份必须跟着变"——如果忘了改身份，取回会拿 fp8 的字节按 bf16 解释，正是身份检查要拦的那类错误。</li>
+</ul>
+<h3 id="e-kv-offloading">E. 真实引擎的 KV offloading</h3>
+<div class="highlight"><pre><span></span><code>python<span class="w"> </span>labs/L8/kv_offload_engine.py<span class="w"> </span>--out-dir<span class="w"> </span>&lt;out&gt;/E<span class="w"> </span>--modes<span class="w"> </span>none,cpu,tiering<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--prefix-len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--num-prefixes<span class="w"> </span><span class="m">8</span><span class="w"> </span>--num-flush<span class="w"> </span><span class="m">8</span><span class="w"> </span>--gpu-mem-util<span class="w"> </span><span class="m">0</span>.30<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-model-len<span class="w"> </span><span class="m">8192</span><span class="w"> </span>--cpu-gib<span class="w"> </span><span class="m">8</span><span class="w"> </span>--restart
+</code></pre></div>
+
+<p>四种配置下都用同一组 4096 token 前缀走四个阶段：<code>warm</code>（首次请求）→ <code>flush</code>（另 8 条等量前缀把 GPU 块挤掉，触发 offload）→ <code>reuse</code>（再请求 warm 前缀）→ <code>reuse_again</code>（第三次）。<code>none</code> 不启用连接器，<code>cpu</code> 只启用 CPU 主层，<code>tiering</code> 是 CPU 主层 + fs 次级层。阶段之间的 <code>/metrics</code> 差值与逐请求 TTFT：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th style="text-align: right;">warm</th>
+<th style="text-align: right;">flush</th>
+<th style="text-align: right;">reuse</th>
+<th style="text-align: right;">reuse 阶段装载的字节</th>
+<th style="text-align: right;">reuse_again</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>none（只重算）</td>
+<td style="text-align: right;">0.0820 s</td>
+<td style="text-align: right;">0.0816 s</td>
+<td style="text-align: right;">0.0811 s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0115 s</td>
+</tr>
+<tr>
+<td>cpu（CPU 主层）</td>
+<td style="text-align: right;">0.0881 s</td>
+<td style="text-align: right;">0.0851 s</td>
+<td style="text-align: right;"><strong>0.0245 s</strong></td>
+<td style="text-align: right;">3.76 GiB</td>
+<td style="text-align: right;">0.0118 s</td>
+</tr>
+<tr>
+<td>tiering（CPU + fs）</td>
+<td style="text-align: right;">0.0890 s</td>
+<td style="text-align: right;">0.0877 s</td>
+<td style="text-align: right;"><strong>0.0237 s</strong></td>
+<td style="text-align: right;">3.76 GiB</td>
+<td style="text-align: right;">0.0109 s</td>
+</tr>
+</tbody>
+</table>
+<p>三条结论：</p>
+<ol>
+<li><strong>不启用 offloading 时，"驱逐后复用"就是重算</strong>：<code>reuse</code> 的 TTFT 0.0811 s 与 <code>warm</code> 的 0.0820 s 相同；真正的命中要等这次请求把 KV 重新算回 GPU，所以收益落在 <code>reuse_again</code>（0.0115 s，<code>prefix_cache_hits_total = 32640/32768</code>）。</li>
+<li><strong>主层命中把 prefill 的关键路径压掉约 70%</strong>：0.0811 s → 0.0245 s（CPU 主层）与 0.0237 s（tiering），对应的 <code>external_prefix_cache_hits_total = 32768/32768</code>、<code>kv_offload_load_bytes_total = 3.76 GiB</code>。这是引擎级复现了第 5 节的交叉点：4 096 token 的 KV 从主机内存取回比重算便宜。</li>
+<li><strong>次级层的数据搬到了，但没有进入这次请求的关键路径</strong>：tiering 配置重启引擎后（fs 目录保留，磁盘上 4 096 个块文件 / 7.5 GiB），同一组前缀的 TTFT 中位数是 0.0882 s，与重算相同；而同阶段的计数器显示 <code>kv_offload_tiering_read_bytes = 3.76 GiB</code>、<code>chunk_hits = 2048</code>、<code>read_time</code> 合计 0.5 s。也就是说，数据确实从 fs 层读出来了，但这一轮请求并没有等它。这与本章 mini store 在第 5 节量到的"32 768 token 从 NVMe 取回 2.50 s 慢于重算 1.64 s"是同一件事在真实调度器里的表现：<strong>次级层的收益取决于晋升与加载是否能赶在计算之前完成</strong>。</li>
+</ol>
+<h3 id="_6">消融建议</h3>
+<ul>
+<li>把 <code>--gpu-mem-util</code> 从 0.30 调到 0.45，GPU 块池变大后 <code>flush</code> 阶段挤不掉 warm 前缀，<code>reuse</code> 会直接命中 GPU（对照"缓存容量决定 offload 是否被触发"）。</li>
+<li>把 <code>--cpu-gib</code> 从 8 调到 2，主层装不下 warm + flush，reuse 会退化成部分命中，用来观察 <code>store_threshold</code> 那类"写入准入"参数的作用面。</li>
+<li>把 <code>--num-prefixes</code> 与 <code>--num-flush</code> 的比例调成 1:3，可以在同一容量下把主层压满，观察逐出对命中率的影响。</li>
+<li>在 <code>--restart</code> 之后连发两轮 <code>reuse</code>：第一轮看到的是"读到了但没等到"，第二轮应当变成 GPU 命中——两者之差就是次级层加载落不进关键路径的那部分成本。</li>
+</ul>
+<hr />
+<h2 id="_7">原始现场</h2>
+<p>A 段的完整输出（含三层统计、四个拒绝信息、拼接反例）：</p>
+<details class="fold">
+<summary>results/crater/8.6/20260921-kvtier/A/exact.json A 段：身份、对拍与反例</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"L"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span><span class="w"> </span><span class="nt">"kv_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">234881024</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"prefill_wall_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.3668</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefill_device_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.3666</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"put_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.1126</span><span class="p">,</span><span class="w"> </span><span class="nt">"nvme_write_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">234881215</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"put_timing"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"put_stage_cpu_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0378</span><span class="p">,</span><span class="w"> </span><span class="nt">"put_nvme_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0747</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"tiers"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"gpu"</span><span class="p">:</span><span class="w">  </span><span class="p">{</span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">3.4e-05</span><span class="p">,</span><span class="w">  </span><span class="nt">"exact"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"max_abs_diff"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"stats"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"get_hit_gpu"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">}},</span>
+<span class="w">    </span><span class="nt">"cpu"</span><span class="p">:</span><span class="w">  </span><span class="p">{</span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.00532</span><span class="p">,</span><span class="w"> </span><span class="nt">"exact"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"max_abs_diff"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"stats"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"get_hit_cpu"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">}},</span>
+<span class="w">    </span><span class="nt">"nvme"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.09168</span><span class="p">,</span><span class="w"> </span><span class="nt">"exact"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"max_abs_diff"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"stats"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"get_hit_nvme"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">}}</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"decode_from_recomputed_kv"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">15349</span><span class="p">,</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span><span class="w"> </span><span class="mi">431</span><span class="p">,</span><span class="w"> </span><span class="mi">16012</span><span class="p">,</span><span class="w"> </span><span class="mi">43</span><span class="p">,</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span><span class="w"> </span><span class="mi">525</span><span class="p">,</span><span class="w"> </span><span class="mi">6398</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"decode_from_retrieved_kv"</span><span class="p">:</span><span class="w">  </span><span class="p">[</span><span class="mi">15349</span><span class="p">,</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span><span class="w"> </span><span class="mi">431</span><span class="p">,</span><span class="w"> </span><span class="mi">16012</span><span class="p">,</span><span class="w"> </span><span class="mi">43</span><span class="p">,</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span><span class="w"> </span><span class="mi">525</span><span class="p">,</span><span class="w"> </span><span class="mi">6398</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"decode_tokens_identical"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"all_physical_drifts_rejected"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"other_adapter_is_miss"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"old_revision_is_miss"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"spliced_matches_reference"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"kv_diff_half_context_swapped"</span><span class="p">:</span><span class="w"> </span><span class="mf">284.5</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"store_timing"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"get_h2d_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0958</span><span class="p">,</span><span class="w"> </span><span class="nt">"get_nvme_read_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0824</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"nvme_identity_trailer_ok"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>C 段的失败面与重启恢复：</p>
+<details class="fold">
+<summary>results/crater/8.6/20260921-kvtier/C/errors.json C 段：取消、引用、驱逐与重启</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"L"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span><span class="w"> </span><span class="nt">"kv_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">58720256</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttl_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"duplicate_put_same_entry"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"duplicate_put_hits"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"cancel_raises"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"cancel_message"</span><span class="p">:</span><span class="w"> </span><span class="s2">"取回被取消"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"refcount_after_cancel"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"state_after_cancel"</span><span class="p">:</span><span class="w"> </span><span class="s2">"RESIDENT_CPU"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"resume_get_exact"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"state_while_referenced"</span><span class="p">:</span><span class="w"> </span><span class="s2">"RESIDENT_CPU"</span><span class="p">,</span><span class="w"> </span><span class="nt">"deferred_eviction_count"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"double_release_raises"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"state_after_release_and_expire"</span><span class="p">:</span><span class="w"> </span><span class="s2">"EVICTED"</span><span class="p">,</span><span class="w"> </span><span class="nt">"nvme_file_removed"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"get_after_evict_is_miss"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"restart_identity_matches"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"restart_open"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"restored_files"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"rejected_files"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">"restart_get_exact"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"restart_get_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0261</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"corrupt_files"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"truncated"</span><span class="p">:</span><span class="w">  </span><span class="p">{</span><span class="nt">"open_result"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"restored_files"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"rejected_files"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">},</span><span class="w"> </span><span class="nt">"get"</span><span class="p">:</span><span class="w"> </span><span class="s2">"miss"</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"appended"</span><span class="p">:</span><span class="w">   </span><span class="p">{</span><span class="nt">"open_result"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"restored_files"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"rejected_files"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">},</span><span class="w"> </span><span class="nt">"get"</span><span class="p">:</span><span class="w"> </span><span class="s2">"miss"</span><span class="p">},</span>
+<span class="w">    </span><span class="nt">"bad_trailer"</span><span class="p">:{</span><span class="nt">"open_result"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"restored_files"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"rejected_files"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">},</span><span class="w"> </span><span class="nt">"get"</span><span class="p">:</span><span class="w"> </span><span class="s2">"miss"</span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>B 段的逐长度结果与复用间隔扫描：</p>
+<details class="fold">
+<summary>results/crater/8.6/20260921-kvtier/B/L2048/scan.json B 段：写入/取回/重算与 reuse gap（同目录下另有 L128/L8192/L32768 三份）</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"取回含注册/传输/等待/维护四段成本; 传输与等待在 retrieve_*_s 内, 注册是 write_s, 维护成本单列"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"rows"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"prefix_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span><span class="p">,</span><span class="w">   </span><span class="nt">"kv_MiB"</span><span class="p">:</span><span class="w"> </span><span class="mf">14.0</span><span class="p">,</span><span class="w">   </span><span class="nt">"write_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0077</span><span class="p">,</span><span class="w"> </span><span class="nt">"retrieve_gpu_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"retrieve_cpu_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0006</span><span class="p">,</span><span class="w"> </span><span class="nt">"retrieve_nvme_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0050</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefill_wall_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.3329</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"full_request_retrieve_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0627</span><span class="p">,</span><span class="w"> </span><span class="nt">"full_request_recompute_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.4366</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"peak_gpu_MiB"</span><span class="p">:</span><span class="w"> </span><span class="mf">3365.4</span><span class="p">,</span><span class="w"> </span><span class="nt">"host_rss_MiB"</span><span class="p">:</span><span class="w"> </span><span class="mf">1632.6</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"concurrent_retrieve_from_cpu"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"aggregate_ops_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">297.7</span><span class="p">},</span>
+<span class="w">                                      </span><span class="nt">"8"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"aggregate_ops_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">359.9</span><span class="p">,</span><span class="w"> </span><span class="nt">"all_exact"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">}}},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"prefix_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span><span class="w">  </span><span class="nt">"kv_MiB"</span><span class="p">:</span><span class="w"> </span><span class="mf">224.0</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"reuse_gap"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"0.0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"0.0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"retrieve_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0919</span><span class="p">},</span>
+<span class="w">                           </span><span class="nt">"60.0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"retrieve_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.101</span><span class="p">}},</span>
+<span class="w">                   </span><span class="nt">"5.0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"1.0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"retrieve_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0938</span><span class="p">},</span>
+<span class="w">                           </span><span class="nt">"10.0"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"full_request_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.4711</span><span class="p">}}}},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"prefix_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span><span class="w">  </span><span class="nt">"kv_MiB"</span><span class="p">:</span><span class="w"> </span><span class="mf">896.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"write_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.4223</span><span class="p">,</span><span class="w"> </span><span class="nt">"retrieve_cpu_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0244</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"retrieve_nvme_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.3684</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefill_wall_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5258</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"concurrent_retrieve_from_cpu"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"8"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"aggregate_ops_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">33.3</span><span class="p">,</span><span class="w"> </span><span class="nt">"all_exact"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">}}},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"prefix_len"</span><span class="p">:</span><span class="w"> </span><span class="mi">32768</span><span class="p">,</span><span class="w"> </span><span class="nt">"kv_MiB"</span><span class="p">:</span><span class="w"> </span><span class="mf">3584.0</span><span class="p">,</span><span class="w"> </span><span class="nt">"write_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.7530</span><span class="p">,</span><span class="w"> </span><span class="nt">"retrieve_cpu_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0976</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"retrieve_nvme_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.5022</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefill_wall_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.6369</span><span class="p">,</span><span class="w"> </span><span class="nt">"peak_gpu_MiB"</span><span class="p">:</span><span class="w"> </span><span class="mf">16522.0</span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"maintenance_sweep"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">"entries"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"sweep_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">5.8e-05</span><span class="p">},</span>
+<span class="w">                        </span><span class="p">{</span><span class="nt">"entries"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="nt">"sweep_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.000173</span><span class="p">},</span>
+<span class="w">                        </span><span class="p">{</span><span class="nt">"entries"</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">,</span><span class="w"> </span><span class="nt">"sweep_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.001525</span><span class="p">}],</span>
+<span class="w">  </span><span class="nt">"store_timing"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"put_stage_cpu_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5738</span><span class="p">,</span><span class="w"> </span><span class="nt">"put_nvme_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">2.179</span><span class="p">,</span>
+<span class="w">                   </span><span class="nt">"get_h2d_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.9577</span><span class="p">,</span><span class="w"> </span><span class="nt">"get_nvme_read_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.67</span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>真实引擎侧 E 段的分阶段计数（同一组 4096 token 前缀，<code>ttft_p50</code> 与装载字节）：</p>
+<details class="fold">
+<summary>results/crater/8.6/20260921-kvtier/E/result_tiering.json E 段：none/cpu/tiering 与重启</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"none"</span><span class="p">:</span><span class="w">  </span><span class="p">{</span><span class="nt">"warm"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0820</span><span class="p">},</span><span class="w"> </span><span class="nt">"flush"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0816</span><span class="p">},</span>
+<span class="w">            </span><span class="nt">"reuse"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0811</span><span class="p">,</span><span class="w"> </span><span class="nt">"external_prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">},</span>
+<span class="w">            </span><span class="nt">"reuse_again"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0115</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">32640</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"cpu"</span><span class="p">:</span><span class="w">   </span><span class="p">{</span><span class="nt">"warm"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0881</span><span class="p">,</span><span class="w"> </span><span class="nt">"kv_offload_store_bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">3523215360</span><span class="p">},</span>
+<span class="w">            </span><span class="nt">"flush"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0851</span><span class="p">,</span><span class="w"> </span><span class="nt">"kv_offload_store_bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">3523215360</span><span class="p">},</span>
+<span class="w">            </span><span class="nt">"reuse"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0245</span><span class="p">,</span><span class="w"> </span><span class="nt">"external_prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">32768</span><span class="p">,</span>
+<span class="w">                      </span><span class="nt">"kv_offload_load_bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">3758096384</span><span class="p">},</span>
+<span class="w">            </span><span class="nt">"reuse_again"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0118</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">32640</span><span class="p">}},</span>
+<span class="w">  </span><span class="nt">"tiering"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"reuse"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0237</span><span class="p">,</span><span class="w"> </span><span class="nt">"external_prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">32768</span><span class="p">,</span>
+<span class="w">                        </span><span class="nt">"kv_offload_load_bytes_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">3758096384</span><span class="p">},</span>
+<span class="w">              </span><span class="nt">"reuse_again"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0109</span><span class="p">,</span><span class="w"> </span><span class="nt">"prefix_cache_hits_total"</span><span class="p">:</span><span class="w"> </span><span class="mi">32640</span><span class="p">},</span>
+<span class="w">              </span><span class="nt">"restart"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"fs_files_before"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span><span class="w"> </span><span class="nt">"fs_bytes_before"</span><span class="p">:</span><span class="w"> </span><span class="mi">7516192768</span><span class="p">,</span>
+<span class="w">                          </span><span class="nt">"ready_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">22.01</span><span class="p">,</span><span class="w"> </span><span class="nt">"ttft_p50"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0882</span><span class="p">,</span>
+<span class="w">                          </span><span class="nt">"kv_offload_tiering_read_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">3758096384</span><span class="p">,</span>
+<span class="w">                          </span><span class="nt">"kv_offload_tiering_chunk_hits"</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
+<span class="w">                          </span><span class="nt">"kv_offload_tiering_read_time_sum"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">}}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<p>D 段的完整输出（三种位置 × 两种策略 × 两个预算 + 拼接反例）：</p>
+<details class="fold">
+<summary>results/crater/8.6/20260921-kvtier/D/approx.json D 段：精确复用与近似保留</summary>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">"note"</span><span class="p">:</span><span class="w"> </span><span class="s2">"近似的正确语义是保留位置后重算, 不是直接拼接 KV 片段; spliced_kv 列给出后者的反例"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"task"</span><span class="p">:</span><span class="w"> </span><span class="s2">"NFCorpus 文档拼接 + 固定 code needle, 位置 10/50/90%"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"rows"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"needle_pos_frac"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.1</span><span class="p">,</span><span class="w"> </span><span class="nt">"code"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ZQ710"</span><span class="p">,</span><span class="w"> </span><span class="nt">"ctx_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">4114</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"exact_full"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-0.1351</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">6</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"sink_window@0.1"</span><span class="p">:</span><span class="w">  </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"kept_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">411</span><span class="p">,</span><span class="w">  </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.6611</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"sink_window@0.25"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"kept_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1028</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.4049</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"heavy_hitter@0.1"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"kept_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">412</span><span class="p">,</span><span class="w">  </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-5.1410</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"heavy_hitter@0.25"</span><span class="p">:{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"kept_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">1029</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-5.2022</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"heavy_hitter@0.25_spliced_kv"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"answer"</span><span class="p">:</span><span class="w"> </span><span class="s2">"The access code for vault UMBRA is 1234."</span><span class="p">}},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"needle_pos_frac"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span><span class="w"> </span><span class="nt">"code"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ZQ750"</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"exact_full"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-0.0971</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">6</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"sink_window@0.25"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-4.4085</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"heavy_hitter@0.25"</span><span class="p">:{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-5.2273</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"heavy_hitter@0.25_spliced_kv"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"answer"</span><span class="p">:</span><span class="w"> </span><span class="s2">"The access code for vault UMBRA is 7500."</span><span class="p">}},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">"needle_pos_frac"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.9</span><span class="p">,</span><span class="w"> </span><span class="nt">"code"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ZQ790"</span><span class="p">,</span>
+<span class="w">     </span><span class="nt">"exact_full"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-0.0680</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">6</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"sink_window@0.25"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-0.0817</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">6</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"heavy_hitter@0.25"</span><span class="p">:{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_mean_logprob"</span><span class="p">:</span><span class="w"> </span><span class="mf">-5.2604</span><span class="p">,</span><span class="w"> </span><span class="nt">"target_token_match"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"sink_window@0.25_spliced_kv"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"answer"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ZQ790.\\nThe answer is: ZQ790.\\nThe answer is:"</span><span class="p">},</span>
+<span class="w">     </span><span class="nt">"heavy_hitter@0.25_spliced_kv"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"hit"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"answer"</span><span class="p">:</span><span class="w"> </span><span class="s2">"The access code for vault UMBRA is 7777."</span><span class="p">}}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+</details>
+<hr />
+<h2 id="_8">前沿</h2>
+<ol>
+<li><strong>异步分层与晋升中的可见性。</strong> vLLM 0.29 的 <code>TieringOffloadingManager</code> 把次级层的命中表达成 <code>HIT_PENDING</code>，并要求调用方在 <code>RETRY</code> 之后再问一次（<code>v1/kv_offload/tiering/manager.py:12-18</code>）。这套语义解决了"搬运期间调度器该做什么"：不是阻塞，而是把这次命中暂时当成不可用，同时保证数据一旦晋升到位立刻可读。读者可以把它与本章 mini store 的 <code>TRANSFERRING</code> 状态对照：前者把等待暴露给上层，后者把等待藏在同步调用里。</li>
+<li><strong>跨位置的一致性哈希与共享。</strong> vLLM 的文件次级层文档写明：多个实例共享同一 <code>root_dir</code> 时，块文件名由内容哈希决定，因此<strong>相同 token 内容在不同实例上落到同一个文件</strong>；使用非加密前缀哈希算法时需要显式固定 <code>PYTHONHASHSEED</code>（<code>tiering/fs/manager.py</code> 头部注释）。这是一个容易被忽略的前置条件：共享存储层的正确性依赖哈希种子一致，而不是靠"大家都读同一个目录"。</li>
+<li><strong>把身份与校验和写进对象。</strong> Mooncake 的 NVMe KV 对象带逻辑键、物理键、slot、manifest 与 payload 校验和，并把"同一键上已有不同对象"作为显式分支处理（<code>nvme_kv_object_layout.h</code>、<code>nvme_kv_key_conflict_policy.h</code>）。它比"文件名即身份"更重，但换来了在对象层就能回答"这份数据是不是所期望的那一份"。</li>
+<li><strong>近似上下文复用的工程化。</strong> LMCache 的 <code>LMCBlender</code> 把非前缀块拼进注意力计算（<code>v1/compute/blend/blender.py:19</code>），配合 <code>lookup(pin=True)</code> 的置顶接口避免拼接期间被逐出。它属于本章第 6 节那一类"改变注意力输入"的方法，与三层存储的精确复用必须分开验收。</li>
+</ol>
+<hr />
+<h2 id="_9">陷阱</h2>
+<ol>
+<li><strong>命中率高不等于请求更快。</strong> 命中要被复用间隔与搬运成本同时满足；TTL 小于间隔时命中率再高，这次请求也要重算。</li>
+<li><strong>磁盘上有文件不等于能命中。</strong> 截断、追加、尾部损坏三类文件都必须被拒绝；本次三类的取回结果都是 miss。</li>
+<li><strong>物理身份漂移不能降级成 miss。</strong> dtype/layout/长度变了却"恰好没命中"，会让配置错误永远不被发现；本次四类漂移全部显式拒绝。</li>
+<li><strong>把近似压缩的 <code>hit</code> 当质量。</strong> 拼接 KV 片段在某一格能输出正确 code，但那格输出在复读；字符串包含判断会被复读欺骗。</li>
+<li><strong>引用没归还就驱逐。</strong> 持引用时驱逐会产生使用中的内存被回收；本次实现把它记成 <code>deferred_eviction</code> 并在归还后才真正释放。</li>
+<li><strong>把 H2D 的入队时间当搬运时间。</strong> <code>non_blocking=True</code> 的拷贝如果不 <code>synchronize</code>，量到的是入队耗时；本章所有取回计时都先同步再计时。</li>
+<li><strong>把一层的时间当三层。</strong> 224 MiB 在 GPU 上是 3.4×10⁻⁵ s、CPU 上是 0.0053 s、NVMe 上是 0.0917 s，相差三个数量级；报一个数会掩盖掉真正的瓶颈段。</li>
+</ol>
+<hr />
+<h2 id="_10">自测题</h2>
+<details class="fold">
+<summary>1. 为什么缓存键里不放 dtype 与 layout，而要在命中之后再检查一次？</summary>
+<p><strong>答案：</strong>
+两者出错的语义不同。换 adapter 或换模型 revision 是"另一份数据"，应该表现为 miss；而 dtype/layout/长度变化是<strong>同一份逻辑数据被配置改掉了物理布局</strong>，这时如果表现为 miss，就等于把配置漂移掩盖成"没缓存"，而且下一次写盘可能把两种布局混在同一个键下。所以键只放逻辑身份，物理身份在命中后逐字段比较，不一致直接抛 <code>KVIdentityError</code>。本次四类漂移（layout/dtype/长度/量化）全部被拒。</p>
+</details>
+<details class="fold">
+<summary>2. 2048 token 的 KV 在 NVMe 上取回 0.0917 s，重算 0.3668 s，为什么不能直接说&quot;取回快 4 倍&quot;？</summary>
+<p><strong>答案：</strong>
+因为两条路径的完整成本不同。取回的 0.0917 s 里含读盘 0.0824 s 与 H2D；但前提是这份 KV 已经写入过，写入成本是 CPU 暂存 0.0378 s + NVMe 写 0.0747 s。更重要的是复用间隔：如果 TTL 小于间隔，缓存已被逐出，这次请求仍然要重算。只有把注册、传输、等待、维护四段和复用间隔分布一起算，"取回 vs 重算"才是可判断的。</p>
+</details>
+<details class="fold">
+<summary>3. 近似保留在 needle@90%/25% 预算下答对了，能说明 sink+window 是有效策略吗？</summary>
+<p><strong>答案：</strong>
+不能只凭这一格。同一预算下 needle 在 10% 与 50% 位置时都从 −0.07 掉到 −4.4 左右，说明策略的有效性取决于<strong>要的信息是否落在被保留的区间</strong>。窗口策略保留的是序列末尾，所以 needle 越靠后越可能命中；要给出结论必须固定任务并报告位置分布，而不是报告一个平均压缩比。</p>
+</details>
+<details class="fold">
+<summary>4. &quot;直接拼接保留下来的 KV 片段&quot;为什么会失败，而&quot;保留 token 后重算&quot;能成功？</summary>
+<p><strong>答案：</strong>
+KV 不只是 K 和 V 两个张量，它与位置编码和注意力掩码绑定。保留下来的位置是不连续的（例如 sink 4 个 + 末尾 1024 个），直接把这两段 KV 接起来，序列长度与位置之间的对应关系就断了，模型看到的是"这些 token 连续排在一起"，掩码与 RoPE 都不再自洽。保留 token 后重算则把原始位置一起带回去（本实验用 <code>position_ids = idx</code>），位置关系保持正确，所以语义上是"压缩后的上下文"而不是"错位的上下文"。本次拼接版本在 90% 那格输出复读、在其他格子输出语料里的无关数字，正是错位的表现。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L8/8.5-cost-power-selection.html">&#8592; 8.5 成本、能耗与硬件选型</a><a class="nav-next" href="../L8/8.7-cold-start-weight-distribution.html">8.7 冷启动与权重分发 &#8594;</a></nav>
+</main>
+</body>
+</html>

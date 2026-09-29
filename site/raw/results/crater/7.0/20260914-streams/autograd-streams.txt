@@ -1,0 +1,41 @@
+/scratch/learn/envs/serve/lib/python3.12/site-packages/torch/autograd/graph.py:979: UserWarning: The AccumulateGrad node's stream does not match the stream of the node that produced the incoming gradient. This may incur unnecessary synchronization and break CUDA graph capture if the AccumulateGrad node's stream is the default stream. This mismatch is caused by an AccumulateGrad node created prior to the current iteration being kept alive. This can happen if the autograd graph is still being kept alive by tensors such as the loss, or if you are using DDP, which will stash a reference to the node. To resolve the mismatch, delete all references to the autograd graph or ensure that DDP initialization is performed under the same stream as subsequent forwards. If the mismatch is intentional, you can use torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False) to suppress this warning. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/input_buffer.cpp:310.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+CUDA 反向完成语义与跨流梯度消费
+torch 2.13.0+cu130，device=NVIDIA GeForce RTX 5090 D，capability=(12, 0)
+参照 loss=1.000326，参数量=7347200
+
+========================================================================
+[A] backward 的 CPU 提交时间与设备执行时间
+========================================================================
+  forward+backward 调用返回的 CPU 侧耗时=0.838 ms
+  同一段工作在设备上的时间（event 跨度）=0.856 ms
+  CPU 返回时设备工作尚未结束，梯度缓冲在返回后仍可能被后续 kernel 写入。
+
+========================================================================
+[B] 反向流写梯度、消费流无同步读取
+========================================================================
+  无同步消费：18/20 轮读到的梯度与参照不同
+
+========================================================================
+[C] 反向流记录 event，消费流 wait_event
+========================================================================
+  等 event 后消费：0/20 轮与参照不同
+
+========================================================================
+[D] backward 后立即 D2H 拷回（默认流，无同步）
+========================================================================
+  立即 D2H：0/20 次读到的第一个权重梯度与参照不同
+  默认流等 event 后 D2H 与参照相同: True
+
+========================================================================
+[E] 把 D2H 也放到消费流 s2（默认流的隐式行为被排除）
+========================================================================
+  s2 上立即 D2H：0/20 次与参照不同
+  s2 等 event 后 D2H 与参照相同: True
+
+========================================================================
+[F] 非阻塞 D2H（pinned 缓冲）到 s2，不等待 event
+========================================================================
+  非阻塞 D2H：1/20 次与参照不同
+  阻塞式 .to('cpu') 走同步 cudaMemcpy，会把设备工作串行化，所以 [D]/[E] 读不到脏数据；
+  改成 pinned + non_blocking 后同一竞争出现（本配置只命中 1/20，检出率随反向时长与拷贝大小变化）。

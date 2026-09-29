@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.0b 分布式张量：DeviceMesh、DTensor 与布局变换</title>
+<link rel="stylesheet" href="../assets/style.css?v=43509634">
+<link rel="stylesheet" href="../assets/code.css?v=43509634">
+
+</head>
+<body>
+<aside class="sidebar">
+  <a class="sidebar-home" href="../index.html">&#8592; 教程目录</a>
+  <div class="sidebar-id">6.0b</div>
+  <div class="sidebar-title">分布式张量：DeviceMesh、DTensor 与布局变换</div>
+  <nav class="toc" aria-label="本章目录"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一个全局张量，三张局部视图</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-rank">1. rank 坐标与切分规则</a></li>
+<li><a href="#2-partial">2. Partial 不是副本，是一个加数</a></li>
+<li><a href="#3">3. 布局传播是一次纯局部推理</a></li>
+<li><a href="#4-redistribute">4. 换分片维：同一条 redistribute，两种后端实现</a></li>
+<li><a href="#5-partial">5. Partial 在前后向里的位置</a></li>
+<li><a href="#6-redistribute-buffer">6. redistribute 的临时 buffer</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
+<li><a href="#_5">代码入口</a></li>
+<li><a href="#_6">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_8">命令</a></li>
+<li><a href="#_9">实测数字</a></li>
+<li><a href="#_10">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  <details class="mobile-toc"><summary>本章目录</summary>
+    <nav aria-label="本章目录（移动端）"><div class="toc">
+<ul>
+<li><a href="#_1">本章回答三个问题</a></li>
+<li><a href="#_2">心智模型：一个全局张量，三张局部视图</a></li>
+<li><a href="#_3">机制拆解与推导</a><ul>
+<li><a href="#1-rank">1. rank 坐标与切分规则</a></li>
+<li><a href="#2-partial">2. Partial 不是副本，是一个加数</a></li>
+<li><a href="#3">3. 布局传播是一次纯局部推理</a></li>
+<li><a href="#4-redistribute">4. 换分片维：同一条 redistribute，两种后端实现</a></li>
+<li><a href="#5-partial">5. Partial 在前后向里的位置</a></li>
+<li><a href="#6-redistribute-buffer">6. redistribute 的临时 buffer</a></li>
+</ul>
+</li>
+<li><a href="#_4">工程实现 · 源码解析</a><ul>
+<li><a href="#_5">代码入口</a></li>
+<li><a href="#_6">设计取舍</a></li>
+</ul>
+</li>
+<li><a href="#_7">工程实现 · 自己写一遍</a></li>
+<li><a href="#lab">动手 lab</a><ul>
+<li><a href="#_8">命令</a></li>
+<li><a href="#_9">实测数字</a></li>
+<li><a href="#_10">消融建议</a></li>
+</ul>
+</li>
+<li><a href="#_11">原始现场</a></li>
+<li><a href="#_12">前沿</a></li>
+<li><a href="#_13">陷阱</a></li>
+<li><a href="#_14">自测题</a></li>
+</ul>
+</div>
+</nav>
+  </details>
+</aside>
+<main class="page">
+<header class="page-head">
+  <div class="crumb"><a href="../index.html">教程目录</a> <span>&#8250;</span> L6 · 分布式：通信、并行、分离</div>
+  <div class="mod-id">6.0b</div>
+  <h1>分布式张量：DeviceMesh、DTensor 与布局变换</h1>
+  <p class="lede">从全局张量、局部 shard 和进程组构造 DeviceMesh，剖析 Shard、Replicate、Partial 与 redistribute，连接布局传播、autograd 和 FSDP2。</p>
+  <div class="chips"><span class="chip">实测机器 本地（macOS，CPU，torch 2.14.0）· worldvln（2× L40S，sm_89，torch 2.13.0+cu130）</span><span class="chip">前置 6.0（进程组与完成语义）· 7.0（autograd 图）</span></div>
+</header><article class="prose"><h2 id="_1">本章回答三个问题</h2>
+<p>6.0 讲了 rank 手里有什么、谁和谁配对、什么时候算完成。但「每个 rank 该持有哪些元素」这件事还没有被形式化。PyTorch 的答案是 <strong>DeviceMesh + placement</strong>：把一个逻辑上的全局张量描述成「在哪些 rank 上、以什么方式切开」，然后让算子沿着这个描述传播。</p>
+<p>这套描述的价值在于把并行策略变成可以写下来、可以检查、可以被框架自动传播的东西。代价是它引入了一个新的失败模式：<strong>局部 shape 相同不代表全局语义相同</strong>，而布局变化可能在你没写任何通信调用的地方触发通信。</p>
+<ol>
+<li>全局张量怎样表示为局部片段？三类 placement 的数值语义分别是什么？</li>
+<li>布局怎样沿算子传播？哪些算子会隐含通信？</li>
+<li>Partial 在前向和反向里怎么表现？梯度对拍怎么做？</li>
+</ol>
+<hr />
+<h2 id="_2">心智模型：一个全局张量，三张局部视图</h2>
+<figure>
+
+
+<svg viewBox="0 0 820 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="全局张量与三类 placement 的局部视图">
+  <defs>
+    <marker id="c60" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-size="11" fill="currentColor">
+    <text x="12" y="18" font-size="13" font-weight="600">全局 8×6，mesh = 2 个 rank</text>
+
+    <!-- 全局张量 -->
+    <text x="12" y="46" font-size="11" font-weight="600">全局张量 G</text>
+    <rect x="12" y="56" width="216" height="120" rx="4" fill="none" stroke="currentColor"/>
+    <g font-size="9" font-family="monospace" opacity="0.85">
+      <text x="24" y="76">0  1  2  3  4  5</text>
+      <text x="24" y="92">6  7  8  9 10 11</text>
+      <text x="24" y="108">12 13 14 15 16 17</text>
+      <text x="24" y="124">18 19 20 21 22 23</text>
+      <text x="24" y="140">24 25 26 27 28 29</text>
+      <text x="24" y="156">30 31 32 33 34 35</text>
+      <text x="24" y="172">36 37 38 39 40 41</text>
+    </g>
+
+    <!-- Shard(0) -->
+    <text x="262" y="46" font-size="11" font-weight="600">Shard(0)</text>
+    <rect x="262" y="56" width="150" height="56" rx="4" fill="none" stroke="currentColor"/>
+    <text x="270" y="74" font-size="9.5">rank 0：(4, 6) offset 行 0</text>
+    <text x="270" y="90" font-size="9.5" font-family="monospace">0..23</text>
+    <rect x="262" y="118" width="150" height="56" rx="4" fill="none" stroke="currentColor"/>
+    <text x="270" y="136" font-size="9.5">rank 1：(4, 6) offset 行 4</text>
+    <text x="270" y="152" font-size="9.5" font-family="monospace">24..47</text>
+
+    <!-- Shard(1) -->
+    <text x="450" y="46" font-size="11" font-weight="600">Shard(1)</text>
+    <rect x="450" y="56" width="150" height="56" rx="4" fill="none" stroke="currentColor"/>
+    <text x="458" y="74" font-size="9.5">rank 0：(8, 3) offset 列 0</text>
+    <text x="458" y="90" font-size="9.5" font-family="monospace">stride (6,1)</text>
+    <rect x="450" y="118" width="150" height="56" rx="4" fill="none" stroke="currentColor"/>
+    <text x="458" y="136" font-size="9.5">rank 1：(8, 3) offset 列 3</text>
+    <text x="458" y="152" font-size="9.5" font-family="monospace">stride (6,1)</text>
+
+    <!-- Replicate -->
+    <text x="640" y="46" font-size="11" font-weight="600">Replicate</text>
+    <rect x="640" y="56" width="168" height="56" rx="4" fill="none" stroke="currentColor"/>
+    <text x="648" y="74" font-size="9.5">rank 0：(8, 6) 完整副本</text>
+    <rect x="640" y="118" width="168" height="56" rx="4" fill="none" stroke="currentColor"/>
+    <text x="648" y="136" font-size="9.5">rank 1：(8, 6) 完全相同的副本</text>
+
+    <!-- Partial -->
+    <text x="12" y="212" font-size="11.5" font-weight="600">Partial：局部 shape 与全局相同，但每一块只是一个加数</text>
+    <rect x="12" y="224" width="380" height="86" rx="4" fill="none" stroke="currentColor"/>
+    <text x="24" y="244" font-size="10">rank 0 局部：只有自己那段非零，其余补 0（局部和 276）</text>
+    <text x="24" y="262" font-size="10">rank 1 局部：只有自己那段非零，其余补 0（局部和 852）</text>
+    <text x="24" y="282" font-size="10" font-weight="600">全局 = rank0 + rank1（逐元素），归约前不能当完整副本用</text>
+    <text x="24" y="300" font-size="9.5" opacity="0.85">276 + 852 = 1128 = G.sum()</text>
+
+    <rect x="412" y="224" width="396" height="86" rx="4" fill="none" stroke="currentColor"/>
+    <text x="424" y="244" font-size="10">注意 (8, 3)：(8, 6) = 每个 rank 的局部块</text>
+    <text x="424" y="262" font-size="10">但它不是一块连续内存——stride 仍是 (6, 1)</text>
+    <text x="424" y="282" font-size="10">直接把 to_local() 丢给只认连续内存的 kernel 会错</text>
+    <text x="424" y="300" font-size="9.5" opacity="0.85">.contiguous() 会复制一份</text>
+
+    <!-- 底部：传播 -->
+    <line x1="12" y1="328" x2="808" y2="328" stroke="currentColor" opacity="0.3"/>
+    <text x="12" y="350" font-size="11.5" font-weight="600">传播的关键事实（本章实测）：布局推理本身一次通信都不发</text>
+    <text x="12" y="370" font-size="10">10 个表达式里有 9 个的输出 placement 是纯局部规则算出来的；通信只在</text>
+    <text x="12" y="386" font-size="10">「物化 full_tensor()」和「显式 redistribute」这两个边界上出现。</text>
+  </g>
+</svg>
+
+
+</figure>
+
+<hr />
+<h2 id="_3">机制拆解与推导</h2>
+<h3 id="1-rank">1. rank 坐标与切分规则</h3>
+<p>DeviceMesh 把一组 rank 组织成多维网格。rank 到网格坐标的映射是行主序（最后一个 mesh 维变化最快），这与 <code>torch.arange(shape).reshape(shape)</code> 的展开顺序一致：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">mesh_coord</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">mesh_shape</span><span class="p">):</span>
+    <span class="n">coord</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">(</span><span class="n">mesh_shape</span><span class="p">):</span>
+        <span class="n">coord</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">rank</span> <span class="o">%</span> <span class="n">size</span><span class="p">)</span>
+        <span class="n">rank</span> <span class="o">//=</span> <span class="n">size</span>
+    <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">reversed</span><span class="p">(</span><span class="n">coord</span><span class="p">))</span>
+</code></pre></div>
+
+<p>对一个 mesh 维上的 <code>Shard(dim)</code>，第 <code>i</code> 段的大小按 <code>torch.chunk</code> 的规则切分：前 <code>n % k</code> 段各多 1。7 切 2 得 <code>[4, 3]</code>，5 切 2 得 <code>[3, 2]</code>。段起始下标是前面各段之和，也就是 <code>i * (n // k) + min(i, n % k)</code>。</p>
+<p>实测（<code>labs/L6/mini_dtensor.py</code>，本地 Gloo，2 rank）：</p>
+<table>
+<thead>
+<tr>
+<th>全局张量</th>
+<th>placement</th>
+<th>rank 0</th>
+<th>rank 1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8×6</td>
+<td><code>S(0)</code></td>
+<td><code>(4,6)</code> stride <code>(6,1)</code> offset <code>[0,0]</code></td>
+<td><code>(4,6)</code> stride <code>(6,1)</code> offset <code>[4,0]</code></td>
+</tr>
+<tr>
+<td>8×6</td>
+<td><code>S(1)</code></td>
+<td><code>(8,3)</code> stride <code>(6,1)</code> offset <code>[0,0]</code></td>
+<td><code>(8,3)</code> stride <code>(6,1)</code> offset <code>[0,3]</code></td>
+</tr>
+<tr>
+<td>8×6</td>
+<td><code>R</code></td>
+<td><code>(8,6)</code></td>
+<td><code>(8,6)</code> 完全相同的副本</td>
+</tr>
+<tr>
+<td>7×5</td>
+<td><code>S(0)</code></td>
+<td><code>(4,5)</code> offset <code>[0,0]</code></td>
+<td><code>(3,5)</code> offset <code>[4,0]</code></td>
+</tr>
+<tr>
+<td>7×5</td>
+<td><code>S(1)</code></td>
+<td><code>(7,3)</code> offset <code>[0,0]</code></td>
+<td><code>(7,2)</code> offset <code>[0,3]</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>S(1)</code> 那一行的 stride 值得单独看：局部块的 shape 是 <code>(8,3)</code>，但 stride 是 <code>(6,1)</code>——它是全局张量的一个视图，不是一块连续内存。<strong>把 <code>to_local()</code> 直接交给要求连续的 kernel，得到的是错的。</strong> 这也是「局部 shape 相同不保证全局语义相同」的最直接例子：两个 rank 的局部 shape 都是 <code>(8,3)</code>，但一个从第 0 列开始，一个从第 3 列开始。</p>
+<p>手写的放置函数与 DTensor 的 <code>to_local()</code> 在 8×6 与 7×5 两个张量、<code>S(0)</code>/<code>S(1)</code>/<code>R</code> 三类 placement、2 rank 与 2×2（4 rank）两种 mesh 上共 6 个组合全部逐元素相等；把各 rank 的局部块按 offset 拼回去，也与全局张量逐元素相等。</p>
+<h3 id="2-partial">2. Partial 不是副本，是一个加数</h3>
+<p><code>Partial(sum)</code> 的语义是：<strong>全局张量等于所有 rank 的局部张量逐元素之和</strong>。局部 shape 与全局相同——这一点最容易骗人，因为一个 <code>(8,6)</code> 的张量看上去就是一份完整数据。</p>
+<p><code>Shard(0)</code> → <code>Partial(sum)</code> 的转换是纯本地的：每个 rank 把自己的那段放进一个同 shape 的全零张量，位置对上就行。实测 rank 0 的局部和是 276、rank 1 是 852，逐元素相加得到 1128，正好等于全局张量的和；对 rank 0 来说，局部和 276 恰好等于全局前 24 个元素之和。</p>
+<div class="admonition warning">
+<p class="admonition-title">这个转换在不同版本上的可用性不同</p>
+<p>同一句 <code>redistribute(mesh, [Partial()])</code>，本地 torch 2.14.0 直接执行并与手写结果逐元素相等；worldvln 的 torch 2.13.0 报错：</p>
+<div class="highlight"><pre><span></span><code>RuntimeError: Can not redistribute from S(0) to P(sum),
+redistributing to Partial is for internal use only!
+</code></pre></div>
+
+<p>版本差异不改变 Partial 的数值语义，但决定了它是不是一个公开的 API 路径。凡是依赖「显式转换到 Partial」的代码都要按版本核对。</p>
+</div>
+<h3 id="3">3. 布局传播是一次纯局部推理</h3>
+<p><code>torch/distributed/tensor/_sharding_prop.py</code> 的 <code>ShardingPropagator.propagate</code>（<code>:710</code>）为每个算子推导输出 placement。本章对 10 个表达式先写下预测、再跑真实 DTensor，两种后端上都是 10/10 命中：</p>
+<table>
+<thead>
+<tr>
+<th>表达式</th>
+<th>输出 placement</th>
+<th>局部 shape</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>matmul(xS0, Wr)</code></td>
+<td><code>S(0)</code></td>
+<td><code>(2,6)</code></td>
+<td>x 的分片维不与收缩维重合，逐 rank 独立算</td>
+</tr>
+<tr>
+<td><code>matmul(xr, WS1)</code></td>
+<td><code>S(1)</code></td>
+<td><code>(4,3)</code></td>
+<td>W 的第 1 维被切走，输出第 1 维随之分片</td>
+</tr>
+<tr>
+<td><code>linear(xS1, WS1)</code></td>
+<td><code>P(sum)</code></td>
+<td><code>(4,6)</code></td>
+<td>列并行，各 rank 只算了一部分和</td>
+</tr>
+<tr>
+<td><code>linear(xr, WS0)</code></td>
+<td><code>S(1)</code></td>
+<td><code>(4,3)</code></td>
+<td>行并行，输出直接在最后一维分片</td>
+</tr>
+<tr>
+<td><code>linear(xr, WS1)</code></td>
+<td><code>P(sum)</code></td>
+<td><code>(4,6)</code></td>
+<td>列并行，输出是部分和</td>
+</tr>
+<tr>
+<td><code>sum(xS0)</code></td>
+<td><code>P(sum)</code></td>
+<td><code>[]</code></td>
+<td>全量求和消掉分片维</td>
+</tr>
+<tr>
+<td><code>sum(dim=1)(xS1)</code></td>
+<td><code>P(sum)</code></td>
+<td><code>[4]</code></td>
+<td>被求和维正是分片维</td>
+</tr>
+<tr>
+<td><code>reshape(xS0)</code></td>
+<td><code>S(0)</code></td>
+<td><code>(1,12)</code></td>
+<td>分片边界在 reshape 后仍落在第 0 维</td>
+</tr>
+<tr>
+<td><code>t(xS1)</code></td>
+<td><code>S(0)</code></td>
+<td><code>(3,4)</code></td>
+<td>转置把分片维搬到第 0 维</td>
+</tr>
+<tr>
+<td><code>redistribute S0→S1</code></td>
+<td><code>S(1)</code></td>
+<td><code>(4,3)</code></td>
+<td>显式换分片维，必须交换数据</td>
+</tr>
+</tbody>
+</table>
+<p><strong>这 10 个表达式里，只有最后一行在算子执行期间产生了通信。</strong> 前 9 个的 placement 都是局部规则算出来的，通信被推迟到「把结果物化」的那一刻：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>算子内通信</th>
+<th><code>full_tensor()</code> 时的通信</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>matmul(xS0, Wr)</code> / <code>matmul(xr, WS1)</code></td>
+<td>0</td>
+<td><code>all_gather_into_tensor</code> ×1</td>
+</tr>
+<tr>
+<td><code>linear(xS1, WS1)</code> / <code>linear(xr, WS1)</code></td>
+<td>0</td>
+<td><code>all_reduce</code> ×1</td>
+</tr>
+<tr>
+<td><code>linear(xr, WS0)</code></td>
+<td>0</td>
+<td><code>all_gather_into_tensor</code> ×1</td>
+</tr>
+<tr>
+<td><code>sum(xS0)</code> / <code>sum(dim=1)(xS1)</code></td>
+<td>0</td>
+<td><code>all_reduce</code> ×1</td>
+</tr>
+<tr>
+<td><code>reshape(xS0)</code> / <code>t(xS1)</code></td>
+<td>0</td>
+<td><code>all_gather_into_tensor</code> ×1</td>
+</tr>
+<tr>
+<td><code>redistribute S0→S1</code></td>
+<td>1（见下）</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>Partial 物化走 <code>all_reduce</code>，Shard 物化走 <code>all_gather_into_tensor</code>——这条对应关系不依赖后端。<strong>「布局推理本身不发通信」和「布局变化会隐含通信」这两句话并不矛盾</strong>：前者说的是传播阶段，后者说的是边界阶段。只统计显式 <code>dist.all_reduce</code> 调用，会漏掉物化阶段这 10 次。</p>
+<h3 id="4-redistribute">4. 换分片维：同一条 <code>redistribute</code>，两种后端实现</h3>
+<p><code>Shard(0)</code> → <code>Shard(1)</code> 必须做一次「换维」，两个后端的实现路径不同：</p>
+<table>
+<thead>
+<tr>
+<th>后端</th>
+<th>dispatch 到的算子</th>
+<th>底层</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Gloo（CPU）</td>
+<td><code>all_gather_into_tensor</code></td>
+<td>先 all-gather 再按维切开（见下）</td>
+</tr>
+<tr>
+<td>NCCL（CUDA）</td>
+<td><code>_dtensor::shard_dim_alltoall</code></td>
+<td><code>nccl:all_to_all</code></td>
+</tr>
+</tbody>
+</table>
+<p>CPU 侧的 fallback 在源码注释里写得很直白（<code>torch/distributed/tensor/_collective_utils.py:107-110</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">shard_dim_alltoall</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">gather_dim</span><span class="p">,</span> <span class="n">shard_dim</span><span class="p">,</span> <span class="n">mesh</span><span class="p">,</span> <span class="n">mesh_dim</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">mesh</span><span class="o">.</span><span class="n">device_type</span> <span class="o">==</span> <span class="s2">"cpu"</span> <span class="ow">and</span> <span class="n">local_tensor_mode</span><span class="p">()</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Gloo does not support alltoall, so falling back to allgather + chunk</span>
+        <span class="n">warning_once</span><span class="p">(</span>
+            <span class="n">logger</span><span class="p">,</span>
+            <span class="s2">"CPU process group does not support alltoall yet, falling back with allgather + chunk!"</span><span class="p">,</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<p>也就是说：同一段 DTensor 代码在 CPU 上跑，走的是「把整个全局张量聚起来再切」的路径；在 GPU 上跑，走的是真正的 all-to-all。两者数值相同，通信量不同——all-gather 方案每个 rank 收到完整的全局张量，all-to-all 方案只需要收发自己那一份。</p>
+<h3 id="5-partial">5. Partial 在前后向里的位置</h3>
+<p>用 <code>x</code> 行分片、<code>W</code> 复制的两 rank 线性层做对拍（<code>y = linear(x, W)</code>，<code>loss = (y²).sum()</code>，float64）：</p>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th>实测 placement</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>y</code></td>
+<td><code>S(0)</code></td>
+<td>前向零通信</td>
+</tr>
+<tr>
+<td><code>loss</code></td>
+<td><code>P(sum)</code></td>
+<td>局部标量 16.485886，全局 31.605360，单机参照 31.605360</td>
+</tr>
+<tr>
+<td><code>grad_x</code></td>
+<td><code>S(0)</code></td>
+<td>与输入同布局，与单机梯度最大绝对差 0</td>
+</tr>
+<tr>
+<td><code>grad_W</code></td>
+<td><code>P(sum)</code></td>
+<td><strong>梯度是部分和</strong>，必须归约后才能当完整梯度用</td>
+</tr>
+</tbody>
+</table>
+<p><code>grad_W</code> 是这张表里最关键的一行。每个 rank 只用自己的那部分激活算出了权重的部分梯度，所以 <code>W.grad</code> 天然是 <code>Partial</code>。把它 <code>full_tensor()</code> 之后与单进程梯度逐元素比较，完全一致。通信字节账：</p>
+<ul>
+<li><code>loss</code> 物化：<code>all_reduce</code> 在标量上，8 字节。</li>
+<li><code>grad_W</code> 物化：<code>all_reduce</code> 在 <code>(3,4)</code> 的 float64 上，96 字节。</li>
+<li>前向与反向本身：0 次通信。</li>
+</ul>
+<p>换成列并行（<code>x</code> 复制、<code>W</code> 按输入维分片）之后，位置换了一处：</p>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th>实测 placement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>y</code></td>
+<td><code>P(sum)</code></td>
+</tr>
+<tr>
+<td><code>loss</code></td>
+<td><code>R</code>（在 <code>sum()</code> 内部就已经归约完毕）</td>
+</tr>
+</tbody>
+</table>
+<p>列并行下必须做一次 <code>all_reduce</code>，而它发生在 <code>.sum()</code> <strong>内部</strong>（<code>(8,3)</code> float64 = 192 字节），不是物化的时候。同一个 <code>loss = (y**2).sum()</code> 表达式，前面的布局不同，通信发生的位置就不同——一个在算子内，一个在物化时。这正是「不能只计显式 collective 调用」的含义。</p>
+<h3 id="6-redistribute-buffer">6. redistribute 的临时 buffer</h3>
+<p><code>Shard(0)</code> → <code>Replicate</code> 需要一个完整副本，临时 buffer 就是全局张量本身。用一个 4096×1024 的 float32 张量（全局 16 MiB，每 rank 8 MiB）在 2×L40S 上做 3 轮 redistribute：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>实测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每次 redistribute 的通信</td>
+<td><code>all_gather_into_tensor</code> ×1，输入是 8 MiB/rank 的局部块</td>
+</tr>
+<tr>
+<td>分配峰值（<code>max_memory_allocated</code>）</td>
+<td>40.26 → 72.26 MB</td>
+</tr>
+<tr>
+<td>循环结束后已分配</td>
+<td>40.26 → 56.26 MB（+16 MiB，正好是一份 Replicate 结果）</td>
+</tr>
+<tr>
+<td>释放后（<code>del</code> + <code>gc.collect()</code> + <code>empty_cache()</code>）</td>
+<td>回到 40.26 MB，reserved 从 90 MB 回到 58 MB</td>
+</tr>
+</tbody>
+</table>
+<p><code>reserved</code> 涨到 90 MB 而 <code>allocated</code> 只涨 16 MB，差额是 CachingAllocator 为这次 all-gather 预留的段。把结果引用释放掉并清空缓存后，两者都回到基线——<strong>临时 buffer 的「释放」分成两件事：引用释放让 allocated 立刻回落，缓存清空才让 reserved 回落。</strong></p>
+<hr />
+<h2 id="_4">工程实现 · 源码解析</h2>
+<h3 id="_5">代码入口</h3>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>torch/distributed/tensor/placement_types.py:162</code></td>
+<td><code>Shard</code>：按 <code>torch.chunk</code> 语义切分</td>
+</tr>
+<tr>
+<td><code>torch/distributed/tensor/placement_types.py:1700</code></td>
+<td><code>Replicate</code></td>
+</tr>
+<tr>
+<td><code>torch/distributed/tensor/placement_types.py:1765</code></td>
+<td><code>Partial</code>：定义 <code>LINEAR_REDUCE_OPS</code> 与 <code>ALL_REDUCE_OPS</code></td>
+</tr>
+<tr>
+<td><code>torch/distributed/tensor/_api.py:939</code></td>
+<td><code>distribute_tensor</code>：从全局张量构造 DTensor</td>
+</tr>
+<tr>
+<td><code>torch/distributed/tensor/_sharding_prop.py:710</code></td>
+<td><code>ShardingPropagator.propagate</code></td>
+</tr>
+<tr>
+<td><code>torch/distributed/tensor/_sharding_prop.py:735</code></td>
+<td><code>propagate_op_sharding_non_cached</code></td>
+</tr>
+<tr>
+<td><code>torch/distributed/tensor/_redistribute.py:1588</code></td>
+<td><code>redistribute_local_tensor</code>：真正执行通信的地方</td>
+</tr>
+<tr>
+<td><code>torch/distributed/tensor/_redistribute.py:1516</code></td>
+<td><code>_gen_transform_infos_non_cached</code>：把布局变化翻译成 collective 序列</td>
+</tr>
+<tr>
+<td><code>torch/distributed/tensor/_collective_utils.py:107-123</code></td>
+<td>CPU 上 <code>shard_dim_alltoall</code> 退化为 all-gather + chunk</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_6">设计取舍</h3>
+<p><strong>为什么把 placement 做成数据而不是函数。</strong> <code>Shard</code>/<code>Replicate</code>/<code>Partial</code> 是三个可以比较、可以打印、可以参与传播规则匹配的值。这让「算子支持哪些输入布局组合」变成一张可以机械查询的表（<code>_sharding_prop.py</code> 里的 ShardingPropagator），而不是散落在每个算子实现里的 if-else。代价是每接一个新算子都要给出这张表的对应行，否则传播会失败或退化。</p>
+<p><strong>为什么 Partial 存在。</strong> 没有 Partial，列并行的输出就必须在算子内部立刻归约，通信无法与后续计算重叠；有了 Partial，「这是一个还没归约的部分和」变成类型系统里的一等信息，归约可以推迟到真正需要完整值的时候。代价是任何把 Partial 当完整副本用的代码都会静默拿到错值。</p>
+<p><strong>为什么 CPU 上退化。</strong> Gloo 不提供 all-to-all，CPU 侧的 <code>shard_dim_alltoall</code> 只能先 all-gather 再切。这不影响正确性，但让同一段代码在两个后端上的通信量和显存峰值不同。跨设备复用布局代码时，这个差异要按后端核对。</p>
+<p><strong>为什么 <code>reshape</code> 不总是免费的。</strong> 只有当分片维的块边界在 reshape 后仍然对齐时，传播才能保持 <code>S(dim)</code> 不变（本例 <code>(4,6) → (1,12)</code> 的第 0 维刚好整除）。一旦 reshape 把分片维打散到多个维上，就必须先 redistribute 成 <code>Replicate</code> 再 reshape。这类「看起来是 view、实际上是通信」的改动，是跨并行度复用模型代码时最常见的性能回归来源。</p>
+<hr />
+<h2 id="_7">工程实现 · 自己写一遍</h2>
+<p><code>labs/L6/mini_dtensor.py</code> 把上面三类 placement 写成可检查的纯 Python：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true"> 96</span> <span class="k">def</span><span class="w"> </span><span class="nf">split_sizes</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true"> 97</span> <span class="w">    </span><span class="sd">"""把长度 n 切成 k 段，前 n%k 段多 1。与 torch.tensor_split 的分法一致。"""</span>
+<span class="linenos" aria-hidden="true"> 98</span>     <span class="n">base</span><span class="p">,</span> <span class="n">rest</span> <span class="o">=</span> <span class="nb">divmod</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true"> 99</span>     <span class="k">return</span> <span class="p">[</span><span class="n">base</span> <span class="o">+</span> <span class="p">(</span><span class="mi">1</span> <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">rest</span> <span class="k">else</span> <span class="mi">0</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">k</span><span class="p">)]</span>
+<span class="linenos" aria-hidden="true">100</span> 
+<span class="linenos" aria-hidden="true">101</span> 
+<span class="linenos" aria-hidden="true">102</span> <span class="k">def</span><span class="w"> </span><span class="nf">chunk_offset</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">i</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">103</span> <span class="w">    </span><span class="sd">"""第 i 段在长度 n 上的起始下标。"""</span>
+<span class="linenos" aria-hidden="true">104</span>     <span class="n">base</span><span class="p">,</span> <span class="n">rest</span> <span class="o">=</span> <span class="nb">divmod</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">105</span>     <span class="k">return</span> <span class="n">i</span> <span class="o">*</span> <span class="n">base</span> <span class="o">+</span> <span class="nb">min</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">rest</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">106</span> 
+<span class="linenos" aria-hidden="true">107</span> 
+<span class="linenos" aria-hidden="true">108</span> <span class="k">def</span><span class="w"> </span><span class="nf">place</span><span class="p">(</span><span class="n">global_tensor</span><span class="p">,</span> <span class="n">mesh_shape</span><span class="p">,</span> <span class="n">placements</span><span class="p">,</span> <span class="n">coord</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">109</span> <span class="w">    </span><span class="sd">"""返回 coord 这个 mesh 坐标上应该持有的局部张量。"""</span>
+<span class="linenos" aria-hidden="true">110</span>     <span class="n">t</span> <span class="o">=</span> <span class="n">global_tensor</span>
+<span class="linenos" aria-hidden="true">111</span>     <span class="k">for</span> <span class="n">size</span><span class="p">,</span> <span class="n">pl</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">mesh_shape</span><span class="p">,</span> <span class="n">placements</span><span class="p">,</span> <span class="n">coord</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">112</span>         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">pl</span><span class="p">,</span> <span class="n">Shard</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">113</span>             <span class="n">sizes</span> <span class="o">=</span> <span class="n">split_sizes</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">pl</span><span class="o">.</span><span class="n">dim</span><span class="p">],</span> <span class="n">size</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">114</span>             <span class="n">start</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">sizes</span><span class="p">[:</span><span class="n">c</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">115</span>             <span class="n">t</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">narrow</span><span class="p">(</span><span class="n">pl</span><span class="o">.</span><span class="n">dim</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">sizes</span><span class="p">[</span><span class="n">c</span><span class="p">])</span>
+<span class="linenos" aria-hidden="true">116</span>     <span class="k">return</span> <span class="n">t</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/mini_dtensor.py 第 96–116 行</code><a href="../code/labs/L6/mini_dtensor.py.html#labs-L6-mini_dtensor-py-L-96">在完整文件中打开 &rarr;</a></div></div>
+<p>手写实现的意义在于，它逐 rank 打印 shape、stride、offset，而这正是排查「局部 shape 相同但语义不同」时需要的三个数：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">119</span> <span class="k">def</span><span class="w"> </span><span class="nf">local_offset</span><span class="p">(</span><span class="n">global_shape</span><span class="p">,</span> <span class="n">mesh_shape</span><span class="p">,</span> <span class="n">placements</span><span class="p">,</span> <span class="n">coord</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">120</span>     <span class="n">off</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">global_shape</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">121</span>     <span class="k">for</span> <span class="n">size</span><span class="p">,</span> <span class="n">pl</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">mesh_shape</span><span class="p">,</span> <span class="n">placements</span><span class="p">,</span> <span class="n">coord</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">122</span>         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">pl</span><span class="p">,</span> <span class="n">Shard</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">123</span>             <span class="n">off</span><span class="p">[</span><span class="n">pl</span><span class="o">.</span><span class="n">dim</span><span class="p">]</span> <span class="o">=</span> <span class="n">chunk_offset</span><span class="p">(</span><span class="n">global_shape</span><span class="p">[</span><span class="n">pl</span><span class="o">.</span><span class="n">dim</span><span class="p">],</span> <span class="n">size</span><span class="p">,</span> <span class="n">c</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">124</span>     <span class="k">return</span> <span class="n">off</span>
+<span class="linenos" aria-hidden="true">125</span> 
+<span class="linenos" aria-hidden="true">126</span> 
+<span class="linenos" aria-hidden="true">127</span> <span class="k">def</span><span class="w"> </span><span class="nf">mesh_coord</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">mesh_shape</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">128</span>     <span class="n">coord</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos" aria-hidden="true">129</span>     <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">(</span><span class="n">mesh_shape</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">130</span>         <span class="n">coord</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">rank</span> <span class="o">%</span> <span class="n">size</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">131</span>         <span class="n">rank</span> <span class="o">//=</span> <span class="n">size</span>
+<span class="linenos" aria-hidden="true">132</span>     <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">reversed</span><span class="p">(</span><span class="n">coord</span><span class="p">))</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/mini_dtensor.py 第 119–133 行</code><a href="../code/labs/L6/mini_dtensor.py.html#labs-L6-mini_dtensor-py-L-119">在完整文件中打开 &rarr;</a></div></div>
+<p>重建全局张量时，Partial 与另外两类走的是两条不同的路径——前者求和，后者按 offset 摆放：</p>
+<div class="srcblock"><div class="highlight"><pre><span></span><span class="linenos" aria-hidden="true">155</span> <span class="k">def</span><span class="w"> </span><span class="nf">reconstruct</span><span class="p">(</span><span class="n">shards</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">mesh_shape</span><span class="p">,</span> <span class="n">placements</span><span class="p">,</span> <span class="n">global_shape</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">156</span> <span class="w">    </span><span class="sd">"""shards: {rank: local tensor}。返回全局张量。</span>
+<span class="linenos" aria-hidden="true">157</span> 
+<span class="linenos" aria-hidden="true">158</span> <span class="sd">    Partial 的语义是「全局 = 各 rank 之和」，其余两类是「按 offset 摆放」。</span>
+<span class="linenos" aria-hidden="true">159</span> <span class="sd">    """</span>
+<span class="linenos" aria-hidden="true">160</span>     <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">Partial</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">placements</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">161</span>         <span class="n">acc</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="linenos" aria-hidden="true">162</span>         <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">shards</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">163</span>             <span class="n">acc</span> <span class="o">=</span> <span class="n">shards</span><span class="p">[</span><span class="n">r</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="k">if</span> <span class="n">acc</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">acc</span> <span class="o">+</span> <span class="n">shards</span><span class="p">[</span><span class="n">r</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">164</span>         <span class="k">return</span> <span class="n">acc</span>
+<span class="linenos" aria-hidden="true">165</span>     <span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">global_shape</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">166</span>     <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">shards</span><span class="p">):</span>
+<span class="linenos" aria-hidden="true">167</span>         <span class="n">coord</span> <span class="o">=</span> <span class="n">mesh_coord</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">mesh_shape</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">168</span>         <span class="n">start</span> <span class="o">=</span> <span class="n">local_offset</span><span class="p">(</span><span class="n">global_shape</span><span class="p">,</span> <span class="n">mesh_shape</span><span class="p">,</span> <span class="n">placements</span><span class="p">,</span> <span class="n">coord</span><span class="p">)</span>
+<span class="linenos" aria-hidden="true">169</span>         <span class="n">t</span> <span class="o">=</span> <span class="n">shards</span><span class="p">[</span><span class="n">r</span><span class="p">]</span>
+<span class="linenos" aria-hidden="true">170</span>         <span class="n">idx</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">slice</span><span class="p">(</span><span class="n">start</span><span class="p">[</span><span class="n">d</span><span class="p">],</span> <span class="n">start</span><span class="p">[</span><span class="n">d</span><span class="p">]</span> <span class="o">+</span> <span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">d</span><span class="p">])</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">global_shape</span><span class="p">)))</span>
+<span class="linenos" aria-hidden="true">171</span>         <span class="n">out</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">t</span>
+<span class="linenos" aria-hidden="true">172</span>     <span class="k">return</span> <span class="n">out</span>
+</pre></div>
+<div class="srcref"><code>labs/L6/mini_dtensor.py 第 155–172 行</code><a href="../code/labs/L6/mini_dtensor.py.html#labs-L6-mini_dtensor-py-L-155">在完整文件中打开 &rarr;</a></div></div>
+<hr />
+<h2 id="lab">动手 lab</h2>
+<h3 id="_8">命令</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 任务 A：手写放置与重建，与 DTensor 对拍（2 rank 与 2×2 mesh）</span>
+python<span class="w"> </span>labs/L6/mini_dtensor.py<span class="w"> </span>A<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--mesh<span class="w"> </span><span class="m">2</span><span class="w"> </span>--out<span class="w"> </span>results/local/6.0b/run/A2
+python<span class="w"> </span>labs/L6/mini_dtensor.py<span class="w"> </span>A<span class="w"> </span>--world-size<span class="w"> </span><span class="m">4</span><span class="w"> </span>--mesh<span class="w"> </span>2x2<span class="w"> </span>--out<span class="w"> </span>results/local/6.0b/run/A4
+
+<span class="c1"># 任务 B：预测布局传播，并记录每一步的 collective</span>
+python<span class="w"> </span>labs/L6/dtensor_probe.py<span class="w"> </span>B<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--out<span class="w"> </span>results/local/6.0b/run/B
+
+<span class="c1"># 任务 C：Partial 的前后向与梯度对拍；--device cuda 时额外采显存</span>
+python<span class="w"> </span>labs/L6/dtensor_probe.py<span class="w"> </span>C<span class="w"> </span>--world-size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--out<span class="w"> </span>results/worldvln/6.0b/run/C<span class="w"> </span>--device<span class="w"> </span>cuda
+</code></pre></div>
+
+<p>collective 的记录用 profiler 事件而不是函数替换：DTensor 走的是 <code>torch.ops._c10d_functional.*</code> 与 <code>_dtensor::*</code>，在 Python 层包 <code>dist.all_reduce</code> 是包不住的。粒度只取这两层，再往下的 <code>c10d::</code> / <code>gloo:</code> / <code>nccl:</code> 是同一件事的后端实现，计入会重复计数。</p>
+<h3 id="_9">实测数字</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>本地（Gloo，CPU）</th>
+<th>worldvln（NCCL，2×L40S）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A：放置与重建一致</td>
+<td>6/6（2 rank）· 6/6（2×2）</td>
+<td>6/6</td>
+</tr>
+<tr>
+<td>B：传播预测命中</td>
+<td>10/10</td>
+<td>10/10</td>
+</tr>
+<tr>
+<td>B：算子内通信（除 redistribute）</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>B：<code>S0→S1</code> 的算子</td>
+<td><code>all_gather_into_tensor</code></td>
+<td><code>_dtensor::shard_dim_alltoall</code></td>
+</tr>
+<tr>
+<td>C：行并行局部 loss / 全局 loss</td>
+<td>16.485886 / 31.605360</td>
+<td>11.015274 / 42.356968</td>
+</tr>
+<tr>
+<td>C：<code>grad_W</code> 归约后与单机一致</td>
+<td>一致（max diff 0）</td>
+<td>一致（max diff 0）</td>
+</tr>
+<tr>
+<td>C：redistribute 显存</td>
+<td>未采（CPU）</td>
+<td>+16 MiB，释放后回落</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_10">消融建议</h3>
+<ol>
+<li>把 <code>mini_dtensor.py</code> 的 7×5 换成 6×6，观察不整除切分的 <code>[4,2]</code> 变成 <code>[3,3]</code> 后 offset 表如何变化——这是验证「切分规则」而不是「碰巧对上」的最快方式。</li>
+<li>在任务 B 里把 <code>reshape(2,12)</code> 改成 <code>reshape(3,8)</code>。第 0 维 4 不能整除以 3，传播会失败或先 redistribute，可以直接看到「view 变成通信」。</li>
+<li>在任务 C 里把 <code>loss</code> 换成 <code>y.sum()</code> 之外的、不消掉分片维的表达式（例如 <code>(y * c).sum()</code> 保留 <code>S(0)</code>），观察通信从「物化时」挪回「算子内」。</li>
+<li>把 2×2 mesh 上的 <code>[Shard(0), Shard(1)]</code> 改成 <code>[Shard(0), Shard(0)]</code>，确认框架明确报错而不是静默变换。</li>
+</ol>
+<hr />
+<h2 id="_11">原始现场</h2>
+<p><strong>不支持的布局必须明确报错</strong>（<code>results/local/6.0b/20260914-layout/B/propagation.json</code>）</p>
+<div class="highlight"><pre><span></span><code>Shard(2) on 2-D tensor              → IndexError: Dimension out of range
+                                      (expected to be in range of [-2, 1], but got 2)
+placements 数与 mesh 维数不符        → ValueError: `placements` must have the same length as
+                                      `device_mesh.ndim`! Found placements length: 2,
+                                      and device_mesh.ndim: 1.
+</code></pre></div>
+
+<p>同一份记录里还有一条反向结果：<code>Shard(-1)</code> <strong>被接受</strong>。负维不是非法的，预测里把它当作「应该报错」是错的——这条留在工件里，用来提醒「预测表本身也需要被验证」。</p>
+<p><strong>Partial 的逐元素求和</strong>（<code>results/local/6.0b/20260914-layout/A2/mini_placements.json</code>）</p>
+<div class="highlight"><pre><span></span><code>rank 0 局部和 276    rank 1 局部和 852
+276 + 852 = 1128 = G.sum()
+逐元素求和等于全局 = True
+与 DTensor 局部一致 = True   （torch 2.14.0）
+worldvln torch 2.13.0：RuntimeError: Can not redistribute from S(0) to P(sum),
+                       redistributing to Partial is for internal use only!
+</code></pre></div>
+
+<p><strong>梯度对拍的原始字段</strong>（<code>results/local/6.0b/20260914-layout/C/partial_grads.json</code>）</p>
+<div class="highlight"><pre><span></span><code>row_parallel:
+  y_placements            ["S(0)"]
+  loss_placements         ["P(sum)"]
+  grad_x_placements       ["S(0)"]     grad_W_placements  ["P(sum)"]
+  grad_W_full_matches_ref True         grad_x_max_abs_diff 0.0
+  collective_bytes        {"loss_materialize": 8, "grad_W_materialize": 96}
+col_parallel:
+  y_placements            ["P(sum)"]
+  loss_placements         ["R"]
+  collective_bytes        {"inside_sum": 192}
+</code></pre></div>
+
+<p><strong>redistribute 的显存时间线</strong>（<code>results/worldvln/6.0b/20260914-layout/C/partial_grads.json</code>）</p>
+<div class="highlight"><pre><span></span><code>local_bytes_per_rank     8388608      global_bytes  16777216
+bytes_per_redistribute   8388608      collectives   all_gather_into_tensor ×1
+before      allocated 40.26 MB   reserved 58 MB   peak 40.26 MB
+after       allocated 56.26 MB   reserved 90 MB   peak 72.26 MB
+after_free  allocated 40.26 MB   reserved 58 MB
+</code></pre></div>
+
+<p><strong>本轮工件的完整入口</strong></p>
+<ul>
+<li>本地（Gloo，CPU）：<a href="../raw/results/local/6.0b/20260914-layout/A2/mini_placements.json">A2 放置表</a>、<a href="../raw/results/local/6.0b/20260914-layout/A4/mini_placements.json">A4（2×2 mesh）</a>、<a href="../raw/results/local/6.0b/20260914-layout/B/propagation.json">B 传播表</a>、<a href="../raw/results/local/6.0b/20260914-layout/C/partial_grads.json">C 梯度对拍</a></li>
+<li>worldvln（NCCL，2×L40S）：<a href="../raw/results/worldvln/6.0b/20260914-layout/A2/mini_placements.json">A2 放置表</a>、<a href="../raw/results/worldvln/6.0b/20260914-layout/B/propagation.json">B 传播表</a>、<a href="../raw/results/worldvln/6.0b/20260914-layout/C/partial_grads.json">C 梯度与显存</a></li>
+<li>每个目录另有 <code>manifest.json</code>（环境版本、输入规格、容差、源码行号）与 <code>cases.json</code>（本轮用例清单）</li>
+</ul>
+<hr />
+<h2 id="_12">前沿</h2>
+<p><strong>编译期布局求解。</strong> 当前传播是「按算子逐条查表」。更激进的方向是把整张计算图上的布局选择当成一个带通信代价的优化问题：给定 mesh 拓扑和算子代价模型，搜索一组 placement 使总通信最小。PyTorch 的 <code>_redistribute.py</code> 里已经有按代价排序的 transform 规划（<code>_redistribute_cost_sort_key</code>，<code>:57</code>），但它仍然是对单次 redistribute 的局部选择，不是全局搜索。</p>
+<p><strong>自动并行与图重写。</strong> TensorRT-LLM、JAX 的 <code>shard_map</code>/GSPMD 与 PyTorch 的 <code>torch.compile</code> 在 DTensor 之上做图级重写。这条路线与本章的关系是：本章的传播规则是它们的输入契约，placement 不合法时它们只会报「不支持」，不会替你猜。</p>
+<p><strong>通信合并。</strong> <code>_redistribute.py:414-435</code> 描述了把多个小 collective 合并成一次的做法（<code>MERGEABLE_COMMUT_TYPES</code> 明确排除了 all-to-all）。这条对长尾小张量（比如每层都有一次小块 all-reduce）收益明显，代价是合并后必须等齐所有参与者，延迟方差变大。本章没有做合并前后的实测，保持 <code>UNVERIFIED</code>。</p>
+<p><strong>FSDP2 与 DTensor。</strong> FSDP2 用 <code>Shard(0)</code> 表示参数分片、用 <code>Partial</code> 表示未归约的梯度累积，本章的三类 placement 正是它的状态表示。6.2 与 7.2 会在这个基础上继续。</p>
+<hr />
+<h2 id="_13">陷阱</h2>
+<p><strong>1. 把局部 shape 相同当成全局语义相同。</strong> <code>S(1)</code> 下两个 rank 的局部 shape 都是 <code>(8,3)</code>，但一个从第 0 列开始、一个从第 3 列开始。跨 rank 对齐时只能比全局视图，不能比局部 shape。</p>
+<p><strong>2. 把 Partial 当完整副本。</strong> 行并行下 <code>loss</code> 的 placement 是 <code>P(sum)</code>，局部标量 16.485886，真值是 31.605360——差了整整一倍。任何在归约前读 Partial 局部值的代码都会静默拿到错值。</p>
+<p><strong>3. 只统计显式 collective 调用。</strong> 本章 10 个表达式里有 9 个在算子执行期间零通信，但每一个在 <code>full_tensor()</code> 时都产生一次通信。若仅按显式调用 <code>dist.all_reduce</code> 的次数评估通信开销，会系统性低估隐式通信代价。</p>
+<p><strong>4. 直接消费 <code>to_local()</code>。</strong> <code>S(1)</code> 的局部块 stride 是 <code>(6,1)</code>、shape 是 <code>(8,3)</code>，不是连续内存。需要连续输入时必须显式 <code>.contiguous()</code>，那是一次复制。</p>
+<p><strong>5. 假定 <code>reshape</code> 不通信。</strong> 只有当分片维的块边界在 reshape 后对齐才能保持布局不变。边界打散时会触发 redistribute，代价是一次 all-gather 级别的通信。</p>
+<p><strong>6. 忽略 CPU 与 GPU 的路径差异。</strong> 同一句 <code>redistribute(S0→S1)</code>，Gloo 走 all-gather + chunk，NCCL 走 all-to-all。数值一样，通信量与显存峰值不同。</p>
+<p><strong>7. 把「转换到 Partial」当成稳定 API。</strong> torch 2.13 直接拒绝，2.14 允许。依赖这条路径的代码要先核对版本。</p>
+<hr />
+<h2 id="_14">自测题</h2>
+<details class="fold">
+<summary>1. 全局张量形状 `(10, 6)`，mesh 大小 4，`Shard(0)` 下各 rank 的局部 shape 是什么？</summary>
+<p><code>[3, 3, 2, 2]</code>。切分规则是「前 <code>n % k</code> 段各多 1」，10 = 3+3+2+2。前两个 rank 拿 3 行，后两个拿 2 行。</p>
+</details>
+<details class="fold">
+<summary>2. `Shard(1)` 的局部块 shape 是 `(128, 32)`，全局 shape 是 `(128, 128)`，mesh 大小 4。这个局部块的 stride 是多少？</summary>
+<p><code>(128, 1)</code>。它仍然是全局张量的视图，第 1 维的步长等于全局的行宽，不是局部的 32。</p>
+</details>
+<details class="fold">
+<summary>3. 两个 rank 上的张量局部 shape 都是 `(4, 6)`，能断定它们在全局视图里占同一段吗？</summary>
+<p>不能。<code>S(0)</code> 下 rank 0 的 offset 是 <code>[0,0]</code>、rank 1 是 <code>[4,0]</code>，形状相同、位置不同。要判断必须看 placement 和 offset。</p>
+</details>
+<details class="fold">
+<summary>4. `loss = (y ** 2).sum()`，`y` 的 placement 是 `P(sum)`。局部 loss 是 16.49，全局是多少？</summary>
+<p>至少是 16.49 加上其他 rank 的局部和。实测两 rank 下全局是 31.61，与单机参照一致。局部值在归约前只是「本 rank 的加数」。</p>
+</details>
+<details class="fold">
+<summary>5. 为什么 `x` 行分片、`W` 复制时，`W.grad` 是 `Partial`？</summary>
+<p>每个 rank 只用自己的那部分激活算权重梯度，算出来的是完整权重梯度的一部分。反向传播不会自动把它们加起来，所以 <code>W.grad</code> 带着 <code>Partial(sum)</code> 布局，直到有代码把它归约成完整梯度。实测 <code>full_tensor()</code> 触发一次 96 字节的 <code>all_reduce</code>，结果与单机逐元素一致。</p>
+</details>
+<details class="fold">
+<summary>6. 把 `to_local()` 交给一个要求连续输入的 kernel，会发生什么？</summary>
+<p>如果 placement 是 <code>S(1)</code>，局部块是全局张量的非连续视图（stride 里带着全局行宽），kernel 会按错误的步长读数据。需要先 <code>.contiguous()</code>，那会复制一份。</p>
+</details>
+<details class="fold">
+<summary>7. 同一段 DTensor 代码在 CPU 和 GPU 上跑，`redistribute(S0→S1)` 的通信量一样吗？</summary>
+<p>不一样。Gloo 没有 all-to-all，退化成 all-gather + chunk，每个 rank 都要收下完整的全局张量；NCCL 走 <code>all_to_all</code>，每个 rank 只收发自己那一份。数值相同，通信量和显存峰值不同。</p>
+</details></article><nav class="pagenav"><a class="nav-prev" href="../L6/6.0-concurrency-semantics.html">&#8592; 6.0 并发与通信语义：rank、进程组、张量归属与次序</a><a class="nav-next" href="../L6/6.1-collective-comm.html">6.1 集合通信与成本模型 &#8594;</a></nav>
+</main>
+</body>
+</html>

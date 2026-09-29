@@ -1,0 +1,52 @@
+autograd 模式与保存值生命周期（torch 2.14.0 FP64 CPU）
+
+========================================================================
+[A] retain_graph：同一张图能否第二次 backward
+========================================================================
+第一次 backward 后 x.grad = [4.0]
+第二次 backward 失败（反向阶段）：Trying to backward through the graph a second time (or directly access saved tensors after they have already been freed). Saved intermediate values of the graph are freed when you call .backward() or autograd.grad(). Specify retain_graph=True if you need to backward through the graph a second time or if you need to access saved tensors after calling backward.
+retain_graph=True 第一次后 x2.grad = [4.0]
+retain_graph=True 第二次后 x2.grad = [8.0]（叶子累积）
+
+========================================================================
+[B] create_graph：高阶梯度
+========================================================================
+y=x^3 在 x=2：一阶 create_graph=True 得 12.0（解析 3x^2=12）
+二阶得 12.0（解析 6x=12）
+一阶 create_graph=False 得 12.0，其 requires_grad=False
+对未建图的一阶梯度再求导失败：element 0 of tensors does not require grad and does not have a grad_fn
+
+========================================================================
+[C] no_grad / inference_mode / detach
+========================================================================
+no_grad 内 y.requires_grad=False，y.grad_fn=None
+inference_mode 内 y2.requires_grad=False，is_inference=True
+inference tensor 被需要梯度的算子保存时失败（前向阶段）：Inference tensors cannot be saved for backward. Please do not use Tensors created in inference mode in computation tracked by autograd. To work around this, you can make a clone to get a normal tensor and use it in autograd, or use `torch.no_grad()` instead of `torch.inference_mode()`.
+detach 后 requires_grad=False，与 y3 共享存储=True
+改写 detached 张量会改到原张量：y3=[7.0]
+detach 处截断后 x3.grad=[6.0]（上游仍可求导）
+
+========================================================================
+[E] 保存值释放：释放后哪些反向仍可执行
+========================================================================
+前向刚结束可读取 saved_tensors=[(1,)]
+backward 后读取失败（反向阶段）：Trying to backward through the graph a second time (or directly access saved tensors after they have already been freed). Saved intermediate values of the graph are freed when you call .backward() or autograd.grad(). Specify retain_graph=True if you need to backward through the graph a second time or if you need to access saved tensors after calling backward.
+retain_graph=True 时 backward 后仍可读取 1 个保存值
+释放一条分支后，另一条独立图的 backward 仍可执行：grad=[8.0]（解析 2x=8）
+
+========================================================================
+[F/G] 原地修改的三个阶段
+========================================================================
+叶子原地写在调用处报错（前向阶段）：a leaf Variable that requires grad is being used in an in-place operation.
+反向需要 y：y._version=0，z.grad_fn=MulBackward0，y.grad_fn=MulBackward0
+原地写后 y._version=1，y.grad_fn 被改挂到原地算子：AddBackward0
+保存值版本不匹配在反向阶段报错：one of the variables needed for gradient computation has been modified by an inplace operation: [torch.DoubleTensor [2]], which is output 0 of Add, is at version 1; expected version 0 instead. Hint: enable anomaly detection to find the operation that failed to compute its gradient, with torch.autograd.set_detect_anomaly(True, check_nan=False).
+AddBackward 保存值字段=[]
+原地写不破坏不需要保存值的算子：x3.grad=[3.0, 3.0]（解析 3）
+
+========================================================================
+[H] 版本计数与保存值
+========================================================================
+叶子 x._version=0
+no_grad 内原地写后 x._version=1（叶子自身不保存值，允许）
+y._version=0，grad_fn=MulBackward0

@@ -202,11 +202,11 @@ __global__ void gemm_v5(const __nv_bfloat16* __restrict__ A,
     const int cRow = blockIdx.y * BM, cCol = blockIdx.x * BN;
     const int threads = blockDim.x;
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[WM / 16][WN / 16];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[WM / 16][WN / 16];
     #pragma unroll
     for (int i = 0; i < WM / 16; ++i)
         #pragma unroll
-        for (int j = 0; j < WN / 16; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+        for (int j = 0; j < WN / 16; ++j) nvcuda::wmma::fill_fragment(acc[i][j], 0.0f);
 
     for (int t = 0; t < K; t += BK) {
         for (int idx = threadIdx.x; idx < BM * BK; idx += threads) {
@@ -221,15 +221,15 @@ __global__ void gemm_v5(const __nv_bfloat16* __restrict__ A,
 
         #pragma unroll
         for (int k = 0; k < BK; k += 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> fb;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __nv_bfloat16, nvcuda::wmma::row_major> fa;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __nv_bfloat16, nvcuda::wmma::row_major> fb;
             #pragma unroll
             for (int i = 0; i < WM / 16; ++i) {
-                wmma::load_matrix_sync(fa, &sA[(wRow * WM + i * 16) * BK + k], BK);
+                nvcuda::wmma::load_matrix_sync(fa, &sA[(wRow * WM + i * 16) * BK + k], BK);
                 #pragma unroll
                 for (int j = 0; j < WN / 16; ++j) {
-                    wmma::load_matrix_sync(fb, &sB[k * BN + wCol * WN + j * 16], BN);
-                    wmma::mma_sync(acc[i][j], fa, fb, acc[i][j]);
+                    nvcuda::wmma::load_matrix_sync(fb, &sB[k * BN + wCol * WN + j * 16], BN);
+                    nvcuda::wmma::mma_sync(acc[i][j], fa, fb, acc[i][j]);
                 }
             }
         }
@@ -239,9 +239,9 @@ __global__ void gemm_v5(const __nv_bfloat16* __restrict__ A,
     for (int i = 0; i < WM / 16; ++i)
         #pragma unroll
         for (int j = 0; j < WN / 16; ++j)
-            wmma::store_matrix_sync(
+            nvcuda::wmma::store_matrix_sync(
                 &C[(cRow + wRow * WM + i * 16) * N + cCol + wCol * WN + j * 16],
-                acc[i][j], N, wmma::mem_row_major);
+                acc[i][j], N, nvcuda::wmma::mem_row_major);
 }
 
 // ---------------------------------------------------------------------------
@@ -263,11 +263,11 @@ __global__ void gemm_v6(const __nv_bfloat16* __restrict__ A,
     const int cRow = blockIdx.y * BM, cCol = blockIdx.x * BN;
     const int threads = blockDim.x;
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[WM / 16][WN / 16];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[WM / 16][WN / 16];
     #pragma unroll
     for (int i = 0; i < WM / 16; ++i)
         #pragma unroll
-        for (int j = 0; j < WN / 16; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+        for (int j = 0; j < WN / 16; ++j) nvcuda::wmma::fill_fragment(acc[i][j], 0.0f);
 
     for (int t = 0; t < K; t += BK) {
         // 用 float4（=8 个 bf16）向量化全局读
@@ -283,15 +283,15 @@ __global__ void gemm_v6(const __nv_bfloat16* __restrict__ A,
 
         #pragma unroll
         for (int k = 0; k < BK; k += 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> fb;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __nv_bfloat16, nvcuda::wmma::row_major> fa;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __nv_bfloat16, nvcuda::wmma::row_major> fb;
             #pragma unroll
             for (int i = 0; i < WM / 16; ++i) {
-                wmma::load_matrix_sync(fa, &sA[(wRow * WM + i * 16) * LDA + k], LDA);
+                nvcuda::wmma::load_matrix_sync(fa, &sA[(wRow * WM + i * 16) * LDA + k], LDA);
                 #pragma unroll
                 for (int j = 0; j < WN / 16; ++j) {
-                    wmma::load_matrix_sync(fb, &sB[k * LDB + wCol * WN + j * 16], LDB);
-                    wmma::mma_sync(acc[i][j], fa, fb, acc[i][j]);
+                    nvcuda::wmma::load_matrix_sync(fb, &sB[k * LDB + wCol * WN + j * 16], LDB);
+                    nvcuda::wmma::mma_sync(acc[i][j], fa, fb, acc[i][j]);
                 }
             }
         }
@@ -301,9 +301,9 @@ __global__ void gemm_v6(const __nv_bfloat16* __restrict__ A,
     for (int i = 0; i < WM / 16; ++i)
         #pragma unroll
         for (int j = 0; j < WN / 16; ++j)
-            wmma::store_matrix_sync(
+            nvcuda::wmma::store_matrix_sync(
                 &C[(cRow + wRow * WM + i * 16) * N + cCol + wCol * WN + j * 16],
-                acc[i][j], N, wmma::mem_row_major);
+                acc[i][j], N, nvcuda::wmma::mem_row_major);
 }
 
 // ---------------------------------------------------------------------------

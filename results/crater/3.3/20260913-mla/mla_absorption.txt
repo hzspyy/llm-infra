@@ -1,0 +1,55 @@
+/scratch/learn/work/labs/L3/mla_absorption.py:259: UserWarning: BatchMLAPagedAttentionWrapper: backend='auto' selected 'fa2' on SM120, which is not Blackwell-native and gives poor MLA decode performance. For decode, use flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla (Blackwell-native trtllm-gen); backend='cutlass' is the closest in-wrapper alternative but may be slower than this fallback for decode shapes.
+  w_mla = BatchMLAPagedAttentionWrapper(ws)
+torch 2.13.0+cu130
+
+==============================================================================
+[A] 从 safetensors 头按字节范围抽取第 0 层 attention 权重
+==============================================================================
+  deepseek-ai/DeepSeek-V2-Lite @ main / model-00001-of-000004.safetensors
+  safetensors 头 164584 字节，数据从文件偏移 164592 开始
+                            张量  dtype              shape           字节         文件偏移
+                 q_proj.weight   BF16       [3072, 2048]     12582912    988456688
+     kv_a_proj_with_mqa.weight   BF16        [576, 2048]      2359296    973514480
+         kv_a_layernorm.weight   BF16              [512]         1024    973513456
+              kv_b_proj.weight   BF16        [4096, 512]      4194304    975873776
+                 o_proj.weight   BF16       [2048, 2048]      8388608    980068080
+  合计 26.25 MB（整个分片 8.59 GB）
+
+==============================================================================
+[B] 重建 vs 吸收：两条路径的对拍
+==============================================================================
+  推导：score = q_nope·k_nope + q_pe·k_pe，其中 k_nope = W_kb_nope · c
+        => score = (q_nope W_kb_nopeᵀ)·c + q_pe·k_pe
+  输出：o = Σ p_j v_j = (Σ p_j c_j) · W_kb_vᵀ，可再吸收进 o_proj
+   float32: 吸收 vs 重建 max|err| = 1.080e-07（相对 1.08e-07）；再吸收 o_proj = 4.917e-07（相对 4.92e-07）
+   float64: 吸收 vs 重建 max|err| = 2.498e-16（相对 2.50e-16）；再吸收 o_proj = 1.055e-15（相对 1.05e-15）
+
+  两条路径在实数算术下等价；差别在**什么时候做哪个矩阵乘**：
+  重建要为每个 KV 头物化 k_nope/v（[H, nope+v] 维），
+  吸收则把 W_kb 的 K 部分挪到 Q 侧、V 部分挪到输出侧，缓存里只留 c。
+  c 的维度 rank = 512，每 token 每层缓存 (rank+rope) 个元素。
+
+==============================================================================
+[C] 与 FlashInfer 的 MLA paged kernel 对拍
+==============================================================================
+  FlashInfer MLA paged kernel vs 本题吸收路径的隐空间输出：max|err| = 1.933e-03（bf16 输入，fp32 参照）
+  返回的维度是 [T,H,rank] = (64, 16, 512)，不是 [T,H,v]；V 侧吸收在 kernel 外完成。
+
+==============================================================================
+[D] 字节账：MLA 每 token 存多少
+==============================================================================
+  DeepSeek-V2-Lite：27 层，H=16，qk_nope=128，qk_rope=64，rank=512，v=128
+  MHA（同头数）每 token 每层 = 2·H·nope·2 = 8192 B
+  MLA 每 token 每层 = (rank+rope)·2 = 1152 B   → 比值 7.11×
+
+  参照 worldvln 单卡 48 GB：权重 bf16 ≈ 29.2 GB，留给 KV 的余量约 16.8 GB
+        上下文        MHA 全模型        MLA 全模型      MHA 可并发      MLA 可并发
+       4096        864.0MB        121.5MB           19          141
+      32768       6912.0MB        972.0MB            2           17
+     131072      27648.0MB       3888.0MB            0            4
+    1048576     221184.0MB      31104.0MB            0            0
+
+  注意：这是**按配置算的字节账**。吸收路径把投影挪到 Q 与输出侧，
+  省下的是缓存读取；多出来的算力开销要单独核算，不能由 dtype/维度比直接推出端到端时间比。
+
+[harness] 工件写入 /scratch/learn/work/out/3.3/20260913-mla  (13 个 case)

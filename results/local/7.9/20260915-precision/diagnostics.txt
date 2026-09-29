@@ -1,0 +1,65 @@
+torch 2.14.0 | CPU | 12 层线性栈，固定 batch (2, 8)
+
+尝试                              loss   有效target    梯度全finite      是否更新                     首个坏张量
+正常 FP32                       3.4681         14         True      True                         -
+FP16 前向溢出                    NaN/Inf         14        False     False  layers.9（116/[2, 8, 64]）
+梯度整体下溢（FP16）                  3.4681         14         True      True                         -
+坏样本：输入含 NaN                  NaN/Inf         14        False     False   layers.0（64/[2, 8, 64]）
+空分母：无有效 target               NaN/Inf          0         True      True                         -
+
+逐层激活的最大绝对值（FP16 前向溢出这次尝试）
+  layers.0            81.5  非有限    0
+  layers.1             198  非有限    0
+  layers.2             462  非有限    0
+  layers.3           893.5  非有限    0
+  layers.4            2050  非有限    0
+  layers.5            4476  非有限    0
+  layers.6       1.004e+04  非有限    0
+  layers.7       3.366e+04  非有限    0
+  layers.8       5.904e+04  非有限    0
+  layers.9       6.493e+04  非有限  116  ← 第一个非有限
+  layers.10      6.538e+04  非有限  755
+  layers.11              -  非有限 1024
+  head                   -  非有限  512
+  FP16 上限 65504.0；量级沿深度按每层增益累乘，
+  溢出点由层号决定，不是 loss 的性质。只看最终 loss 无法区分这一层与上一层。
+
+梯度下溢：所有检查都通过，更新却是空的
+  loss=3.468091（与正常尝试相同） 梯度全 finite=True 全局梯度范数=0.000e+00 是否更新=True
+  embed.weight       零元素比例=1.000 范数=0.000e+00
+  layers.0.weight    零元素比例=1.000 范数=0.000e+00
+  layers.1.weight    零元素比例=1.000 范数=0.000e+00
+  layers.2.weight    零元素比例=1.000 范数=0.000e+00
+  loss 正常、finite 通过、optimizer 也执行了 step，唯一的信号是梯度范数为 0。
+  监控里必须有梯度范数与零元素比例这一项，只看 loss 曲线看不出这种停摆。
+
+坏样本与空分母：现象相同，原因不同
+  坏样本：loss 非有限，第一个非有限张量是 layers.0（64/[2, 8, 64]）；沿输入回溯定位到 batch 内第 2 条样本
+  空分母：有效 target=0，loss=0/0 为 NaN，但梯度全为 0（范数=0.0），finite 检查通过，optimizer 照常执行
+  这一步参数仍然变了：update/weight=1.000e-04，正好是 lr×weight_decay=1e-4 的 decoupled 衰减。
+  先查有效 target 计数，再查输入，最后才查前向和反向——顺序反了会在模型里白找一圈。
+
+更新量与参数的比值
+  参数                          正常        梯度下溢         空分母
+  embed.weight          6.15e-03    0.00e+00    1.00e-04
+  layers.0.weight       8.01e-02    0.00e+00    1.00e-04
+  layers.1.weight       7.28e-02    0.00e+00    1.00e-04
+  layers.2.weight       6.78e-02    0.00e+00    1.00e-04
+  layers.3.weight       6.68e-02    0.00e+00    1.00e-04
+  三列的量级本身就是判据：正常尝试是 AdamW 首步的 ~lr 级更新，
+  下溢与空分母两列只剩 weight decay。绝对数值依赖 lr 与参数范数，
+  有意义的是同一次训练里这条比值随步数的走向。
+
+最后一段：optimizer 自己的常数也会被参数 dtype 吃掉
+  参数 dtype        eps 设定      eps 在该 dtype 中          一步后非有限参数
+  float16          1e-08           0.000e+00           14 / 14
+  float16          1e-04           1.000e-04            0 / 14
+  bfloat16         1e-08           1.001e-08            0 / 14
+  float32          1e-08           1.000e-08            0 / 14
+  这一批只用到 12 个 token，embed 有 20 行梯度恒为 0。
+  FP16 里 1e-8 低于最小次正规数 5.96e-8，直接变成 0；这些零梯度行的
+  denom = sqrt(v)/bc2 + eps 于是也是 0，addcdiv 得到 0/0，整张参数变 NaN。
+  BF16 的指数范围与 FP32 相同，同一个 eps 仍然可表示，不触发这个问题。
+  低精度参数影响的不只是舍入，还包括 optimizer 公式里所有的常数。
+
+逐次尝试的完整记录已写入 ../../results/local/7.9/20260915-precision/diagnostics

@@ -4,23 +4,23 @@
 
 实验：
 1. all-reduce/all-gather/reduce-scatter 通信量与延迟
-2. ring/tree 算法通信模式
-3. NCCL 拓扑检测与算法选择
+2. 按 ring traffic 模型换算 bus bandwidth（不观测算法选择）
+3. CUDA P2P 可访问性检测
 4. 单机多卡与跨机通信对比
 
 运行：
   # 单机 4 卡
-  torchrun --nproc_per_node=4 distributed_collectives.py --exp=collectives
+  torchrun --nproc_per_node=4 distributed_collectives.py --exp=collectives --out-dir "$RUN_DIR/collectives"
 
   # 跨机（两台机器）
   # 机器 0:
   torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 \
     --master_addr=<master_ip> --master_port=29500 \
-    distributed_collectives.py --exp=cross_node
+    distributed_collectives.py --exp=cross_node --out-dir "$RUN_DIR/node0"
   # 机器 1:
   torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 \
     --master_addr=<master_ip> --master_port=29500 \
-    distributed_collectives.py --exp=cross_node
+    distributed_collectives.py --exp=cross_node --out-dir "$RUN_DIR/node0"
 """
 
 import os
@@ -29,6 +29,18 @@ import time
 import argparse
 import torch
 import torch.distributed as dist
+
+OUTPUT_ROOT = None
+
+
+def collective_bus_bytes(op_name, local_mib, world_size):
+    """NCCL-tests traffic convention; all-gather input / reduce-scatter output is local."""
+    local_bytes = local_mib * 2**20
+    if op_name == 'all_reduce':
+        return 2 * (world_size - 1) / world_size * local_bytes
+    if op_name in ('all_gather', 'reduce_scatter'):
+        return (world_size - 1) * local_bytes
+    raise ValueError(op_name)
 
 
 def init_process_group():
@@ -47,7 +59,7 @@ def benchmark_collective(op_name, tensor_mb, warmup=10, repeat=100):
 
     Args:
         op_name: "all_reduce", "all_gather", "reduce_scatter"
-        tensor_mb: 张量大小（MB）
+        tensor_mb: MiB；AR 为完整张量，AG/RS 为单 rank shard
         warmup: 预热次数
         repeat: 测量次数
 
@@ -65,7 +77,7 @@ def benchmark_collective(op_name, tensor_mb, warmup=10, repeat=100):
 
     if op_name == "all_reduce":
         # all-reduce: 每个进程一个张量
-        tensor = torch.randn(numel, device=f"cuda:{local_rank}")
+        tensor = torch.zeros(numel, device=f"cuda:{local_rank}")
     elif op_name == "all_gather":
         # all-gather: 输入张量 + 输出列表
         tensor = torch.randn(numel, device=f"cuda:{local_rank}")
@@ -110,23 +122,17 @@ def benchmark_collective(op_name, tensor_mb, warmup=10, repeat=100):
 
     latency_ms = (end - start) / repeat * 1000
 
-    # 计算带宽
-    if op_name == "all_reduce":
-        # all-reduce 理论通信量：2 * (N-1)/N * S
-        # 实际 ring 算法：2 * (N-1)/N * S
-        bytes_transferred = 2 * (world_size - 1) / world_size * tensor_mb * 1024 * 1024
-    elif op_name == "all_gather":
-        # all-gather: (N-1)/N * S
-        bytes_transferred = (world_size - 1) / world_size * tensor_mb * 1024 * 1024
-    elif op_name == "reduce_scatter":
-        # reduce-scatter: (N-1)/N * S
-        bytes_transferred = (world_size - 1) / world_size * tensor_mb * 1024 * 1024
+    # 该换算是统计约定，不作为实际 ring 算法的观测证据。
+    bytes_transferred = collective_bus_bytes(op_name, tensor_mb, world_size)
 
     bandwidth_gbps = bytes_transferred / (latency_ms / 1000) / 1e9
 
     return {
         "op": op_name,
         "tensor_mb": tensor_mb,
+        "size_unit": "MiB",
+        "tensor_bytes_role": "full tensor" if op_name == "all_reduce" else "single-rank shard",
+        "global_tensor_bytes": int(tensor_mb * 2**20 * (1 if op_name == "all_reduce" else world_size)),
         "world_size": world_size,
         "latency_ms": round(latency_ms, 3),
         "bandwidth_gbps": round(bandwidth_gbps, 2),
@@ -146,14 +152,14 @@ def exp1_collectives():
     for tensor_mb in tensor_sizes:
         for op_name in ops:
             if rank == 0:
-                print(f"Testing {op_name} with {tensor_mb} MB...")
+                print(f"Testing {op_name} with {tensor_mb} MiB local-size convention...")
 
             result = benchmark_collective(op_name, tensor_mb)
             results.append(result)
 
     # Rank 0 保存结果
     if rank == 0:
-        output_dir = "results/worldvln/7.2"
+        output_dir = OUTPUT_ROOT
         os.makedirs(output_dir, exist_ok=True)
 
         with open(f"{output_dir}/collectives.json", "w") as f:
@@ -166,12 +172,12 @@ def exp1_collectives():
 
 
 def exp2_ring_algorithm():
-    """实验 2：ring all-reduce 通信模式"""
+    """实验 2：all-reduce 计时与 traffic 公式；未选择或观测具体算法。"""
     rank, world_size, local_rank = init_process_group()
 
     # 256 MB 张量
     numel = int(256 * 1024 * 1024 / 4)
-    tensor = torch.randn(numel, device=f"cuda:{local_rank}")
+    tensor = torch.zeros(numel, device=f"cuda:{local_rank}")
 
     # 预热
     for _ in range(10):
@@ -197,24 +203,25 @@ def exp2_ring_algorithm():
     bandwidth_gbps = theoretical_bytes / (latency_ms / 1000) / 1e9
 
     result = {
-        "algorithm": "ring_all_reduce",
+        "algorithm": "not observed",
+        "traffic_model": "2*(N-1)/N times full all-reduce tensor bytes",
         "world_size": world_size,
         "tensor_mb": 256,
         "latency_ms": round(latency_ms, 3),
         "theoretical_bytes_mb": round(theoretical_bytes / 1024 / 1024, 2),
         "bandwidth_gbps": round(bandwidth_gbps, 2),
-        "note": "2 phases: reduce-scatter + all-gather"
+        "note": "Derived bus bandwidth does not establish which NCCL algorithm ran"
     }
 
     if rank == 0:
-        output_dir = "results/worldvln/7.2"
+        output_dir = OUTPUT_ROOT
         os.makedirs(output_dir, exist_ok=True)
 
         with open(f"{output_dir}/ring_algorithm.json", "w") as f:
             json.dump(result, f, indent=2)
 
         print(f"\n实验 2 完成，结果保存至 {output_dir}/ring_algorithm.json")
-        print(f"Ring all-reduce: {latency_ms:.3f} ms, {bandwidth_gbps:.2f} GB/s")
+        print(f"All-reduce (algorithm unobserved): {latency_ms:.3f} ms, busbw={bandwidth_gbps:.2f} GB/s")
 
     dist.destroy_process_group()
 
@@ -253,7 +260,7 @@ def exp3_topology_detection():
     dist.all_gather_object(all_info, info)
 
     if rank == 0:
-        output_dir = "results/worldvln/7.2"
+        output_dir = OUTPUT_ROOT
         os.makedirs(output_dir, exist_ok=True)
 
         # 构建 P2P 连接矩阵
@@ -311,7 +318,7 @@ def exp4_cross_node():
         results.append(result)
 
     if rank == 0:
-        output_dir = "results/worldvln/7.2"
+        output_dir = OUTPUT_ROOT
         os.makedirs(output_dir, exist_ok=True)
 
         with open(f"{output_dir}/cross_node.json", "w") as f:
@@ -324,9 +331,14 @@ def exp4_cross_node():
 
 
 def main():
+    global OUTPUT_ROOT
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp", choices=["collectives", "ring", "topology", "cross_node"], required=True)
+    parser.add_argument("--out-dir", required=True, help="new evidence directory")
     args = parser.parse_args()
+    OUTPUT_ROOT = args.out_dir
+    if int(os.environ.get("RANK", 0)) == 0:
+        os.makedirs(OUTPUT_ROOT, exist_ok=False)
 
     if args.exp == "collectives":
         exp1_collectives()

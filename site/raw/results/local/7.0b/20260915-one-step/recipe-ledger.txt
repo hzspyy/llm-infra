@@ -1,0 +1,124 @@
+
+==========================================================================
+1. 参数量、GQA 与 NoPE
+==========================================================================
+
+[SmolLM3-3B-Base（发布 config）] hidden=2048 inter=11008 layers=36 heads=16 kv_heads=4 vocab=128256 tie=True
+  head_dim=128，KV 投影输出维 512，GQA 每 4 个 q head 共用一组 KV
+  模块                        参数量        占比
+    embed_tokens              262,668,288    8.54%
+    q_proj                    150,994,944    4.91%
+    k_proj                     37,748,736    1.23%
+    v_proj                     37,748,736    1.23%
+    o_proj                    150,994,944    4.91%
+    gate_proj                 811,597,824   26.39%
+    up_proj                   811,597,824   26.39%
+    down_proj                 811,597,824   26.39%
+    input_layernorm                73,728    0.00%
+    post_attention_layernorm       73,728    0.00%
+    norm                            2,048    0.00%
+    合计                       3,075,098,624
+    lm_head 与 embed_tokens 绑定：只存一份权重，梯度来自两处使用
+  NoPE：interval=4，跳过 RoPE 的层（1 起数）[4, 8, 12, 16, 20, 24, 28, 32, 36]，共 9/36 层
+
+[SmolLM2-360M（crater 上实测一次更新的模型）] hidden=960 inter=2560 layers=32 heads=15 kv_heads=5 vocab=49152 tie=True
+  head_dim=64，KV 投影输出维 320，GQA 每 3 个 q head 共用一组 KV
+  模块                        参数量        占比
+    embed_tokens               47,185,920   13.04%
+    q_proj                     29,491,200    8.15%
+    k_proj                      9,830,400    2.72%
+    v_proj                      9,830,400    2.72%
+    o_proj                     29,491,200    8.15%
+    gate_proj                  78,643,200   21.74%
+    up_proj                    78,643,200   21.74%
+    down_proj                  78,643,200   21.74%
+    input_layernorm                30,720    0.01%
+    post_attention_layernorm       30,720    0.01%
+    norm                              960    0.00%
+    合计                        361,821,120
+    lm_head 与 embed_tokens 绑定：只存一份权重，梯度来自两处使用
+
+两者结构不同：层数 32→36、词表 49152→128256、SmolLM3 有 NoPE 层而 SmolLM2 没有；参数量相差 8.5 倍。
+本章的实测读数只属于 SmolLM2-360M，SmolLM3 的部分全部来自公开配方。
+
+==========================================================================
+2. 全局 batch 与 token 预算
+==========================================================================
+阶段                       | mbs | accum |  dp | tp | cp |  seq  | 序列/步 | token/步   | train_steps
+stage1_8T.yaml             |   3 |     1 | 192 |  2 |  1 |  4096 |     576 | 2,359,296 | 4,720,000
+stage2_8T_9T.yaml          |   3 |     1 | 192 |  2 |  1 |  4096 |     576 | 2,359,296 | 4,720,000
+stage3_9T_11T.yaml         |   3 |     1 | 192 |  2 |  1 |  4096 |     576 | 2,359,296 | 4,720,000
+long_context_4k_to_32k.yaml |   1 |     6 |  12 |  2 |  4 | 32768 |      72 | 2,359,296 | 20,000
+long_context_32k_to_64.yaml |   1 |     3 |  12 |  2 |  4 | 65536 |      36 | 2,359,296 | 22,000
+
+五份配方的 token/步全部等于 2,359,296：序列长度从 4096 涨到 65536 的同时，mbs×accum×dp 同比例减小。
+全局 batch 的不变量是 token 数而不是序列条数——分母按 token 计时这一点才成立。
+预训练三阶段共享同一条时间轴：train_steps=4,720,000 × 2,359,296 token/步 = 11.1T token。
+  stage1_8T.yaml             最后一个 data_stage 起点 step 1 ≈ 0.0T token；resume 自 1704-48n-part1
+  stage2_8T_9T.yaml          最后一个 data_stage 起点 step 3,450,001 ≈ 8.1T token；resume 自 3450000
+  stage3_9T_11T.yaml         最后一个 data_stage 起点 step 4,198,001 ≈ 9.9T token；resume 自 loubna-2105-decay
+阶段切换的是数据混合与续接的 checkpoint，不是重新计数的新一轮训练。
+
+==========================================================================
+3. 学习率分段
+==========================================================================
+
+stage1_8T.yaml: peak=0.0002 warmup=2000(linear) decay=linear 自 step 4,198,001 起 522,000 步到 0
+  step:              1      2,000  4,198,001  4,459,001  4,720,001
+  lr:        1.000e-07  2.000e-04  2.000e-04  1.000e-04  0.000e+00
+
+long_context_4k_to_32k.yaml: peak=2e-05 warmup=1000(linear) decay=cosine 自 step 1,000 起 19,000 步到 0
+  step:              1      1,000      1,000     10,500     20,000
+  lr:        2.000e-08  2.000e-05  2.000e-05  1.000e-05  0.000e+00
+
+long_context_32k_to_64.yaml: peak=2e-05 warmup=1000(linear) decay=cosine 自 step 1,000 起 21,000 步到 0
+  step:              1      1,000      1,000     11,500     22,000
+  lr:        2.000e-08  2.000e-05  2.000e-05  1.000e-05  0.000e+00
+
+LR 的自变量是 optimizer step，不是消耗的 token 数；改 mbs×accum×dp 会同时移动「每步多少 token」和「同一 step 的 LR」两件事。
+
+==========================================================================
+4. 参数组：weight_decay 的排除规则
+==========================================================================
+  weight_decay=0.1，排除规则 ['.*token_embedding.*']
+  规则按 Nanotron 的参数名书写；用它匹配发布 config 的模块名 ['embed_tokens', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj', 'input_layernorm', 'post_attention_layernorm', 'norm'] 命中 0 个。
+  helpers.py:208-230 逐个参数建组，:210-219 对绑定参数额外用 tied name 再匹配一次，所以 tie_word_embeddings=true 时被排除的是同一块权重的两个名字。
+  norm 与 bias 是否衰减由这份规则决定，本配方只排除了 token embedding。
+
+==========================================================================
+5. 训练状态字节（按 stage1 的实际开关）
+==========================================================================
+  zero_stage=0（optimizer 状态在 192 个 DP rank 上完整复制），tp=2
+  项目                    字节/参数   说明
+    模型参数（bfloat16）            2     前向/反向的计算权重
+    FP32 master 参数            4     gradient_accumulator.py:113 从半精度拷贝而来
+    FP32 梯度缓冲                 4     gradient_accumulator.py:222 累加，:226 随即释放半精度 .grad
+    AdamW exp_avg             4     建立在 FP32 参数上
+    AdamW exp_avg_sq          4     同上
+    合计                       18
+  全模型常驻训练状态 3,075,098,624 × 18 B = 51.55 GiB，按 tp=2 平分后每 rank 25.78 GiB
+  这份账不含激活、通信缓冲与 workspace；完整预算见 7.2/7.9/7.11。
+
+==========================================================================
+6. 训练期配置与发布 config 的差异
+==========================================================================
+字段                     | stage1 训练期 | 最后一个长上下文阶段 | 发布 config
+rope_theta               | 50000.0       | 5000000.0            | 5000000.0
+max_position_embeddings  | 4096          | 65536                | 65536
+no_rope_layer(_interval) | 4             | 4                    | 4
+vocab_size               | 128256        | 128256               | 128256
+tie_word_embeddings      | True          | True                 | True
+
+rope_theta 与 max_position_embeddings 由最后一个训练阶段决定，发布 config 记录的是该阶段的值；
+用发布 config 反推训练全过程会把 50000 这一段完全丢掉。
+
+32k→64k 阶段的 load_optimizer=False、load_lr_scheduler=False：它从上一阶段的权重出发，但新建 optimizer 与调度器。
+这是 warm start 而不是严格 resume，对应 start_modes_and_resume.py 的 D 段。
+训练期还声明了 _use_doc_masking、_use_qkv_packed、z_loss_enabled 等只在训练存在的开关，发布 config 里没有对应字段。
+
+==========================================================================
+7. 只有静态检查能回答的与不能回答的
+==========================================================================
+  可以：结构与参数量、分母与 batch 的数量关系、LR 曲线、状态字节、阶段续接关系。
+  不能：真实吞吐、收敛质量、数据实际混合比例（dataset_folder 指向内部 S3）、以及发布权重是否带有可继续原训练的 optimizer/RNG。
+  配方完整性检查与四框架接口对照在 7.3；本节只做配置到状态的映射。

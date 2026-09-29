@@ -1,0 +1,55 @@
+model=HuggingFaceTB/SmolLM2-360M  device=cuda  dtype=torch.float32
+transformers=5.17.0  torch=2.13.0+cu130
+loss 入口：LlamaForCausalLM.forward → self.loss_function → ForCausalLMLoss → fixed_cross_entropy（num_items_in_batch 为 None 时 reduction='mean'）
+GPU=NVIDIA GeForce RTX 5090 D
+
+========================================================================
+1. batch 与有效 target 数
+========================================================================
+  [0] tokens=  9  有效 target=  8  «The first example sentence for gradient accumulation test.»
+  [1] tokens=  9  有效 target=  8  «The second example with different content and length.»
+  [2] tokens= 10  有效 target=  9  «Third sentence is about machine learning and deep learning.»
+  [3] tokens= 10  有效 target=  9  «Fourth and final sentence concludes the micro batch set.»
+  padding 到 64，合计有效 target N_total=34
+
+========================================================================
+2. 一次完整更新的逐项读数（P1）
+========================================================================
+  model.loss = 5.29408360
+  手算 Σ/N   = 5.29408360   差 0.000e+00
+  逐 token loss（前 10 个有效位置）: [3.839592, 5.226672, 7.317405, 4.371377, 9.286695, 8.936603, 7.27218, 3.362984, 6.314533, 4.7967]
+  clip 前 global grad norm = 37.184788（max_norm=1.0，裁剪）
+  一次 AdamW 更新后参数最大变化 = 1.073e-04
+  有 optimizer 状态的张量 290/290
+
+========================================================================
+3. 三条累积路径
+========================================================================
+[P1] 累计 loss = 5.29408360   grad 全局范数 = 37.184788
+
+[P2] 逐 microbatch：
+    i=0 N=8 model.loss=1.459221 贡献=1.459221
+    i=1 N=8 model.loss=1.205690 贡献=1.205690
+    i=2 N=9 model.loss=0.922522 贡献=0.922522
+    i=3 N=9 model.loss=1.706651 贡献=1.706651
+[P2] 累计 loss = 5.29408437   grad 全局范数 = 37.184772
+
+[P3] 逐 microbatch：
+    i=0 N=8 model.loss=6.201687 贡献=1.550422
+    i=1 N=8 model.loss=5.124184 贡献=1.281046
+    i=2 N=9 model.loss=3.485084 贡献=0.871271
+    i=3 N=9 model.loss=6.447350 贡献=1.611837
+[P3] 累计 loss = 5.31457615   grad 全局范数 = 36.933693
+
+  P1 梯度最大绝对值 = 10.128517
+  对照            | 梯度最大差   | 相对梯度量级 | 一次更新后参数最大差
+  P1 ↔ P2         | 3.475e-05    | 3.431e-06    | 9.455e-05
+  P1 ↔ P3         | 3.970e-01    | 3.920e-02    | 2.003e-04
+
+  P3 的四个 model.loss 按有效数加权平均 = 5.29408442，P1 的 loss = 5.29408360，差 8.27e-07
+  P3 的等权平均 = 5.31457615
+  梯度是这里唯一有分辨力的量：P2 与 P1 差 1e-5 量级（fp32 归约顺序不同），P3 与 P1 差 1e-1 量级。
+  参数差不能用来判断：m/v 从零起步时 Adam 的首步更新约等于 lr·sign(g)=1e-04，
+  只要梯度符号不同，参数差就被钉在 2·lr 附近，与两条路径的真实差距无关。
+
+摘要写入 /scratch/learn/work/out/7.0b/20260915-one-step/one_step.json
